@@ -1,0 +1,19 @@
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+from scipy.optimize import brentq
+
+def black_scholes(S, K, T, r, sigma, option="call"):
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    if option == "call":
+        return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    elif option == "put":
+        return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+    # TODO: add Greeks (delta, gamma, vega, theta, rho)
+    # TODO: add implied volatility solver
+    # TODO: add surface plotting
+ 
+print("1. Black-Scholes")
+print(f"   Call price: ${black_scholes(100, 100, 1, 0.05, 0.20):.4f}")
+print(f"   Put  price: ${black_scholes(100, 100, 1, 0.05, 0.20, 'put'):.4f}")
