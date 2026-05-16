@@ -60,7 +60,15 @@ COLORS = {
 
 @dataclass(frozen=True)
 class CommodityTemplate:
-    """Static template describing the structural characteristics of a commodity."""
+    """Static template describing the structural characteristics of a commodity.
+
+    Includes *benchmark / ideal metrics* that the UI compares live values against:
+        days_cover_target   - normal inventory cover in days
+        ideal_utilization_pct - typical "healthy" storage utilisation
+        typical_monthly_vol_pct - 1σ monthly price volatility band
+        normal_yoy_demand_pct - structural demand growth in a healthy market
+        ideal_mm_pct_of_oi  - normal managed-money positioning as % of OI
+    """
 
     key: str
     name: str
@@ -76,29 +84,72 @@ class CommodityTemplate:
     seasonal_demand: List[float] = field(default_factory=list)
     seasonal_supply: List[float] = field(default_factory=list)
     regions: List[str] = field(default_factory=list)
+    region_weights: List[float] = field(default_factory=list)
     elasticity_alpha: float = 0.0
     elasticity_beta: float = 0.0
     supply_lag_months: int = 6
+    # benchmark / ideal metrics
+    ideal_utilization_pct: float = 65.0
+    typical_monthly_vol_pct: float = 6.0
+    normal_yoy_demand_pct: float = 1.5
+    ideal_mm_pct_of_oi: float = 15.0
+    sector: str = "Energy"          # Energy / Metals / Ags / Softs / Precious
 
 
+# Seasonality patterns - multiplicative factors around 1.0 across Jan..Dec.
+_FLAT = [1.00] * 12
+
+# Energy
 _OIL_DEMAND_SEAS = [1.02, 1.00, 0.99, 0.98, 0.99, 1.01, 1.03, 1.04, 1.02, 1.00, 0.99, 1.03]
-_OIL_SUPPLY_SEAS = [1.00] * 12
+_OIL_SUPPLY_SEAS = _FLAT
 _GAS_DEMAND_SEAS = [1.35, 1.25, 1.10, 0.90, 0.80, 0.85, 0.95, 0.95, 0.85, 0.90, 1.10, 1.30]
-_GAS_SUPPLY_SEAS = [1.00] * 12
+_GAS_SUPPLY_SEAS = _FLAT
+_GASOLINE_DEMAND = [0.92, 0.90, 0.94, 0.98, 1.04, 1.10, 1.13, 1.12, 1.06, 1.00, 0.95, 0.92]
+_GASOLINE_SUPPLY = [0.95, 0.93, 0.96, 1.00, 1.04, 1.06, 1.06, 1.06, 1.04, 1.00, 0.96, 0.94]
+
+# Industrial metals
 _COPPER_DEMAND_SEAS = [0.95, 0.97, 1.02, 1.04, 1.05, 1.03, 1.00, 0.99, 1.02, 1.04, 1.00, 0.89]
 _COPPER_SUPPLY_SEAS = [0.97, 0.96, 1.00, 1.02, 1.03, 1.03, 1.02, 1.02, 1.01, 1.01, 0.98, 0.95]
-_WHEAT_DEMAND_SEAS = [1.00] * 12
+_ALUMINUM_DEMAND = [1.00, 0.98, 1.02, 1.04, 1.05, 1.03, 1.00, 0.99, 1.01, 1.02, 1.00, 0.92]
+_ALUMINUM_SUPPLY = _FLAT
+_NICKEL_DEMAND = [0.95, 0.96, 1.00, 1.03, 1.05, 1.04, 1.02, 1.01, 1.02, 1.03, 1.00, 0.89]
+_NICKEL_SUPPLY = [0.98, 0.97, 1.00, 1.01, 1.02, 1.02, 1.01, 1.01, 1.00, 1.00, 0.99, 0.99]
+_IRON_ORE_DEMAND = [1.08, 0.92, 1.05, 1.06, 1.04, 1.02, 1.00, 0.99, 1.01, 1.03, 1.00, 0.95]
+_IRON_ORE_SUPPLY = [0.92, 0.96, 1.02, 1.05, 1.06, 1.04, 1.02, 1.02, 1.00, 1.00, 0.96, 0.95]
+
+# Precious metals
+_GOLD_DEMAND = [1.15, 1.08, 0.95, 0.92, 0.94, 0.92, 0.95, 0.98, 1.00, 1.10, 1.05, 1.10]
+_GOLD_SUPPLY = _FLAT
+_SILVER_DEMAND = [1.05, 1.00, 0.98, 0.96, 0.97, 0.98, 1.00, 1.02, 1.03, 1.05, 1.02, 1.00]
+_SILVER_SUPPLY = _FLAT
+
+# Grains / oilseeds (northern hemisphere harvest concentrated)
+_WHEAT_DEMAND_SEAS = _FLAT
 _WHEAT_SUPPLY_SEAS = [0.60, 0.50, 0.60, 0.80, 1.10, 1.60, 1.90, 1.70, 1.30, 0.90, 0.70, 0.60]
+_CORN_DEMAND = _FLAT
+_CORN_SUPPLY = [0.50, 0.40, 0.50, 0.70, 1.10, 1.50, 1.40, 1.10, 1.50, 1.80, 1.40, 0.70]
+_SOY_DEMAND = _FLAT
+_SOY_SUPPLY = [0.60, 1.20, 1.50, 1.40, 0.70, 0.60, 0.60, 0.60, 1.40, 1.80, 1.20, 0.80]
+
+# Softs
+_COFFEE_DEMAND = [1.05, 1.03, 1.00, 0.98, 0.95, 0.95, 0.97, 0.99, 1.02, 1.04, 1.04, 1.05]
+_COFFEE_SUPPLY = [0.50, 0.55, 0.65, 0.85, 1.20, 1.50, 1.55, 1.45, 1.30, 1.00, 0.75, 0.60]
+_SUGAR_DEMAND = [1.05, 1.05, 1.10, 1.05, 1.00, 0.95, 0.95, 0.98, 1.00, 1.00, 1.00, 1.05]
+_SUGAR_SUPPLY = [0.70, 0.65, 0.80, 0.95, 1.10, 1.30, 1.40, 1.25, 1.05, 1.00, 0.95, 0.85]
 
 
 COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
+    # ---------- ENERGY ----------
     "crude_oil": CommodityTemplate(
         key="crude_oil", name="Crude Oil", unit="mb/d", inventory_unit="mb",
         ticker="CL=F", base_supply=101.0, base_demand=100.5, base_price=78.0,
         price_band=(40.0, 130.0), storage_capacity=4200.0, days_cover_target=30.0,
         seasonal_demand=_OIL_DEMAND_SEAS, seasonal_supply=_OIL_SUPPLY_SEAS,
         regions=["US", "Europe", "China", "Middle East", "Rest of World"],
+        region_weights=[0.21, 0.14, 0.15, 0.09, 0.41],
         elasticity_alpha=0.06, elasticity_beta=0.10, supply_lag_months=6,
+        ideal_utilization_pct=70, typical_monthly_vol_pct=8,
+        normal_yoy_demand_pct=1.2, ideal_mm_pct_of_oi=15, sector="Energy",
     ),
     "natural_gas": CommodityTemplate(
         key="natural_gas", name="Natural Gas", unit="bcf/d", inventory_unit="bcf",
@@ -106,23 +157,150 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         price_band=(1.50, 9.00), storage_capacity=4200.0, days_cover_target=35.0,
         seasonal_demand=_GAS_DEMAND_SEAS, seasonal_supply=_GAS_SUPPLY_SEAS,
         regions=["US", "Europe", "Asia LNG", "Rest of World"],
+        region_weights=[0.30, 0.18, 0.20, 0.32],
         elasticity_alpha=0.18, elasticity_beta=0.08, supply_lag_months=4,
+        ideal_utilization_pct=75, typical_monthly_vol_pct=12,
+        normal_yoy_demand_pct=1.8, ideal_mm_pct_of_oi=18, sector="Energy",
     ),
+    "gasoline": CommodityTemplate(
+        key="gasoline", name="Gasoline (RBOB)", unit="mb/d", inventory_unit="mb",
+        ticker="RB=F", base_supply=27.0, base_demand=26.5, base_price=92.0,
+        price_band=(50.0, 160.0), storage_capacity=280.0, days_cover_target=23.0,
+        seasonal_demand=_GASOLINE_DEMAND, seasonal_supply=_GASOLINE_SUPPLY,
+        regions=["US", "Europe", "Asia", "Rest of World"],
+        region_weights=[0.34, 0.22, 0.28, 0.16],
+        elasticity_alpha=0.05, elasticity_beta=0.08, supply_lag_months=3,
+        ideal_utilization_pct=80, typical_monthly_vol_pct=9,
+        normal_yoy_demand_pct=0.5, ideal_mm_pct_of_oi=14, sector="Energy",
+    ),
+
+    # ---------- INDUSTRIAL METALS ----------
     "copper": CommodityTemplate(
         key="copper", name="Copper", unit="kt/mo", inventory_unit="kt",
         ticker="HG=F", base_supply=1900.0, base_demand=1910.0, base_price=9200.0,
-        price_band=(5500.0, 11500.0), storage_capacity=600.0, days_cover_target=20.0,
+        price_band=(5500.0, 11500.0), storage_capacity=1400.0, days_cover_target=20.0,
         seasonal_demand=_COPPER_DEMAND_SEAS, seasonal_supply=_COPPER_SUPPLY_SEAS,
         regions=["China", "Europe", "US", "Rest of World"],
+        region_weights=[0.55, 0.15, 0.10, 0.20],
         elasticity_alpha=0.04, elasticity_beta=0.07, supply_lag_months=12,
+        ideal_utilization_pct=50, typical_monthly_vol_pct=6,
+        normal_yoy_demand_pct=2.5, ideal_mm_pct_of_oi=20, sector="Metals",
     ),
+    "aluminum": CommodityTemplate(
+        key="aluminum", name="Aluminum", unit="kt/mo", inventory_unit="kt",
+        ticker="ALI=F", base_supply=5800.0, base_demand=5750.0, base_price=2300.0,
+        price_band=(1700.0, 3500.0), storage_capacity=4000.0, days_cover_target=25.0,
+        seasonal_demand=_ALUMINUM_DEMAND, seasonal_supply=_ALUMINUM_SUPPLY,
+        regions=["China", "Europe", "US", "Rest of World"],
+        region_weights=[0.58, 0.14, 0.10, 0.18],
+        elasticity_alpha=0.04, elasticity_beta=0.05, supply_lag_months=24,
+        ideal_utilization_pct=50, typical_monthly_vol_pct=5,
+        normal_yoy_demand_pct=3.0, ideal_mm_pct_of_oi=14, sector="Metals",
+    ),
+    "nickel": CommodityTemplate(
+        key="nickel", name="Nickel", unit="kt/mo", inventory_unit="kt",
+        ticker="NI=F", base_supply=270.0, base_demand=265.0, base_price=18000.0,
+        price_band=(12000.0, 50000.0), storage_capacity=250.0, days_cover_target=20.0,
+        seasonal_demand=_NICKEL_DEMAND, seasonal_supply=_NICKEL_SUPPLY,
+        regions=["China", "Europe", "Indonesia", "Rest of World"],
+        region_weights=[0.55, 0.12, 0.18, 0.15],
+        elasticity_alpha=0.05, elasticity_beta=0.04, supply_lag_months=18,
+        ideal_utilization_pct=50, typical_monthly_vol_pct=12,
+        normal_yoy_demand_pct=5.0, ideal_mm_pct_of_oi=18, sector="Metals",
+    ),
+    "iron_ore": CommodityTemplate(
+        key="iron_ore", name="Iron Ore", unit="mt/mo", inventory_unit="mt",
+        ticker="TIO=F", base_supply=130.0, base_demand=128.0, base_price=110.0,
+        price_band=(50.0, 230.0), storage_capacity=250.0, days_cover_target=25.0,
+        seasonal_demand=_IRON_ORE_DEMAND, seasonal_supply=_IRON_ORE_SUPPLY,
+        regions=["China", "Europe", "Japan/Korea", "Rest of World"],
+        region_weights=[0.70, 0.10, 0.10, 0.10],
+        elasticity_alpha=0.05, elasticity_beta=0.06, supply_lag_months=18,
+        ideal_utilization_pct=65, typical_monthly_vol_pct=10,
+        normal_yoy_demand_pct=1.5, ideal_mm_pct_of_oi=12, sector="Metals",
+    ),
+
+    # ---------- PRECIOUS METALS ----------
+    "gold": CommodityTemplate(
+        key="gold", name="Gold", unit="t/mo", inventory_unit="t",
+        ticker="GC=F", base_supply=305.0, base_demand=300.0, base_price=2000.0,
+        price_band=(1200.0, 3000.0), storage_capacity=5000.0, days_cover_target=90.0,
+        seasonal_demand=_GOLD_DEMAND, seasonal_supply=_GOLD_SUPPLY,
+        regions=["China", "India", "OECD ETFs", "Rest of World"],
+        region_weights=[0.25, 0.22, 0.28, 0.25],
+        elasticity_alpha=0.03, elasticity_beta=0.02, supply_lag_months=24,
+        ideal_utilization_pct=60, typical_monthly_vol_pct=4,
+        normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=22, sector="Precious",
+    ),
+    "silver": CommodityTemplate(
+        key="silver", name="Silver", unit="t/mo", inventory_unit="t",
+        ticker="SI=F", base_supply=2400.0, base_demand=2500.0, base_price=25.0,
+        price_band=(15.0, 50.0), storage_capacity=30000.0, days_cover_target=90.0,
+        seasonal_demand=_SILVER_DEMAND, seasonal_supply=_SILVER_SUPPLY,
+        regions=["China", "India", "OECD", "Rest of World"],
+        region_weights=[0.30, 0.20, 0.30, 0.20],
+        elasticity_alpha=0.05, elasticity_beta=0.03, supply_lag_months=18,
+        ideal_utilization_pct=60, typical_monthly_vol_pct=7,
+        normal_yoy_demand_pct=2.0, ideal_mm_pct_of_oi=20, sector="Precious",
+    ),
+
+    # ---------- AGRICULTURE / GRAINS ----------
     "wheat": CommodityTemplate(
         key="wheat", name="Wheat", unit="mt/mo", inventory_unit="mt",
         ticker="ZW=F", base_supply=65.0, base_demand=64.5, base_price=620.0,
         price_band=(380.0, 1100.0), storage_capacity=320.0, days_cover_target=70.0,
         seasonal_demand=_WHEAT_DEMAND_SEAS, seasonal_supply=_WHEAT_SUPPLY_SEAS,
         regions=["US", "EU", "Black Sea", "China", "Rest of World"],
+        region_weights=[0.10, 0.15, 0.12, 0.18, 0.45],
         elasticity_alpha=0.05, elasticity_beta=0.03, supply_lag_months=9,
+        ideal_utilization_pct=60, typical_monthly_vol_pct=7,
+        normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=15, sector="Ags",
+    ),
+    "corn": CommodityTemplate(
+        key="corn", name="Corn", unit="mt/mo", inventory_unit="mt",
+        ticker="ZC=F", base_supply=100.0, base_demand=99.0, base_price=200.0,
+        price_band=(140.0, 380.0), storage_capacity=700.0, days_cover_target=80.0,
+        seasonal_demand=_CORN_DEMAND, seasonal_supply=_CORN_SUPPLY,
+        regions=["US", "China", "Brazil", "Rest of World"],
+        region_weights=[0.32, 0.27, 0.10, 0.31],
+        elasticity_alpha=0.05, elasticity_beta=0.04, supply_lag_months=9,
+        ideal_utilization_pct=55, typical_monthly_vol_pct=6,
+        normal_yoy_demand_pct=1.2, ideal_mm_pct_of_oi=16, sector="Ags",
+    ),
+    "soybeans": CommodityTemplate(
+        key="soybeans", name="Soybeans", unit="mt/mo", inventory_unit="mt",
+        ticker="ZS=F", base_supply=32.0, base_demand=31.5, base_price=480.0,
+        price_band=(300.0, 800.0), storage_capacity=220.0, days_cover_target=85.0,
+        seasonal_demand=_SOY_DEMAND, seasonal_supply=_SOY_SUPPLY,
+        regions=["US", "Brazil", "China", "Rest of World"],
+        region_weights=[0.28, 0.34, 0.06, 0.32],
+        elasticity_alpha=0.06, elasticity_beta=0.04, supply_lag_months=8,
+        ideal_utilization_pct=55, typical_monthly_vol_pct=7,
+        normal_yoy_demand_pct=2.5, ideal_mm_pct_of_oi=18, sector="Ags",
+    ),
+
+    # ---------- SOFTS ----------
+    "coffee": CommodityTemplate(
+        key="coffee", name="Coffee (Arabica)", unit="kt/mo", inventory_unit="kt",
+        ticker="KC=F", base_supply=880.0, base_demand=870.0, base_price=4500.0,
+        price_band=(2500.0, 9000.0), storage_capacity=1800.0, days_cover_target=60.0,
+        seasonal_demand=_COFFEE_DEMAND, seasonal_supply=_COFFEE_SUPPLY,
+        regions=["Brazil", "Vietnam", "Europe (consumer)", "US (consumer)", "Rest of World"],
+        region_weights=[0.35, 0.18, 0.20, 0.15, 0.12],
+        elasticity_alpha=0.06, elasticity_beta=0.04, supply_lag_months=24,
+        ideal_utilization_pct=60, typical_monthly_vol_pct=9,
+        normal_yoy_demand_pct=2.0, ideal_mm_pct_of_oi=22, sector="Softs",
+    ),
+    "sugar": CommodityTemplate(
+        key="sugar", name="Sugar (Raw #11)", unit="mt/mo", inventory_unit="mt",
+        ticker="SB=F", base_supply=15.0, base_demand=14.8, base_price=480.0,
+        price_band=(250.0, 800.0), storage_capacity=80.0, days_cover_target=90.0,
+        seasonal_demand=_SUGAR_DEMAND, seasonal_supply=_SUGAR_SUPPLY,
+        regions=["Brazil", "India", "Thailand", "EU", "Rest of World"],
+        region_weights=[0.35, 0.20, 0.10, 0.10, 0.25],
+        elasticity_alpha=0.05, elasticity_beta=0.04, supply_lag_months=12,
+        ideal_utilization_pct=60, typical_monthly_vol_pct=8,
+        normal_yoy_demand_pct=1.5, ideal_mm_pct_of_oi=18, sector="Softs",
     ),
 }
 
@@ -228,16 +406,31 @@ def get_sd_dataset(commodity_key: str, start: str = "2018-01-01",
         supply_monthly = supply
         demand_monthly = demand
 
+    # Anchor the structural balance: rescale supply so the historic window
+    # averages a tiny ~0.2% surplus over demand. Removes runaway stock builds
+    # caused by base_supply/base_demand calibration drift.
+    n_hist = len(idx)
+    hist_supply_mean = float(np.mean(supply_monthly[:n_hist]))
+    hist_demand_mean = float(np.mean(demand_monthly[:n_hist]))
+    if hist_supply_mean > 0:
+        scale = (hist_demand_mean * 1.002) / hist_supply_mean
+        supply = supply * scale
+        supply_monthly = supply_monthly * scale
+
     if tpl.unit.endswith("/d"):
         starting_stocks = tpl.base_demand * tpl.days_cover_target
     else:
         starting_stocks = tpl.base_demand * (tpl.days_cover_target / 30.0)
-    starting_stocks = min(starting_stocks, 0.8 * tpl.storage_capacity)
+    # Keep starting stocks within a sensible band relative to capacity.
+    starting_stocks = min(max(starting_stocks, 0.2 * tpl.storage_capacity),
+                          0.7 * tpl.storage_capacity)
 
     stocks = np.empty(n)
     stocks[0] = starting_stocks
+    cap_soft = tpl.storage_capacity * 1.2  # soft cap to keep series finite
     for i in range(1, n):
-        stocks[i] = max(stocks[i - 1] + (supply_monthly[i] - demand_monthly[i]), 0.0)
+        candidate = stocks[i - 1] + (supply_monthly[i] - demand_monthly[i])
+        stocks[i] = float(np.clip(candidate, 0.0, cap_soft))
 
     avg_daily_demand = demand_monthly / days_in_month
     days_cover = stocks / np.where(avg_daily_demand > 0, avg_daily_demand, 1)
@@ -263,22 +456,20 @@ def get_sd_dataset(commodity_key: str, start: str = "2018-01-01",
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_regional_dataset(commodity_key: str, seed: int = 7) -> pd.DataFrame:
+    """Synthetic regional split using template `region_weights` (falls back to uniform)."""
     tpl = COMMODITY_TEMPLATES[commodity_key]
     rng = np.random.default_rng(seed)
     regions = tpl.regions
+    n = len(regions)
 
-    if tpl.key == "crude_oil":
-        weights = np.array([0.21, 0.14, 0.15, 0.09, 0.41])
-    elif tpl.key == "natural_gas":
-        weights = np.array([0.30, 0.18, 0.20, 0.32])
-    elif tpl.key == "copper":
-        weights = np.array([0.55, 0.15, 0.10, 0.20])
+    if tpl.region_weights and len(tpl.region_weights) == n:
+        weights = np.array(tpl.region_weights, dtype=float)
     else:
-        weights = np.array([0.10, 0.15, 0.12, 0.18, 0.45])
+        weights = np.ones(n)
+    weights = weights / weights.sum()
 
-    weights = weights[: len(regions)] / weights[: len(regions)].sum()
-    demand = tpl.base_demand * weights * (1 + rng.normal(0, 0.03, len(regions)))
-    skew = rng.normal(1.0, 0.20, len(regions))
+    demand = tpl.base_demand * weights * (1 + rng.normal(0, 0.03, n))
+    skew = rng.normal(1.0, 0.20, n)
     supply = tpl.base_supply * weights * skew
     supply = supply * (tpl.base_supply / supply.sum())
     return pd.DataFrame({
@@ -439,13 +630,16 @@ def run_balance(df: pd.DataFrame, commodity_key: str,
 
     start = (a.beginning_stocks if a.beginning_stocks is not None
              else float(adj["stocks"].iloc[0]))
+    storage_cap = a.storage_capacity or tpl.storage_capacity
+    # Soft cap of 1.3× capacity to represent the real-world release valves
+    # (floating storage, ad-hoc exports, rationing) and keep synthetic series
+    # from drifting unbounded. The Inventories page enforces a hard cap.
+    soft_cap = storage_cap * 1.3
     stocks = np.empty(len(adj))
-    stocks[0] = start
+    stocks[0] = float(np.clip(start, 0.0, soft_cap))
     for i in range(1, len(adj)):
         delta = supply_total[i] - demand_total[i] + (net_trade[i] - net_trade.mean()) * 0.05
-        stocks[i] = max(stocks[i - 1] + delta, 0.0)
-
-    storage_cap = a.storage_capacity or tpl.storage_capacity
+        stocks[i] = float(np.clip(stocks[i - 1] + delta, 0.0, soft_cap))
     avg_daily_demand = demand_total / days
     avg_daily_demand = np.where(avg_daily_demand <= 0, 1e-6, avg_daily_demand)
     days_cover = stocks / avg_daily_demand
@@ -1412,6 +1606,260 @@ PAGES = [
 ]
 
 
+# Per-page help text - explains data sources, formulas and what each chart shows.
+HELP_TEXT: Dict[str, str] = {
+    "🏠 Dashboard": """
+**Purpose.** One-screen cross-module snapshot of the selected commodity.
+
+**Data sources.**
+- **`get_sd_dataset(commodity_key)`** — synthetic *monthly* S&D series. Built from
+  the commodity template (`base_supply`, `base_demand`, seasonal factors,
+  growth trend, deterministic noise via `np.random.default_rng(seed)`).
+  Columns: `supply, demand, imports, exports, stocks, days_cover, price,
+  gdp_index, weather_index, refinery_runs, is_forecast`.
+- **`get_regional_dataset()`** — current-period split using
+  `CommodityTemplate.region_weights`.
+- **`get_high_frequency()`** — daily synthetic series (120 days) for vessels,
+  refinery util, satellite production proxy.
+- **`get_positioning()`** — weekly synthetic CFTC-style net positioning,
+  open interest, sentiment.
+- **`run_balance(df, key, assumptions)`** — applies the balance identity
+  `EndingStocks = BeginStocks + Supply − Demand` over the dataset and
+  returns the augmented frame used by all visuals.
+
+**KPI strip (top).**
+- *Spot Price* — last historic point of `bal["price"]`.
+- *Fair Value* — `estimate_fair_value()`: OLS of `log(price)` on `days_cover`
+  fit on history only, then extrapolated.
+- *End Stocks (FC)* — last forecast point of `stocks_model`.
+- *Days of Cover* — `stocks_model / daily_demand`; compared to
+  `tpl.days_cover_target`.
+- *Storage Util* — `stocks_model / storage_capacity × 100`; compared to
+  `tpl.ideal_utilization_pct`.
+
+**Benchmarks vs Actual panel.** Per-commodity *ideal metrics* from the
+template (days-of-cover target, ideal utilisation, expected monthly
+volatility, normal YoY demand growth, normal managed-money share of OI).
+
+**Charts.**
+- *Supply, Demand & Inventory*: balance engine output, stocks on second axis.
+- *Fair Value vs Observed Price*: ±10% regression band.
+- *Inventory Trajectory*: `stocks_model` series.
+- *Days of Forward Cover*: with target line.
+- *Regional Supply vs Demand*: grouped bars from `get_regional_dataset()`.
+- *Daily Telemetry*: 7-day deltas of high-frequency series.
+- *Positioning*: latest weekly point + sentiment label.
+""",
+    "⚖️ Supply & Demand": """
+**Purpose.** The balance engine — drive supply, demand and inventory under
+your assumptions.
+
+**Data sources.**
+- `get_sd_dataset()` for the base monthly series, or your uploaded CSV
+  (must have columns `date, supply, demand` — optional: imports, exports,
+  stocks, price).
+- `run_balance(df, key, BalanceAssumptions)` rebuilds inventory from
+  supply, demand and the adjustments configured in the sidebar.
+
+**Formulas.**
+- Balance identity: `Stocks_t = max(Stocks_{t-1} + Supply_t − Demand_t, 0)`.
+- Adjustments only touch the forecast portion so history is preserved.
+- Effective demand multiplier: `1 + demand_adj% + weather% + (GDP%−2.5)*0.6%`
+  plus refinery-runs (oil only).
+- Resampling to Q/Y uses last-value for stocks, sums for build/draw, mean
+  for flow rates.
+
+**Seasonality block.**
+- *Monthly Seasonal Profile*: 5-year per-month mean / range with current
+  year overlay — from `monthly_profile()`.
+- *Demand Heatmap*: year × month pivot via `year_over_year_pivot()`.
+- *Decomposition*: trend / seasonal / residual via
+  `statsmodels.seasonal_decompose` when available, else moving-average
+  fallback.
+
+**Elasticity block.**
+- Linear schedules
+  `Demand(P) = D0 (1 − α(P−P0)/P0)` and `Supply(P) = S0 (1 + β(P−P0)/P0)`.
+- *Equilibrium* solved analytically from
+  `P_eq = P0 (1 + (D0−S0)/(D0·α + S0·β))`.
+
+**Lagged Supply Response block.**
+- `fit_lagged_supply()` runs a distributed-lag OLS of supply on lagged
+  prices.
+- `project_lagged_response()` simulates a synthetic logistic supply
+  response to a one-off price shock — controls drilling/planting lags.
+
+**Export.** Balance table is exportable as CSV or Excel (`openpyxl`).
+""",
+    "🛢️ Inventories": """
+**Purpose.** Stress-test storage: enforce capacity, simulate floating
+storage, monitor utilisation.
+
+**Data sources.**
+- Same `run_balance()` output as the Supply & Demand page.
+- `project_inventory()` recomputes inventory with capacity caps and
+  optional floating-storage buffer (% of capacity).
+
+**Logic.**
+- Stocks projected month-by-month from `build_draw`.
+- If projected stocks > capacity → spillover is parked in *floating
+  storage* up to `floating_buffer_pct × capacity`.
+- `utilization_pct = stocks / capacity × 100` — compared to
+  `tpl.ideal_utilization_pct`.
+
+**Charts.**
+- *Inventory Trajectory*: capped inventory path.
+- *Build/Draw Waterfall*: last 12 monthly deltas.
+- *Utilisation Gauge*: vs the 80% threshold.
+- *Forward Days of Cover*: with target reference line.
+- *Stocks vs Capacity*: stacked area of land + floating storage.
+""",
+    "🌪️ Scenarios": """
+**Purpose.** Bull / Base / Bear scenario engine with probability weighting.
+
+**Data sources.**
+- `SCENARIO_PRESETS` dict — per-scenario shocks (supply%, demand%, GDP,
+  weather, FX, probability). Editable inline.
+- `run_scenarios()` invokes `run_balance()` once per scenario with
+  preset-derived `BalanceAssumptions`.
+- Fair-value path uses `estimate_fair_value()` to give each scenario its
+  own implied price trajectory.
+
+**Outputs.**
+- *Inventory paths by scenario*: end-stocks trajectory under each shock.
+- *Price paths by scenario*: fair-value implied price.
+- *Summary table*: probability, end-stocks, days-of-cover, build/draw,
+  average forecast price, end fair-value.
+- *Probability-weighted forecast price*:
+  `Σ_i P_i × mean(FC_price_i)` with renormalised probabilities.
+""",
+    "🌍 Regional Flows": """
+**Purpose.** Regional supply/demand split + implied trade-flow Sankey.
+
+**Data sources.**
+- `get_regional_dataset(commodity_key)` — uses `CommodityTemplate.region_weights`
+  to allocate `base_supply` and `base_demand`, with Gaussian noise (`σ=3%` for
+  demand and a `±20%` skew on supply) to create realistic surpluses/deficits.
+
+**Methodology.**
+- `regional_summary()` adds `balance = supply − demand` and labels each
+  region Exporter / Importer / Balanced.
+- `build_trade_flows()` constructs a bipartite flow: each exporter sends
+  its surplus to importers in proportion to each importer's deficit share.
+- `arbitrage_signals()` tags regions Export Arb / Import Need / Neutral.
+
+**Charts.**
+- *Regional Supply vs Demand*: grouped bars.
+- *Inter-Regional Trade Flows*: Plotly Sankey, link width ∝ implied flow.
+""",
+    "📈 Futures Curve": """
+**Purpose.** Term-structure analytics — contango/backwardation, spreads,
+storage economics, and the inventory↔curve relationship.
+
+**Data sources.**
+- `get_futures_curve(commodity_key, structure)` — synthetic curve built as
+  `price_t = spot × exp(slope × t + ε)` where `slope` depends on the
+  chosen shape (contango: +0.005/mo; backwardation: −0.006/mo).
+- Live front-month price is available via the optional `get_yahoo_history()`
+  hook (degraded automatically when offline).
+
+**Outputs.**
+- *Classification* via `classify_structure()` — Contango / Backwardation /
+  Mixed using sign of consecutive price differences.
+- *Calendar spreads*: m1−m2, m1−m6, m1−m12, m6−m12.
+- *Storage economics*: positive carry = `contango_premium > carry_cost`,
+  where `carry_cost = (storage/mo + financing/12 × spot) × tenor`.
+- *Inventory ↔ Curve*: heuristic *tightness score* = clipped
+  `(35 − days_cover) / 20` ∈ [−1, +1]. Tight inventory supports
+  backwardation; loose supports contango.
+""",
+    "🏦 Macro": """
+**Purpose.** Link the commodity price to macro drivers — GDP, PMI, USD,
+policy rate.
+
+**Data sources.**
+- `get_sd_dataset()` price column.
+- `get_macro_panel()` — synthetic 84-month panel: GDP index, PMI
+  (mean-reverting around 50), USD index, policy rate.
+- `align_macro()` inner-joins both on the monthly date index (dropping
+  overlapping columns from S&D so macro values take precedence).
+
+**Tools.**
+- *Correlation matrix* — Pearson, rounded; `correlation_heatmap()`.
+- *Scatter diagnostics* — selectable X driver vs Price, with OLS fit
+  (`statsmodels` if installed, else `np.polyfit`).
+- *Rolling correlations* — 24-month window via `rolling_correlation()`.
+- *Multivariate regression* — `regression_summary()` runs OLS of
+  `log(price) ~ macro panel`, returning coefficients, intercept and R².
+""",
+    "🎲 Monte Carlo": """
+**Purpose.** Probabilistic forecast under random shocks.
+
+**Data sources.**
+- Same balance engine as elsewhere. The configured
+  `BalanceAssumptions` is the *centre* of the random distribution.
+- `MCConfig` controls path count, supply/demand/weather σ, outage
+  probability per month, and outage size %.
+
+**Engine.**
+For each path:
+1. Draw supply Δ ~ Normal(μ=`supply_adj%`, σ=`supply_sigma_pct`); same
+   for demand and weather.
+2. With probability `outage_prob × n_forecast_months`, multiply supply
+   from a random forecast month onward by `(1 − outage_size%)` and
+   rebuild stocks.
+3. Re-run the balance engine and `estimate_fair_value()`.
+
+**Outputs.**
+- Distributions of average forecast price, end-stocks, and cumulative
+  build/draw — `histogram()` with P5/P50/P95 markers.
+- Probabilistic *fan charts* for both price and stocks
+  (5th/50th/95th percentiles across paths).
+- *VaR 95%* — `value_at_risk()` on `max(0, median_price − path_price)`.
+""",
+    "📉 Sensitivities": """
+**Purpose.** Identify which assumptions drive the chosen metric most.
+
+**Data sources.**
+- Base `BalanceAssumptions` from the sidebar.
+- Each variable is perturbed independently to its `low` / `high` value
+  while everything else is held fixed.
+
+**Tornado chart.**
+- `tornado()` evaluates the metric (`end_stocks`, `avg_fc_price`, or
+  `build_draw_sum`) at low / base / high for each variable, sorted by
+  range. Bars show Δ vs base; longest bars = biggest sensitivities.
+
+**Stress matrix.**
+- `stress_matrix()` runs a 6×6 grid over two variables, returning the
+  metric in each cell. Visualised as a heatmap so you can see
+  interaction effects.
+""",
+    "⚙️ Settings": """
+**Purpose.** Persist + reload model parameters, manage cache, inspect
+commodity templates.
+
+**Features.**
+- *Download/Load JSON*: persist `BalanceAssumptions` to and from JSON via
+  `params_to_json()` / `params_from_json()`.
+- *Clear cache*: hits `st.cache_data.clear()` then `st.rerun()`.
+- *Commodity Templates*: full template (base supply/demand/price,
+  storage capacity, days-cover target, ideal utilisation, expected
+  volatility, region weights, elasticity, supply lag, sector) for every
+  commodity in `COMMODITY_TEMPLATES`.
+""",
+}
+
+
+def render_page_help(page_name: str) -> None:
+    """Render an info expander explaining the page's data sources & methods."""
+    body = HELP_TEXT.get(page_name)
+    if not body:
+        return
+    with st.expander("ℹ️ About this page — data sources & methodology", expanded=False):
+        st.markdown(body)
+
+
 def init_session_defaults() -> None:
     ss = st.session_state
     ss.setdefault("commodity_key", "crude_oil")
@@ -1479,6 +1927,9 @@ def kpi_row(items: List[Tuple[str, str, Optional[str]]]) -> None:
 def page_dashboard(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame,
                    fv: pd.DataFrame) -> None:
     st.title(f"🏠 {tpl.name} Dashboard")
+    st.caption(f"Sector: **{tpl.sector}** · Trades as **{tpl.ticker}** · "
+               f"Unit: {tpl.unit} · Inventory: {tpl.inventory_unit}")
+    render_page_help("🏠 Dashboard")
 
     last_h = bal[~bal["is_forecast"]].iloc[-1]
     last_f = bal.iloc[-1]
@@ -1494,8 +1945,37 @@ def page_dashboard(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame,
         ("End Stocks (FC)", f"{last_f['stocks_model']:,.0f} {tpl.inventory_unit}", None),
         ("Days of Cover", f"{last_f['days_cover_model']:.1f}",
          f"target {tpl.days_cover_target:.0f}"),
-        ("Storage Util", f"{last_f['capacity_pct']:.1f}%", None),
+        ("Storage Util", f"{last_f['capacity_pct']:.1f}%",
+         f"ideal {tpl.ideal_utilization_pct:.0f}%"),
     ])
+
+    # Benchmarks vs Actual
+    st.markdown("##### 📐 Ideal Benchmarks vs Current")
+    yoy_demand = (bal["demand"].iloc[-1] / bal["demand"].iloc[max(-13, -len(bal))] - 1) * 100
+    rolling_vol = bal["price"].pct_change().tail(12).std() * 100
+    bench_rows = [
+        {"Metric": "Days of Cover", "Ideal": f"{tpl.days_cover_target:.0f} d",
+         "Current": f"{last_f['days_cover_model']:.1f} d",
+         "Reading": "Tight" if last_f["days_cover_model"] < tpl.days_cover_target * 0.85
+                    else "Loose" if last_f["days_cover_model"] > tpl.days_cover_target * 1.15
+                    else "Balanced"},
+        {"Metric": "Storage Util", "Ideal": f"{tpl.ideal_utilization_pct:.0f}%",
+         "Current": f"{last_f['capacity_pct']:.1f}%",
+         "Reading": "Under-used" if last_f["capacity_pct"] < tpl.ideal_utilization_pct - 10
+                    else "Stretched" if last_f["capacity_pct"] > tpl.ideal_utilization_pct + 10
+                    else "Healthy"},
+        {"Metric": "Monthly Vol (1y)", "Ideal": f"{tpl.typical_monthly_vol_pct:.1f}%",
+         "Current": f"{rolling_vol:.1f}%",
+         "Reading": "Elevated" if rolling_vol > tpl.typical_monthly_vol_pct * 1.3
+                    else "Subdued" if rolling_vol < tpl.typical_monthly_vol_pct * 0.7
+                    else "Normal"},
+        {"Metric": "YoY Demand Growth", "Ideal": f"{tpl.normal_yoy_demand_pct:+.1f}%",
+         "Current": f"{yoy_demand:+.1f}%",
+         "Reading": "Above trend" if yoy_demand > tpl.normal_yoy_demand_pct + 1
+                    else "Below trend" if yoy_demand < tpl.normal_yoy_demand_pct - 1
+                    else "On trend"},
+    ]
+    st.dataframe(pd.DataFrame(bench_rows), hide_index=True, use_container_width=True)
 
     st.markdown("---")
     left, right = st.columns([3, 2])
@@ -1534,6 +2014,7 @@ def page_dashboard(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame,
 
 def page_supply_demand(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
     st.title(f"⚖️ {tpl.name} - Balance Engine")
+    render_page_help("⚖️ Supply & Demand")
 
     with st.expander("Upload custom CSV (date, supply, demand, ...)"):
         file = st.file_uploader("CSV file", type=["csv"])
@@ -1608,6 +2089,7 @@ def page_supply_demand(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
 
 def page_inventories(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame) -> None:
     st.title(f"🛢️ {tpl.name} - Inventory & Storage")
+    render_page_help("🛢️ Inventories")
 
     c1, c2, c3 = st.columns(3)
     cap = c1.number_input("Storage capacity", value=float(tpl.storage_capacity),
@@ -1649,6 +2131,7 @@ def page_inventories(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame
 
 def page_scenarios(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
     st.title(f"🌪️ {tpl.name} - Scenario Engine")
+    render_page_help("🌪️ Scenarios")
 
     c1, c2, c3 = st.columns(3)
     new_probs = {}
@@ -1682,6 +2165,7 @@ def page_scenarios(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
 
 def page_regional(tpl: CommodityTemplate) -> None:
     st.title(f"🌍 {tpl.name} - Regional Flows")
+    render_page_help("🌍 Regional Flows")
     reg = get_regional_dataset(st.session_state["commodity_key"])
     rs = regional_summary(reg)
 
@@ -1704,6 +2188,7 @@ def page_regional(tpl: CommodityTemplate) -> None:
 
 def page_futures_curve(tpl: CommodityTemplate, bal: pd.DataFrame) -> None:
     st.title(f"📈 {tpl.name} - Term Structure")
+    render_page_help("📈 Futures Curve")
 
     c1, c2, c3 = st.columns(3)
     structure_choice = c1.selectbox("Curve shape", ["contango", "backwardation", "flat"])
@@ -1738,6 +2223,7 @@ def page_futures_curve(tpl: CommodityTemplate, bal: pd.DataFrame) -> None:
 
 def page_macro(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
     st.title(f"🏦 {tpl.name} - Macro Overlay")
+    render_page_help("🏦 Macro")
     macro = get_macro_panel(months=84)
     joined = align_macro(df, macro)
 
@@ -1776,6 +2262,7 @@ def page_macro(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
 
 def page_monte_carlo(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
     st.title(f"🎲 {tpl.name} - Monte Carlo Engine")
+    render_page_help("🎲 Monte Carlo")
 
     c1, c2, c3 = st.columns(3)
     n_paths = c1.slider("Paths", 100, 2000, 500, step=100)
@@ -1830,6 +2317,7 @@ def page_monte_carlo(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
 
 def page_sensitivities(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
     st.title(f"📉 {tpl.name} - Sensitivity Analysis")
+    render_page_help("📉 Sensitivities")
     metric = st.selectbox("Metric",
                           ["end_stocks", "avg_fc_price", "build_draw_sum"], index=0)
     variables = [
@@ -1860,6 +2348,7 @@ def page_sensitivities(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
 
 def page_settings() -> None:
     st.title("⚙️ Settings")
+    render_page_help("⚙️ Settings")
 
     st.subheader("Active Assumptions")
     a: BalanceAssumptions = st.session_state["assumptions"]
@@ -1884,19 +2373,41 @@ def page_settings() -> None:
         st.rerun()
 
     st.subheader("Commodity Templates")
+    # Side-by-side summary table of ideal/benchmark metrics
+    rows = []
     for k, tpl in COMMODITY_TEMPLATES.items():
-        with st.expander(tpl.name):
+        rows.append({
+            "Commodity": tpl.name, "Sector": tpl.sector, "Ticker": tpl.ticker,
+            "Unit": tpl.unit, "Days-of-Cover Target": tpl.days_cover_target,
+            "Ideal Util %": tpl.ideal_utilization_pct,
+            "Monthly Vol %": tpl.typical_monthly_vol_pct,
+            "YoY Demand %": tpl.normal_yoy_demand_pct,
+            "MM% of OI": tpl.ideal_mm_pct_of_oi,
+            "Storage Cap": tpl.storage_capacity,
+            "Supply Lag (m)": tpl.supply_lag_months,
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    for k, tpl in COMMODITY_TEMPLATES.items():
+        with st.expander(f"{tpl.name} — full template"):
             st.json({
-                "key": tpl.key, "unit": tpl.unit,
-                "inventory_unit": tpl.inventory_unit, "ticker": tpl.ticker,
+                "key": tpl.key, "name": tpl.name, "sector": tpl.sector,
+                "unit": tpl.unit, "inventory_unit": tpl.inventory_unit,
+                "ticker": tpl.ticker,
                 "base_supply": tpl.base_supply, "base_demand": tpl.base_demand,
                 "base_price": tpl.base_price, "price_band": tpl.price_band,
                 "storage_capacity": tpl.storage_capacity,
                 "days_cover_target": tpl.days_cover_target,
-                "regions": tpl.regions,
+                "ideal_utilization_pct": tpl.ideal_utilization_pct,
+                "typical_monthly_vol_pct": tpl.typical_monthly_vol_pct,
+                "normal_yoy_demand_pct": tpl.normal_yoy_demand_pct,
+                "ideal_mm_pct_of_oi": tpl.ideal_mm_pct_of_oi,
+                "regions": tpl.regions, "region_weights": tpl.region_weights,
                 "elasticity_alpha": tpl.elasticity_alpha,
                 "elasticity_beta": tpl.elasticity_beta,
                 "supply_lag_months": tpl.supply_lag_months,
+                "seasonal_demand": tpl.seasonal_demand,
+                "seasonal_supply": tpl.seasonal_supply,
             })
 
 
