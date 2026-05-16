@@ -1328,8 +1328,19 @@ def correlation_heatmap(corr: pd.DataFrame) -> go.Figure:
 
 def scatter_with_fit(x: pd.Series, y: pd.Series, x_label: str, y_label: str) -> go.Figure:
     common = pd.concat([x, y], axis=1, keys=["x", "y"]).dropna()
-    fig = px.scatter(common, x="x", y="y", trendline="ols",
-                     labels={"x": x_label, "y": y_label})
+    try:
+        import statsmodels.api  # noqa: F401  - required for trendline="ols"
+        fig = px.scatter(common, x="x", y="y", trendline="ols",
+                         labels={"x": x_label, "y": y_label})
+    except ImportError:
+        fig = px.scatter(common, x="x", y="y",
+                         labels={"x": x_label, "y": y_label})
+        if len(common) >= 2:
+            slope, intercept = np.polyfit(common["x"], common["y"], 1)
+            xs = np.linspace(common["x"].min(), common["x"].max(), 50)
+            fig.add_trace(go.Scatter(x=xs, y=slope * xs + intercept,
+                                     mode="lines", name="OLS fit",
+                                     line=dict(color=COLORS["price"], width=1.5)))
     fig.update_layout(title=f"{y_label} vs {x_label}", height=320)
     return fig
 
