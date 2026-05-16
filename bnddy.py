@@ -858,7 +858,7 @@ def chart_budget_bars(assets, weights, budget, label="Portfolio") -> go.Figure:
     ))
     fig.update_layout(**base_layout(
         f"Budget Allocation — {label}  (Total €{budget:,})",
-        "Amount Allocated (€)", "",
+        "Montant alloué (€)", "",
         height=max(300, len(a_show) * 46 + 120),
     ))
     return fig
@@ -887,8 +887,8 @@ def chart_live_vs_backtest(assets, hist_prices, live_prices) -> go.Figure:
     ))
     fig.add_vline(x=0, line=dict(color=MUTED, width=1))
     fig.update_layout(**base_layout(
-        "Performance Since Backtest End (Live Price vs Last Historical Price)",
-        "Change (%)", "",
+        "Performance depuis la fin du backtest (prix live vs dernier prix historique)",
+        "Variation (%)", "",
         height=max(300, len(assets) * 46 + 120),
     ))
     return fig
@@ -911,13 +911,13 @@ def build_alloc_table(assets, weights, budget, live_prices,
 
         rows.append({
             "Asset":               a,
-            "Weight":              f"{w*100:.1f}%",
-            "Allocated (€)":       f"€ {alloc_eur:,.0f}",
-            "Allocated ($)":       f"$ {alloc_usd:,.0f}",
-            "Live Price":          f"$ {live:,.2f}" if live else "—",
-            "Shares":              f"{shares:.4f}" if shares else "—",
-            "Current Value (€)":   f"€ {live_val:,.0f}" if live_val else "—",
-            "Δ Backtest End":      (f"+{chg_pct:.1f}%" if chg_pct and chg_pct >= 0
+            "Poids":               f"{w*100:.1f}%",
+            "Alloué (€)":          f"€ {alloc_eur:,.0f}",
+            "Alloué ($)":          f"$ {alloc_usd:,.0f}",
+            "Prix live":           f"$ {live:,.2f}" if live else "—",
+            "Nb actions":          f"{shares:.4f}" if shares else "—",
+            "Valeur actuelle (€)": f"€ {live_val:,.0f}" if live_val else "—",
+            "Δ fin backtest":      (f"+{chg_pct:.1f}%" if chg_pct and chg_pct >= 0
                                     else f"{chg_pct:.1f}%" if chg_pct else "—"),
         })
     return pd.DataFrame(rows)
@@ -930,7 +930,7 @@ def style_delta(df: pd.DataFrame):
         if isinstance(val, str) and val.startswith("-"):
             return f"color:{RED}"
         return f"color:{MUTED}"
-    return df.style.map(_color, subset=["Δ Backtest End"])
+    return df.style.map(_color, subset=["Δ fin backtest"])
 
 
 # ─── Sidebar ──────────────────────────────────────────────────────
@@ -954,17 +954,17 @@ def render_sidebar() -> tuple:
 </div>
 """, unsafe_allow_html=True)
 
-    sidebar_section("Parameters")
+    sidebar_section("Paramètres")
     c1, c2 = st.sidebar.columns(2)
-    start  = c1.date_input("Start", date(2019, 1, 1))
-    end    = c2.date_input("End",   date(2026, 1, 1))
+    start  = c1.date_input("Début", date(2019, 1, 1))
+    end    = c2.date_input("Fin",   date(2026, 1, 1))
     rf_pct = st.sidebar.slider(
-        "Risk-Free Rate (%)", 0.0, 10.0, 4.0, 0.25, format="%.2f%%"
+        "Taux sans risque (%)", 0.0, 10.0, 4.0, 0.25, format="%.2f%%"
     )
 
     sidebar_section("Budget")
     budget = st.sidebar.number_input(
-        "Amount (€)", min_value=100, max_value=10_000_000,
+        "Montant (€)", min_value=100, max_value=10_000_000,
         value=4000, step=100, format="%d",
         label_visibility="collapsed",
     )
@@ -978,21 +978,21 @@ def render_sidebar() -> tuple:
     <span style="color:#D4AF37;font-weight:700;font-size:0.95rem;">
         € {budget:,}
     </span>
-    <span style="color:#64748B;font-size:0.72rem;">total budget</span>
+    <span style="color:#64748B;font-size:0.72rem;">budget total</span>
 </div>""", unsafe_allow_html=True)
 
-    sidebar_section("Asset Database")
+    sidebar_section("Base d'actifs")
     if "selected_tickers" not in st.session_state:
         st.session_state.selected_tickers = ["AAPL", "MSFT"]
 
     with st.sidebar:
-        with st.spinner("Loading…"):
+        with st.spinner("Chargement…"):
             db = load_asset_db()
 
     if db:
-        st.sidebar.caption(f"{len(db):,} assets available")
+        st.sidebar.caption(f"{len(db):,} actifs disponibles")
         query   = st.sidebar.text_input(
-            "🔍", placeholder="Name or ticker…", key="search_query",
+            "🔍", placeholder="Nom ou ticker…", key="search_query",
             label_visibility="collapsed",
         )
         results = search_assets(db, query)
@@ -1002,7 +1002,7 @@ def render_sidebar() -> tuple:
                 "select_result", options,
                 label_visibility="collapsed", key="search_select",
             )
-            if st.sidebar.button("＋  Add to portfolio",
+            if st.sidebar.button("＋  Ajouter au portfolio",
                                   use_container_width=True):
                 symbol = next(
                     (r["symbol"] for r in results if r["label"] == chosen), None
@@ -1012,11 +1012,11 @@ def render_sidebar() -> tuple:
                         st.session_state.selected_tickers.append(symbol)
                         st.rerun()
                     else:
-                        st.sidebar.warning(f"{symbol} already selected.")
+                        st.sidebar.warning(f"{symbol} déjà sélectionné.")
         else:
-            st.sidebar.caption("No results.")
+            st.sidebar.caption("Aucun résultat.")
     else:
-        st.sidebar.caption("Manual entry.")
+        st.sidebar.caption("Saisie manuelle.")
         col_in, col_btn = st.sidebar.columns([3, 1])
         manual = col_in.text_input("Ticker", placeholder="AAPL",
                                     label_visibility="collapsed",
@@ -1027,7 +1027,7 @@ def render_sidebar() -> tuple:
                 st.session_state.selected_tickers.append(t)
                 st.rerun()
 
-    sidebar_section(f"Portfolio  ·  {len(st.session_state.selected_tickers)} asset(s)")
+    sidebar_section(f"Portfolio  ·  {len(st.session_state.selected_tickers)} actif(s)")
     for i, ticker in enumerate(list(st.session_state.selected_tickers)):
         c1, c2 = st.sidebar.columns([5, 1])
         c1.markdown(f"""<span style="color:#64748B;font-size:0.72rem;">#{i+1}</span>
@@ -1035,12 +1035,12 @@ def render_sidebar() -> tuple:
 border:1px solid rgba(212,175,55,0.2);border-radius:4px;
 padding:2px 6px;font-size:0.82rem;">{ticker}</code>""",
                     unsafe_allow_html=True)
-        if c2.button("✕", key=f"rm_{i}", help=f"Remove {ticker}"):
+        if c2.button("✕", key=f"rm_{i}", help=f"Retirer {ticker}"):
             if len(st.session_state.selected_tickers) > 2:
                 st.session_state.selected_tickers.pop(i)
                 st.rerun()
             else:
-                st.sidebar.warning("Minimum 2 assets required.")
+                st.sidebar.warning("Minimum 2 actifs.")
 
     st.sidebar.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
     run = st.sidebar.button("▶  RUN ANALYSIS", type="primary",
@@ -1058,25 +1058,25 @@ def main():
 
     if run:
         if len(tickers) < 2:
-            st.error("Please select at least 2 assets.")
+            st.error("Sélectionner au moins 2 actifs.")
             st.stop()
         if start >= end:
-            st.error("Start date must be earlier than end date.")
+            st.error("La date de début doit être antérieure à la date de fin.")
             st.stop()
 
-        with st.spinner("Downloading data from Yahoo Finance…"):
+        with st.spinner("Téléchargement des données Yahoo Finance…"):
             prices = load_prices(tuple(tickers), str(start), str(end))
 
         if prices.empty:
-            st.error("Download failed — please check the tickers.")
+            st.error("Échec du téléchargement — vérifier les tickers.")
             st.stop()
 
         available = [t for t in tickers if t in prices.columns]
         missing   = [t for t in tickers if t not in prices.columns]
         if missing:
-            st.warning(f"Tickers not found (skipped): **{', '.join(missing)}**")
+            st.warning(f"Tickers introuvables (ignorés) : **{', '.join(missing)}**")
         if len(available) < 2:
-            st.error("Fewer than 2 assets available.")
+            st.error("Moins de 2 actifs disponibles.")
             st.stop()
 
         prices  = prices[available].dropna()
@@ -1084,7 +1084,7 @@ def main():
         mu      = log_ret.mean().values * 252
         cov     = log_ret.cov().values  * 252
 
-        with st.spinner("Running Markowitz optimization…"):
+        with st.spinner("Optimisation Markowitz en cours…"):
             w_tan, w_mvp, fv, fr, mc_r, mc_v, mc_s = optimize(
                 tuple(float(x) for x in mu),
                 tuple(float(x) for x in cov.flatten()),
@@ -1108,11 +1108,11 @@ def main():
 ">
     <div style="font-size:3rem;margin-bottom:16px;">📊</div>
     <div style="font-size:1.1rem;font-weight:600;color:#EEF2F7;margin-bottom:8px;">
-        Ready to optimize your portfolio
+        Prêt à optimiser votre portfolio
     </div>
     <div style="color:#64748B;font-size:0.85rem;max-width:400px;margin:0 auto;">
-        Search for assets in the sidebar, set your budget,
-        then click <strong style="color:#D4AF37;">▶ RUN ANALYSIS</strong>.
+        Recherchez vos actifs dans la sidebar, définissez votre budget,
+        puis cliquez sur <strong style="color:#D4AF37;">▶ RUN ANALYSIS</strong>.
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1140,16 +1140,16 @@ def main():
 <div style="font-size:0.68rem;font-weight:700;color:#64748B;
             text-transform:uppercase;letter-spacing:0.12em;
             margin-bottom:12px;">
-    Tangent Portfolio &nbsp;·&nbsp; Key Metrics
+    Tangent Portfolio &nbsp;·&nbsp; Métriques clés
 </div>""", unsafe_allow_html=True)
 
     kpis = [
         ("Sharpe Ratio",     f"{tan_sh:.3f}",           "◆"),
-        ("Annual Return",    f"{tan_r*100:+.2f}%",      "↗"),
-        ("Volatility",       f"{tan_v*100:.2f}%",       "〜"),
+        ("Rendement annuel", f"{tan_r*100:+.2f}%",      "↗"),
+        ("Volatilité",       f"{tan_v*100:.2f}%",       "〜"),
         ("CAGR",             f"{tan_cagr*100:+.2f}%",   "∑"),
         ("Max Drawdown",     f"{tan_mdd*100:.1f}%",     "↘"),
-        ("Assets",           str(n),                    "#"),
+        ("Actifs",           str(n),                    "#"),
         ("Budget",           f"€ {bud:,}",              "💶"),
     ]
     cols = st.columns(7)
@@ -1162,11 +1162,11 @@ def main():
     # ── Tabs ────────────────────────────────────────────────────
     t1, t2, t3, t4, t5, t6 = st.tabs([
         "  📊  Frontier  ",
-        "  📈  Prices & Drawdown  ",
+        "  📈  Prix & Drawdown  ",
         "  🥧  Allocations  ",
-        "  🔬  Risk  ",
+        "  🔬  Risque  ",
         "  💰  Budget & Live  ",
-        "  📋  Summary  ",
+        "  📋  Résumé  ",
     ])
 
     with t1:
@@ -1196,7 +1196,7 @@ def main():
                             use_container_width=True)
         with c2:
             st.plotly_chart(chart_correlation(returns), use_container_width=True)
-        win = st.slider("Rolling window (days)", 60, 504, 252, 21)
+        win = st.slider("Fenêtre glissante (jours)", 60, 504, 252, 21)
         st.plotly_chart(chart_rolling_sharpe(returns, rf, win),
                         use_container_width=True)
 
@@ -1204,14 +1204,14 @@ def main():
         hdr, btn = st.columns([6, 1])
         hdr.markdown(
             f"<div style='font-size:1rem;font-weight:600;color:#EEF2F7;"
-            f"padding:4px 0;'>Budget Allocation {live_badge()}</div>",
+            f"padding:4px 0;'>Allocation budgétaire {live_badge()}</div>",
             unsafe_allow_html=True)
-        if btn.button("🔄", help="Refresh live prices"):
+        if btn.button("🔄", help="Rafraîchir les prix live"):
             get_live_prices.clear()
             get_eur_usd.clear()
             st.rerun()
 
-        with st.spinner("Fetching live prices…"):
+        with st.spinner("Récupération des prix live…"):
             live_prices = get_live_prices(tuple(assets))
             eur_usd     = get_eur_usd()
 
@@ -1224,11 +1224,11 @@ def main():
     border-radius:10px;padding:10px 16px;margin-bottom:20px;
     font-size:0.75rem;color:#64748B;
 ">
-    <span>💱 EUR/USD: <strong style="color:#D4AF37;">{eur_usd:.4f}</strong></span>
+    <span>💱 EUR/USD : <strong style="color:#D4AF37;">{eur_usd:.4f}</strong></span>
     <span>·</span>
-    <span>💶 Budget: <strong style="color:#D4AF37;">€ {bud:,}</strong></span>
+    <span>💶 Budget : <strong style="color:#D4AF37;">€ {bud:,}</strong></span>
     <span>·</span>
-    <span>🔄 Auto-refreshed every 60s</span>
+    <span>🔄 Mise à jour automatique toutes les 60 s</span>
 </div>""", unsafe_allow_html=True)
 
         section_title("Tangent Portfolio (Max Sharpe)")
@@ -1247,24 +1247,24 @@ def main():
 
         st.divider()
 
-        section_title("Live Price vs Backtest End")
+        section_title("Prix live vs fin du backtest")
         st.plotly_chart(
             chart_live_vs_backtest(assets, hist_end, live_prices),
             use_container_width=True)
 
-        section_title("Live Price Details")
+        section_title("Prix live détaillés")
         live_rows = []
         for a in assets:
             live = live_prices.get(a)
             hist = hist_end.get(a)
             chg  = (live / hist - 1) * 100 if live and hist and hist > 0 else None
             live_rows.append({
-                "Ticker":                  a,
-                "Backtest End Price":      f"$ {hist:,.2f}" if hist else "—",
-                "Live Price":              f"$ {live:,.2f}" if live else "—",
-                "Change":                  (f"+{chg:.2f}%" if chg and chg >= 0
-                                            else f"{chg:.2f}%" if chg else "—"),
-                "Value (€ / share)":       f"€ {live/eur_usd:,.2f}" if live else "—",
+                "Ticker":             a,
+                "Prix fin backtest":  f"$ {hist:,.2f}" if hist else "—",
+                "Prix live":          f"$ {live:,.2f}" if live else "—",
+                "Variation":          (f"+{chg:.2f}%" if chg and chg >= 0
+                                       else f"{chg:.2f}%" if chg else "—"),
+                "Valeur (€ / action)": f"€ {live/eur_usd:,.2f}" if live else "—",
             })
         live_df = pd.DataFrame(live_rows)
         st.dataframe(
@@ -1272,23 +1272,23 @@ def main():
                 lambda v: (f"color:{GREEN}" if isinstance(v, str) and v.startswith("+")
                            else f"color:{RED}" if isinstance(v, str) and v.startswith("-")
                            else ""),
-                subset=["Change"],
+                subset=["Variation"],
             ),
             use_container_width=True, hide_index=True,
         )
 
     with t6:
-        section_title("Portfolio Weights")
+        section_title("Poids du portfolio")
         st.dataframe(pd.DataFrame({
             "Asset":            assets,
             "Tangent (%)":      [f"{w_tan[i]*100:.1f}%" for i in range(n)],
             "Min Variance (%)": [f"{w_mvp[i]*100:.1f}%" for i in range(n)],
         }), use_container_width=True, hide_index=True)
 
-        section_title("Portfolio Comparison")
+        section_title("Comparaison des portfolios")
         st.dataframe(pd.DataFrame({
-            "Metric": ["Annual Return", "Volatility", "Sharpe",
-                       "CAGR", "Max Drawdown"],
+            "Métrique": ["Rendement annuel", "Volatilité", "Sharpe",
+                         "CAGR", "Max Drawdown"],
             "Tangent Portfolio": [
                 f"{tan_r*100:+.2f}%", f"{tan_v*100:.2f}%",
                 f"{tan_sh:.3f}", f"{tan_cagr*100:+.2f}%",
@@ -1299,14 +1299,14 @@ def main():
                 f"{mvp_mdd*100:.2f}%"],
         }), use_container_width=True, hide_index=True)
 
-        section_title("Individual Asset Statistics")
+        section_title("Statistiques individuelles")
         st.dataframe(pd.DataFrame({
-            "Asset":           assets,
-            "Annual Return":   [f"{mu[i]*100:+.2f}%" for i in range(n)],
-            "Volatility":      [f"{vols[i]*100:.2f}%" for i in range(n)],
-            "Sharpe":          [f"{(mu[i]-rf)/vols[i]:.3f}" for i in range(n)],
-            "CAGR":            [f"{asset_cagr(prices[a])*100:+.2f}%" for a in assets],
-            "Max DD":          [f"{asset_max_dd(prices[a])*100:.2f}%" for a in assets],
+            "Asset":        assets,
+            "Rend. annuel": [f"{mu[i]*100:+.2f}%" for i in range(n)],
+            "Volatilité":   [f"{vols[i]*100:.2f}%" for i in range(n)],
+            "Sharpe":       [f"{(mu[i]-rf)/vols[i]:.3f}" for i in range(n)],
+            "CAGR":         [f"{asset_cagr(prices[a])*100:+.2f}%" for a in assets],
+            "Max DD":       [f"{asset_max_dd(prices[a])*100:.2f}%" for a in assets],
         }), use_container_width=True, hide_index=True)
 
         section_title("Export")
@@ -1321,7 +1321,7 @@ def main():
             "sharpe":            [(mu[i]-rf)/vols[i] for i in range(n)],
         })
         st.download_button(
-            "⬇  Download Full Report (CSV)",
+            "⬇  Télécharger le rapport complet (CSV)",
             data=export_df.to_csv(index=False),
             file_name="portfolio_optimizer_results.csv",
             mime="text/csv",
