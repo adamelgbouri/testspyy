@@ -1,6 +1,6 @@
 """
-Portfolio Optimizer — Streamlit Edition  ™ by AEG
-Markowitz Modern Portfolio Theory — Premium UI
+Portfolio Optimizer -- Streamlit Edition  ™ by AEG
+Markowitz Modern Portfolio Theory -- Premium UI
 """
 
 import streamlit as st
