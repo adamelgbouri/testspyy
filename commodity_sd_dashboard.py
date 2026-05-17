@@ -142,39 +142,71 @@ _COFFEE_DEMAND = [1.05, 1.03, 1.00, 0.98, 0.95, 0.95, 0.97, 0.99, 1.02, 1.04, 1.
 _COFFEE_SUPPLY = [0.50, 0.55, 0.65, 0.85, 1.20, 1.50, 1.55, 1.45, 1.30, 1.00, 0.75, 0.60]
 _SUGAR_DEMAND = [1.05, 1.05, 1.10, 1.05, 1.00, 0.95, 0.95, 0.98, 1.00, 1.00, 1.00, 1.05]
 _SUGAR_SUPPLY = [0.70, 0.65, 0.80, 0.95, 1.10, 1.30, 1.40, 1.25, 1.05, 1.00, 0.95, 0.85]
+_COCOA_DEMAND = [1.05, 1.03, 1.00, 0.98, 0.95, 0.95, 0.97, 1.00, 1.02, 1.05, 1.05, 1.05]
+_COCOA_SUPPLY = [0.65, 0.70, 0.85, 1.00, 1.20, 1.30, 1.25, 1.10, 1.00, 1.05, 1.00, 0.90]
+_COTTON_DEMAND = [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.05, 1.05, 1.00]
+_COTTON_SUPPLY = [0.60, 0.65, 0.75, 0.90, 1.00, 1.05, 1.10, 1.10, 1.25, 1.40, 1.20, 1.00]
+
+# Livestock — slaughter cyclicality
+_CATTLE_DEMAND = [0.90, 0.92, 0.98, 1.02, 1.10, 1.08, 1.05, 1.02, 1.00, 1.00, 0.95, 0.98]
+_CATTLE_SUPPLY = [0.95, 0.95, 1.00, 1.02, 1.05, 1.08, 1.08, 1.05, 1.00, 1.00, 0.95, 0.87]
+_HOGS_DEMAND = [0.95, 0.95, 1.00, 1.00, 1.05, 1.05, 1.05, 1.00, 1.00, 1.00, 1.00, 0.95]
+_HOGS_SUPPLY = [0.92, 0.95, 1.05, 1.05, 1.05, 1.02, 1.00, 1.00, 1.05, 1.10, 1.05, 0.76]
 
 
 COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
-    # ---------- ENERGY ----------
-    "crude_oil": CommodityTemplate(
-        key="crude_oil", name="Crude Oil", unit="mb/d", inventory_unit="mb",
-        ticker="CL=F", base_supply=101.0, base_demand=100.5, base_price=78.0,
+    # ──────────────────────────────────────────────────────────────────
+    #  ENERGY
+    # ──────────────────────────────────────────────────────────────────
+    "wti_crude": CommodityTemplate(
+        key="wti_crude", name="WTI Crude Oil",
+        unit="mb/d", inventory_unit="mb",
+        ticker="CL=F", base_supply=101.0, base_demand=100.5, base_price=70.0,
         price_unit="$/bbl",
         price_band=(40.0, 130.0), storage_capacity=4200.0, days_cover_target=30.0,
         seasonal_demand=_OIL_DEMAND_SEAS, seasonal_supply=_OIL_SUPPLY_SEAS,
         regions=["US", "Europe", "China", "Middle East", "Rest of World"],
-        region_weights=[0.21, 0.14, 0.15, 0.09, 0.41],
+        region_weights=[0.21, 0.14, 0.16, 0.09, 0.40],
         elasticity_alpha=0.06, elasticity_beta=0.10, supply_lag_months=6,
         ideal_utilization_pct=70, typical_monthly_vol_pct=8,
-        normal_yoy_demand_pct=1.2, ideal_mm_pct_of_oi=15, sector="Energy",
-        yf_fmt="CL{M}{YY}.NYM", active_months="FGHJKMNQUVXZ", liquid_months=12, storage_cost_per_yr=0.072,
+        normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=15, sector="Energy",
+        yf_fmt="CL{M}{YY}.NYM", active_months="FGHJKMNQUVXZ",
+        liquid_months=12, storage_cost_per_yr=0.072,
     ),
-    "natural_gas": CommodityTemplate(
-        key="natural_gas", name="Natural Gas", unit="bcf/d", inventory_unit="bcf",
+    "brent_crude": CommodityTemplate(
+        key="brent_crude", name="Brent Crude Oil",
+        unit="mb/d", inventory_unit="mb",
+        ticker="BZ=F", base_supply=101.0, base_demand=100.5, base_price=74.0,
+        price_unit="$/bbl",
+        price_band=(40.0, 130.0), storage_capacity=4200.0, days_cover_target=30.0,
+        seasonal_demand=_OIL_DEMAND_SEAS, seasonal_supply=_OIL_SUPPLY_SEAS,
+        regions=["Europe", "Asia", "Africa", "Americas", "Rest of World"],
+        region_weights=[0.20, 0.35, 0.10, 0.15, 0.20],
+        elasticity_alpha=0.06, elasticity_beta=0.10, supply_lag_months=6,
+        ideal_utilization_pct=70, typical_monthly_vol_pct=8,
+        normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=15, sector="Energy",
+        yf_fmt="BZ{M}{YY}.NYM", active_months="FGHJKMNQUVXZ",
+        liquid_months=12, storage_cost_per_yr=0.072,
+    ),
+    "henry_hub_gas": CommodityTemplate(
+        key="henry_hub_gas", name="Natural Gas (Henry Hub)",
+        unit="bcf/d", inventory_unit="bcf",
         ticker="NG=F", base_supply=105.0, base_demand=104.0, base_price=3.20,
         price_unit="$/MMBtu",
         price_band=(1.50, 9.00), storage_capacity=4200.0, days_cover_target=35.0,
         seasonal_demand=_GAS_DEMAND_SEAS, seasonal_supply=_GAS_SUPPLY_SEAS,
-        regions=["US", "Europe", "Asia LNG", "Rest of World"],
-        region_weights=[0.30, 0.18, 0.20, 0.32],
+        regions=["US", "Mexico (export)", "LNG export", "Power", "Rest of World"],
+        region_weights=[0.55, 0.06, 0.14, 0.20, 0.05],
         elasticity_alpha=0.18, elasticity_beta=0.08, supply_lag_months=4,
         ideal_utilization_pct=75, typical_monthly_vol_pct=12,
         normal_yoy_demand_pct=1.8, ideal_mm_pct_of_oi=18, sector="Energy",
-        yf_fmt="NG{M}{YY}.NYM", active_months="FGHJKMNQUVXZ", liquid_months=12, storage_cost_per_yr=0.12,
+        yf_fmt="NG{M}{YY}.NYM", active_months="FGHJKMNQUVXZ",
+        liquid_months=12, storage_cost_per_yr=0.120,
     ),
-    "gasoline": CommodityTemplate(
-        key="gasoline", name="Gasoline (RBOB)", unit="mb/d", inventory_unit="mb",
-        ticker="RB=F", base_supply=27.0, base_demand=26.5, base_price=2.40,
+    "rbob_gasoline": CommodityTemplate(
+        key="rbob_gasoline", name="RBOB Gasoline",
+        unit="mb/d", inventory_unit="mb",
+        ticker="RB=F", base_supply=27.0, base_demand=26.5, base_price=2.20,
         price_unit="$/gal",
         price_band=(1.50, 4.50), storage_capacity=280.0, days_cover_target=23.0,
         seasonal_demand=_GASOLINE_DEMAND, seasonal_supply=_GASOLINE_SUPPLY,
@@ -183,149 +215,224 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.05, elasticity_beta=0.08, supply_lag_months=3,
         ideal_utilization_pct=80, typical_monthly_vol_pct=9,
         normal_yoy_demand_pct=0.5, ideal_mm_pct_of_oi=14, sector="Energy",
-        yf_fmt="RB{M}{YY}.NYM", active_months="FGHJKMNQUVXZ", liquid_months=12, storage_cost_per_yr=0.084,
+        yf_fmt="RB{M}{YY}.NYM", active_months="FGHJKMNQUVXZ",
+        liquid_months=12, storage_cost_per_yr=0.084,
+    ),
+    "ulsd_heating_oil": CommodityTemplate(
+        key="ulsd_heating_oil", name="Heating Oil (ULSD)",
+        unit="mb/d", inventory_unit="mb",
+        ticker="HO=F", base_supply=27.0, base_demand=26.0, base_price=2.30,
+        price_unit="$/gal",
+        price_band=(1.60, 4.80), storage_capacity=180.0, days_cover_target=28.0,
+        seasonal_demand=_GAS_DEMAND_SEAS, seasonal_supply=_GASOLINE_SUPPLY,
+        regions=["US", "Europe", "Asia", "Rest of World"],
+        region_weights=[0.30, 0.30, 0.25, 0.15],
+        elasticity_alpha=0.05, elasticity_beta=0.07, supply_lag_months=3,
+        ideal_utilization_pct=75, typical_monthly_vol_pct=9,
+        normal_yoy_demand_pct=0.3, ideal_mm_pct_of_oi=14, sector="Energy",
+        yf_fmt="HO{M}{YY}.NYM", active_months="FGHJKMNQUVXZ",
+        liquid_months=12, storage_cost_per_yr=0.084,
     ),
 
-    # ---------- INDUSTRIAL METALS ----------
-    "copper": CommodityTemplate(
-        key="copper", name="Copper", unit="kt/mo", inventory_unit="kt",
-        ticker="HG=F", base_supply=1900.0, base_demand=1910.0, base_price=4.20,
+    # ──────────────────────────────────────────────────────────────────
+    #  INDUSTRIAL METALS
+    # ──────────────────────────────────────────────────────────────────
+    "comex_copper": CommodityTemplate(
+        key="comex_copper", name="Copper (COMEX)",
+        unit="kt/mo", inventory_unit="kt",
+        ticker="HG=F", base_supply=1900.0, base_demand=1910.0, base_price=4.40,
         price_unit="$/lb",
         price_band=(2.50, 6.00), storage_capacity=1400.0, days_cover_target=20.0,
         seasonal_demand=_COPPER_DEMAND_SEAS, seasonal_supply=_COPPER_SUPPLY_SEAS,
-        regions=["China", "Europe", "US", "Rest of World"],
-        region_weights=[0.55, 0.15, 0.10, 0.20],
+        regions=["China", "Europe", "US", "Japan/Korea", "Rest of World"],
+        region_weights=[0.55, 0.14, 0.08, 0.10, 0.13],
         elasticity_alpha=0.04, elasticity_beta=0.07, supply_lag_months=12,
         ideal_utilization_pct=50, typical_monthly_vol_pct=6,
         normal_yoy_demand_pct=2.5, ideal_mm_pct_of_oi=20, sector="Metals",
-        yf_fmt="HG{M}{YY}.CMX", active_months="HKNUZ", liquid_months=8, storage_cost_per_yr=0.048,
+        yf_fmt="HG{M}{YY}.CMX", active_months="HKNUZ",
+        liquid_months=8, storage_cost_per_yr=0.048,
     ),
-    "aluminum": CommodityTemplate(
-        key="aluminum", name="Aluminum", unit="kt/mo", inventory_unit="kt",
-        ticker="ALI=F", base_supply=5800.0, base_demand=5750.0, base_price=2300.0,
+    "lme_aluminum": CommodityTemplate(
+        key="lme_aluminum", name="Aluminum (LME)",
+        unit="kt/mo", inventory_unit="kt",
+        ticker="ALI=F", base_supply=5800.0, base_demand=5750.0, base_price=2550.0,
         price_unit="$/t",
         price_band=(1700.0, 3500.0), storage_capacity=4000.0, days_cover_target=25.0,
         seasonal_demand=_ALUMINUM_DEMAND, seasonal_supply=_ALUMINUM_SUPPLY,
-        regions=["China", "Europe", "US", "Rest of World"],
-        region_weights=[0.58, 0.14, 0.10, 0.18],
+        regions=["China", "Europe", "US", "India", "Rest of World"],
+        region_weights=[0.57, 0.13, 0.08, 0.07, 0.15],
         elasticity_alpha=0.04, elasticity_beta=0.05, supply_lag_months=24,
         ideal_utilization_pct=50, typical_monthly_vol_pct=5,
         normal_yoy_demand_pct=3.0, ideal_mm_pct_of_oi=14, sector="Metals",
-        yf_fmt="", active_months="FGHJKMNQUVXZ", liquid_months=12, storage_cost_per_yr=0.048,
+        yf_fmt="", active_months="FGHJKMNQUVXZ",
+        liquid_months=15, storage_cost_per_yr=0.048,
     ),
-    "nickel": CommodityTemplate(
-        key="nickel", name="Nickel", unit="kt/mo", inventory_unit="kt",
-        ticker="NI=F", base_supply=270.0, base_demand=265.0, base_price=18000.0,
+    "lme_nickel": CommodityTemplate(
+        key="lme_nickel", name="Nickel (LME)",
+        unit="kt/mo", inventory_unit="kt",
+        ticker="", base_supply=270.0, base_demand=265.0, base_price=16000.0,
         price_unit="$/t",
-        price_band=(12000.0, 50000.0), storage_capacity=250.0, days_cover_target=20.0,
+        price_band=(11000.0, 35000.0), storage_capacity=250.0, days_cover_target=20.0,
         seasonal_demand=_NICKEL_DEMAND, seasonal_supply=_NICKEL_SUPPLY,
-        regions=["China", "Europe", "Indonesia", "Rest of World"],
-        region_weights=[0.55, 0.12, 0.18, 0.15],
+        regions=["China", "Europe", "Indonesia", "Japan/Korea", "Rest of World"],
+        region_weights=[0.55, 0.10, 0.18, 0.07, 0.10],
         elasticity_alpha=0.05, elasticity_beta=0.04, supply_lag_months=18,
         ideal_utilization_pct=50, typical_monthly_vol_pct=12,
         normal_yoy_demand_pct=5.0, ideal_mm_pct_of_oi=18, sector="Metals",
-        yf_fmt="", active_months="FGHJKMNQUVXZ", liquid_months=12, storage_cost_per_yr=0.048,
+        yf_fmt="", active_months="FGHJKMNQUVXZ",
+        liquid_months=15, storage_cost_per_yr=0.048,
     ),
     "iron_ore": CommodityTemplate(
-        key="iron_ore", name="Iron Ore", unit="mt/mo", inventory_unit="mt",
-        ticker="TIO=F", base_supply=130.0, base_demand=128.0, base_price=110.0,
+        key="iron_ore", name="Iron Ore (SGX TSI 62%)",
+        unit="mt/mo", inventory_unit="mt",
+        ticker="TIO=F", base_supply=130.0, base_demand=128.0, base_price=105.0,
         price_unit="$/t",
         price_band=(50.0, 230.0), storage_capacity=250.0, days_cover_target=25.0,
         seasonal_demand=_IRON_ORE_DEMAND, seasonal_supply=_IRON_ORE_SUPPLY,
-        regions=["China", "Europe", "Japan/Korea", "Rest of World"],
-        region_weights=[0.70, 0.10, 0.10, 0.10],
+        regions=["China", "Japan/Korea", "Europe", "Taiwan", "Rest of World"],
+        region_weights=[0.70, 0.10, 0.07, 0.04, 0.09],
         elasticity_alpha=0.05, elasticity_beta=0.06, supply_lag_months=18,
         ideal_utilization_pct=65, typical_monthly_vol_pct=10,
         normal_yoy_demand_pct=1.5, ideal_mm_pct_of_oi=12, sector="Metals",
-        yf_fmt="", active_months="FGHJKMNQUVXZ", liquid_months=12, storage_cost_per_yr=0.06,
+        yf_fmt="", active_months="FGHJKMNQUVXZ",
+        liquid_months=12, storage_cost_per_yr=0.060,
     ),
 
-    # ---------- PRECIOUS METALS ----------
+    # ──────────────────────────────────────────────────────────────────
+    #  PRECIOUS METALS
+    # ──────────────────────────────────────────────────────────────────
     "gold": CommodityTemplate(
-        key="gold", name="Gold", unit="t/mo", inventory_unit="t",
-        ticker="GC=F", base_supply=305.0, base_demand=300.0, base_price=2000.0,
+        key="gold", name="Gold",
+        unit="t/mo", inventory_unit="t",
+        ticker="GC=F", base_supply=305.0, base_demand=300.0, base_price=2650.0,
         price_unit="$/oz",
-        price_band=(1200.0, 3000.0), storage_capacity=5000.0, days_cover_target=90.0,
+        price_band=(1500.0, 3500.0), storage_capacity=5000.0, days_cover_target=90.0,
         seasonal_demand=_GOLD_DEMAND, seasonal_supply=_GOLD_SUPPLY,
-        regions=["China", "India", "OECD ETFs", "Rest of World"],
-        region_weights=[0.25, 0.22, 0.28, 0.25],
+        regions=["China", "India", "OECD ETFs", "Central Banks", "Rest of World"],
+        region_weights=[0.22, 0.20, 0.24, 0.20, 0.14],
         elasticity_alpha=0.03, elasticity_beta=0.02, supply_lag_months=24,
         ideal_utilization_pct=60, typical_monthly_vol_pct=4,
         normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=22, sector="Precious",
-        yf_fmt="GC{M}{YY}.CMX", active_months="GJMQVZ", liquid_months=8, storage_cost_per_yr=0.024,
+        yf_fmt="GC{M}{YY}.CMX", active_months="GJMQVZ",
+        liquid_months=8, storage_cost_per_yr=0.024,
     ),
     "silver": CommodityTemplate(
-        key="silver", name="Silver", unit="t/mo", inventory_unit="t",
-        ticker="SI=F", base_supply=2400.0, base_demand=2500.0, base_price=25.0,
+        key="silver", name="Silver",
+        unit="t/mo", inventory_unit="t",
+        ticker="SI=F", base_supply=2400.0, base_demand=2500.0, base_price=30.0,
         price_unit="$/oz",
         price_band=(15.0, 50.0), storage_capacity=30000.0, days_cover_target=90.0,
         seasonal_demand=_SILVER_DEMAND, seasonal_supply=_SILVER_SUPPLY,
-        regions=["China", "India", "OECD", "Rest of World"],
-        region_weights=[0.30, 0.20, 0.30, 0.20],
+        regions=["China", "India", "OECD", "Industrial", "Rest of World"],
+        region_weights=[0.28, 0.18, 0.27, 0.18, 0.09],
         elasticity_alpha=0.05, elasticity_beta=0.03, supply_lag_months=18,
         ideal_utilization_pct=60, typical_monthly_vol_pct=7,
         normal_yoy_demand_pct=2.0, ideal_mm_pct_of_oi=20, sector="Precious",
-        yf_fmt="SI{M}{YY}.CMX", active_months="HKNUZ", liquid_months=6, storage_cost_per_yr=0.036,
+        yf_fmt="SI{M}{YY}.CMX", active_months="HKNUZ",
+        liquid_months=6, storage_cost_per_yr=0.036,
+    ),
+    "platinum": CommodityTemplate(
+        key="platinum", name="Platinum",
+        unit="t/mo", inventory_unit="t",
+        ticker="PL=F", base_supply=15.0, base_demand=16.0, base_price=980.0,
+        price_unit="$/oz",
+        price_band=(700.0, 1500.0), storage_capacity=250.0, days_cover_target=90.0,
+        seasonal_demand=_SILVER_DEMAND, seasonal_supply=_FLAT,
+        regions=["China", "Europe", "US", "Japan", "Rest of World"],
+        region_weights=[0.27, 0.30, 0.18, 0.15, 0.10],
+        elasticity_alpha=0.04, elasticity_beta=0.03, supply_lag_months=24,
+        ideal_utilization_pct=60, typical_monthly_vol_pct=6,
+        normal_yoy_demand_pct=1.5, ideal_mm_pct_of_oi=18, sector="Precious",
+        yf_fmt="PL{M}{YY}.NYM", active_months="FJNV",
+        liquid_months=6, storage_cost_per_yr=0.030,
+    ),
+    "palladium": CommodityTemplate(
+        key="palladium", name="Palladium",
+        unit="t/mo", inventory_unit="t",
+        ticker="PA=F", base_supply=17.0, base_demand=17.5, base_price=980.0,
+        price_unit="$/oz",
+        price_band=(800.0, 3000.0), storage_capacity=180.0, days_cover_target=70.0,
+        seasonal_demand=_SILVER_DEMAND, seasonal_supply=_FLAT,
+        regions=["China", "Europe", "US", "Japan", "Rest of World"],
+        region_weights=[0.30, 0.25, 0.25, 0.10, 0.10],
+        elasticity_alpha=0.04, elasticity_beta=0.03, supply_lag_months=24,
+        ideal_utilization_pct=60, typical_monthly_vol_pct=10,
+        normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=18, sector="Precious",
+        yf_fmt="PA{M}{YY}.NYM", active_months="HMUZ",
+        liquid_months=6, storage_cost_per_yr=0.030,
     ),
 
-    # ---------- AGRICULTURE / GRAINS ----------
-    "wheat": CommodityTemplate(
-        key="wheat", name="Wheat", unit="mt/mo", inventory_unit="mt",
-        ticker="ZW=F", base_supply=65.0, base_demand=64.5, base_price=620.0,
+    # ──────────────────────────────────────────────────────────────────
+    #  AGRICULTURE — GRAINS & OILSEEDS
+    # ──────────────────────────────────────────────────────────────────
+    "cbot_wheat": CommodityTemplate(
+        key="cbot_wheat", name="Wheat (CBOT)",
+        unit="mt/mo", inventory_unit="mt",
+        ticker="ZW=F", base_supply=65.0, base_demand=64.5, base_price=560.0,
         price_unit="¢/bu",
         price_band=(380.0, 1100.0), storage_capacity=320.0, days_cover_target=70.0,
         seasonal_demand=_WHEAT_DEMAND_SEAS, seasonal_supply=_WHEAT_SUPPLY_SEAS,
-        regions=["US", "EU", "Black Sea", "China", "Rest of World"],
-        region_weights=[0.10, 0.15, 0.12, 0.18, 0.45],
+        regions=["China", "EU", "India", "Russia", "US", "Rest of World"],
+        region_weights=[0.18, 0.14, 0.13, 0.10, 0.06, 0.39],
         elasticity_alpha=0.05, elasticity_beta=0.03, supply_lag_months=9,
         ideal_utilization_pct=60, typical_monthly_vol_pct=7,
         normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=15, sector="Ags",
-        yf_fmt="ZW{M}{YY}.CBT", active_months="HKNUZ", liquid_months=8, storage_cost_per_yr=0.06,
+        yf_fmt="ZW{M}{YY}.CBT", active_months="HKNUZ",
+        liquid_months=8, storage_cost_per_yr=0.060,
     ),
     "corn": CommodityTemplate(
-        key="corn", name="Corn", unit="mt/mo", inventory_unit="mt",
-        ticker="ZC=F", base_supply=100.0, base_demand=99.0, base_price=450.0,
+        key="corn", name="Corn (CBOT)",
+        unit="mt/mo", inventory_unit="mt",
+        ticker="ZC=F", base_supply=100.0, base_demand=99.0, base_price=430.0,
         price_unit="¢/bu",
         price_band=(330.0, 800.0), storage_capacity=700.0, days_cover_target=80.0,
         seasonal_demand=_CORN_DEMAND, seasonal_supply=_CORN_SUPPLY,
-        regions=["US", "China", "Brazil", "Rest of World"],
-        region_weights=[0.32, 0.27, 0.10, 0.31],
+        regions=["US", "China", "Brazil", "EU", "Rest of World"],
+        region_weights=[0.31, 0.27, 0.10, 0.06, 0.26],
         elasticity_alpha=0.05, elasticity_beta=0.04, supply_lag_months=9,
         ideal_utilization_pct=55, typical_monthly_vol_pct=6,
         normal_yoy_demand_pct=1.2, ideal_mm_pct_of_oi=16, sector="Ags",
-        yf_fmt="ZC{M}{YY}.CBT", active_months="HKNUZ", liquid_months=8, storage_cost_per_yr=0.06,
+        yf_fmt="ZC{M}{YY}.CBT", active_months="HKNUZ",
+        liquid_months=8, storage_cost_per_yr=0.060,
     ),
     "soybeans": CommodityTemplate(
-        key="soybeans", name="Soybeans", unit="mt/mo", inventory_unit="mt",
-        ticker="ZS=F", base_supply=32.0, base_demand=31.5, base_price=1200.0,
+        key="soybeans", name="Soybeans",
+        unit="mt/mo", inventory_unit="mt",
+        ticker="ZS=F", base_supply=32.0, base_demand=31.5, base_price=990.0,
         price_unit="¢/bu",
-        price_band=(900.0, 1800.0), storage_capacity=220.0, days_cover_target=85.0,
+        price_band=(800.0, 1800.0), storage_capacity=220.0, days_cover_target=85.0,
         seasonal_demand=_SOY_DEMAND, seasonal_supply=_SOY_SUPPLY,
-        regions=["US", "Brazil", "China", "Rest of World"],
-        region_weights=[0.28, 0.34, 0.06, 0.32],
+        regions=["China", "US", "Brazil", "Argentina", "Rest of World"],
+        region_weights=[0.32, 0.20, 0.20, 0.10, 0.18],
         elasticity_alpha=0.06, elasticity_beta=0.04, supply_lag_months=8,
         ideal_utilization_pct=55, typical_monthly_vol_pct=7,
         normal_yoy_demand_pct=2.5, ideal_mm_pct_of_oi=18, sector="Ags",
-        yf_fmt="ZS{M}{YY}.CBT", active_months="FHKNQUX", liquid_months=8, storage_cost_per_yr=0.06,
+        yf_fmt="ZS{M}{YY}.CBT", active_months="FHKNQUX",
+        liquid_months=8, storage_cost_per_yr=0.060,
     ),
 
-    # ---------- SOFTS ----------
-    "coffee": CommodityTemplate(
-        key="coffee", name="Coffee (Arabica)", unit="kt/mo", inventory_unit="kt",
-        ticker="KC=F", base_supply=880.0, base_demand=870.0, base_price=250.0,
+    # ──────────────────────────────────────────────────────────────────
+    #  SOFTS
+    # ──────────────────────────────────────────────────────────────────
+    "arabica_coffee": CommodityTemplate(
+        key="arabica_coffee", name="Coffee (Arabica)",
+        unit="kt/mo", inventory_unit="kt",
+        ticker="KC=F", base_supply=880.0, base_demand=870.0, base_price=320.0,
         price_unit="¢/lb",
         price_band=(120.0, 500.0), storage_capacity=1800.0, days_cover_target=60.0,
         seasonal_demand=_COFFEE_DEMAND, seasonal_supply=_COFFEE_SUPPLY,
-        regions=["Brazil", "Vietnam", "Europe (consumer)", "US (consumer)", "Rest of World"],
+        regions=["Brazil", "Vietnam", "Europe", "US", "Rest of World"],
         region_weights=[0.35, 0.18, 0.20, 0.15, 0.12],
         elasticity_alpha=0.06, elasticity_beta=0.04, supply_lag_months=24,
         ideal_utilization_pct=60, typical_monthly_vol_pct=9,
         normal_yoy_demand_pct=2.0, ideal_mm_pct_of_oi=22, sector="Softs",
-        yf_fmt="KC{M}{YY}.NYB", active_months="HKNUZ", liquid_months=6, storage_cost_per_yr=0.048,
+        yf_fmt="KC{M}{YY}.NYB", active_months="HKNUZ",
+        liquid_months=6, storage_cost_per_yr=0.048,
     ),
-    "sugar": CommodityTemplate(
-        key="sugar", name="Sugar (Raw #11)", unit="mt/mo", inventory_unit="mt",
-        ticker="SB=F", base_supply=15.0, base_demand=14.8, base_price=22.0,
+    "raw_sugar": CommodityTemplate(
+        key="raw_sugar", name="Sugar #11 (Raw)",
+        unit="mt/mo", inventory_unit="mt",
+        ticker="SB=F", base_supply=15.0, base_demand=14.8, base_price=19.5,
         price_unit="¢/lb",
         price_band=(12.0, 40.0), storage_capacity=80.0, days_cover_target=90.0,
         seasonal_demand=_SUGAR_DEMAND, seasonal_supply=_SUGAR_SUPPLY,
@@ -334,7 +441,72 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.05, elasticity_beta=0.04, supply_lag_months=12,
         ideal_utilization_pct=60, typical_monthly_vol_pct=8,
         normal_yoy_demand_pct=1.5, ideal_mm_pct_of_oi=18, sector="Softs",
-        yf_fmt="SB{M}{YY}.NYB", active_months="HKNV", liquid_months=6, storage_cost_per_yr=0.048,
+        yf_fmt="SB{M}{YY}.NYB", active_months="HKNV",
+        liquid_months=6, storage_cost_per_yr=0.048,
+    ),
+    "cocoa": CommodityTemplate(
+        key="cocoa", name="Cocoa",
+        unit="kt/mo", inventory_unit="kt",
+        ticker="CC=F", base_supply=420.0, base_demand=410.0, base_price=8000.0,
+        price_unit="$/t",
+        price_band=(2200.0, 12000.0), storage_capacity=1200.0, days_cover_target=90.0,
+        seasonal_demand=_COCOA_DEMAND, seasonal_supply=_COCOA_SUPPLY,
+        regions=["Ivory Coast", "Ghana", "Indonesia", "Europe", "Rest of World"],
+        region_weights=[0.38, 0.20, 0.10, 0.18, 0.14],
+        elasticity_alpha=0.05, elasticity_beta=0.03, supply_lag_months=18,
+        ideal_utilization_pct=60, typical_monthly_vol_pct=12,
+        normal_yoy_demand_pct=1.5, ideal_mm_pct_of_oi=20, sector="Softs",
+        yf_fmt="CC{M}{YY}.NYB", active_months="HKNUZ",
+        liquid_months=6, storage_cost_per_yr=0.048,
+    ),
+    "cotton": CommodityTemplate(
+        key="cotton", name="Cotton (Upland)",
+        unit="kt/mo", inventory_unit="kt",
+        ticker="CT=F", base_supply=2100.0, base_demand=2080.0, base_price=70.0,
+        price_unit="¢/lb",
+        price_band=(50.0, 130.0), storage_capacity=6000.0, days_cover_target=120.0,
+        seasonal_demand=_COTTON_DEMAND, seasonal_supply=_COTTON_SUPPLY,
+        regions=["China", "India", "US", "Brazil", "Rest of World"],
+        region_weights=[0.30, 0.22, 0.12, 0.10, 0.26],
+        elasticity_alpha=0.04, elasticity_beta=0.04, supply_lag_months=12,
+        ideal_utilization_pct=60, typical_monthly_vol_pct=7,
+        normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=16, sector="Softs",
+        yf_fmt="CT{M}{YY}.NYB", active_months="HKNVZ",
+        liquid_months=6, storage_cost_per_yr=0.048,
+    ),
+
+    # ──────────────────────────────────────────────────────────────────
+    #  LIVESTOCK
+    # ──────────────────────────────────────────────────────────────────
+    "live_cattle": CommodityTemplate(
+        key="live_cattle", name="Live Cattle",
+        unit="kt/mo", inventory_unit="kt",
+        ticker="LE=F", base_supply=2500.0, base_demand=2500.0, base_price=190.0,
+        price_unit="¢/lb",
+        price_band=(120.0, 230.0), storage_capacity=400.0, days_cover_target=20.0,
+        seasonal_demand=_CATTLE_DEMAND, seasonal_supply=_CATTLE_SUPPLY,
+        regions=["US", "Brazil", "EU", "China", "Rest of World"],
+        region_weights=[0.20, 0.18, 0.12, 0.20, 0.30],
+        elasticity_alpha=0.04, elasticity_beta=0.03, supply_lag_months=18,
+        ideal_utilization_pct=50, typical_monthly_vol_pct=4,
+        normal_yoy_demand_pct=0.5, ideal_mm_pct_of_oi=18, sector="Livestock",
+        yf_fmt="LE{M}{YY}.CME", active_months="GJMQVZ",
+        liquid_months=8, storage_cost_per_yr=0.036,
+    ),
+    "lean_hogs": CommodityTemplate(
+        key="lean_hogs", name="Lean Hogs",
+        unit="kt/mo", inventory_unit="kt",
+        ticker="HE=F", base_supply=10500.0, base_demand=10500.0, base_price=88.0,
+        price_unit="¢/lb",
+        price_band=(50.0, 130.0), storage_capacity=600.0, days_cover_target=14.0,
+        seasonal_demand=_HOGS_DEMAND, seasonal_supply=_HOGS_SUPPLY,
+        regions=["China", "EU", "US", "Brazil", "Rest of World"],
+        region_weights=[0.48, 0.20, 0.10, 0.04, 0.18],
+        elasticity_alpha=0.05, elasticity_beta=0.03, supply_lag_months=10,
+        ideal_utilization_pct=50, typical_monthly_vol_pct=6,
+        normal_yoy_demand_pct=0.5, ideal_mm_pct_of_oi=18, sector="Livestock",
+        yf_fmt="HE{M}{YY}.CME", active_months="GJKMNQVZ",
+        liquid_months=6, storage_cost_per_yr=0.036,
     ),
 }
 
@@ -611,17 +783,43 @@ def get_live_futures_curve(commodity_key: str, n_max: int = 12
 @st.cache_data(ttl=600, show_spinner=False)
 def get_synthetic_futures_curve(commodity_key: str, structure: str = "contango",
                                 months: int = 24, seed: int = 5) -> pd.DataFrame:
-    """Cost-of-carry style synthetic curve used as fallback."""
+    """Cost-of-carry style synthetic curve, labeled with real contract months."""
     tpl = COMMODITY_TEMPLATES[commodity_key]
     spot = tpl.base_price
     rng = np.random.default_rng(seed)
-    tenors = np.arange(1, months + 1)
+    contracts = _build_contract_tickers(tpl, n_max=months) if tpl.yf_fmt \
+                 else _fallback_calendar_labels(months)
+    n = len(contracts)
+    if n == 0:
+        contracts = _fallback_calendar_labels(months)
+        n = len(contracts)
     slope = {"contango": 0.005, "backwardation": -0.006, "flat": 0.0}.get(structure, 0.0)
-    log_price = np.log(spot) + slope * tenors + rng.normal(0, 0.005, months)
+    log_price = np.log(spot) + slope * np.arange(1, n + 1) + rng.normal(0, 0.005, n)
     prices = np.exp(log_price)
     dates = pd.date_range(start=pd.Timestamp.today().normalize() + pd.offsets.MonthBegin(1),
-                          periods=months, freq="MS")
-    return pd.DataFrame({"tenor_month": tenors, "expiry": dates, "price": prices})
+                          periods=n, freq="MS")
+    df = pd.DataFrame({
+        "tenor_month": [c["tenor_month"] for c in contracts],
+        "label": [c["label"] for c in contracts],
+        "expiry": dates,
+        "price": prices,
+    })
+    return df
+
+
+def _fallback_calendar_labels(months: int) -> List[Dict]:
+    """When a template has no yf_fmt, generate generic Month-Year labels."""
+    from datetime import datetime
+    now = datetime.now()
+    out = []
+    for i in range(months):
+        m = (now.month - 1 + i + 1) % 12
+        year = now.year + (now.month - 1 + i + 1) // 12
+        out.append({
+            "tenor_month": i + 1,
+            "label": f"{_MONTH_NAMES[m]}-{year}",
+        })
+    return out
 
 
 # Keep the old name as a thin wrapper so existing callers don't break.
@@ -688,7 +886,7 @@ def load_csv(file) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_yahoo_history(commodity_key: str, period: str = "1y") -> Optional[pd.DataFrame]:
-    """Récupère l'historique de prix Yahoo Finance pour la commodité, ou None si indisponible."""
+    """Fetch Yahoo Finance price history for the commodity, or None if unavailable."""
     tpl = COMMODITY_TEMPLATES[commodity_key]
     if os.environ.get("COMMODITY_SD_DISABLE_YF") == "1":
         return None
@@ -706,7 +904,7 @@ def get_yahoo_history(commodity_key: str, period: str = "1y") -> Optional[pd.Dat
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_live_spot(commodity_key: str) -> Optional[Dict[str, float]]:
-    """Renvoie le dernier prix coté en direct (Yahoo) avec date et variation 1j."""
+    """Return the latest live quote (Yahoo) with date and 1-day change."""
     hist = get_yahoo_history(commodity_key, period="5d")
     if hist is None or hist.empty:
         return None
@@ -721,7 +919,7 @@ def get_live_spot(commodity_key: str) -> Optional[Dict[str, float]]:
 
 
 def fmt_price(value: float, unit: str) -> str:
-    """Formate un prix avec son unité, ex: '78.42 $/bbl' ou '2.40 $/gal'."""
+    """Format a price with its unit, e.g. '78.42 $/bbl' or '2.40 $/gal'."""
     if not isinstance(value, (int, float)) or pd.isna(value):
         return "—"
     if "¢" in unit:
@@ -764,7 +962,7 @@ def _apply_adjustments(df: pd.DataFrame, tpl: CommodityTemplate,
         + (a.gdp_growth_pct - 2.5) / 100.0 * 0.6
     )
     out.loc[mask, "demand"] *= base_demand_mult
-    if tpl.key == "crude_oil":
+    if tpl.key in ("wti_crude", "brent_crude"):
         out.loc[mask, "demand"] *= 1 + a.refinery_runs_pct / 100.0 * 0.4
     out.loc[mask, "imports"] *= 1 + a.imports_adj_pct / 100.0
     out.loc[mask, "exports"] *= 1 + a.exports_adj_pct / 100.0
@@ -1684,13 +1882,40 @@ def sankey_chart(nodes: List[str], sources: List[int], targets: List[int],
     return fig
 
 
-def futures_curve_chart(curve: pd.DataFrame, structure: str) -> go.Figure:
+def futures_curve_chart(curve: pd.DataFrame, structure: str,
+                        price_unit: str = "") -> go.Figure:
+    """Plot the forward curve.  Uses contract labels (Jun-2025) on the X axis
+    when the dataframe carries them; falls back to tenor numbers otherwise."""
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=curve["tenor_month"], y=curve["price"],
-                             mode="lines+markers", name=structure,
-                             line=dict(color=COLORS["price"], width=2)))
-    fig.update_layout(title=f"Futures Curve - {structure}",
-                      xaxis_title="Contract Month", yaxis_title="Price", height=320)
+    x = curve["label"] if "label" in curve.columns else curve["tenor_month"]
+    hover_template = (
+        "<b>%{x}</b><br>Price: %{y:.2f}"
+        + (f" {price_unit}" if price_unit else "")
+        + "<extra></extra>"
+    )
+    fig.add_trace(go.Scatter(
+        x=x, y=curve["price"],
+        mode="lines+markers", name=structure,
+        line=dict(color=COLORS["price"], width=2, shape="spline"),
+        marker=dict(size=7, line=dict(color="#1f2937", width=1)),
+        hovertemplate=hover_template,
+    ))
+    # Highlight the front contract
+    if len(curve) > 0:
+        fig.add_trace(go.Scatter(
+            x=[x.iloc[0]] if hasattr(x, "iloc") else [x[0]],
+            y=[curve["price"].iloc[0]],
+            mode="markers", name="Front month",
+            marker=dict(size=12, color=COLORS["stocks"], symbol="diamond",
+                        line=dict(color="#0e1117", width=1.5)),
+            hovertemplate="<b>Front: %{x}</b><br>%{y:.2f}<extra></extra>",
+        ))
+    fig.update_layout(
+        title=f"Forward Curve — {structure}",
+        xaxis_title="Contract", yaxis_title=f"Price ({price_unit})" if price_unit else "Price",
+        height=360,
+        xaxis=dict(tickangle=-30),
+    )
     return fig
 
 
@@ -2011,7 +2236,7 @@ commodity templates.
 
 
 def render_page_help(page_name: str) -> None:
-    """Affiche un encadré expliquant l'origine des données et l'utilité de la page."""
+    """Render an info expander explaining the page's data sources and purpose."""
     body = HELP_TEXT.get(page_name)
     if not body:
         return
@@ -2211,7 +2436,7 @@ def read_tornado(tornado_df: pd.DataFrame) -> str:
 
 def init_session_defaults() -> None:
     ss = st.session_state
-    ss.setdefault("commodity_key", "crude_oil")
+    ss.setdefault("commodity_key", "wti_crude")
     ss.setdefault("horizon_months", 24)
     ss.setdefault("history_start", "2018-01-01")
     ss.setdefault("seed", 42)
@@ -2229,9 +2454,11 @@ def sidebar_controls() -> None:
         st.divider()
 
         keys = list(COMMODITY_TEMPLATES.keys())
+        # Show "[Sector] Name" so the dropdown groups visually
         st.session_state["commodity_key"] = st.selectbox(
             "Commodity", options=keys,
-            format_func=lambda k: COMMODITY_TEMPLATES[k].name,
+            format_func=lambda k: f"[{COMMODITY_TEMPLATES[k].sector}] "
+                                  f"{COMMODITY_TEMPLATES[k].name}",
             index=keys.index(st.session_state["commodity_key"]),
         )
         st.session_state["horizon_months"] = st.slider(
@@ -2252,7 +2479,8 @@ def sidebar_controls() -> None:
                                          a.gdp_growth_pct or 2.5, 0.1)
             a.imports_adj_pct = st.slider("Imports Δ %", -20.0, 20.0, a.imports_adj_pct, 0.5)
             a.exports_adj_pct = st.slider("Exports Δ %", -20.0, 20.0, a.exports_adj_pct, 0.5)
-            if st.session_state["commodity_key"] == "crude_oil":
+            if st.session_state["commodity_key"] in ("wti_crude", "brent_crude",
+                                                    "rbob_gasoline", "ulsd_heating_oil"):
                 a.refinery_runs_pct = st.slider("Refinery runs Δ %", -10.0, 10.0,
                                                 a.refinery_runs_pct, 0.1)
             a.forecast_months = st.session_state["horizon_months"]
@@ -2284,7 +2512,7 @@ def page_dashboard(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame,
     last_h = bal[~bal["is_forecast"]].iloc[-1]
     last_f = bal.iloc[-1]
 
-    # Spot live (Yahoo) si disponible, sinon spot synthétique de référence
+    # Live spot (Yahoo) if available, otherwise the synthetic reference
     live = get_live_spot(st.session_state["commodity_key"])
     if live is not None:
         spot = float(live["price"])
@@ -2300,7 +2528,7 @@ def page_dashboard(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame,
     yoy_idx = max(-13, -len(bal))
     yoy_pct = (last_h["price"] - bal["price"].iloc[yoy_idx]) / bal["price"].iloc[yoy_idx] * 100
 
-    # --- Bandeau d'indicateurs clés
+    # --- KPI strip
     chart_intro("Key indicators",
                 "Market snapshot at a glance — price, fair value, stocks and "
                 "storage utilization, compared to their targets.")
@@ -2380,7 +2608,7 @@ def page_dashboard(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame,
         st.plotly_chart(days_cover_chart(bal, target=tpl.days_cover_target),
                         use_container_width=True)
 
-    # --- Régional
+    # --- Regional
     st.markdown("### Regional snapshot")
     reg = get_regional_dataset(st.session_state["commodity_key"])
     rs = regional_summary(reg)
@@ -2397,7 +2625,7 @@ def page_dashboard(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame,
                      use_container_width=True, hide_index=True)
     interpretation(read_regional(rs))
 
-    # --- Télémétrie
+    # --- Telemetry
     st.markdown("### Daily telemetry")
     chart_intro("High-frequency indicators",
                 "Three proxy indicators tracking real-world activity day by day. "
@@ -2466,9 +2694,9 @@ def page_supply_demand(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
     ])
     interpretation(read_balance(bal, tpl))
 
-    chart_intro("Offre, demande & stocks",
-                "L'écart entre les deux lignes pleines (offre vs demande) "
-                "explique la pente des stocks (ligne pointillée).")
+    chart_intro("Supply, demand & stocks",
+                "The gap between the two solid lines (supply vs demand) "
+                "drives the slope of the stocks line (dotted).")
     st.plotly_chart(supply_demand_chart(bal, unit=tpl.unit), use_container_width=True)
 
     chart_intro("Monthly builds & draws",
@@ -2491,7 +2719,7 @@ def page_supply_demand(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
         st.plotly_chart(seasonal_heatmap(piv, "Demand heatmap (Year × Month)"),
                         use_container_width=True)
 
-    # Lecture saisonnalité
+    # Seasonal interpretation
     peak_month = int(profile["mean"].idxmax())
     trough_month = int(profile["mean"].idxmin())
     months_en = ["January", "February", "March", "April", "May", "June",
@@ -2606,8 +2834,8 @@ def page_inventories(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame
     ])
     interpretation(read_inventory(inv, tpl))
 
-    chart_intro("Trajectoire des stocks",
-                "Stocks projetés mois par mois, plafonnés par la capacité fixe.")
+    chart_intro("Inventory trajectory",
+                "Stocks projected month by month, capped by fixed capacity.")
     st.plotly_chart(inventory_chart(inv, unit=tpl.inventory_unit),
                     use_container_width=True)
 
@@ -2792,7 +3020,8 @@ def page_futures_curve(tpl: CommodityTemplate, bal: pd.DataFrame) -> None:
                 "trade above spot — well-supplied market). "
                 "**Backwardation** = downward-sloping (forwards below spot — "
                 "premium for holding physical today).")
-    st.plotly_chart(futures_curve_chart(curve, struct_label), use_container_width=True)
+    st.plotly_chart(futures_curve_chart(curve, struct_label, price_unit=tpl.price_unit),
+                    use_container_width=True)
 
     c1, c2 = st.columns([2, 3])
     with c1:
