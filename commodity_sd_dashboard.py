@@ -81,7 +81,7 @@ class CommodityTemplate:
     price_band: tuple
     storage_capacity: float
     days_cover_target: float
-    price_unit: str = "$"        # unité de cotation: $/bbl, $/oz, ¢/lb, $/t, ¢/bu, $/MMBtu...
+    price_unit: str = "$"        # quote unit: $/bbl, $/oz, ¢/lb, $/t, ¢/bu, $/MMBtu...
     seasonal_demand: List[float] = field(default_factory=list)
     seasonal_supply: List[float] = field(default_factory=list)
     regions: List[str] = field(default_factory=list)
@@ -95,6 +95,11 @@ class CommodityTemplate:
     normal_yoy_demand_pct: float = 1.5
     ideal_mm_pct_of_oi: float = 15.0
     sector: str = "Energy"          # Energy / Metals / Ags / Softs / Precious
+    # Live futures-curve metadata (inspired by cfcap):
+    yf_fmt: str = ""                # Yahoo contract pattern e.g. "CL{M}{YY}.NYM"
+    active_months: str = "FGHJKMNQUVXZ"   # delivery months actually listed
+    liquid_months: int = 12         # how many forward contracts are liquid
+    storage_cost_per_yr: float = 0.06     # for synthetic carry curve fallback
 
 
 # Seasonality patterns - multiplicative factors around 1.0 across Jan..Dec.
@@ -152,6 +157,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.06, elasticity_beta=0.10, supply_lag_months=6,
         ideal_utilization_pct=70, typical_monthly_vol_pct=8,
         normal_yoy_demand_pct=1.2, ideal_mm_pct_of_oi=15, sector="Energy",
+        yf_fmt="CL{M}{YY}.NYM", active_months="FGHJKMNQUVXZ", liquid_months=12, storage_cost_per_yr=0.072,
     ),
     "natural_gas": CommodityTemplate(
         key="natural_gas", name="Natural Gas", unit="bcf/d", inventory_unit="bcf",
@@ -164,6 +170,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.18, elasticity_beta=0.08, supply_lag_months=4,
         ideal_utilization_pct=75, typical_monthly_vol_pct=12,
         normal_yoy_demand_pct=1.8, ideal_mm_pct_of_oi=18, sector="Energy",
+        yf_fmt="NG{M}{YY}.NYM", active_months="FGHJKMNQUVXZ", liquid_months=12, storage_cost_per_yr=0.12,
     ),
     "gasoline": CommodityTemplate(
         key="gasoline", name="Gasoline (RBOB)", unit="mb/d", inventory_unit="mb",
@@ -176,6 +183,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.05, elasticity_beta=0.08, supply_lag_months=3,
         ideal_utilization_pct=80, typical_monthly_vol_pct=9,
         normal_yoy_demand_pct=0.5, ideal_mm_pct_of_oi=14, sector="Energy",
+        yf_fmt="RB{M}{YY}.NYM", active_months="FGHJKMNQUVXZ", liquid_months=12, storage_cost_per_yr=0.084,
     ),
 
     # ---------- INDUSTRIAL METALS ----------
@@ -190,6 +198,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.04, elasticity_beta=0.07, supply_lag_months=12,
         ideal_utilization_pct=50, typical_monthly_vol_pct=6,
         normal_yoy_demand_pct=2.5, ideal_mm_pct_of_oi=20, sector="Metals",
+        yf_fmt="HG{M}{YY}.CMX", active_months="HKNUZ", liquid_months=8, storage_cost_per_yr=0.048,
     ),
     "aluminum": CommodityTemplate(
         key="aluminum", name="Aluminum", unit="kt/mo", inventory_unit="kt",
@@ -202,6 +211,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.04, elasticity_beta=0.05, supply_lag_months=24,
         ideal_utilization_pct=50, typical_monthly_vol_pct=5,
         normal_yoy_demand_pct=3.0, ideal_mm_pct_of_oi=14, sector="Metals",
+        yf_fmt="", active_months="FGHJKMNQUVXZ", liquid_months=12, storage_cost_per_yr=0.048,
     ),
     "nickel": CommodityTemplate(
         key="nickel", name="Nickel", unit="kt/mo", inventory_unit="kt",
@@ -214,6 +224,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.05, elasticity_beta=0.04, supply_lag_months=18,
         ideal_utilization_pct=50, typical_monthly_vol_pct=12,
         normal_yoy_demand_pct=5.0, ideal_mm_pct_of_oi=18, sector="Metals",
+        yf_fmt="", active_months="FGHJKMNQUVXZ", liquid_months=12, storage_cost_per_yr=0.048,
     ),
     "iron_ore": CommodityTemplate(
         key="iron_ore", name="Iron Ore", unit="mt/mo", inventory_unit="mt",
@@ -226,6 +237,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.05, elasticity_beta=0.06, supply_lag_months=18,
         ideal_utilization_pct=65, typical_monthly_vol_pct=10,
         normal_yoy_demand_pct=1.5, ideal_mm_pct_of_oi=12, sector="Metals",
+        yf_fmt="", active_months="FGHJKMNQUVXZ", liquid_months=12, storage_cost_per_yr=0.06,
     ),
 
     # ---------- PRECIOUS METALS ----------
@@ -240,6 +252,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.03, elasticity_beta=0.02, supply_lag_months=24,
         ideal_utilization_pct=60, typical_monthly_vol_pct=4,
         normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=22, sector="Precious",
+        yf_fmt="GC{M}{YY}.CMX", active_months="GJMQVZ", liquid_months=8, storage_cost_per_yr=0.024,
     ),
     "silver": CommodityTemplate(
         key="silver", name="Silver", unit="t/mo", inventory_unit="t",
@@ -252,6 +265,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.05, elasticity_beta=0.03, supply_lag_months=18,
         ideal_utilization_pct=60, typical_monthly_vol_pct=7,
         normal_yoy_demand_pct=2.0, ideal_mm_pct_of_oi=20, sector="Precious",
+        yf_fmt="SI{M}{YY}.CMX", active_months="HKNUZ", liquid_months=6, storage_cost_per_yr=0.036,
     ),
 
     # ---------- AGRICULTURE / GRAINS ----------
@@ -266,6 +280,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.05, elasticity_beta=0.03, supply_lag_months=9,
         ideal_utilization_pct=60, typical_monthly_vol_pct=7,
         normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=15, sector="Ags",
+        yf_fmt="ZW{M}{YY}.CBT", active_months="HKNUZ", liquid_months=8, storage_cost_per_yr=0.06,
     ),
     "corn": CommodityTemplate(
         key="corn", name="Corn", unit="mt/mo", inventory_unit="mt",
@@ -278,6 +293,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.05, elasticity_beta=0.04, supply_lag_months=9,
         ideal_utilization_pct=55, typical_monthly_vol_pct=6,
         normal_yoy_demand_pct=1.2, ideal_mm_pct_of_oi=16, sector="Ags",
+        yf_fmt="ZC{M}{YY}.CBT", active_months="HKNUZ", liquid_months=8, storage_cost_per_yr=0.06,
     ),
     "soybeans": CommodityTemplate(
         key="soybeans", name="Soybeans", unit="mt/mo", inventory_unit="mt",
@@ -290,6 +306,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.06, elasticity_beta=0.04, supply_lag_months=8,
         ideal_utilization_pct=55, typical_monthly_vol_pct=7,
         normal_yoy_demand_pct=2.5, ideal_mm_pct_of_oi=18, sector="Ags",
+        yf_fmt="ZS{M}{YY}.CBT", active_months="FHKNQUX", liquid_months=8, storage_cost_per_yr=0.06,
     ),
 
     # ---------- SOFTS ----------
@@ -304,6 +321,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.06, elasticity_beta=0.04, supply_lag_months=24,
         ideal_utilization_pct=60, typical_monthly_vol_pct=9,
         normal_yoy_demand_pct=2.0, ideal_mm_pct_of_oi=22, sector="Softs",
+        yf_fmt="KC{M}{YY}.NYB", active_months="HKNUZ", liquid_months=6, storage_cost_per_yr=0.048,
     ),
     "sugar": CommodityTemplate(
         key="sugar", name="Sugar (Raw #11)", unit="mt/mo", inventory_unit="mt",
@@ -316,6 +334,7 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         elasticity_alpha=0.05, elasticity_beta=0.04, supply_lag_months=12,
         ideal_utilization_pct=60, typical_monthly_vol_pct=8,
         normal_yoy_demand_pct=1.5, ideal_mm_pct_of_oi=18, sector="Softs",
+        yf_fmt="SB{M}{YY}.NYB", active_months="HKNV", liquid_months=6, storage_cost_per_yr=0.048,
     ),
 }
 
@@ -493,9 +512,106 @@ def get_regional_dataset(commodity_key: str, seed: int = 7) -> pd.DataFrame:
     })
 
 
+# ---------------------------------------------------------------------------
+# Live futures curve (inspired by cfcap / tst3.py)
+# ---------------------------------------------------------------------------
+_MONTH_CODES = list("FGHJKMNQUVXZ")  # CME futures month codes Jan..Dec
+_MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _build_contract_tickers(tpl: CommodityTemplate, n_max: int) -> List[Dict]:
+    """
+    Build the list of *active* (non-expired) contracts for a commodity.
+
+    Walks calendar months forward, keeps those whose delivery letter is in
+    `active_months`, and skips contracts whose expiry has already passed
+    (rule of thumb: contract expires ~20th of the month preceding delivery).
+    """
+    if not tpl.yf_fmt:
+        return []
+    from datetime import datetime
+    now = datetime.now()
+    contracts: List[Dict] = []
+    offset = 0
+    while len(contracts) < n_max and offset < n_max * 4:
+        m = (now.month - 1 + offset) % 12
+        year = now.year + (now.month - 1 + offset) // 12
+        offset += 1
+        if _MONTH_CODES[m] not in tpl.active_months:
+            continue
+        # expiry ~20th of month preceding delivery
+        exp_m = m - 1 if m > 0 else 11
+        exp_y = year if m > 0 else year - 1
+        if now > datetime(exp_y, exp_m + 1, 20):
+            continue
+        yr2 = f"{year}"[-2:]
+        ticker = tpl.yf_fmt.replace("{M}", _MONTH_CODES[m]).replace("{YY}", yr2)
+        contracts.append({
+            "ticker": ticker,
+            "label": f"{_MONTH_NAMES[m]}-{year}",
+            "month_code": _MONTH_CODES[m],
+            "tenor_month": len(contracts) + 1,
+        })
+    return contracts
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_live_futures_curve(commodity_key: str, n_max: int = 12
+                           ) -> Optional[pd.DataFrame]:
+    """
+    Fetch the live forward curve from Yahoo, contract by contract.
+
+    Returns a DataFrame with columns tenor_month, label, ticker, price, expiry,
+    or None if no template/yfinance/connectivity.  Same approach as cfcap:
+    download each maturity, keep only those with a usable close, renumber
+    tenors so the result has no gaps.
+    """
+    tpl = COMMODITY_TEMPLATES[commodity_key]
+    if not tpl.yf_fmt or os.environ.get("COMMODITY_SD_DISABLE_YF") == "1":
+        return None
+    contracts = _build_contract_tickers(tpl, n_max=n_max)
+    if not contracts:
+        return None
+    try:
+        import yfinance as yf
+        tickers = [c["ticker"] for c in contracts]
+        raw = yf.download(tickers, period="5d", auto_adjust=True,
+                          progress=False, group_by="ticker")
+        if raw is None or raw.empty:
+            return None
+        results = []
+        for c in contracts:
+            try:
+                if isinstance(raw.columns, pd.MultiIndex):
+                    close = raw[c["ticker"]]["Close"].dropna()
+                else:
+                    close = raw["Close"].dropna()
+                if close.empty:
+                    continue
+                results.append({**c, "price": float(close.iloc[-1])})
+            except Exception:
+                continue
+        if len(results) < 2:
+            return None
+        df = pd.DataFrame(results).sort_values("tenor_month").reset_index(drop=True)
+        df["tenor_month"] = range(1, len(df) + 1)
+        # Derive an approximate expiry date for plotting (1st of delivery month)
+        df["expiry"] = pd.date_range(
+            start=pd.Timestamp.today().normalize() + pd.offsets.MonthBegin(1),
+            periods=len(df), freq="MS",
+        )
+        return df
+    except Exception as exc:
+        logger.warning("Live futures curve fetch failed for %s: %s",
+                       commodity_key, exc)
+        return None
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def get_futures_curve(commodity_key: str, structure: str = "contango",
-                      months: int = 24, seed: int = 5) -> pd.DataFrame:
+def get_synthetic_futures_curve(commodity_key: str, structure: str = "contango",
+                                months: int = 24, seed: int = 5) -> pd.DataFrame:
+    """Cost-of-carry style synthetic curve used as fallback."""
     tpl = COMMODITY_TEMPLATES[commodity_key]
     spot = tpl.base_price
     rng = np.random.default_rng(seed)
@@ -506,6 +622,12 @@ def get_futures_curve(commodity_key: str, structure: str = "contango",
     dates = pd.date_range(start=pd.Timestamp.today().normalize() + pd.offsets.MonthBegin(1),
                           periods=months, freq="MS")
     return pd.DataFrame({"tenor_month": tenors, "expiry": dates, "price": prices})
+
+
+# Keep the old name as a thin wrapper so existing callers don't break.
+def get_futures_curve(commodity_key: str, structure: str = "contango",
+                      months: int = 24, seed: int = 5) -> pd.DataFrame:
+    return get_synthetic_futures_curve(commodity_key, structure, months, seed)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -1327,10 +1449,29 @@ def apply_page_style() -> None:
                 background: #161b22;
                 border: 1px solid #1f2937;
                 border-radius: 8px;
-                padding: 0.6rem 0.9rem;
+                padding: 0.55rem 0.8rem;
             }
-            div[data-testid="stMetricValue"] {color: #e5e7eb;}
+            /* Smaller KPI value font + tighter label + smaller delta */
+            div[data-testid="stMetricValue"] {
+                color: #e5e7eb;
+                font-size: 1.15rem !important;
+                line-height: 1.25 !important;
+            }
+            div[data-testid="stMetricLabel"] {
+                font-size: 0.78rem !important;
+                color: #9ca3af !important;
+            }
+            div[data-testid="stMetricDelta"] {
+                font-size: 0.72rem !important;
+            }
             h1, h2, h3, h4 {color: #f3f4f6 !important;}
+            /* Italic light-gray chart purpose caption */
+            .chart-purpose {
+                color: #9ca3af;
+                font-style: italic;
+                font-size: 0.85rem;
+                margin: -0.25rem 0 0.45rem 0;
+            }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1647,245 +1788,226 @@ PAGES = [
 ]
 
 
-# Texte d'aide par page — explications simples sur l'origine des données et l'utilité.
+# Per-page help text — simple explanations of where data comes from and what the page does.
 HELP_TEXT: Dict[str, str] = {
     "🏠 Dashboard": """
-**À quoi sert cette page ?** Vue d'ensemble du marché : un seul écran pour
-voir le prix, l'équilibre offre/demande, les stocks, la télémétrie et le
-positionnement des spéculateurs.
+**What is this page for?** A market overview at a glance: price, supply/demand
+balance, stocks, telemetry and speculative positioning, all on a single screen.
 
-**D'où viennent les chiffres ?**
-- **Prix spot** : récupéré en direct depuis Yahoo Finance via le ticker
-  du contrat à terme (CL=F pour le pétrole, GC=F pour l'or, etc.). Si
-  l'accès internet est indisponible, on retombe sur une valeur de
-  référence interne. L'unité de cotation (\$/bbl, \$/oz, ¢/lb…) est
-  affichée à côté.
-- **Offre, demande, stocks** : séries mensuelles **simulées** à partir
-  des paramètres typiques du marché (production de référence,
-  consommation, saisonnalité, croissance tendancielle). Une vraie
-  source (EIA, IEA, USDA, JODI…) peut remplacer ce générateur.
-- **Régions** : répartition de l'offre et de la demande selon les parts
-  historiques de chaque grande zone (par ex. la Chine prend ~55 % de la
-  demande mondiale de cuivre).
-- **Télémétrie haute fréquence** : suivi quotidien simulé — nombre de
-  navires en mer, taux d'utilisation des raffineries, estimation
-  satellite de production.
-- **Positionnement spéculatif** : positions nettes des hedge funds et
-  indice de sentiment, style rapport CFTC, simulés.
+**Where do the numbers come from?**
+- **Spot price**: pulled live from Yahoo Finance via the futures contract ticker
+  (CL=F for crude, GC=F for gold, etc.). When no internet is available, the
+  app falls back to an internal reference value. The quote unit ($/bbl,
+  $/oz, ¢/lb…) is shown next to the price.
+- **Supply, demand, stocks**: monthly **synthetic** series built from typical
+  market parameters (reference production, consumption, seasonality, trend
+  growth). A real-world source (EIA, IEA, USDA, JODI…) can replace the
+  generator.
+- **Regions**: supply/demand split using each major zone's historical share
+  (e.g. China ~55 % of global copper demand).
+- **Daily telemetry**: simulated daily tracking — vessels in transit,
+  refinery utilization, satellite production estimate.
+- **Speculative positioning**: Managed Money net positions and a sentiment
+  index, CFTC-style, simulated.
 
-**Ce que vous trouvez ici.**
-- Bandeau d'indicateurs clés (prix, juste valeur, stocks, jours de
-  couverture, taux d'utilisation du stockage).
-- Tableau « Benchmarks vs Actuel » qui compare chaque indicateur à sa
-  norme idéale pour ce produit.
-- Graphique consolidé Offre / Demande / Stocks.
-- Comparaison prix observé vs juste valeur modélisée.
-- Trajectoire des stocks et jours de couverture.
-- Photo régionale et télémétrie quotidienne.
+**What you'll find here.**
+- Key-indicator strip (price, fair value, stocks, days of cover, storage util).
+- "Benchmarks vs Current" table comparing each indicator to its ideal norm.
+- Combined Supply / Demand / Stocks chart.
+- Observed price vs modeled fair value.
+- Inventory trajectory and days of cover.
+- Regional snapshot and daily telemetry.
 """,
     "⚖️ Supply & Demand": """
-**À quoi sert cette page ?** Construire et tester un bilan offre/demande.
-On part d'une série historique, on applique des hypothèses (croissance,
-choc d'offre, météo…) et on regarde comment les stocks évoluent.
+**What is this page for?** Build and stress-test a supply/demand balance.
+Start from a historical series, apply assumptions (growth, supply shock,
+weather…) and watch how stocks evolve.
 
-**D'où viennent les chiffres ?**
-- Les séries mensuelles sont **synthétiques** par défaut. Vous pouvez
-  charger votre propre fichier CSV (colonnes `date`, `supply`, `demand`
-  au minimum, plus optionnellement `imports`, `exports`, `stocks`,
-  `price`).
-- Les ajustements (production, demande, météo, PIB, raffinage…) viennent
-  directement des curseurs de la barre latérale.
+**Where do the numbers come from?**
+- The monthly series are **synthetic** by default. You can upload your own
+  CSV (minimum columns: `date`, `supply`, `demand` — optional: `imports`,
+  `exports`, `stocks`, `price`).
+- The adjustments (production, demand, weather, GDP, refining…) come directly
+  from the sidebar sliders.
 
-**Logique de calcul.**
-- Identité comptable : *Stocks fin = Stocks début + Offre − Demande*.
-  On peut afficher en cadence mensuelle, trimestrielle ou annuelle.
-- L'historique reste figé ; les ajustements ne s'appliquent qu'aux mois
-  prévisionnels, pour ne pas réécrire le passé.
+**Computation logic.**
+- Accounting identity: *End stocks = Begin stocks + Supply − Demand*.
+  Displayable monthly, quarterly or yearly.
+- History is frozen; adjustments apply only to forecast months, so the past
+  is never rewritten.
 
-**Sections de la page.**
-- Indicateurs clés du bilan (stocks fin, surplus/déficit, jours de
-  couverture, utilisation du stockage).
-- Graphique consolidé Offre/Demande/Stocks.
-- Histogramme des builds/draws mensuels.
-- Module saisonnalité (profil mensuel, heatmap, décomposition
-  tendance/saisonnier/résidu).
-- Courbes d'élasticité (offre et demande en fonction du prix avec point
-  d'équilibre).
-- Réponse retardée de l'offre à un choc de prix (par ex. délai
-  shale, lag de plantation).
-- Tableau exportable en CSV ou Excel.
+**Page sections.**
+- Balance key indicators (end stocks, surplus/deficit, days of cover, storage util).
+- Combined Supply/Demand/Stocks chart.
+- Histogram of monthly builds/draws.
+- Seasonality module (monthly profile, heatmap, trend/seasonal/residual decomposition).
+- Elasticity curves (supply and demand as functions of price with the
+  equilibrium point).
+- Lagged supply response to a price shock (e.g. shale delay, planting lag).
+- Exportable table (CSV / Excel).
 """,
     "🛢️ Inventories": """
-**À quoi sert cette page ?** Mettre les stocks à l'épreuve des
-contraintes de capacité, simuler un stockage flottant, et suivre les
-jours de couverture.
+**What is this page for?** Test stocks against capacity constraints, simulate
+floating storage, and track days of cover.
 
-**D'où viennent les chiffres ?**
-- Mêmes séries que la page Supply & Demand (bilan calculé à partir des
-  hypothèses de la barre latérale).
-- La capacité de stockage et la part de stockage flottant sont
-  modifiables en haut de page.
+**Where do the numbers come from?**
+- Same series as the Supply & Demand page (balance computed from the sidebar
+  assumptions).
+- Storage capacity and the floating-storage share are editable at the top of
+  the page.
 
-**Logique.**
-- Mois par mois, les stocks sont projetés à partir des builds/draws.
-- Si les stocks projetés dépassent la capacité, le surplus part en
-  *stockage flottant* (limité par le % de la capacité).
-- Le taux d'utilisation = stocks ÷ capacité × 100. Comparé à la norme
-  idéale de la commodité.
+**Logic.**
+- Month by month, stocks are projected from builds/draws.
+- If projected stocks exceed capacity, the surplus goes into *floating
+  storage* (capped at the configured % of capacity).
+- Utilization rate = stocks ÷ capacity × 100. Compared to the commodity's
+  ideal norm.
 
 **Sections.**
-- Indicateurs clés (stocks courants, utilisation, stocks flottants,
-  jours de couverture).
-- Trajectoire d'inventaire.
-- Waterfall des 12 dernières variations.
-- Jauge d'utilisation.
-- Jours de couverture forward avec ligne cible.
-- Aire empilée stocks terrestres + flottants.
+- Key indicators (current stocks, utilization, floating stocks, days of cover).
+- Inventory trajectory.
+- Last-12-month delta waterfall.
+- Utilization gauge.
+- Forward days of cover with target line.
+- Stacked area: fixed + floating stocks.
 """,
     "🌪️ Scenarios": """
-**À quoi sert cette page ?** Comparer rapidement trois scénarios —
-Bull, Base, Bear — pour cadrer un range de prix probable.
+**What is this page for?** Quickly compare three scenarios — Bull, Base,
+Bear — to frame a likely price range.
 
-**D'où viennent les chiffres ?**
-- Chaque scénario applique un jeu d'ajustements pré-réglés (choc
-  d'offre, choc de demande, croissance PIB, météo, USD) sur le bilan de
-  base. Les probabilités sont éditables en haut de page.
-- Le bilan est rejoué pour chaque scénario, puis la juste valeur est
-  recalculée pour donner une trajectoire de prix implicite.
+**Where do the numbers come from?**
+- Each scenario applies a preset bundle of adjustments (supply shock, demand
+  shock, GDP growth, weather, USD) to the base balance. Probabilities are
+  editable at the top.
+- The balance is re-run per scenario, then fair value is recomputed to give
+  each scenario its own implied price trajectory.
 
 **Sections.**
-- Trajectoires de stocks par scénario.
-- Trajectoires de prix par scénario.
-- Tableau récapitulatif (probabilité, stocks fin, jours de couverture,
-  build/draw 12 mois, prix moyen, juste valeur fin).
-- Prix moyen attendu pondéré par les probabilités.
+- Stocks paths by scenario.
+- Price paths by scenario.
+- Summary table (probability, end stocks, days of cover, 12m build/draw,
+  average price, end fair value).
+- Probability-weighted forecast price.
 """,
     "🌍 Regional Flows": """
-**À quoi sert cette page ?** Voir qui produit, qui consomme, et déduire
-les flux commerciaux entre régions.
+**What is this page for?** See who produces, who consumes, and infer trade
+flows between regions.
 
-**D'où viennent les chiffres ?**
-- La répartition régionale utilise les **poids historiques** de chaque
-  zone définis dans la fiche commodité (par ex. Chine 55 % de la demande
-  cuivre).
-- L'offre et la demande sont simulées par région avec un peu de bruit
-  pour générer des surplus/déficits réalistes.
+**Where do the numbers come from?**
+- Regional split uses the **historical weights** of each zone defined in the
+  commodity template (e.g. China = 55 % of copper demand).
+- Supply and demand are simulated per region with a bit of noise to generate
+  realistic surpluses/deficits.
 
-**Logique.**
-- *Balance régionale* = offre − demande. Positive → exportateur net.
-  Négative → importateur net.
-- Les flux du diagramme Sankey sont calculés en faisant transiter le
-  surplus de chaque exportateur vers les importateurs au prorata de
-  leur déficit.
+**Logic.**
+- *Regional balance* = supply − demand. Positive → net exporter.
+  Negative → net importer.
+- Sankey flows are built by sending each exporter's surplus to importers in
+  proportion to their deficit share.
 
 **Sections.**
-- Bar chart Offre vs Demande par région.
-- Sankey des flux commerciaux implicites.
-- Tableau de signaux d'arbitrage (Export Arb / Import Need / Neutre).
+- Supply vs Demand bar chart by region.
+- Implied trade-flow Sankey diagram.
+- Arbitrage signals table (Export Arb / Import Need / Neutral).
 """,
     "📈 Futures Curve": """
-**À quoi sert cette page ?** Analyser la structure à terme : contango
-ou backwardation, spreads de calendrier, économie du stockage.
+**What is this page for?** Analyze the term structure: contango vs
+backwardation, calendar spreads, storage economics.
 
-**D'où viennent les chiffres ?**
-- La courbe est **simulée** selon la forme choisie (contango,
-  backwardation, plate). Une connexion à un vrai feed (CME, ICE) peut
-  remplacer ce générateur.
-- Le prix spot vient de la page Dashboard (Yahoo en direct ou
-  référence interne).
+**Where do the numbers come from?**
+- The curve is built from **live futures contracts on Yahoo Finance** when
+  available. For each commodity we walk the active delivery months
+  (e.g. `CLM25.NYM` for June 2025 WTI, `GCQ25.CMX` for August 2025 gold),
+  skip expired contracts, and pull the latest close. Spot is the front-month
+  live close.
+- When live data isn't reachable (offline, throttled tickers, no contract
+  listing for that product), the page falls back to a synthetic curve whose
+  shape — contango, backwardation or flat — you control with a selector.
 
-**Logique.**
-- *Contango* : prix forward > spot (marché long sur stocks, faible
-  rareté).
-- *Backwardation* : prix forward < spot (marché tendu, prime à la
-  détention physique).
-- *Économie du stockage* : on regarde si la prime de contango couvre
-  le coût mensuel de stockage + financement. Si oui, "positive carry"
-  → on peut stocker physiquement et vendre forward.
+**Logic.**
+- *Contango*: forward price > spot (well-supplied market, low scarcity).
+- *Backwardation*: forward price < spot (tight market, premium for holding
+  physical today).
+- *Storage economics*: checks whether the contango premium covers monthly
+  storage + financing cost. If yes → "positive carry": it's profitable to
+  buy physical and sell forward.
 
 **Sections.**
-- Graphique de la courbe (avec étiquette du régime détecté).
-- Tableau des spreads calendaires (m1-m2, m1-m6, m1-m12, m6-m12).
-- Tableau économie du stockage (prime de contango vs coût de portage).
-- Lecture du marché : indice de tension dérivé des jours de couverture.
+- Curve chart (with detected regime label and data-source badge).
+- Calendar spreads table (m1-m2, m1-m6, m1-m12, m6-m12).
+- Storage economics table (contango premium vs carry cost).
+- Market reading: tightness score derived from days of cover.
 """,
     "🏦 Macro": """
-**À quoi sert cette page ?** Voir comment les grands agrégats macro
-(PIB, PMI, USD, taux directeur) influencent le prix de la commodité.
+**What is this page for?** See how the big macro aggregates (GDP, PMI, USD,
+policy rate) drive the commodity price.
 
-**D'où viennent les chiffres ?**
-- Le panel macro est **simulé** sur 7 ans : indice PIB (marche
-  aléatoire avec dérive), PMI (oscillant autour de 50), indice USD,
-  taux directeur. Peut être remplacé par des séries FRED, OCDE, etc.
-- Le prix de la commodité vient de la série synthétique de la page
-  Supply & Demand.
+**Where do the numbers come from?**
+- The macro panel is **simulated** over 7 years: GDP index (drift random
+  walk), PMI (mean-reverting around 50), USD index, policy rate. Can be
+  swapped for FRED, OECD series, etc.
+- Commodity price comes from the synthetic series of the Supply & Demand page.
 
-**Analyses disponibles.**
-- *Matrice de corrélation* entre prix et chaque agrégat macro.
-- *Scatter plots* avec droite de régression : on choisit deux
-  variables et on les confronte au prix.
-- *Corrélations roulantes* (24 mois) pour voir comment la relation
-  évolue dans le temps.
-- *Régression multivariée* : log(prix) expliqué par tous les facteurs
-  macro. Retourne les coefficients, la constante et le R².
+**Available analyses.**
+- *Correlation matrix* between price and each macro aggregate.
+- *Scatter plots* with regression line: pick two variables and confront them
+  with price.
+- *Rolling correlations* (24 months) to see how the relationship evolves.
+- *Multivariate regression*: log(price) explained by all macro factors at
+  once. Returns coefficients, intercept and R².
 """,
     "🎲 Monte Carlo": """
-**À quoi sert cette page ?** Générer un range probabiliste de prix et
-de stocks en tirant des chocs aléatoires (offre, demande, météo,
-pannes).
+**What is this page for?** Generate a probabilistic range of prices and
+stocks by drawing random shocks (supply, demand, weather, outages).
 
-**D'où viennent les chiffres ?**
-- Toutes les hypothèses centrales viennent des curseurs de la barre
-  latérale. Les volatilités et le profil de pannes sont définis sur la
-  page elle-même.
+**Where do the numbers come from?**
+- All central assumptions come from the sidebar sliders. Volatilities and the
+  outage profile are configured on the page itself.
 
-**Comment ça marche ?**
-Pour chaque trajectoire simulée :
-1. On tire un choc d'offre, un choc de demande et une perturbation
-   météo dans des lois normales centrées sur les hypothèses de base.
-2. Avec une probabilité paramétrable, on injecte une panne (par ex.
-   ouragan, arrêt de raffinerie) qui ampute l'offre.
-3. On rejoue le bilan et on recalcule la juste valeur.
+**How does it work?**
+For each simulated path:
+1. Draw a supply shock, a demand shock and a weather perturbation from
+   normal distributions centered on the base assumptions.
+2. With a configurable probability, inject an outage (e.g. hurricane,
+   refinery shutdown) that cuts supply.
+3. Re-run the balance and recompute fair value.
 
-**Sorties.**
-- Distributions du prix moyen prévisionnel, du niveau de stocks fin et
-  du build/draw cumulé. Marqueurs P5/P50/P95.
-- Fan charts (cône d'incertitude) pour prix et stocks.
-- VaR 95 % : perte de prix dans le pire 5 % des cas.
+**Outputs.**
+- Distributions of average forecast price, end-stocks level and cumulative
+  build/draw. P5/P50/P95 markers.
+- Fan charts (uncertainty cone) for price and stocks.
+- VaR 95 %: price loss in the worst 5 % of cases.
 """,
     "📉 Sensitivities": """
-**À quoi sert cette page ?** Identifier *quelles* hypothèses bougent le
-plus la métrique cible (stocks fin, prix moyen, build/draw).
+**What is this page for?** Identify *which* assumptions move the target
+metric (end stocks, average price, build/draw) the most.
 
-**D'où viennent les chiffres ?**
-- Base : hypothèses courantes (barre latérale). Chaque variable est
-  poussée à son extrême bas et à son extrême haut, toutes choses égales
-  par ailleurs.
+**Where do the numbers come from?**
+- Base: current assumptions (sidebar). Each variable is pushed to its low and
+  high extreme, all else equal.
 
 **Sections.**
-- *Tornado chart* : variables classées par amplitude d'impact. Le bar
-  le plus long indique la variable la plus sensible.
-- *Stress matrix 2D* : on choisit deux variables, on quadrille leurs
-  valeurs et on lit la métrique dans chaque cellule. Permet de voir les
-  effets d'interaction.
+- *Tornado chart*: variables ranked by impact magnitude. The longest bar is
+  the most sensitive variable.
+- *2D stress matrix*: pick two variables, grid their values and read the
+  metric in each cell. Reveals interaction effects.
 """,
     "⚙️ Settings": """
-**À quoi sert cette page ?** Sauvegarder/charger les hypothèses,
-nettoyer le cache, consulter les fiches commodité.
+**What is this page for?** Save/load assumptions, flush the cache, browse
+commodity templates.
 
-**Contenu.**
-- *Export/Import JSON* des hypothèses.
-- *Bouton de cache* : vide les données mémorisées et recalcule tout.
-- *Matrice de benchmarks* : tous les paramètres idéaux (jours de
-  couverture cible, utilisation idéale, volatilité typique, croissance
-  normale de la demande, % MM/OI cible) pour les 14 commodités côte à
-  côte.
-- *Fiche détaillée* par commodité (offre/demande de référence, capacité
-  de stockage, prix de référence, unité de cotation, bande de prix,
-  poids régionaux, élasticités, délai de réponse de l'offre,
-  saisonnalités).
+**Content.**
+- *Export/import JSON* for assumptions.
+- *Cache button*: flushes cached data and recomputes everything.
+- *Benchmarks matrix*: all ideal parameters (days-of-cover target, ideal
+  utilization, typical volatility, normal demand growth, target MM/OI %)
+  for all 14 commodities side by side.
+- *Detailed template* per commodity (reference supply/demand, storage
+  capacity, reference price, quote unit, price band, region weights,
+  elasticities, supply lag, seasonality).
 """,
 }
+
 
 
 def render_page_help(page_name: str) -> None:
@@ -1893,45 +2015,49 @@ def render_page_help(page_name: str) -> None:
     body = HELP_TEXT.get(page_name)
     if not body:
         return
-    with st.expander("ℹ️ À propos de cette page — sources et méthode", expanded=False):
+    with st.expander("ℹ️ About this page — data sources & method", expanded=False):
         st.markdown(body)
 
 
 def chart_intro(title: str, purpose: str) -> None:
-    """Affiche un mini titre + ligne d'objectif AVANT un graphique ou un tableau."""
-    st.markdown(f"**{title}** — {purpose}")
+    """Render a small title and an italic light-gray purpose line BEFORE the chart."""
+    st.markdown(f"**{title}**")
+    st.markdown(
+        f"<div class='chart-purpose'>{purpose}</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def interpretation(text: str) -> None:
-    """Affiche un encart d'interprétation des données présentées."""
-    st.info(f"💡 **Lecture** — {text}")
+    """Render an info box with a data-driven reading of the section."""
+    st.info(f"💡 **Reading** — {text}")
 
 
 # ---------------------------------------------------------------------------
-# Lectures automatiques — produisent un texte d'interprétation à partir des données
+# Automatic readings — produce a data-driven interpretation string
 # ---------------------------------------------------------------------------
 def _label_dc(actual: float, target: float) -> str:
     if actual < target * 0.85:
-        return "tendu"
+        return "tight"
     if actual > target * 1.15:
-        return "ample"
-    return "équilibré"
+        return "loose"
+    return "balanced"
 
 
 def _label_util(actual: float, ideal: float) -> str:
     if actual < ideal - 12:
-        return "sous-utilisé"
+        return "under-used"
     if actual > ideal + 12:
-        return "saturé"
+        return "saturated"
     return "normal"
 
 
 def _label_fv(deviation_pct: float) -> str:
     if deviation_pct > 10:
-        return "surévalué"
+        return "overvalued"
     if deviation_pct < -10:
-        return "sous-évalué"
-    return "proche de la juste valeur"
+        return "undervalued"
+    return "close to fair value"
 
 
 def read_dashboard(tpl: "CommodityTemplate", bal: pd.DataFrame, fv: pd.DataFrame,
@@ -1941,13 +2067,13 @@ def read_dashboard(tpl: "CommodityTemplate", bal: pd.DataFrame, fv: pd.DataFrame
     util = float(last["capacity_pct"])
     dev = (spot - fv_now) / fv_now * 100 if fv_now else 0.0
     parts = [
-        f"Avec un prix spot à **{fmt_price(spot, tpl.price_unit)}** et une "
-        f"juste valeur modélisée de **{fmt_price(fv_now, tpl.price_unit)}**, "
-        f"le marché est **{_label_fv(dev)}** (écart {dev:+.1f} %).",
-        f"Les stocks couvrent **{dc:.0f} jours** de demande (cible "
-        f"{tpl.days_cover_target:.0f} j) → bilan **{_label_dc(dc, tpl.days_cover_target)}**.",
-        f"Le taux d'utilisation du stockage est de **{util:.0f} %** "
-        f"(idéal {tpl.ideal_utilization_pct:.0f} %) → régime "
+        f"With a spot price at **{fmt_price(spot, tpl.price_unit)}** and a "
+        f"modeled fair value of **{fmt_price(fv_now, tpl.price_unit)}**, the "
+        f"market is **{_label_fv(dev)}** (deviation {dev:+.1f} %).",
+        f"Stocks cover **{dc:.0f} days** of demand (target "
+        f"{tpl.days_cover_target:.0f} d) → balance is **{_label_dc(dc, tpl.days_cover_target)}**.",
+        f"Storage utilization is **{util:.0f} %** "
+        f"(ideal {tpl.ideal_utilization_pct:.0f} %) → regime "
         f"**{_label_util(util, tpl.ideal_utilization_pct)}**.",
     ]
     return " ".join(parts)
@@ -1959,13 +2085,13 @@ def read_balance(bal: pd.DataFrame, tpl: "CommodityTemplate") -> str:
     bd12 = float(bal["build_draw"].iloc[-12:].sum())
     avg_demand = float(bal["demand"].mean())
     sd_pct = sd / avg_demand * 100 if avg_demand else 0.0
-    sense = "surplus" if sd > 0 else "déficit"
+    sense = "surplus" if sd > 0 else "deficit"
     cumul = "build" if bd12 > 0 else "draw"
     return (
-        f"Sur le dernier mois projeté, le marché est en **{sense}** "
-        f"de {abs(sd):,.1f} {tpl.unit} (~{abs(sd_pct):.1f} % de la demande). "
-        f"Sur 12 mois glissants, l'inventaire affiche un **{cumul}** cumulé "
-        f"de {abs(bd12):,.0f} {tpl.inventory_unit}."
+        f"In the last projected month the market is in **{sense}** of "
+        f"{abs(sd):,.1f} {tpl.unit} (~{abs(sd_pct):.1f} % of demand). "
+        f"Over the trailing 12 months, inventory shows a cumulative **{cumul}** "
+        f"of {abs(bd12):,.0f} {tpl.inventory_unit}."
     )
 
 
@@ -1974,15 +2100,15 @@ def read_inventory(inv: pd.DataFrame, tpl: "CommodityTemplate") -> str:
     util = float(last["utilization_pct"])
     floating = float(last["overflow_floating"])
     msg = (
-        f"Utilisation des entrepôts à **{util:.0f} %** "
-        f"(idéal {tpl.ideal_utilization_pct:.0f} %) → "
+        f"Warehouse utilization is at **{util:.0f} %** "
+        f"(ideal {tpl.ideal_utilization_pct:.0f} %) → "
         f"**{_label_util(util, tpl.ideal_utilization_pct)}**. "
     )
     if floating > 1:
-        msg += (f"Du stockage flottant est mobilisé ({floating:,.0f} "
-                f"{tpl.inventory_unit}) — signe que la capacité fixe est saturée.")
+        msg += (f"Floating storage is being used ({floating:,.0f} "
+                f"{tpl.inventory_unit}) — a sign that fixed capacity is saturated.")
     else:
-        msg += "Pas de stockage flottant activé : la capacité fixe suffit."
+        msg += "No floating storage in use: fixed capacity is sufficient."
     return msg
 
 
@@ -1991,12 +2117,12 @@ def read_scenarios(results: Dict[str, pd.DataFrame], tpl: "CommodityTemplate") -
     bull = fc(results["Bull"]); base = fc(results["Base"]); bear = fc(results["Bear"])
     spread_pct = (bull - bear) / base * 100 if base else 0.0
     return (
-        f"Le scénario haussier projette un prix moyen de "
-        f"**{fmt_price(bull, tpl.price_unit)}**, le central "
-        f"**{fmt_price(base, tpl.price_unit)}** et le baissier "
+        f"The bull scenario projects an average price of "
+        f"**{fmt_price(bull, tpl.price_unit)}**, the central case "
+        f"**{fmt_price(base, tpl.price_unit)}** and the bear "
         f"**{fmt_price(bear, tpl.price_unit)}**. "
-        f"La fourchette bull–bear représente **{spread_pct:.1f} %** du prix "
-        f"central : plus elle est large, plus le marché est exposé aux chocs."
+        f"The bull–bear range is **{spread_pct:.1f} %** of the central price: "
+        f"the wider it is, the more the market is exposed to shocks."
     )
 
 
@@ -2004,58 +2130,58 @@ def read_regional(rs: pd.DataFrame) -> str:
     exporters = rs[rs["balance"] > 0]
     importers = rs[rs["balance"] < 0]
     if exporters.empty or importers.empty:
-        return "Toutes les régions sont à l'équilibre — pas de flux structurels visibles."
+        return "All regions are balanced — no structural flows visible."
     top_exp = exporters.sort_values("balance", ascending=False).iloc[0]
     top_imp = importers.sort_values("balance").iloc[0]
     return (
-        f"**{top_exp['region']}** est l'exportateur dominant ({top_exp['balance']:+,.1f}) ; "
-        f"**{top_imp['region']}** est l'importateur le plus déficitaire "
+        f"**{top_exp['region']}** is the dominant exporter ({top_exp['balance']:+,.1f}); "
+        f"**{top_imp['region']}** is the largest importer "
         f"({top_imp['balance']:+,.1f}). "
-        "Les flèches du Sankey indiquent qui alimente qui, en proportion des déficits."
+        "Sankey links show who feeds whom, in proportion to deficits."
     )
 
 
 def read_curve(structure: str, score: float) -> str:
     if score > 0.3:
-        market = "tendu (peu de stocks)"
+        market = "tight (low stocks)"
         consistent = "backwardation"
     elif score < -0.3:
-        market = "ample (stocks abondants)"
+        market = "loose (abundant stocks)"
         consistent = "contango"
     else:
-        market = "équilibré"
-        consistent = "courbe plate"
-    cohérent = (
-        "cohérent" if (consistent in structure.lower()
-                       or (consistent == "courbe plate" and "flat" in structure.lower()))
-        else "incohérent"
+        market = "balanced"
+        consistent = "flat curve"
+    coherent = (
+        "consistent" if (consistent in structure.lower()
+                         or (consistent == "flat curve" and "flat" in structure.lower()))
+        else "inconsistent"
     )
     return (
-        f"Stocks → marché **{market}**, ce qui suggère une structure en **{consistent}**. "
-        f"Observation : **{structure}** ({cohérent} avec la fondamentale). "
-        "Quand la courbe diverge de la fondamentale, il y a souvent un trade de "
-        "convergence à jouer."
+        f"Stocks → **{market}** market, suggesting a **{consistent}** structure. "
+        f"Observed: **{structure}** ({coherent} with the fundamental). "
+        "When the curve diverges from the fundamentals, there is often a "
+        "convergence trade to play."
     )
 
 
 def read_macro(corr: pd.DataFrame) -> str:
     if "price" not in corr.columns:
-        return "Pas assez de données pour interpréter."
+        return "Not enough data to interpret."
     line = corr["price"].drop("price", errors="ignore")
     top = line.abs().sort_values(ascending=False)
     if top.empty:
         return ""
     name = top.index[0]
     val = line[name]
-    direction = "positive" if val > 0 else "négative"
-    label = {"gdp_index": "PIB", "pmi": "PMI", "usd_index": "USD",
-             "policy_rate": "taux directeur"}.get(name, name)
+    direction = "positive" if val > 0 else "negative"
+    label = {"gdp_index": "GDP", "pmi": "PMI", "usd_index": "USD",
+             "policy_rate": "policy rate"}.get(name, name)
     return (
-        f"Le facteur macro le plus lié au prix est **{label}** "
-        f"(corrélation {val:+.2f}, direction **{direction}**). "
-        "Un signe positif signifie que le prix monte quand l'indicateur monte ; négatif, "
-        "le contraire. Les corrélations roulantes permettent de voir si cette relation "
-        "tient dans le temps."
+        f"The macro factor most tied to price is **{label}** "
+        f"(correlation {val:+.2f}, **{direction}**). "
+        "A positive sign means price moves with the indicator; negative means "
+        "the opposite. Rolling correlations help check whether the relationship "
+        "is stable over time."
     )
 
 
@@ -2064,11 +2190,11 @@ def read_monte_carlo(avg_price: np.ndarray, end_stocks: np.ndarray,
     p5, p50, p95 = np.quantile(avg_price, [0.05, 0.5, 0.95])
     width_pct = (p95 - p5) / p50 * 100 if p50 else 0.0
     return (
-        f"Le prix moyen attendu se situe autour de "
+        f"Expected average price sits around "
         f"**{fmt_price(p50, tpl.price_unit)}** "
-        f"(95 % des trajectoires entre {fmt_price(p5, tpl.price_unit)} et "
-        f"{fmt_price(p95, tpl.price_unit)}, soit une largeur de **{width_pct:.0f} %** "
-        f"du médian). Plus la fourchette est large, plus le marché est risqué."
+        f"(95 % of paths between {fmt_price(p5, tpl.price_unit)} and "
+        f"{fmt_price(p95, tpl.price_unit)} — a **{width_pct:.0f} %** width of "
+        f"the median). The wider the range, the riskier the market."
     )
 
 
@@ -2077,10 +2203,9 @@ def read_tornado(tornado_df: pd.DataFrame) -> str:
         return ""
     top = tornado_df.iloc[-1]
     return (
-        f"La variable la plus sensible est **{top['variable']}** : un mouvement entre "
-        f"{top['low_input']:+.1f} et {top['high_input']:+.1f} fait varier la métrique "
-        f"de {top['range']:,.1f} unités. C'est cette hypothèse-là qu'il faut surveiller "
-        "en priorité."
+        f"The most sensitive variable is **{top['variable']}**: a move between "
+        f"{top['low_input']:+.1f} and {top['high_input']:+.1f} swings the metric "
+        f"by {top['range']:,.1f} units. This is the assumption to watch first."
     )
 
 
@@ -2097,44 +2222,44 @@ def init_session_defaults() -> None:
 def sidebar_controls() -> None:
     init_session_defaults()
     with st.sidebar:
-        st.markdown("### 🛢️ Desk S&D Commodités")
+        st.markdown("### 🛢️ Commodity S&D Desk")
 
-        st.session_state["page"] = st.radio("Navigation", PAGES,
+        st.session_state["page"] = st.radio("Navigate", PAGES,
                                             index=PAGES.index(st.session_state["page"]))
         st.divider()
 
         keys = list(COMMODITY_TEMPLATES.keys())
         st.session_state["commodity_key"] = st.selectbox(
-            "Commodité", options=keys,
+            "Commodity", options=keys,
             format_func=lambda k: COMMODITY_TEMPLATES[k].name,
             index=keys.index(st.session_state["commodity_key"]),
         )
         st.session_state["horizon_months"] = st.slider(
-            "Horizon de prévision (mois)", 6, 36,
+            "Forecast horizon (months)", 6, 36,
             st.session_state["horizon_months"], step=3,
         )
         st.session_state["history_start"] = st.text_input(
-            "Début de l'historique (AAAA-MM-JJ)", st.session_state["history_start"]
+            "History start (YYYY-MM-DD)", st.session_state["history_start"]
         )
         st.divider()
 
-        with st.expander("Hypothèses", expanded=False):
+        with st.expander("Assumptions", expanded=False):
             a: BalanceAssumptions = st.session_state["assumptions"]
-            a.supply_adj_pct = st.slider("Offre Δ %", -10.0, 10.0, a.supply_adj_pct, 0.1)
-            a.demand_adj_pct = st.slider("Demande Δ %", -10.0, 10.0, a.demand_adj_pct, 0.1)
-            a.weather_pct = st.slider("Météo Δ %", -5.0, 5.0, a.weather_pct, 0.1)
-            a.gdp_growth_pct = st.slider("Croissance PIB %", -2.0, 6.0,
+            a.supply_adj_pct = st.slider("Supply Δ %", -10.0, 10.0, a.supply_adj_pct, 0.1)
+            a.demand_adj_pct = st.slider("Demand Δ %", -10.0, 10.0, a.demand_adj_pct, 0.1)
+            a.weather_pct = st.slider("Weather Δ %", -5.0, 5.0, a.weather_pct, 0.1)
+            a.gdp_growth_pct = st.slider("GDP growth %", -2.0, 6.0,
                                          a.gdp_growth_pct or 2.5, 0.1)
             a.imports_adj_pct = st.slider("Imports Δ %", -20.0, 20.0, a.imports_adj_pct, 0.5)
             a.exports_adj_pct = st.slider("Exports Δ %", -20.0, 20.0, a.exports_adj_pct, 0.5)
             if st.session_state["commodity_key"] == "crude_oil":
-                a.refinery_runs_pct = st.slider("Activité raffineries Δ %", -10.0, 10.0,
+                a.refinery_runs_pct = st.slider("Refinery runs Δ %", -10.0, 10.0,
                                                 a.refinery_runs_pct, 0.1)
             a.forecast_months = st.session_state["horizon_months"]
             st.session_state["assumptions"] = a
 
         st.divider()
-        st.caption("Streamlit · données live (Yahoo) avec repli synthétique")
+        st.caption("Streamlit · live data (Yahoo) with synthetic fallback")
 
 
 def kpi_row(items: List[Tuple[str, str, Optional[str]]]) -> None:
@@ -2150,10 +2275,10 @@ def kpi_row(items: List[Tuple[str, str, Optional[str]]]) -> None:
 
 def page_dashboard(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame,
                    fv: pd.DataFrame) -> None:
-    st.title(f"🏠 {tpl.name} — Tableau de bord")
-    st.caption(f"Secteur : **{tpl.sector}** · Contrat à terme : **{tpl.ticker}** · "
-               f"Unité de flux : {tpl.unit} · Stocks : {tpl.inventory_unit} · "
-               f"Cotation : {tpl.price_unit}")
+    st.title(f"🏠 {tpl.name} — Dashboard")
+    st.caption(f"Sector: **{tpl.sector}** · Futures contract: **{tpl.ticker}** · "
+               f"Flow unit: {tpl.unit} · Inventory: {tpl.inventory_unit} · "
+               f"Quote: {tpl.price_unit}")
     render_page_help("🏠 Dashboard")
 
     last_h = bal[~bal["is_forecast"]].iloc[-1]
@@ -2168,7 +2293,7 @@ def page_dashboard(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame,
     else:
         spot = float(last_h["price"])
         spot_label = f"{fmt_price(spot, tpl.price_unit)}"
-        spot_delta = "référence interne (live indisponible)"
+        spot_delta = "internal reference (live unavailable)"
 
     fv_now = float(fv.loc[fv.index == last_h.name, "fair_value_price"].iloc[0])
     delta_fv_pct = (spot - fv_now) / fv_now * 100.0 if fv_now else 0.0
@@ -2176,54 +2301,54 @@ def page_dashboard(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame,
     yoy_pct = (last_h["price"] - bal["price"].iloc[yoy_idx]) / bal["price"].iloc[yoy_idx] * 100
 
     # --- Bandeau d'indicateurs clés
-    chart_intro("Indicateurs clés",
-                "Photographie du marché en un coup d'œil — prix, juste valeur, "
-                "stocks et utilisation du stockage, comparés à leurs cibles.")
+    chart_intro("Key indicators",
+                "Market snapshot at a glance — price, fair value, stocks and "
+                "storage utilization, compared to their targets.")
     kpi_row([
-        ("Prix spot", spot_label, spot_delta),
-        ("Juste valeur", fmt_price(fv_now, tpl.price_unit),
+        ("Spot price", spot_label, spot_delta),
+        ("Fair value", fmt_price(fv_now, tpl.price_unit),
          f"{delta_fv_pct:+.1f} % vs spot"),
-        (f"Stocks fin ({tpl.inventory_unit})",
+        (f"End stocks ({tpl.inventory_unit})",
          f"{last_f['stocks_model']:,.0f}",
          f"YoY prix {yoy_pct:+.1f} %"),
-        ("Jours de couverture", f"{last_f['days_cover_model']:.1f}",
-         f"cible {tpl.days_cover_target:.0f}"),
-        ("Utilisation stockage", f"{last_f['capacity_pct']:.1f} %",
-         f"idéal {tpl.ideal_utilization_pct:.0f} %"),
+        ("Days of cover", f"{last_f['days_cover_model']:.1f}",
+         f"target {tpl.days_cover_target:.0f}"),
+        ("Storage util", f"{last_f['capacity_pct']:.1f} %",
+         f"ideal {tpl.ideal_utilization_pct:.0f} %"),
     ])
 
     interpretation(read_dashboard(tpl, bal, fv, spot, fv_now))
 
     # --- Benchmarks
-    chart_intro("📐 Benchmarks idéaux vs lecture actuelle",
-                "Pour chaque indicateur on affiche la valeur 'normale' pour ce "
-                "produit et la valeur courante. La colonne *Lecture* dit si "
-                "on est dans la norme, au-dessus, ou en dessous.")
+    chart_intro("📐 Ideal benchmarks vs current reading",
+                "For each indicator we show the 'normal' value for this product "
+                "and the current value. The *Reading* column tells whether "
+                "you're in range, above, or below.")
     yoy_demand = (bal["demand"].iloc[-1] / bal["demand"].iloc[max(-13, -len(bal))] - 1) * 100
     rolling_vol = bal["price"].pct_change().tail(12).std() * 100
     bench_rows = [
-        {"Métrique": "Jours de couverture", "Idéal": f"{tpl.days_cover_target:.0f} j",
-         "Actuel": f"{last_f['days_cover_model']:.1f} j",
-         "Lecture": "Tendu" if last_f["days_cover_model"] < tpl.days_cover_target * 0.85
-                    else "Ample" if last_f["days_cover_model"] > tpl.days_cover_target * 1.15
-                    else "Équilibré"},
-        {"Métrique": "Utilisation stockage", "Idéal": f"{tpl.ideal_utilization_pct:.0f} %",
-         "Actuel": f"{last_f['capacity_pct']:.1f} %",
-         "Lecture": "Sous-utilisé" if last_f["capacity_pct"] < tpl.ideal_utilization_pct - 10
-                    else "Saturé" if last_f["capacity_pct"] > tpl.ideal_utilization_pct + 10
-                    else "Sain"},
-        {"Métrique": "Volatilité mensuelle (12m)",
-         "Idéal": f"{tpl.typical_monthly_vol_pct:.1f} %",
-         "Actuel": f"{rolling_vol:.1f} %",
-         "Lecture": "Élevée" if rolling_vol > tpl.typical_monthly_vol_pct * 1.3
-                    else "Faible" if rolling_vol < tpl.typical_monthly_vol_pct * 0.7
-                    else "Normale"},
-        {"Métrique": "Croissance demande YoY",
-         "Idéal": f"{tpl.normal_yoy_demand_pct:+.1f} %",
-         "Actuel": f"{yoy_demand:+.1f} %",
-         "Lecture": "Au-dessus tendance" if yoy_demand > tpl.normal_yoy_demand_pct + 1
-                    else "Sous tendance" if yoy_demand < tpl.normal_yoy_demand_pct - 1
-                    else "Sur tendance"},
+        {"Metric": "Jours de couverture", "Ideal": f"{tpl.days_cover_target:.0f} d",
+         "Current": f"{last_f['days_cover_model']:.1f} d",
+         "Reading": "Tight" if last_f["days_cover_model"] < tpl.days_cover_target * 0.85
+                    else "Loose" if last_f["days_cover_model"] > tpl.days_cover_target * 1.15
+                    else "Balanced"},
+        {"Metric": "Utilisation stockage", "Ideal": f"{tpl.ideal_utilization_pct:.0f} %",
+         "Current": f"{last_f['capacity_pct']:.1f} %",
+         "Reading": "Under-used" if last_f["capacity_pct"] < tpl.ideal_utilization_pct - 10
+                    else "Saturated" if last_f["capacity_pct"] > tpl.ideal_utilization_pct + 10
+                    else "Healthy"},
+        {"Metric": "Monthly vol (12m)",
+         "Ideal": f"{tpl.typical_monthly_vol_pct:.1f} %",
+         "Current": f"{rolling_vol:.1f} %",
+         "Reading": "Elevated" if rolling_vol > tpl.typical_monthly_vol_pct * 1.3
+                    else "Subdued" if rolling_vol < tpl.typical_monthly_vol_pct * 0.7
+                    else "Normal"},
+        {"Metric": "YoY demand growth",
+         "Ideal": f"{tpl.normal_yoy_demand_pct:+.1f} %",
+         "Current": f"{yoy_demand:+.1f} %",
+         "Reading": "Above trend" if yoy_demand > tpl.normal_yoy_demand_pct + 1
+                    else "Below trend" if yoy_demand < tpl.normal_yoy_demand_pct - 1
+                    else "On trend"},
     ]
     st.dataframe(pd.DataFrame(bench_rows), hide_index=True, use_container_width=True)
 
@@ -2232,112 +2357,112 @@ def page_dashboard(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame,
     # --- Bloc graphiques principaux
     left, right = st.columns([3, 2])
     with left:
-        chart_intro("Offre, demande & stocks",
-                    "Montre l'évolution mensuelle de l'offre et de la demande "
-                    "(échelle gauche) et le niveau de stocks (échelle droite). "
-                    "La ligne verticale marque le début de la prévision.")
+        chart_intro("Supply, demand & stocks",
+                    "Monthly evolution of supply and demand (left axis) plus "
+                    "the inventory level (right axis). The vertical line "
+                    "marks the start of the forecast horizon.")
         st.plotly_chart(supply_demand_chart(bal, unit=tpl.unit), use_container_width=True)
 
-        chart_intro("Prix observé vs juste valeur",
-                    "La juste valeur est estimée à partir d'une régression "
-                    "stocks↔prix. La bande violette est l'intervalle ±10 % "
-                    "considéré comme 'équitablement valorisé'.")
+        chart_intro("Observed price vs fair value",
+                    "Fair value is estimated from a stocks↔price regression. "
+                    "The violet band is the ±10 % range considered 'fairly "
+                    "valued'.")
         st.plotly_chart(fair_value_chart(fv), use_container_width=True)
     with right:
-        chart_intro("Trajectoire des stocks",
-                    "Stocks projetés mois par mois jusqu'à la fin de l'horizon.")
+        chart_intro("Inventory trajectory",
+                    "Stocks projected month by month through the forecast horizon.")
         st.plotly_chart(inventory_chart(bal, unit=tpl.inventory_unit),
                         use_container_width=True)
 
-        chart_intro("Jours de couverture forward",
-                    "Combien de jours de demande les stocks couvriraient. La "
-                    "ligne pointillée représente la cible normale pour ce produit.")
+        chart_intro("Forward days of cover",
+                    "How many days of demand stocks would cover. The dashed "
+                    "line is the normal target for this product.")
         st.plotly_chart(days_cover_chart(bal, target=tpl.days_cover_target),
                         use_container_width=True)
 
     # --- Régional
-    st.markdown("### Photo régionale")
+    st.markdown("### Regional snapshot")
     reg = get_regional_dataset(st.session_state["commodity_key"])
     rs = regional_summary(reg)
     c1, c2 = st.columns([3, 2])
     with c1:
-        chart_intro("Offre vs demande par région",
-                    "Barres groupées. Une barre verte plus grande que rouge "
-                    "= région exportatrice nette ; l'inverse = importatrice nette.")
+        chart_intro("Supply vs demand by region",
+                    "Grouped bars. A green bar larger than red = net exporter "
+                    "region ; the opposite = net importer.")
         st.plotly_chart(regional_bar(reg), use_container_width=True)
     with c2:
-        chart_intro("Détail par région",
-                    "Balance = Offre − Demande. *Exporter* / *Importer* selon le signe.")
+        chart_intro("Regional detail",
+                    "Balance = Supply − Demand. *Exporter* / *Importer* per sign.")
         st.dataframe(rs[["region", "supply", "demand", "balance", "status"]].round(2),
                      use_container_width=True, hide_index=True)
     interpretation(read_regional(rs))
 
     # --- Télémétrie
-    st.markdown("### Télémétrie quotidienne")
-    chart_intro("Indicateurs haute fréquence",
-                "Trois indicateurs proxy pour suivre l'activité réelle au jour "
-                "le jour. La variation 7 jours montre la tendance récente.")
+    st.markdown("### Daily telemetry")
+    chart_intro("High-frequency indicators",
+                "Three proxy indicators tracking real-world activity day by day. "
+                "The 7-day change shows the recent trend.")
     hf = get_high_frequency(st.session_state["commodity_key"])
     c1, c2, c3 = st.columns(3)
-    c1.metric("Navires suivis", int(hf["vessels_tracked"].iloc[-1]),
-              f"{hf['vessels_tracked'].iloc[-1] - hf['vessels_tracked'].iloc[-8]:+d} sur 7j")
-    c2.metric("Utilisation raffineries %", f"{hf['refinery_util_pct'].iloc[-1]:.1f}",
+    c1.metric("Vessels tracked", int(hf["vessels_tracked"].iloc[-1]),
+              f"{hf['vessels_tracked'].iloc[-1] - hf['vessels_tracked'].iloc[-8]:+d} on 7d")
+    c2.metric("Refinery util %", f"{hf['refinery_util_pct'].iloc[-1]:.1f}",
               f"{hf['refinery_util_pct'].iloc[-1] - hf['refinery_util_pct'].iloc[-8]:+.2f}")
-    c3.metric("Production satellite", f"{hf['sat_production_est'].iloc[-1]:,.1f}",
+    c3.metric("Sat production est", f"{hf['sat_production_est'].iloc[-1]:,.1f}",
               f"{(hf['sat_production_est'].iloc[-1] / hf['sat_production_est'].iloc[-8] - 1) * 100:+.2f} %")
     interpretation(
-        "Une utilisation raffineries en hausse ou des navires en transit qui "
-        "augmentent signalent une **demande robuste**. Une baisse soutenue est "
-        "souvent annonciatrice d'un relâchement du marché."
+        "Rising refinery utilization or more vessels in transit signal **robust "
+        "demand**. A sustained decline often precedes a loosening market."
     )
 
     # --- Positionnement
-    st.markdown("### Positionnement spéculatif")
+    st.markdown("### Speculative positioning")
     chart_intro("Hedge funds & sentiment",
-                "Position nette des Managed Money (positions longues − courtes) "
-                "et indice de sentiment global. Indicateur 'mou' : peut diverger "
-                "longtemps des fondamentaux.")
+                "Managed Money net position (longs − shorts) plus a global "
+                "sentiment index. A *soft* indicator: can stay disconnected "
+                "from fundamentals for long stretches.")
     pos = get_positioning(st.session_state["commodity_key"])
     c1, c2 = st.columns(2)
     mm_now = float(pos['managed_money_net'].iloc[-1])
     sent_now = float(pos['sentiment_score'].iloc[-1])
     c1.metric("Managed Money net", f"{mm_now:,.0f}")
-    c2.metric("Score de sentiment",
+    c2.metric("Sentiment score",
               f"{sent_now:.0f}/100 · {sentiment_label(sent_now)}")
     interpretation(
-        f"Le sentiment est à **{sent_now:.0f}/100** ({sentiment_label(sent_now)}). "
-        f"Un sentiment extrême (>80 ou <20) est souvent un signal contrarian — "
-        f"le consensus est déjà pricé, la prochaine surprise va dans l'autre sens."
+        f"Sentiment is at **{sent_now:.0f}/100** ({sentiment_label(sent_now)}). "
+        f"Extreme sentiment (>80 or <20) is often a contrarian signal — the "
+        f"consensus is already priced and the next surprise tends to go the "
+        f"other way."
     )
 
 
 def page_supply_demand(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
-    st.title(f"⚖️ {tpl.name} — Bilan offre/demande")
+    st.title(f"⚖️ {tpl.name} — Supply/Demand Balance")
     render_page_help("⚖️ Supply & Demand")
 
-    with st.expander("Charger un fichier CSV personnalisé (colonnes : date, supply, demand…)"):
-        file = st.file_uploader("Fichier CSV", type=["csv"])
+    with st.expander("Upload a custom CSV (columns: date, supply, demand…)"):
+        file = st.file_uploader("CSV file", type=["csv"])
         if file is not None:
             df = load_csv(file)
 
-    chart_intro("Fréquence d'agrégation",
-                "Mensuelle (par défaut), trimestrielle ou annuelle. "
-                "Choisir une cadence plus large lisse la saisonnalité.")
-    freq = st.radio("Fréquence", ["Mensuelle", "Trimestrielle", "Annuelle"], horizontal=True)
-    freq_map = {"Mensuelle": "M", "Trimestrielle": "Q", "Annuelle": "Y"}
+    chart_intro("Aggregation frequency",
+                "Monthly (default), quarterly or yearly. Coarser cadence "
+                "smooths out seasonality.")
+    freq = st.radio("Frequency", ["Monthly", "Quarterly", "Yearly"], horizontal=True)
+    freq_map = {"Monthly": "M", "Quarterly": "Q", "Yearly": "Y"}
     bal = run_balance(df, st.session_state["commodity_key"],
                       st.session_state["assumptions"], frequency=freq_map[freq])
 
     last = bal.iloc[-1]
-    chart_intro("Indicateurs clés du bilan",
-                "État du marché en fin de période projetée.")
+    chart_intro("Balance key indicators",
+                "State of the market at the end of the projected period.")
     kpi_row([
-        (f"Stocks fin ({tpl.inventory_unit})", f"{last['stocks_model']:,.0f}", None),
-        ("Surplus / Déficit", f"{last['surplus_deficit']:+,.1f}", None),
-        ("Jours de couverture", f"{last['days_cover_model']:.1f}",
-         f"cible {tpl.days_cover_target:.0f}"),
-        ("Utilisation stockage", f"{last['capacity_pct']:.1f} %",
-         f"idéal {tpl.ideal_utilization_pct:.0f} %"),
+        (f"End stocks ({tpl.inventory_unit})", f"{last['stocks_model']:,.0f}", None),
+        ("Surplus / Deficit", f"{last['surplus_deficit']:+,.1f}", None),
+        ("Days of cover", f"{last['days_cover_model']:.1f}",
+         f"target {tpl.days_cover_target:.0f}"),
+        ("Storage util", f"{last['capacity_pct']:.1f} %",
+         f"ideal {tpl.ideal_utilization_pct:.0f} %"),
     ])
     interpretation(read_balance(bal, tpl))
 
@@ -2346,141 +2471,138 @@ def page_supply_demand(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
                 "explique la pente des stocks (ligne pointillée).")
     st.plotly_chart(supply_demand_chart(bal, unit=tpl.unit), use_container_width=True)
 
-    chart_intro("Builds & draws mensuels",
-                "Barres vertes = stocks qui montent (build), rouges = qui baissent "
-                "(draw). Les 24 derniers mois.")
+    chart_intro("Monthly builds & draws",
+                "Green bars = inventory rising (build), red = falling (draw). "
+                "Last 24 months.")
     st.plotly_chart(balance_bars(bal), use_container_width=True)
 
-    st.markdown("### Saisonnalité")
-    chart_intro("Profil saisonnier moyen",
-                "Pour chaque mois, on affiche la moyenne historique sur 5 ans, "
-                "la fourchette min-max, et l'année en cours en pointillé.")
+    st.markdown("### Seasonality")
+    chart_intro("Average seasonal profile",
+                "For each month, displays the 5-year historical mean, the "
+                "min-max range, and the current year as a dotted line.")
     profile = monthly_profile(df["demand"])
     piv = year_over_year_pivot(df["demand"])
     c1, c2 = st.columns([2, 3])
     with c1:
         st.plotly_chart(seasonal_lines(profile), use_container_width=True)
     with c2:
-        chart_intro("Heatmap saisonnier",
-                    "Carte de chaleur année × mois pour repérer les anomalies "
-                    "structurelles.")
-        st.plotly_chart(seasonal_heatmap(piv, "Heatmap demande (Année × Mois)"),
+        chart_intro("Seasonal heatmap",
+                    "Year × month heatmap for spotting structural anomalies.")
+        st.plotly_chart(seasonal_heatmap(piv, "Demand heatmap (Year × Month)"),
                         use_container_width=True)
 
     # Lecture saisonnalité
     peak_month = int(profile["mean"].idxmax())
     trough_month = int(profile["mean"].idxmin())
-    months_fr = ["janvier", "février", "mars", "avril", "mai", "juin",
-                 "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+    months_en = ["January", "February", "March", "April", "May", "June",
+                 "July", "August", "September", "October", "November", "December"]
     interpretation(
-        f"Le pic saisonnier de demande tombe en **{months_fr[peak_month - 1]}** "
-        f"({profile.loc[peak_month, 'mean']:,.1f}), le creux en "
-        f"**{months_fr[trough_month - 1]}** ({profile.loc[trough_month, 'mean']:,.1f}). "
-        "Identifier ce cycle aide à anticiper les builds/draws structurels et "
-        "à ne pas confondre un mouvement saisonnier avec un vrai signal fondamental."
+        f"The seasonal demand peak is in **{months_en[peak_month - 1]}** "
+        f"({profile.loc[peak_month, 'mean']:,.1f}), the trough in "
+        f"**{months_en[trough_month - 1]}** ({profile.loc[trough_month, 'mean']:,.1f}). "
+        "Knowing this cycle helps anticipate structural builds/draws and "
+        "avoid confusing a seasonal move with a real fundamental signal."
     )
 
-    with st.expander("Décomposition saisonnière (tendance / saisonnier / résidu)"):
-        st.markdown("On sépare la série en 3 composantes additives : "
-                    "**tendance** (long terme), **saisonnier** (cycle annuel) et "
-                    "**résidu** (le reste, qui doit ressembler à du bruit si le modèle est bon).")
+    with st.expander("Seasonal decomposition (trend / seasonal / residual)"):
+        st.markdown("We split the series into 3 additive components: **trend** (long term), "
+                    "**seasonal** (annual cycle) and **residual** (the rest, which should "
+                    "look like noise if the model is good).")
         trend, seasonal, resid = decompose(df["demand"], period=12)
-        st.markdown("**Tendance long terme**")
+        st.markdown("**Long-term trend**")
         st.line_chart(trend.dropna(), height=180)
-        st.markdown("**Composante saisonnière**")
+        st.markdown("**Seasonal component**")
         st.line_chart(seasonal.dropna(), height=180)
-        st.markdown("**Résidu**")
+        st.markdown("**Residual**")
         st.line_chart(resid.dropna(), height=180)
-        st.markdown("**Moyenne mobile 12 mois (lissage)**")
+        st.markdown("**12-month moving average (smoothing)**")
         st.line_chart(rolling_seasonal_average(df["demand"]).dropna(), height=180)
 
-    st.markdown("### Élasticité-prix")
-    chart_intro("Courbes d'offre et de demande",
-                "Plus α (alpha) est grand, plus la demande baisse quand le prix monte. "
-                "Plus β (beta) est grand, plus la production réagit positivement au prix. "
-                "Le point d'intersection est l'équilibre de marché.")
+    st.markdown("### Price elasticity")
+    chart_intro("Supply and demand curves",
+                "The larger α (alpha), the more demand falls when price rises. "
+                "The larger β (beta), the more strongly production responds to price. "
+                "The intersection is the market equilibrium.")
     c1, c2 = st.columns(2)
-    alpha = c1.slider("Élasticité demande α", 0.0, 0.5, tpl.elasticity_alpha, 0.005)
-    beta = c2.slider("Élasticité offre β", 0.0, 0.5, tpl.elasticity_beta, 0.005)
+    alpha = c1.slider("Demand elasticity α", 0.0, 0.5, tpl.elasticity_alpha, 0.005)
+    beta = c2.slider("Supply elasticity β", 0.0, 0.5, tpl.elasticity_beta, 0.005)
     curves = build_curves(st.session_state["commodity_key"], alpha=alpha, beta=beta)
     p = ElasticityParams(alpha=alpha, beta=beta, base_price=tpl.base_price,
                          d0=tpl.base_demand, s0=tpl.base_supply)
     eq_p, eq_q = equilibrium(p)
     st.plotly_chart(elasticity_chart(curves, eq_p, eq_q), use_container_width=True)
     interpretation(
-        f"Le prix d'équilibre est de **{fmt_price(eq_p, tpl.price_unit)}** pour une "
-        f"quantité de **{eq_q:,.2f} {tpl.unit}**. "
-        f"Si α et β sont faibles, la demande et l'offre sont **rigides** : il "
-        "faut de gros mouvements de prix pour rééquilibrer le marché. "
-        "Quand α et β sont élevés, le marché est **flexible** et absorbe les "
-        "chocs avec moins de volatilité."
+        f"Equilibrium price is **{fmt_price(eq_p, tpl.price_unit)}** for a quantity "
+        f"of **{eq_q:,.2f} {tpl.unit}**. "
+        f"When α and β are small, demand and supply are **rigid**: large price "
+        "moves are needed to rebalance the market. "
+        "When α and β are high, the market is **flexible** and absorbs shocks "
+        "with less volatility."
     )
 
-    st.markdown("### Réponse retardée de l'offre")
-    chart_intro("Effet d'un choc de prix sur la production future",
-                "Simule combien de temps la production met à réagir à un mouvement "
-                "de prix. Pour le shale c'est ~6 mois ; pour le cuivre on parle "
-                "d'années (capex minier).")
+    st.markdown("### Lagged supply response")
+    chart_intro("Effect of a price shock on future production",
+                "Simulates how long production takes to react to a price move. "
+                "Shale is ~6 months ; copper takes years (mining capex).")
     c1, c2 = st.columns(2)
-    lag = c1.slider("Délai de réaction (mois)", 1, 18, tpl.supply_lag_months)
-    shock = c2.slider("Choc de prix %", -50.0, 50.0, 20.0, 5.0)
+    lag = c1.slider("Reaction lag (months)", 1, 18, tpl.supply_lag_months)
+    shock = c2.slider("Price shock %", -50.0, 50.0, 20.0, 5.0)
     try:
         result = fit_lagged_supply(df, lag_months=lag)
-        st.caption(f"Qualité de l'ajustement (R²) sur l'historique : {result.r_squared:.3f}")
+        st.caption(f"Fit quality (R²) on history: {result.r_squared:.3f}")
     except ValueError as exc:
         st.warning(str(exc))
     proj = project_lagged_response(tpl.base_supply, shock, lag)
     st.line_chart(proj, height=220)
     interpretation(
-        f"Avec un délai de {lag} mois et un choc de {shock:+.0f} %, la production "
-        f"converge progressivement vers un nouveau niveau. La forme en S montre "
-        "que la réaction est nulle tant que le délai n'est pas écoulé, puis "
-        "s'accélère, puis se stabilise."
+        f"With a {lag}-month lag and a {shock:+.0f} % price shock, production "
+        f"converges gradually to a new level. The S-curve shows reaction is "
+        "zero until the lag has elapsed, then accelerates, then stabilizes."
     )
 
-    st.markdown("### Tableau du bilan & export")
-    chart_intro("Détail mois par mois",
-                "Les 36 dernières lignes du bilan complet, exportable.")
+    st.markdown("### Balance table & export")
+    chart_intro("Month-by-month detail",
+                "The last 36 rows of the full balance, exportable.")
     st.dataframe(bal.tail(36).round(2), use_container_width=True)
     c1, c2 = st.columns(2)
-    c1.download_button("Télécharger le bilan (CSV)", df_to_csv_bytes(bal),
+    c1.download_button("Download balance (CSV)", df_to_csv_bytes(bal),
                        file_name=f"{st.session_state['commodity_key']}_balance.csv",
                        mime="text/csv")
-    c2.download_button("Télécharger le classeur Excel",
+    c2.download_button("Download Excel workbook",
                        df_to_excel_bytes({"balance": bal, "seasonal_profile": profile}),
                        file_name=f"{st.session_state['commodity_key']}_workbook.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 def page_inventories(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame) -> None:
-    st.title(f"🛢️ {tpl.name} — Stocks & stockage")
+    st.title(f"🛢️ {tpl.name} — Inventory & Storage")
     render_page_help("🛢️ Inventories")
 
-    chart_intro("Paramètres de stockage",
-                "Modifiez la capacité de stockage et la part autorisée en "
-                "stockage flottant (navires, wagons). Si les stocks dépassent "
-                "la capacité fixe, le surplus est absorbé jusqu'à cette limite.")
+    chart_intro("Storage parameters",
+                "Edit the storage capacity and the share allowed in floating "
+                "storage (vessels, rail). If stocks exceed fixed capacity, "
+                "the surplus is absorbed up to this limit.")
     c1, c2, c3 = st.columns(3)
-    cap = c1.number_input(f"Capacité ({tpl.inventory_unit})",
+    cap = c1.number_input(f"Capacity ({tpl.inventory_unit})",
                           value=float(tpl.storage_capacity),
                           step=10.0, min_value=10.0)
-    floating = c2.slider("Stockage flottant (% capacité)", 0.0, 25.0, 5.0, 0.5)
-    allow_neg = c3.checkbox("Autoriser stocks négatifs (debug)", value=False)
+    floating = c2.slider("Floating storage (% of capacity)", 0.0, 25.0, 5.0, 0.5)
+    allow_neg = c3.checkbox("Allow negative stocks (debug)", value=False)
     inv = project_inventory(bal, st.session_state["commodity_key"],
                             StorageConfig(capacity=cap, floating_buffer_pct=floating,
                                           allow_negative=allow_neg))
 
     last = inv.iloc[-1]
-    chart_intro("Indicateurs clés des stocks",
-                "Lecture de la fin de période projetée.")
+    chart_intro("Inventory key indicators",
+                "Reading at the end of the projected period.")
     kpi_row([
-        (f"Stocks courants ({tpl.inventory_unit})",
+        (f"Current stocks ({tpl.inventory_unit})",
          f"{last['stocks_capped']:,.0f}", None),
-        ("Utilisation stockage", f"{last['utilization_pct']:.1f} %",
-         f"idéal {tpl.ideal_utilization_pct:.0f} %"),
-        ("Stocks flottants", f"{last['overflow_floating']:,.0f}", None),
-        ("Jours de couverture", f"{last['days_cover_model']:.1f}",
-         f"cible {tpl.days_cover_target:.0f}"),
+        ("Storage util", f"{last['utilization_pct']:.1f} %",
+         f"ideal {tpl.ideal_utilization_pct:.0f} %"),
+        ("Floating stocks", f"{last['overflow_floating']:,.0f}", None),
+        ("Days of cover", f"{last['days_cover_model']:.1f}",
+         f"target {tpl.days_cover_target:.0f}"),
     ])
     interpretation(read_inventory(inv, tpl))
 
@@ -2491,31 +2613,31 @@ def page_inventories(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame
 
     c1, c2 = st.columns([2, 1])
     with c1:
-        chart_intro("Waterfall builds/draws (12 mois)",
-                    "Pour chaque mois récent, on voit la variation de stocks. "
-                    "Une succession de barres vertes = accumulation soutenue.")
+        chart_intro("Builds/draws waterfall (12 months)",
+                    "For each recent month, shows the inventory delta. A run "
+                    "of green bars = sustained accumulation.")
         st.plotly_chart(waterfall_chart(draw_build_waterfall(inv, n=12)),
                         use_container_width=True)
     with c2:
-        chart_intro("Jauge d'utilisation",
-                    "Visualisation rapide de la pression sur la capacité de "
-                    "stockage. Au-delà de 80 %, la marge se réduit.")
+        chart_intro("Utilisation gauge",
+                    "Quick visual of pressure on storage capacity. Above 80 %, "
+                    "the buffer shrinks.")
         st.plotly_chart(utilization_gauge(last["utilization_pct"]),
                         use_container_width=True)
 
-    chart_intro("Jours de couverture forward",
-                "Combien de jours de demande les stocks tiendraient sans nouvelle "
-                "production. La ligne pointillée représente la cible normale.")
+    chart_intro("Forward days of cover",
+                "How many days of demand stocks would last with zero new "
+                "production. The dashed line is the normal target.")
     st.plotly_chart(days_cover_chart(inv, target=tpl.days_cover_target),
                     use_container_width=True)
 
-    chart_intro("Stocks fixes vs flottants",
-                "Aire empilée. Quand la couche bleu clair (flottant) apparaît, "
-                "c'est que la capacité fixe est dépassée.")
+    chart_intro("Fixed vs floating stocks",
+                "Stacked area. When the light-blue layer (floating) appears, "
+                "fixed capacity has been exceeded.")
     st.area_chart(inv[["stocks_capped", "overflow_floating"]].tail(48), height=260)
 
-    chart_intro("Détail mensuel",
-                "Tableau récapitulatif des 24 derniers mois.")
+    chart_intro("Monthly detail",
+                "Summary table of the last 24 months.")
     st.dataframe(
         inv[["stocks_model", "stocks_capped", "overflow_floating",
              "utilization_pct", "days_cover_model"]].tail(24).round(2),
@@ -2524,18 +2646,18 @@ def page_inventories(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame
 
 
 def page_scenarios(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
-    st.title(f"🌪️ {tpl.name} — Moteur de scénarios")
+    st.title(f"🌪️ {tpl.name} — Scenario Engine")
     render_page_help("🌪️ Scenarios")
 
-    chart_intro("Probabilités des scénarios",
-                "Ajustez les probabilités attribuées à chaque scénario. "
-                "Le système les renormalise automatiquement à 100 %.")
+    chart_intro("Scenario probabilities",
+                "Adjust the probability assigned to each scenario. The system "
+                "renormalizes them to 100 % automatically.")
     c1, c2, c3 = st.columns(3)
     new_probs = {}
-    labels = {"Bull": "Bull (haussier)", "Base": "Base (central)", "Bear": "Bear (baissier)"}
+    labels = {"Bull": "Bull (upside)", "Base": "Base (central)", "Bear": "Bear (downside)"}
     for col, name in zip([c1, c2, c3], ["Bull", "Base", "Bear"]):
         new_probs[name] = col.number_input(
-            f"Probabilité {labels[name]}", min_value=0.0, max_value=1.0,
+            f"Probability — {labels[name]}", min_value=0.0, max_value=1.0,
             value=float(SCENARIO_PRESETS[name]["probability"]), step=0.05,
         )
     total = sum(new_probs.values()) or 1.0
@@ -2545,149 +2667,176 @@ def page_scenarios(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
     results = run_scenarios(df, st.session_state["commodity_key"],
                             st.session_state["assumptions"])
 
-    chart_intro("Trajectoires de stocks par scénario",
-                "Comment les stocks évoluent dans chaque scénario. Bear = stocks "
-                "qui montent (surplus) ; Bull = stocks qui baissent (rareté).")
-    st.plotly_chart(scenario_paths(results, "stocks_model", "Trajectoires de stocks"),
+    chart_intro("Inventory paths by scenario",
+                "How stocks evolve in each scenario. Bear = stocks rising "
+                "(surplus) ; Bull = stocks falling (tightness).")
+    st.plotly_chart(scenario_paths(results, "stocks_model", "Inventory trajectories"),
                     use_container_width=True)
 
-    chart_intro("Trajectoires de prix par scénario",
-                "Prix de juste valeur implicite déduit du niveau de stocks de chaque scénario.")
+    chart_intro("Price paths by scenario",
+                "Fair-value price implied by each scenario's stocks level.")
     st.plotly_chart(scenario_paths(results, "fair_value_price",
-                                    "Trajectoires de juste valeur"),
+                                    "Fair value trajectories"),
                     use_container_width=True)
     interpretation(read_scenarios(results, tpl))
 
-    chart_intro("Tableau récapitulatif",
-                "Synthèse par scénario : probabilité, stocks fin, jours de "
-                "couverture, build/draw 12m, prix moyen, juste valeur fin.")
+    chart_intro("Summary table",
+                "Per scenario: probability, end stocks, days of cover, "
+                "12-month build/draw, average price, end fair value.")
     summary = scenario_summary(results, st.session_state["commodity_key"])
     st.dataframe(summary.round(2), use_container_width=True)
     pw = probability_weighted_price(results)
-    st.metric("Prix moyen pondéré par les probabilités",
+    st.metric("Probability-weighted forecast price",
               fmt_price(pw, tpl.price_unit))
     interpretation(
-        f"Le prix attendu en moyenne pondérée est de **{fmt_price(pw, tpl.price_unit)}**. "
-        "Cette valeur sert de point d'ancrage pour budgéter ou hedger. "
-        "Si le prix de marché actuel diverge fortement de ce niveau, il y a soit "
-        "une opportunité, soit un risque que nos hypothèses soient mal calibrées."
+        f"The probability-weighted expected price is **{fmt_price(pw, tpl.price_unit)}**. "
+        "This serves as an anchor for budgeting or hedging. If the current "
+        "market price diverges sharply from this level, it's either an "
+        "opportunity or a sign our assumptions need recalibrating."
     )
 
-    with st.expander("Détails des hypothèses par scénario"):
+    with st.expander("Per-scenario assumption details"):
         st.json(SCENARIO_PRESETS)
 
 
 def page_regional(tpl: CommodityTemplate) -> None:
-    st.title(f"🌍 {tpl.name} — Flux régionaux")
+    st.title(f"🌍 {tpl.name} — Regional Flows")
     render_page_help("🌍 Regional Flows")
     reg = get_regional_dataset(st.session_state["commodity_key"])
     rs = regional_summary(reg)
 
     c1, c2 = st.columns([3, 2])
     with c1:
-        chart_intro("Offre vs demande par région",
-                    "Barres groupées. Compare directement les capacités de "
-                    "production et la consommation de chaque grande zone.")
+        chart_intro("Supply vs demand by region",
+                    "Grouped bars. Direct comparison of production capacity "
+                    "and consumption for each major zone.")
         st.plotly_chart(regional_bar(reg), use_container_width=True)
     with c2:
-        chart_intro("Tableau régional",
-                    "Balance = Offre − Demande. Positive → exportateur net.")
+        chart_intro("Regional table",
+                    "Balance = Supply − Demand. Positive → net exporter.")
         st.dataframe(rs.round(2), hide_index=True, use_container_width=True)
     interpretation(read_regional(rs))
 
-    chart_intro("Flux commerciaux implicites (diagramme de Sankey)",
-                "Chaque exportateur net envoie son surplus vers les importateurs "
-                "nets, au prorata de leur déficit. L'épaisseur des liens représente "
-                "le volume de flux. Permet de visualiser la dépendance commerciale.")
+    chart_intro("Implied trade flows (Sankey)",
+                "Each net exporter sends its surplus to net importers, in "
+                "proportion to each importer's deficit. Link width represents "
+                "flow volume. Visualizes trade dependency.")
     nodes, sources, targets, values = build_trade_flows(reg)
     st.plotly_chart(sankey_chart(nodes, sources, targets, values),
                     use_container_width=True)
 
-    chart_intro("Signaux d'arbitrage",
-                "Tableau qui classe chaque région : *Export Arb* = excédent à "
-                "écouler à l'export ; *Import Need* = besoin urgent de cargos. "
-                "Plus la balance est extrême, plus le différentiel de prix "
-                "régional sera large.")
+    chart_intro("Arbitrage signals",
+                "Classifies each region: *Export Arb* = surplus to ship out ; "
+                "*Import Need* = urgent cargo need. The more extreme the "
+                "balance, the wider the regional price differential.")
     arb = arbitrage_signals(reg)
     st.dataframe(arb[["region", "balance", "arb_signal"]].round(2),
                  hide_index=True, use_container_width=True)
     interpretation(
-        "Quand une région passe en *Import Need*, les prix locaux montent jusqu'à "
-        "attirer assez de cargos. C'est ce mécanisme qui explique la prime "
-        "Brent-Dubai, le spread TTF-Henry Hub, ou encore l'écart Chicago-Heartland "
-        "sur le maïs."
+        "When a region flips to *Import Need*, local prices rise until enough "
+        "cargos are attracted. This mechanism explains the Brent-Dubai premium, "
+        "the TTF-Henry Hub spread, or the Chicago-Heartland corn basis."
     )
 
 
 def page_futures_curve(tpl: CommodityTemplate, bal: pd.DataFrame) -> None:
-    st.title(f"📈 {tpl.name} — Structure à terme")
+    st.title(f"📈 {tpl.name} — Term Structure")
     render_page_help("📈 Futures Curve")
 
-    chart_intro("Paramètres de la courbe",
-                "Choisissez la forme de courbe à simuler et les coûts de "
-                "portage (stockage mensuel + taux de financement annuel).")
-    c1, c2, c3 = st.columns(3)
-    structure_choice = c1.selectbox("Forme de courbe",
-                                     ["contango", "backwardation", "flat"])
-    months = c2.slider("Échéances (mois)", 6, 36, 18)
-    storage_cost = c3.number_input(f"Coût de stockage mensuel ({tpl.price_unit})",
-                                    value=0.20, step=0.05)
-    financing_rate = st.slider("Taux de financement %", 0.0, 12.0, 5.0, 0.25)
+    # Try a live curve from Yahoo first (cfcap-style contract walking).
+    ck = st.session_state["commodity_key"]
+    live_curve = get_live_futures_curve(ck, n_max=tpl.liquid_months or 12)
+    is_live = live_curve is not None and len(live_curve) >= 2
 
-    curve = get_futures_curve(st.session_state["commodity_key"],
-                              structure=structure_choice, months=months)
+    chart_intro("Curve source & parameters",
+                "When live futures contracts can be fetched from Yahoo Finance "
+                "(WTI, Henry Hub, RBOB, Gold, Silver, Copper, Wheat, Corn, "
+                "Soybeans, Coffee, Sugar…), the curve is **real**. Otherwise "
+                "we fall back to a synthetic shape that you choose below — "
+                "useful for stress testing and for LME/SGX products that "
+                "Yahoo doesn't list.")
+    c1, c2, c3 = st.columns(3)
+    mode_options = ["Live (Yahoo)" if is_live else "Synthetic (Yahoo unavailable)",
+                    "Synthetic — contango",
+                    "Synthetic — backwardation",
+                    "Synthetic — flat"]
+    mode = c1.selectbox("Curve source", mode_options,
+                         index=0 if is_live else 1)
+    months = c2.slider("Tenors (months)", 6, 36, 18)
+    storage_cost = c3.number_input(f"Monthly storage cost ({tpl.price_unit})",
+                                    value=0.20, step=0.05)
+    financing_rate = st.slider("Financing rate %", 0.0, 12.0, 5.0, 0.25)
+
+    if mode.startswith("Live") and is_live:
+        curve = live_curve.copy()
+        source_badge = (f"🟢 **Live data** — {len(curve)} contracts pulled from "
+                        f"Yahoo Finance (pattern `{tpl.yf_fmt}`, expired "
+                        f"contracts skipped).")
+    else:
+        synth_shape = "contango"
+        if "backwardation" in mode:
+            synth_shape = "backwardation"
+        elif "flat" in mode:
+            synth_shape = "flat"
+        curve = get_synthetic_futures_curve(ck, structure=synth_shape, months=months)
+        reason = ("forced synthetic" if mode.startswith("Synthetic —")
+                  else "Yahoo unreachable / no listed contracts")
+        source_badge = (f"🟡 **Synthetic curve** ({synth_shape}) — {reason}. "
+                        f"Real LME (aluminum, nickel) and SGX (iron ore) feeds "
+                        f"are not on Yahoo; a paid data source would be needed.")
+    st.caption(source_badge)
     struct_label = classify_structure(curve)
 
-    chart_intro("Courbe à terme",
-                "Prix par échéance. **Contango** = courbe ascendante (forwards plus "
-                "chers que le spot — marché bien approvisionné). "
-                "**Backwardation** = descendante (forwards moins chers — prime à la "
-                "détention physique aujourd'hui).")
+    chart_intro("Term structure",
+                "Price per maturity. **Contango** = upward-sloping (forwards "
+                "trade above spot — well-supplied market). "
+                "**Backwardation** = downward-sloping (forwards below spot — "
+                "premium for holding physical today).")
     st.plotly_chart(futures_curve_chart(curve, struct_label), use_container_width=True)
 
     c1, c2 = st.columns([2, 3])
     with c1:
-        chart_intro("Spreads calendaires",
-                    "Différence entre l'échéance proche et les échéances plus "
-                    "lointaines. Un spread proche-lointain positif = contango.")
+        chart_intro("Calendar spreads",
+                    "Difference between the near maturity and farther "
+                    "maturities. A positive near-far spread = contango.")
         st.dataframe(calendar_spreads(curve).round(3), use_container_width=True)
     with c2:
-        chart_intro("Économie du stockage",
-                    "Pour chaque échéance, compare la prime de contango au coût "
-                    "de portage (stockage + financement). *positive_carry* = il est "
-                    "rentable de stocker physiquement et vendre forward.")
+        chart_intro("Storage economics",
+                    "For each maturity, compares contango premium to carry "
+                    "cost (storage + financing). *positive_carry* = storing "
+                    "physical and selling forward is profitable.")
         econ = storage_economics(curve, storage_cost, financing_rate)
         st.dataframe(econ[["tenor_month", "price", "contango_premium",
                            "carry", "positive_carry"]].round(3),
                      hide_index=True, use_container_width=True)
     pos_carry_pct = float(econ["positive_carry"].mean()) * 100
     interpretation(
-        f"{pos_carry_pct:.0f} % des échéances offrent un **positive carry** : "
-        "à ces tenors, un négociant peut acheter le physique aujourd'hui, "
-        "stocker, et vendre forward avec un gain mécanique. "
-        "Si le carry est positif partout, le marché est sous offre abondante."
+        f"{pos_carry_pct:.0f} % of maturities offer **positive carry**: at these "
+        "tenors, a trader can buy physical today, store, and sell forward for "
+        "a mechanical gain. If carry is positive everywhere, the market is "
+        "oversupplied."
     )
 
-    st.subheader("Cohérence stocks ↔ courbe")
-    chart_intro("Lecture du marché",
-                "On compare le régime de courbe observé au régime théoriquement "
-                "induit par les jours de couverture des stocks.")
+    st.subheader("Stocks ↔ curve coherence")
+    chart_intro("Market reading",
+                "Compares the observed curve regime to the regime theoretically "
+                "induced by the stocks' days of cover.")
     last_dc = float(bal["days_cover_model"].iloc[-1])
     label, score = inventory_curve_relationship(curve, last_dc)
     kpi_row([
-        ("Jours de couverture", f"{last_dc:.1f}", None),
-        ("Indice de tension", f"{score:+.2f}",
-         "+1 très tendu, −1 très ample"),
-        ("Diagnostic", label, None),
+        ("Days of cover", f"{last_dc:.1f}", None),
+        ("Tightness score", f"{score:+.2f}",
+         "+1 very tight, −1 very loose"),
+        ("Diagnosis", label, None),
     ])
     interpretation(read_curve(label, score))
 
-    with st.expander("Données brutes de la courbe"):
+    with st.expander("Raw curve data"):
         st.dataframe(curve.round(3), hide_index=True, use_container_width=True)
 
 
 def page_macro(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
-    st.title(f"🏦 {tpl.name} — Macro overlay")
+    st.title(f"🏦 {tpl.name} — Macro Overlay")
     render_page_help("🏦 Macro")
     macro = get_macro_panel(months=84)
     joined = align_macro(df, macro)
@@ -2695,98 +2844,97 @@ def page_macro(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
     cols = ["price", "gdp_index", "pmi", "usd_index", "policy_rate"]
     corr = correlation_matrix(joined, cols)
 
-    chart_intro("Matrice de corrélation",
-                "Mesure de la relation linéaire entre le prix et chaque agrégat "
-                "macro. Lecture : vert = corrélation positive, rouge = négative. "
-                "Plus la valeur absolue est proche de 1, plus le lien est fort.")
+    chart_intro("Correlation matrix",
+                "Linear relationship between price and each macro aggregate. "
+                "Reading: green = positive correlation, red = negative. The "
+                "closer to 1 in absolute value, the stronger the link.")
     st.plotly_chart(correlation_heatmap(corr), use_container_width=True)
     interpretation(read_macro(corr))
 
-    chart_intro("Diagnostic croisé prix vs facteur macro",
-                "Choisissez deux variables macro à confronter au prix. La droite "
-                "de régression montre la tendance moyenne. Une dispersion large "
-                "= relation faible ; une forme bien alignée = relation robuste.")
+    chart_intro("Cross-diagnostic: price vs macro factor",
+                "Pick two macro variables to confront with price. The "
+                "regression line shows the average trend. Wide scatter = "
+                "weak relationship ; tight alignment = robust relationship.")
     choices = ["gdp_index", "pmi", "usd_index", "policy_rate"]
-    label_map = {"gdp_index": "Indice PIB", "pmi": "PMI",
-                 "usd_index": "Indice USD", "policy_rate": "Taux directeur"}
+    label_map = {"gdp_index": "GDP index", "pmi": "PMI",
+                 "usd_index": "USD index", "policy_rate": "Policy rate"}
     c1, c2 = st.columns(2)
     with c1:
-        x1 = st.selectbox("Variable macro A", choices, index=0,
+        x1 = st.selectbox("Macro variable A", choices, index=0,
                           format_func=lambda x: label_map[x], key="ma")
         st.plotly_chart(scatter_with_fit(joined[x1], joined["price"],
-                                          label_map[x1], f"Prix ({tpl.price_unit})"),
+                                          label_map[x1], f"Price ({tpl.price_unit})"),
                         use_container_width=True)
     with c2:
-        x2 = st.selectbox("Variable macro B", choices, index=2,
+        x2 = st.selectbox("Macro variable B", choices, index=2,
                           format_func=lambda x: label_map[x], key="mb")
         st.plotly_chart(scatter_with_fit(joined[x2], joined["price"],
-                                          label_map[x2], f"Prix ({tpl.price_unit})"),
+                                          label_map[x2], f"Price ({tpl.price_unit})"),
                         use_container_width=True)
 
-    st.subheader("Corrélations glissantes vs prix")
-    chart_intro("Stabilité de la relation dans le temps",
-                "Corrélation calculée sur une fenêtre roulante de 24 mois. "
-                "Si la courbe oscille beaucoup autour de zéro, la relation n'est "
-                "pas stable ; si elle reste éloignée de zéro, le lien est durable.")
+    st.subheader("Rolling correlations vs price")
+    chart_intro("Stability of the relationship over time",
+                "Correlation on a rolling 24-month window. If the curve "
+                "oscillates around zero, the relationship is unstable ; if it "
+                "stays away from zero, the link is durable.")
     c1, c2 = st.columns(2)
     rc1 = rolling_correlation(joined["price"], joined["gdp_index"])
-    c1.plotly_chart(rolling_corr_chart(rc1, "Prix vs PIB"), use_container_width=True)
+    c1.plotly_chart(rolling_corr_chart(rc1, "Price vs GDP"), use_container_width=True)
     rc2 = rolling_correlation(joined["price"], joined["usd_index"])
-    c2.plotly_chart(rolling_corr_chart(rc2, "Prix vs USD"), use_container_width=True)
+    c2.plotly_chart(rolling_corr_chart(rc2, "Price vs USD"), use_container_width=True)
     last_usd_corr = float(rc2.dropna().iloc[-1]) if not rc2.dropna().empty else 0
     last_gdp_corr = float(rc1.dropna().iloc[-1]) if not rc1.dropna().empty else 0
     interpretation(
-        f"Corrélation 24m récente : Prix–PIB = {last_gdp_corr:+.2f}, Prix–USD = "
-        f"{last_usd_corr:+.2f}. Pour la plupart des commodités, on attend une "
-        "corrélation négative avec l'USD (prix libellés en dollars) et positive "
-        "avec le PIB (demande)."
+        f"Recent 24m correlation: Price–GDP = {last_gdp_corr:+.2f}, Price–USD = "
+        f"{last_usd_corr:+.2f}. For most commodities, we expect a negative "
+        "correlation with USD (dollar-denominated prices) and a positive one "
+        "with GDP (demand)."
     )
 
-    st.subheader("Régression multivariée : log(prix) expliqué par la macro")
-    chart_intro("Modèle linéaire à plusieurs facteurs",
-                "On essaie d'expliquer le logarithme du prix avec **tous** les "
-                "facteurs macro simultanément. Le R² indique la part de variance "
-                "captée par le modèle (plus c'est proche de 1, mieux c'est).")
+    st.subheader("Multivariate regression: log(price) ~ macro")
+    chart_intro("Multi-factor linear model",
+                "Tries to explain log-price using **all** macro factors "
+                "simultaneously. R² indicates the variance share captured by "
+                "the model (the closer to 1, the better).")
     joined["log_price"] = np.log(joined["price"])
     try:
         res = regression_summary(joined, "log_price",
                                  ["gdp_index", "pmi", "usd_index", "policy_rate"])
         st.json(res)
         interpretation(
-            f"Le modèle explique **{res['r_squared'] * 100:.0f} %** de la "
-            "variance du prix. Plus c'est haut, plus la macro est un bon "
-            "raccourci pour comprendre le prix. Au-dessus de 50 %, on peut "
-            "raisonnablement utiliser les indicateurs macro pour anticiper les "
-            "mouvements."
+            f"The model explains **{res['r_squared'] * 100:.0f} %** of price "
+            "variance. The higher, the better macro works as a shortcut for "
+            "understanding price. Above 50 %, macro indicators can reasonably "
+            "be used to anticipate moves."
         )
     except ValueError as exc:
         st.warning(str(exc))
 
 
 def page_monte_carlo(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
-    st.title(f"🎲 {tpl.name} — Moteur Monte Carlo")
+    st.title(f"🎲 {tpl.name} — Monte Carlo Engine")
     render_page_help("🎲 Monte Carlo")
 
-    chart_intro("Paramètres des chocs aléatoires",
-                "Volatilités (σ) des chocs d'offre, de demande, de météo, et "
-                "fréquence/intensité des pannes. Plus σ est grand, plus les "
-                "trajectoires sont dispersées.")
+    chart_intro("Random shock parameters",
+                "Volatilities (σ) for supply, demand and weather shocks plus "
+                "outage frequency/size. The larger σ, the more dispersed the "
+                "trajectories.")
     c1, c2, c3 = st.columns(3)
-    n_paths = c1.slider("Nombre de trajectoires", 100, 2000, 500, step=100)
-    sigma_supply = c2.slider("Choc offre σ %", 0.5, 5.0, 1.5, 0.1)
-    sigma_demand = c3.slider("Choc demande σ %", 0.5, 5.0, 1.2, 0.1)
+    n_paths = c1.slider("Number of paths", 100, 2000, 500, step=100)
+    sigma_supply = c2.slider("Supply shock σ %", 0.5, 5.0, 1.5, 0.1)
+    sigma_demand = c3.slider("Demand shock σ %", 0.5, 5.0, 1.2, 0.1)
 
     c1, c2, c3 = st.columns(3)
-    sigma_weather = c1.slider("Choc météo σ %", 0.0, 3.0, 1.0, 0.1)
-    outage_prob = c2.slider("Probabilité de panne (par mois)", 0.0, 0.20, 0.05, 0.01)
-    outage_size = c3.slider("Taille de panne %", 0.0, 15.0, 4.0, 0.5)
+    sigma_weather = c1.slider("Weather shock σ %", 0.0, 3.0, 1.0, 0.1)
+    outage_prob = c2.slider("Outage probability (per month)", 0.0, 0.20, 0.05, 0.01)
+    outage_size = c3.slider("Outage size %", 0.0, 15.0, 4.0, 0.5)
 
     cfg = MCConfig(n_paths=n_paths, supply_sigma_pct=sigma_supply,
                    demand_sigma_pct=sigma_demand, weather_sigma_pct=sigma_weather,
                    outage_prob=outage_prob, outage_size_pct=outage_size)
 
-    if st.button("Lancer la simulation Monte Carlo", type="primary"):
-        with st.spinner(f"Simulation de {n_paths} trajectoires…"):
+    if st.button("Run Monte Carlo simulation", type="primary"):
+        with st.spinner(f"Simulating {n_paths} paths…"):
             out = run_monte_carlo(df, st.session_state["commodity_key"],
                                   st.session_state["assumptions"], cfg)
         end_stocks = out["end_stocks"]
@@ -2796,76 +2944,76 @@ def page_monte_carlo(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
         losses = np.maximum(0, base_price - avg_price)
         var95 = value_at_risk(losses, 0.95)
 
-        chart_intro("Indicateurs probabilistes",
-                    "Synthèse des trajectoires simulées : médiane, fourchette P5-P95, "
-                    "et Value at Risk 95 % (perte de prix dans le pire 5 % des cas).")
+        chart_intro("Probabilistic indicators",
+                    "Synthesis of simulated paths: median, P5-P95 range and "
+                    "Value at Risk 95 % (price drop in the worst 5 % of cases).")
         kpi_row([
-            ("Prix médian", fmt_price(float(np.median(avg_price)), tpl.price_unit), None),
-            ("Fourchette P5 – P95",
+            ("Median price", fmt_price(float(np.median(avg_price)), tpl.price_unit), None),
+            ("P5 – P95 range",
              f"{fmt_price(float(np.quantile(avg_price, 0.05)), tpl.price_unit)} – "
              f"{fmt_price(float(np.quantile(avg_price, 0.95)), tpl.price_unit)}", None),
-            (f"Stocks fin médians ({tpl.inventory_unit})",
+            (f"Median end stocks ({tpl.inventory_unit})",
              f"{np.median(end_stocks):,.0f}", None),
-            (f"VaR 95 % (baisse de prix)",
+            (f"VaR 95 % (price drop)",
              fmt_price(var95, tpl.price_unit), None),
         ])
         interpretation(read_monte_carlo(avg_price, end_stocks, tpl))
 
         c1, c2 = st.columns(2)
         with c1:
-            chart_intro("Distribution du prix moyen prévisionnel",
-                        "Histogramme des prix moyens obtenus sur les N trajectoires. "
-                        "Les barres verticales P5/P50/P95 indiquent les seuils.")
-            st.plotly_chart(histogram(avg_price, "Distribution du prix moyen",
-                                       x_label=f"Prix ({tpl.price_unit})"),
+            chart_intro("Forecast average price distribution",
+                        "Histogram of average prices across N paths. Vertical "
+                        "bars at P5/P50/P95 mark the thresholds.")
+            st.plotly_chart(histogram(avg_price, "Average price distribution",
+                                       x_label=f"Price ({tpl.price_unit})"),
                             use_container_width=True)
         with c2:
-            chart_intro("Distribution des stocks de fin d'horizon",
-                        "Plus la distribution est étroite, plus la prévision est "
-                        "robuste face aux chocs.")
-            st.plotly_chart(histogram(end_stocks, "Distribution des stocks fin",
+            chart_intro("End-of-horizon stocks distribution",
+                        "The narrower the distribution, the more robust the "
+                        "forecast against shocks.")
+            st.plotly_chart(histogram(end_stocks, "End stocks distribution",
                                        x_label=f"Stocks ({tpl.inventory_unit})"),
                             use_container_width=True)
-        chart_intro("Distribution du cumul build/draw",
-                    "Variation totale de stocks sur la période prévue, toutes "
-                    "trajectoires confondues.")
-        st.plotly_chart(histogram(bd, "Distribution build/draw cumulé",
+        chart_intro("Cumulative build/draw distribution",
+                    "Total stocks variation over the forecast period across "
+                    "all paths.")
+        st.plotly_chart(histogram(bd, "Cumulative build/draw distribution",
                                    x_label="Δ Stocks"), use_container_width=True)
 
-        st.subheader("Fan charts probabilistes")
-        chart_intro("Cône d'incertitude",
-                    "La bande colorée représente l'intervalle P5–P95 mois par "
-                    "mois. La ligne centrale est la médiane. Plus le cône s'évase, "
-                    "plus l'incertitude grandit avec l'horizon.")
+        st.subheader("Probabilistic fan charts")
+        chart_intro("Uncertainty cone",
+                    "The shaded band is the P5–P95 interval month by month. "
+                    "The center line is the median. The wider the cone, the "
+                    "more uncertainty grows with horizon.")
         pct = out["percentiles"]
         c1, c2 = st.columns(2)
         c1.plotly_chart(fan_chart(pct, "price"), use_container_width=True)
         c2.plotly_chart(fan_chart(pct, "stocks"), use_container_width=True)
     else:
-        st.info("Réglez les paramètres puis cliquez sur **Lancer la simulation** pour démarrer.")
+        st.info("Set the parameters then click **Run simulation** to start.")
 
 
 def page_sensitivities(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
-    st.title(f"📉 {tpl.name} — Analyse de sensibilité")
+    st.title(f"📉 {tpl.name} — Sensitivity Analysis")
     render_page_help("📉 Sensitivities")
 
-    chart_intro("Choix de la métrique cible",
-                "Quelle valeur veut-on tester ? Stocks fin, prix moyen "
-                "prévisionnel, ou build/draw cumulé sur 12 mois.")
+    chart_intro("Choice of target metric",
+                "Which value to test? End stocks, average forecast price, "
+                "or 12-month cumulative build/draw.")
     metric_map = {
-        "end_stocks": "Stocks fin de période",
-        "avg_fc_price": "Prix moyen prévisionnel",
-        "build_draw_sum": "Build/draw cumulé 12m",
+        "end_stocks": "End-of-period stocks",
+        "avg_fc_price": "Average forecast price",
+        "build_draw_sum": "12-month cumulative build/draw",
     }
-    metric = st.selectbox("Métrique",
+    metric = st.selectbox("Metric",
                           list(metric_map.keys()),
                           format_func=lambda k: metric_map[k], index=0)
 
     variables = [
-        SensitivityVar("Offre Δ %", "supply_adj_pct", -3.0, 3.0),
-        SensitivityVar("Demande Δ %", "demand_adj_pct", -3.0, 3.0),
-        SensitivityVar("Météo Δ %", "weather_pct", -2.0, 2.0),
-        SensitivityVar("PIB %", "gdp_growth_pct", 0.5, 4.0),
+        SensitivityVar("Supply Δ %", "supply_adj_pct", -3.0, 3.0),
+        SensitivityVar("Demand Δ %", "demand_adj_pct", -3.0, 3.0),
+        SensitivityVar("Weather Δ %", "weather_pct", -2.0, 2.0),
+        SensitivityVar("GDP %", "gdp_growth_pct", 0.5, 4.0),
         SensitivityVar("Imports Δ %", "imports_adj_pct", -10.0, 10.0),
         SensitivityVar("Exports Δ %", "exports_adj_pct", -10.0, 10.0),
     ]
@@ -2873,18 +3021,18 @@ def page_sensitivities(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
                    st.session_state["assumptions"], variables, metric=metric)
 
     chart_intro("Tornado chart",
-                "Pour chaque variable, on pousse à sa valeur basse et haute "
-                "et on mesure l'impact sur la métrique. Les barres les plus "
-                "longues sont les leviers à surveiller en priorité.")
+                "For each variable, push it to its low and high values and "
+                "measure the impact on the metric. The longest bars are the "
+                "top levers to watch.")
     st.plotly_chart(tornado_chart(torn), use_container_width=True)
     st.dataframe(torn.round(2), hide_index=True, use_container_width=True)
     interpretation(read_tornado(torn))
 
-    st.subheader("Matrice de stress 2D")
-    chart_intro("Effets d'interaction entre deux variables",
-                "Heatmap où on quadrille deux hypothèses et on lit la métrique "
-                "dans chaque cellule. Très utile pour détecter les zones "
-                "extrêmes (par ex. choc offre + choc demande simultanés).")
+    st.subheader("2D stress matrix")
+    chart_intro("Interaction effects between two variables",
+                "Heatmap where two assumptions are gridded and the metric is "
+                "read in each cell. Useful for spotting extreme zones (e.g. "
+                "a simultaneous supply + demand shock).")
     c1, c2 = st.columns(2)
     labels = [v.name for v in variables]
     a = c1.selectbox("Variable A", labels, index=0)
@@ -2897,64 +3045,63 @@ def page_sensitivities(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
                                       title=f"{metric_map[metric]} — {a} × {b}"),
                     use_container_width=True)
     interpretation(
-        "Les cellules les plus rouges/bleues du coin de la heatmap indiquent les "
-        "combinaisons de stress les plus dangereuses. C'est là qu'il faut "
-        "construire ses scénarios de risque extrême."
+        "The reddest/bluest corner cells indicate the most dangerous stress "
+        "combinations. That's where to build extreme risk scenarios."
     )
 
 
 def page_settings() -> None:
-    st.title("⚙️ Paramètres")
+    st.title("⚙️ Settings")
     render_page_help("⚙️ Settings")
 
-    chart_intro("Hypothèses actives",
-                "Ce sont les ajustements actuellement appliqués au bilan, "
-                "issus des curseurs de la barre latérale.")
+    chart_intro("Active assumptions",
+                "The adjustments currently applied to the balance, coming "
+                "from the sidebar sliders.")
     a: BalanceAssumptions = st.session_state["assumptions"]
     st.json(asdict(a))
 
-    st.subheader("Sauvegarder / Charger")
+    st.subheader("Save / Load")
     chart_intro("Export / import JSON",
-                "Permet de figer un jeu d'hypothèses pour le ré-utiliser plus tard "
-                "ou le partager avec un collègue.")
+                "Freezes a set of assumptions so you can re-use it later or "
+                "share with a colleague.")
     blob = params_to_json(asdict(a))
-    st.download_button("Télécharger les paramètres (JSON)", blob.encode("utf-8"),
+    st.download_button("Download parameters (JSON)", blob.encode("utf-8"),
                        file_name="commodity_sd_params.json", mime="application/json")
-    uploaded = st.file_uploader("Charger des paramètres (JSON)", type=["json"])
+    uploaded = st.file_uploader("Load parameters (JSON)", type=["json"])
     if uploaded is not None:
         try:
             loaded = params_from_json(uploaded.read().decode("utf-8"))
             st.session_state["assumptions"] = BalanceAssumptions(**loaded)
-            st.success("Paramètres chargés — ils s'appliquent à toutes les pages.")
+            st.success("Parameters loaded — they apply across all pages.")
         except Exception as exc:
-            st.error(f"Échec du chargement : {exc}")
+            st.error(f"Load failed: {exc}")
 
     st.subheader("Cache")
-    if st.button("Vider le cache et recharger"):
+    if st.button("Clear cache & reload"):
         st.cache_data.clear()
         st.rerun()
 
-    st.subheader("Benchmarks idéaux par commodité")
-    chart_intro("Vue comparative",
-                "Tableau récapitulatif des paramètres normaux pour chaque "
-                "produit. Sert de référence pour la lecture des autres pages.")
+    st.subheader("Ideal benchmarks per commodity")
+    chart_intro("Comparative view",
+                "Summary table of normal parameters for each product. Acts "
+                "as the reference for reading the other pages.")
     rows = []
     for k, tpl in COMMODITY_TEMPLATES.items():
         rows.append({
-            "Commodité": tpl.name, "Secteur": tpl.sector, "Ticker": tpl.ticker,
-            "Cotation": tpl.price_unit, "Jours-couverture cible": tpl.days_cover_target,
-            "Utilisation idéale %": tpl.ideal_utilization_pct,
-            "Vol. mensuelle %": tpl.typical_monthly_vol_pct,
-            "Croissance demande YoY %": tpl.normal_yoy_demand_pct,
+            "Commodity": tpl.name, "Sector": tpl.sector, "Ticker": tpl.ticker,
+            "Quote": tpl.price_unit, "Days-of-cover target": tpl.days_cover_target,
+            "Ideal util %": tpl.ideal_utilization_pct,
+            "Monthly vol %": tpl.typical_monthly_vol_pct,
+            "YoY demand growth %": tpl.normal_yoy_demand_pct,
             "% MM/OI": tpl.ideal_mm_pct_of_oi,
-            "Capacité stockage": tpl.storage_capacity,
-            "Délai offre (mois)": tpl.supply_lag_months,
+            "Storage capacity": tpl.storage_capacity,
+            "Supply lag (months)": tpl.supply_lag_months,
         })
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
-    st.subheader("Fiches détaillées par commodité")
+    st.subheader("Detailed commodity templates")
     for k, tpl in COMMODITY_TEMPLATES.items():
-        with st.expander(f"{tpl.name} — fiche complète"):
+        with st.expander(f"{tpl.name} — full template"):
             st.json({
                 "key": tpl.key, "name": tpl.name, "sector": tpl.sector,
                 "unit": tpl.unit, "inventory_unit": tpl.inventory_unit,
