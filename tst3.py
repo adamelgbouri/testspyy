@@ -180,11 +180,6 @@ COMMODITY_REGISTRY = {
             ns_bounds=([5000,-20000,-20000,0.5],[100000,20000,20000,60])),
     },
     "Energy (Additional)": {
-        "Dutch TTF Natural Gas": dict(name="Dutch TTF Natural Gas", unit="EUR/MWh",
-            source="tradingview", tv_prefix="TTFG", tv_exchange="ICEENDEX",
-            active_months="FGHJKMNQUVXZ", liquid_months=24,
-            storage_cost=0.120, synthetic_spot=35.0,
-            ns_bounds=([2,-60,-60,0.5],[200,60,60,60])),
         "European Carbon (EUA)": dict(name="European Carbon (EUA)", unit="EUR/tCO2",
             source="tradingview", tv_prefix="EUAD", tv_exchange="ICE",
             active_months="HMNUZ", liquid_months=12,
