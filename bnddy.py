@@ -1021,36 +1021,36 @@ def render_sidebar() -> tuple:
     )
 
     # filter db by type before search
-    if asset_type != "All":
-        filtered_db = [item for item in db if f"—  {asset_type}" in item["label"]]
-    else:
-        filtered_db = db
+         if asset_type != "All":
+             filtered_db = [item for item in db if f"—  {asset_type}" in item["label"]]
+         else:
+             filtered_db = db
 
-    st.sidebar.caption(f"{len(filtered_db):,} matching")
+         st.sidebar.caption(f"{len(filtered_db):,} matching")
 
-    query   = st.sidebar.text_input(
-        "🔍", placeholder="Name or ticker…", key="search_query",
-        label_visibility="collapsed",
-    )
-    results = search_assets(filtered_db, query)   # ← use filtered_db here
-    if results:
-        options = [r["label"] for r in results]
-        chosen  = st.sidebar.selectbox(
-            "select_result", options,
-            label_visibility="collapsed", key="search_select",
-        )
-        if st.sidebar.button("＋  Add to portfolio", use_container_width=True):
-            symbol = next(
-                (r["symbol"] for r in results if r["label"] == chosen), None
-            )
-            if symbol:
-                if symbol not in st.session_state.selected_tickers:
-                    st.session_state.selected_tickers.append(symbol)
-                    st.rerun()
-                else:
-                    st.sidebar.warning(f"{symbol} already selected.")
-    else:
-        st.sidebar.caption("No results.")
+         query   = st.sidebar.text_input(
+             "🔍", placeholder="Name or ticker…", key="search_query",
+             label_visibility="collapsed",
+         )
+         results = search_assets(filtered_db, query)   # ← use filtered_db here
+         if results:
+             options = [r["label"] for r in results]
+             chosen  = st.sidebar.selectbox(
+                 "select_result", options,
+                 label_visibility="collapsed", key="search_select",
+             )
+             if st.sidebar.button("＋  Add to portfolio", use_container_width=True):
+                 symbol = next(
+                     (r["symbol"] for r in results if r["label"] == chosen), None
+                 )
+                 if symbol:
+                     if symbol not in st.session_state.selected_tickers:
+                         st.session_state.selected_tickers.append(symbol)
+                         st.rerun()
+                     else:
+                         st.sidebar.warning(f"{symbol} already selected.")
+         else:
+             st.sidebar.caption("No results.")
     else:
         st.sidebar.caption("Manual entry.")
         col_in, col_btn = st.sidebar.columns([3, 1])
