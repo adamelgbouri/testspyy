@@ -513,28 +513,45 @@ def asset_cagr(s: pd.Series) -> float:
 def load_asset_db() -> list:
     try:
         import financedatabase as fd
-        ALLOWED = {"NMS", "NAS", "NYQ", "NYS", "PCX", "ARCX",
-                   "PAR", "LSE", "SHH", "JPX", "FRA", "XETRA"}
-        datasets = {
-            "Equity":   fd.Equities().select(market_cap=["Large Cap", "Mega Cap", "Mid Cap"]),
-            "ETF":      fd.ETFs().select(),
-            "Crypto":   fd.Cryptos().select(),
-            "Index":    fd.Indices().select(),
-            "Fund":     fd.Funds().select(),
-            "Currency": fd.Currencies().select(),
-        }
-        out = []
-        for atype, df in datasets.items():
+    except ImportError:
+        return []          # package missing — caller shows manual entry
+
+    ALLOWED = {"NMS", "NAS", "NYQ", "NYS", "PCX", "ARCX",
+               "PAR", "LSE", "SHH", "JPX", "FRA", "XETRA"}
+
+    loaders = {
+        "Equity":   lambda: fd.Equities().select(),
+        "ETF":      lambda: fd.ETFs().select(),
+        "Crypto":   lambda: fd.Cryptos().select(),
+        "Index":    lambda: fd.Indices().select(),
+        "Fund":     lambda: fd.Funds().select(),
+        "Currency": lambda: fd.Currencies().select(),
+    }
+
+    out = []
+    for atype, loader in loaders.items():
+        try:
+            df = loader()
+            if df is None or df.empty:
+                continue
             if "exchange" in df.columns:
                 df = df[df["exchange"].isin(ALLOWED) | df["exchange"].isna()]
+            # market_cap filter for equities only (if column exists)
+            if atype == "Equity" and "market_cap" in df.columns:
+                df = df[df["market_cap"].isin(
+                    ["Large Cap", "Mega Cap", "Mid Cap"]
+                )]
             for sym, row in df.iterrows():
-                name  = str(row.get("name", "") or "")
-                exch  = str(row.get("exchange", "") or "")
-                label = f"{name}  ({sym})  —  {atype}  {exch}".strip()
+                if not sym or str(sym).strip() in ("", "nan"):
+                    continue
+                name  = str(row.get("name", "") or "").strip()
+                exch  = str(row.get("exchange", "") or "").strip()
+                label = f"{name}  ({sym})  —  {atype}" + (f"  {exch}" if exch else "")
                 out.append({"label": label, "symbol": str(sym).upper()})
-        return sorted(out, key=lambda x: x["label"].lower())
-    except Exception:
-        return []
+        except Exception:
+            continue          # skip broken dataset, keep others
+
+    return sorted(out, key=lambda x: x["label"].lower())
 
 
 def search_assets(db: list, query: str, limit: int = 120) -> list:
