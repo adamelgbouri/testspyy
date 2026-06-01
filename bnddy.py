@@ -511,45 +511,25 @@ def asset_cagr(s: pd.Series) -> float:
 
 @st.cache_data(show_spinner=False)
 def load_asset_db() -> list:
+    errors = []
     try:
         import financedatabase as fd
-    except ImportError:
-        return []          # package missing — caller shows manual entry
+        errors.append(f"✅ financedatabase imported, version: {fd.__version__}")
+    except ImportError as e:
+        errors.append(f"❌ Import failed: {e}")
+        for msg in errors:
+            st.sidebar.write(msg)
+        return []
 
-    ALLOWED = {"NMS", "NAS", "NYQ", "NYS", "PCX", "ARCX",
-               "PAR", "LSE", "SHH", "JPX", "FRA", "XETRA"}
+    try:
+        test = fd.Equities().select()
+        errors.append(f"✅ Equities loaded: {type(test)}, shape: {getattr(test, 'shape', 'N/A')}")
+    except Exception as e:
+        errors.append(f"❌ Equities().select() failed: {e}")
 
-    loaders = {
-        "Equity":   lambda: fd.Equities().select(),
-        "ETF":      lambda: fd.ETFs().select(),
-        "Crypto":   lambda: fd.Cryptos().select(),
-        "Index":    lambda: fd.Indices().select(),
-        "Fund":     lambda: fd.Funds().select(),
-        "Currency": lambda: fd.Currencies().select(),
-    }
-
-    out = []
-    for atype, loader in loaders.items():
-        try:
-            df = loader()
-            if df is None or df.empty:
-                continue
-            if "exchange" in df.columns:
-                df = df[df["exchange"].isin(ALLOWED) | df["exchange"].isna()]
-            # market_cap filter for equities only (if column exists)
-            if atype == "Equity" and "market_cap" in df.columns:
-                df = df[df["market_cap"].isin(
-                    ["Large Cap", "Mega Cap", "Mid Cap"]
-                )]
-            for sym, row in df.iterrows():
-                if not sym or str(sym).strip() in ("", "nan"):
-                    continue
-                name  = str(row.get("name", "") or "").strip()
-                exch  = str(row.get("exchange", "") or "").strip()
-                label = f"{name}  ({sym})  —  {atype}" + (f"  {exch}" if exch else "")
-                out.append({"label": label, "symbol": str(sym).upper()})
-        except Exception:
-            continue          # skip broken dataset, keep others
+    for msg in errors:
+        st.sidebar.write(msg)
+    return []   # return empty for now just to see the debug
 
     return sorted(out, key=lambda x: x["label"].lower())
 
