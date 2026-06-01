@@ -999,15 +999,15 @@ def render_sidebar() -> tuple:
 </div>""", unsafe_allow_html=True)
 
     sidebar_section("Asset Database")
-if "selected_tickers" not in st.session_state:
-    st.session_state.selected_tickers = ["AAPL", "MSFT"]
+    if "selected_tickers" not in st.session_state:
+        st.session_state.selected_tickers = ["AAPL", "MSFT"]
 
-with st.sidebar:
-    with st.spinner("Loading…"):
-        db = load_asset_db()
+    with st.sidebar:
+        with st.spinner("Loading…"):
+            db = load_asset_db()
 
-if db:
-    st.sidebar.caption(f"{len(db):,} assets available")
+    if db:
+        st.sidebar.caption(f"{len(db):,} assets available")
 
     # ── Asset type filter ──────────────────────────────────────────
     ASSET_TYPES = ["All", "Equity", "ETF", "Crypto", "Index", "Fund", "Currency"]
