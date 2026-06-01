@@ -611,7 +611,39 @@ def load_prices(tickers: tuple, start: str, end: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_scenario_prices(tickers: tuple, start: str, end: str) -> pd.DataFrame:
-    return load_prices(tickers, start, end)
+    """More permissive loader for scenario periods — forward-fills gaps, keeps partial data."""
+    try:
+        raw = yf.download(
+            list(tickers), start=start, end=end,
+            auto_adjust=True,          # ← True is more reliable for older dates
+            progress=False,
+            group_by="ticker",
+        )
+        if raw.empty:
+            return pd.DataFrame()
+
+        if isinstance(raw.columns, pd.MultiIndex):
+            # extract Close for each ticker
+            if "Close" in raw.columns.get_level_values(0):
+                raw = raw["Close"]
+            elif "Adj Close" in raw.columns.get_level_values(0):
+                raw = raw["Adj Close"]
+            else:
+                raw = raw.iloc[:, raw.columns.get_level_values(1) != ""]
+        
+        if isinstance(raw, pd.Series):
+            raw = raw.to_frame(tickers[0])
+
+        # forward-fill up to 5 days (handles weekends/holidays), then drop full-NaN rows
+        raw = raw.ffill(limit=5).dropna(how="all")
+        
+        # keep columns that have at least 10 data points
+        raw = raw.loc[:, raw.notna().sum() >= 10]
+        
+        return raw
+
+    except Exception as e:
+        return pd.DataFrame()
 
 
 # ─── Optimization ─────────────────────────────────────────────────
@@ -693,31 +725,42 @@ def optimize(mu_t: tuple, cov_t: tuple, n: int, rf: float,
 
 # ─── Scenario analysis ────────────────────────────────────────────
 
-def run_scenario(prices_scenario: pd.DataFrame, w_tan, w_mvp, w_rp,
-                 assets, scenario_name, scenario_meta) -> dict:
-    """Compute scenario stats for all three portfolios and individual assets."""
-    if prices_scenario.empty:
+def run_scenario(prices_scenario, w_tan, w_mvp, w_rp, assets, scenario_name, scenario_meta):
+    if prices_scenario is None or prices_scenario.empty:
         return {}
 
-    available = [a for a in assets if a in prices_scenario.columns]
-    if not available:
+    # only use assets that actually exist AND have enough data
+    available = [a for a in assets
+                 if a in prices_scenario.columns
+                 and prices_scenario[a].notna().sum() >= 5]
+
+    if len(available) == 0:
         return {}
 
-    p = prices_scenario[available].dropna()
-    if len(p) < 2:
+    p = prices_scenario[available].copy()
+    # fill any remaining gaps column-by-column
+    p = p.ffill().bfill().dropna(how="all")
+
+    if len(p) < 3:
         return {}
+
+    n_orig = len(assets)
+
+    # slice weights to available assets only (re-normalize)
+    idx = [assets.index(a) for a in available]
 
     results = {}
     port_defs = {
-        "Tangent":      w_tan[:len(available)],
-        "Min Variance": w_mvp[:len(available)],
-        "Risk Parity":  w_rp[:len(available)],
+        "Tangent":      w_tan[idx],
+        "Min Variance": w_mvp[idx],
+        "Risk Parity":  w_rp[idx],
     }
     for name, w in port_defs.items():
-        w = np.array(w)
-        if w.sum() == 0:
+        w = np.array(w, dtype=float)
+        if w.sum() < 1e-9:
             continue
-        w = w / w.sum()
+        w = w / w.sum()   # re-normalize for the available subset
+
         total_ret  = float((p / p.iloc[0]).iloc[-1].values @ w) - 1
         cum        = port_cum(p, w) / 100
         mdd        = float((cum / cum.cummax() - 1).min())
@@ -730,17 +773,24 @@ def run_scenario(prices_scenario: pd.DataFrame, w_tan, w_mvp, w_rp,
             "cum_series":   port_cum(p, w),
         }
 
-    # individual assets
     asset_stats = {}
     for a in available:
-        s = p[a]
+        s = p[a].dropna()
+        if len(s) < 2:
+            continue
         asset_stats[a] = {
             "total_return": float(s.iloc[-1] / s.iloc[0] - 1),
             "max_drawdown": asset_max_dd(s),
         }
 
-    return {"portfolios": results, "assets": asset_stats,
-            "prices": p, "name": scenario_name, "meta": scenario_meta}
+    return {
+        "portfolios": results,
+        "assets":     asset_stats,
+        "prices":     p,
+        "name":       scenario_name,
+        "meta":       scenario_meta,
+        "available":  available,   # so UI can warn about missing ones
+    }
 
 
 # ─── Charts ───────────────────────────────────────────────────────
@@ -1324,9 +1374,18 @@ def render_scenario_tab(res: dict):
 
         sc_result = run_scenario(sc_prices, w_tan, w_mvp, w_rp,
                                  assets, sc_name, meta)
-        if not sc_result:
-            st.warning(f"No data for **{sc_name}** — dates may be outside history.")
-            continue
+       # after sc_result = run_scenario(...)
+       if not sc_result:
+          st.warning(f"No data for **{sc_name}** — dates may be outside history for all selected assets.")
+          continue
+
+# show a soft warning if only some assets had data
+      available_in_sc = sc_result.get("available", [])
+      missing_in_sc   = [a for a in assets if a not in available_in_sc]
+      if missing_in_sc:
+          st.info(f"ℹ️ No data for **{', '.join(missing_in_sc)}** during this period — "
+                  f"results use the {len(available_in_sc)} available asset(s).")
+                  continue
 
         portfolios = sc_result.get("portfolios", {})
         n_days     = len(sc_result["prices"])
