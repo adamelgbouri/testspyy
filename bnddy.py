@@ -1375,9 +1375,9 @@ def render_scenario_tab(res: dict):
         sc_result = run_scenario(sc_prices, w_tan, w_mvp, w_rp,
                                  assets, sc_name, meta)
        # after sc_result = run_scenario(...)
-       if not sc_result:
-          st.warning(f"No data for **{sc_name}** — dates may be outside history for all selected assets.")
-          continue
+        if not sc_result:
+           st.warning(f"No data for **{sc_name}** — dates may be outside history for all selected assets.")
+           continue
 
 # show a soft warning if only some assets had data
       available_in_sc = sc_result.get("available", [])
