@@ -1380,12 +1380,12 @@ def render_scenario_tab(res: dict):
            continue
 
 # show a soft warning if only some assets had data
-      available_in_sc = sc_result.get("available", [])
-      missing_in_sc   = [a for a in assets if a not in available_in_sc]
-      if missing_in_sc:
-          st.info(f"ℹ️ No data for **{', '.join(missing_in_sc)}** during this period — "
-                  f"results use the {len(available_in_sc)} available asset(s).")
-                  continue
+       available_in_sc = sc_result.get("available", [])
+       missing_in_sc   = [a for a in assets if a not in available_in_sc]
+       if missing_in_sc:
+           st.info(f"ℹ️ No data for **{', '.join(missing_in_sc)}** during this period — "
+                   f"results use the {len(available_in_sc)} available asset(s).")
+                   continue
 
         portfolios = sc_result.get("portfolios", {})
         n_days     = len(sc_result["prices"])
