@@ -1049,14 +1049,14 @@ def render_sidebar() -> tuple:
                         st.rerun()
                     else:
                         st.sidebar.warning(f"{symbol} already selected.")
-        else:
-            st.sidebar.caption("No results.")
-        else:
-            st.sidebar.caption("Manual entry.")
-            col_in, col_btn = st.sidebar.columns([3, 1])
-            manual = col_in.text_input("Ticker", placeholder="AAPL",
-                                        label_visibility="collapsed",
-                                        key="manual_ticker")
+                else:
+                    st.sidebar.caption("No results.")
+            else:
+                st.sidebar.caption("Manual entry.")
+                col_in, col_btn = st.sidebar.columns([3, 1])
+                manual = col_in.text_input("Ticker", placeholder="AAPL",
+                                            label_visibility="collapsed",
+                                            key="manual_ticker")
             if col_btn.button("＋", key="manual_add"):
                 t = manual.strip().upper()
                 if t and t not in st.session_state.selected_tickers:
