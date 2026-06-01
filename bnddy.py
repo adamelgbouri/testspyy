@@ -1,7 +1,7 @@
 """
 Portfolio Optimizer -- Streamlit Edition  (c) AEG
 Markowitz Modern Portfolio Theory -- Premium UI
-Scenario Analysis · Multi-Currency · Weight Constraints · Ticker Validation
+v2.1: Scenario Analysis · Multi-Currency · Weight Constraints · Ticker Validation
 """
 
 import streamlit as st
@@ -180,7 +180,7 @@ def page_header():
       Portfolio Optimizer</div>
     <div style="color:#64748B;font-size:0.72rem;font-weight:500;
         letter-spacing:0.14em;text-transform:uppercase;margin-top:3px;">
-      Modern Portfolio Theory · Markowitz Efficient Frontier · by AEG
+      Modern Portfolio Theory · Markowitz Efficient Frontier · by AEG · v2.1
     </div>
   </div>
 </div>""", unsafe_allow_html=True)
@@ -981,7 +981,7 @@ def render_sidebar():
   <div style="font-family:'Playfair Display',serif;font-size:1.15rem;font-weight:700;color:#D4AF37;">
     📈 Portfolio Optimizer</div>
   <div style="color:#64748B;font-size:0.66rem;font-weight:600;text-transform:uppercase;
-      letter-spacing:0.14em;margin-top:5px;">Markowitz MPT · by AEG</div>
+      letter-spacing:0.14em;margin-top:5px;">Markowitz MPT · v2.1 · by AEG</div>
 </div>""", unsafe_allow_html=True)
 
     sidebar_section("Parameters")
@@ -1108,9 +1108,9 @@ def render_sidebar():
 # VALIDATION PANEL
 # ═══════════════════════════════════════════════════════════════════
 
-def render_validation_panel(tickers):
+def render_validation_panel(tickers, btn_key="revalidate"):
     section_title("Ticker Validation", "Live verification against Yahoo Finance")
-    if st.button("🔄 Re-validate all"):
+    if st.button("🔄 Re-validate all", key=btn_key):
         validate_ticker.clear()
         st.rerun()
     rows      = []
@@ -1341,7 +1341,7 @@ def main():
 
         # Ticker validation
         with st.spinner("Validating tickers…"):
-            valid_set = render_validation_panel(tickers)
+            valid_set = render_validation_panel(tickers, btn_key="revalidate_run")
 
         tickers_ok = [t for t in tickers if t in valid_set]
         if len(tickers_ok) < 2:
@@ -1623,13 +1623,13 @@ def main():
 <div style="text-align:center;margin-top:40px;padding:20px;
     border-top:1px solid rgba(212,175,55,0.1);
     color:#64748B;font-size:0.72rem;letter-spacing:0.06em;">
-  PORTFOLIO OPTIMIZER · MARKOWITZ MPT · (c) AEG<br>
+  PORTFOLIO OPTIMIZER · MARKOWITZ MPT · v2.1 · (c) AEG<br>
   <span style="color:rgba(212,175,55,0.4);font-size:0.65rem;">
     Not financial advice — Educational purposes only</span>
 </div>""", unsafe_allow_html=True)
 
     with t8:
-        render_validation_panel(assets)
+        render_validation_panel(assets, btn_key="revalidate_tab")
         section_title("Weight Constraints Applied")
         if constraints:
             rows = [
