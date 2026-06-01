@@ -1010,7 +1010,7 @@ def render_sidebar() -> tuple:
         st.sidebar.caption(f"{len(db):,} assets available")
         
         # ── Asset type filter ──────────────────────────────────────────
-        ASSET_TYPES = ["All", "Equity", "ETF", "Crypto", "Index", "Fund", "Currency"]
+        ASSET_TYPES = ["All", "Equity", "ETF", "Crypto", "Index", "Fund"]
         asset_type  = st.sidebar.selectbox(
             "Asset type",
             ASSET_TYPES,
