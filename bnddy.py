@@ -647,7 +647,7 @@ def chart_frontier(res) -> go.Figure:
         x=res["mc_vols"]*100, y=res["mc_rets"]*100, mode="markers",
         marker=dict(size=3, color=res["mc_sh"], colorscale="RdYlGn",
                     showscale=True,
-                    colorbar=dict(title="Sharpe", x=0.97, thickness=12,
+                    colorbar=dict(title="Sharpe", x=0.975, thickness=12,
                                   tickfont=dict(color=MUTED, size=9),
                                   title_font=dict(color=MUTED, size=10))),
         opacity=0.35, name="Simulated portfolios",
