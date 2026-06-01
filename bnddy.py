@@ -718,7 +718,7 @@ def chart_drawdown(prices) -> go.Figure:
     return fig
 
 
-def chart_pie(w, assets, title, ret, vol) -> go.Figure:
+def chart_pie(w, assets, title, ret, vol, height=520) -> go.Figure:
     mask   = w > 0.01
     labels = [assets[i] for i in range(len(assets)) if mask[i]]
     vals   = w[mask]
@@ -726,16 +726,17 @@ def chart_pie(w, assets, title, ret, vol) -> go.Figure:
         fig = go.Figure()
         fig.add_annotation(text="No significant weights", xref="paper", yref="paper",
                            x=0.5, y=0.5, font=dict(color=TEXT, size=14), showarrow=False)
-        fig.update_layout(**base_layout(title))
+        fig.update_layout(**base_layout(title, height=height))
         return fig
     fig = go.Figure(go.Pie(
-        labels=labels, values=vals, hole=0.42,
+        labels=labels, values=vals, hole=0.44,
         marker=dict(colors=PALETTE[:len(labels)], line=dict(color=BG, width=2.5)),
-        textinfo="label+percent", textfont=dict(size=11),
+        textinfo="label+percent", textfont=dict(size=13),
+        insidetextorientation="radial",
         hovertemplate="%{label}: %{percent} · %{value:.3f}<extra></extra>",
     ))
     fig.update_layout(**base_layout(
-        f"{title}  ·  Ret {ret*100:+.1f}%  ·  Vol {vol*100:.1f}%", height=420,
+        f"{title}  ·  Ret {ret*100:+.1f}%  ·  Vol {vol*100:.1f}%", height=height,
     ))
     return fig
 
@@ -1472,10 +1473,13 @@ def main():
         st.plotly_chart(chart_drawdown(prices), use_container_width=True)
 
     with t3:
-        c1, c2, c3 = st.columns(3)
-        with c1: st.plotly_chart(chart_pie(w_tan, assets, "Tangent Portfolio", tan_r, tan_v), use_container_width=True)
-        with c2: st.plotly_chart(chart_pie(w_mvp, assets, "Min Variance",      mvp_r, mvp_v), use_container_width=True)
-        with c3: st.plotly_chart(chart_pie(w_rp,  assets, "Risk Parity",       rp_r,  rp_v),  use_container_width=True)
+        # Row 1 — Tangent + Min Variance side by side
+        c1, c2 = st.columns(2)
+        with c1: st.plotly_chart(chart_pie(w_tan, assets, "Tangent Portfolio", tan_r, tan_v, height=520), use_container_width=True)
+        with c2: st.plotly_chart(chart_pie(w_mvp, assets, "Min Variance",      mvp_r, mvp_v, height=520), use_container_width=True)
+        # Row 2 — Risk Parity centred (half width)
+        _, c_mid, _ = st.columns([1, 2, 1])
+        with c_mid: st.plotly_chart(chart_pie(w_rp, assets, "Risk Parity", rp_r, rp_v, height=520), use_container_width=True)
         st.plotly_chart(chart_cumulative(prices, w_tan, w_mvp, w_rp), use_container_width=True)
 
     with t4:
