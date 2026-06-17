@@ -86,6 +86,7 @@ class CommodityTemplate:
     seasonal_supply: List[float] = field(default_factory=list)
     regions: List[str] = field(default_factory=list)
     region_weights: List[float] = field(default_factory=list)
+    supply_weights: List[float] = field(default_factory=list)
     elasticity_alpha: float = 0.0
     elasticity_beta: float = 0.0
     supply_lag_months: int = 6
@@ -165,8 +166,12 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         price_unit="$/bbl",
         price_band=(40.0, 130.0), storage_capacity=4200.0, days_cover_target=30.0,
         seasonal_demand=_OIL_DEMAND_SEAS, seasonal_supply=_OIL_SUPPLY_SEAS,
-        regions=["US", "Europe", "China", "Middle East", "Rest of World"],
-        region_weights=[0.21, 0.14, 0.16, 0.09, 0.40],
+        # Global oil market: realistic supply (producers) vs demand (consumers)
+        # Sources: IEA OMR, EIA STEO (typical 2024-2025 splits).
+        regions=["US", "Middle East", "Russia & CIS", "China",
+                 "Europe", "Other Asia", "Rest of World"],
+        region_weights=[0.19, 0.09, 0.04, 0.16, 0.13, 0.13, 0.26],   # demand
+        supply_weights=[0.20, 0.30, 0.11, 0.04, 0.04, 0.02, 0.29],   # production
         elasticity_alpha=0.06, elasticity_beta=0.10, supply_lag_months=6,
         ideal_utilization_pct=70, typical_monthly_vol_pct=8,
         normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=15, sector="Energy",
@@ -180,8 +185,11 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         price_unit="$/bbl",
         price_band=(40.0, 130.0), storage_capacity=4200.0, days_cover_target=30.0,
         seasonal_demand=_OIL_DEMAND_SEAS, seasonal_supply=_OIL_SUPPLY_SEAS,
-        regions=["Europe", "Asia", "Africa", "Americas", "Rest of World"],
-        region_weights=[0.20, 0.35, 0.10, 0.15, 0.20],
+        # Brent is the global benchmark — same world balance as WTI.
+        regions=["US", "Middle East", "Russia & CIS", "China",
+                 "Europe", "Other Asia", "Rest of World"],
+        region_weights=[0.19, 0.09, 0.04, 0.16, 0.13, 0.13, 0.26],
+        supply_weights=[0.20, 0.30, 0.11, 0.04, 0.04, 0.02, 0.29],
         elasticity_alpha=0.06, elasticity_beta=0.10, supply_lag_months=6,
         ideal_utilization_pct=70, typical_monthly_vol_pct=8,
         normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=15, sector="Energy",
@@ -244,8 +252,11 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         price_unit="$/lb",
         price_band=(2.50, 6.00), storage_capacity=1400.0, days_cover_target=20.0,
         seasonal_demand=_COPPER_DEMAND_SEAS, seasonal_supply=_COPPER_SUPPLY_SEAS,
-        regions=["China", "Europe", "US", "Japan/Korea", "Rest of World"],
-        region_weights=[0.55, 0.14, 0.08, 0.10, 0.13],
+        # Supply: mine production. Demand: refined copper consumption (ICSG).
+        regions=["Chile & Peru", "China", "DRC & Zambia", "US",
+                 "Europe", "Japan/Korea", "Rest of World"],
+        region_weights=[0.05, 0.55, 0.04, 0.08, 0.14, 0.07, 0.07],   # demand
+        supply_weights=[0.38, 0.09, 0.16, 0.06, 0.04, 0.02, 0.25],   # mine output
         elasticity_alpha=0.04, elasticity_beta=0.07, supply_lag_months=12,
         ideal_utilization_pct=50, typical_monthly_vol_pct=6,
         normal_yoy_demand_pct=2.5, ideal_mm_pct_of_oi=20, sector="Metals",
@@ -308,8 +319,12 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         price_unit="$/oz",
         price_band=(1500.0, 3500.0), storage_capacity=5000.0, days_cover_target=90.0,
         seasonal_demand=_GOLD_DEMAND, seasonal_supply=_GOLD_SUPPLY,
-        regions=["China", "India", "OECD ETFs", "Central Banks", "Rest of World"],
-        region_weights=[0.22, 0.20, 0.24, 0.20, 0.14],
+        # Supply: mine output by country.  Demand: jewelry / investment /
+        # central banks.  Sources: World Gold Council.
+        regions=["China (mine)", "Russia", "Australia", "Canada",
+                 "India (consumer)", "OECD ETFs / investment", "Central Banks"],
+        region_weights=[0.10, 0.06, 0.04, 0.04, 0.22, 0.30, 0.24],
+        supply_weights=[0.10, 0.10, 0.10, 0.06, 0.02, 0.0, 0.62],
         elasticity_alpha=0.03, elasticity_beta=0.02, supply_lag_months=24,
         ideal_utilization_pct=60, typical_monthly_vol_pct=4,
         normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=22, sector="Precious",
@@ -372,8 +387,11 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         price_unit="¢/bu",
         price_band=(380.0, 1100.0), storage_capacity=320.0, days_cover_target=70.0,
         seasonal_demand=_WHEAT_DEMAND_SEAS, seasonal_supply=_WHEAT_SUPPLY_SEAS,
-        regions=["China", "EU", "India", "Russia", "US", "Rest of World"],
-        region_weights=[0.18, 0.14, 0.13, 0.10, 0.06, 0.39],
+        # Sources: USDA FAS PSD database — production vs domestic consumption.
+        regions=["China", "EU", "India", "Russia", "US",
+                 "Canada", "Ukraine", "Rest of World"],
+        region_weights=[0.18, 0.13, 0.13, 0.05, 0.04, 0.01, 0.02, 0.44],   # consumption
+        supply_weights=[0.17, 0.17, 0.14, 0.11, 0.06, 0.04, 0.04, 0.27],   # production
         elasticity_alpha=0.05, elasticity_beta=0.03, supply_lag_months=9,
         ideal_utilization_pct=60, typical_monthly_vol_pct=7,
         normal_yoy_demand_pct=1.0, ideal_mm_pct_of_oi=15, sector="Ags",
@@ -387,8 +405,10 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         price_unit="¢/bu",
         price_band=(330.0, 800.0), storage_capacity=700.0, days_cover_target=80.0,
         seasonal_demand=_CORN_DEMAND, seasonal_supply=_CORN_SUPPLY,
-        regions=["US", "China", "Brazil", "EU", "Rest of World"],
-        region_weights=[0.31, 0.27, 0.10, 0.06, 0.26],
+        # Sources: USDA FAS PSD.
+        regions=["US", "China", "Brazil", "EU", "Argentina", "Rest of World"],
+        region_weights=[0.31, 0.27, 0.08, 0.06, 0.03, 0.25],   # consumption
+        supply_weights=[0.30, 0.23, 0.11, 0.05, 0.04, 0.27],   # production
         elasticity_alpha=0.05, elasticity_beta=0.04, supply_lag_months=9,
         ideal_utilization_pct=55, typical_monthly_vol_pct=6,
         normal_yoy_demand_pct=1.2, ideal_mm_pct_of_oi=16, sector="Ags",
@@ -402,8 +422,9 @@ COMMODITY_TEMPLATES: Dict[str, CommodityTemplate] = {
         price_unit="¢/bu",
         price_band=(800.0, 1800.0), storage_capacity=220.0, days_cover_target=85.0,
         seasonal_demand=_SOY_DEMAND, seasonal_supply=_SOY_SUPPLY,
-        regions=["China", "US", "Brazil", "Argentina", "Rest of World"],
-        region_weights=[0.32, 0.20, 0.20, 0.10, 0.18],
+        regions=["China", "US", "Brazil", "Argentina", "EU", "Rest of World"],
+        region_weights=[0.32, 0.17, 0.14, 0.09, 0.04, 0.24],   # consumption (crushed)
+        supply_weights=[0.04, 0.27, 0.40, 0.14, 0.01, 0.14],   # production
         elasticity_alpha=0.06, elasticity_beta=0.04, supply_lag_months=8,
         ideal_utilization_pct=55, typical_monthly_vol_pct=7,
         normal_yoy_demand_pct=2.5, ideal_mm_pct_of_oi=18, sector="Ags",
@@ -662,25 +683,48 @@ def get_sd_dataset(commodity_key: str, start: str = "2018-01-01",
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_regional_dataset(commodity_key: str, seed: int = 7) -> pd.DataFrame:
-    """Synthetic regional split using template `region_weights` (falls back to uniform)."""
+    """
+    Regional supply / demand / net-trade split.
+
+    Uses `supply_weights` AND `region_weights` (demand) from the commodity
+    template when both are available. When only `region_weights` is given
+    we fall back to demand=supply=that weight + slight randomness to keep
+    backwards compatibility.
+    """
     tpl = COMMODITY_TEMPLATES[commodity_key]
     rng = np.random.default_rng(seed)
     regions = tpl.regions
     n = len(regions)
 
     if tpl.region_weights and len(tpl.region_weights) == n:
-        weights = np.array(tpl.region_weights, dtype=float)
+        d_w = np.array(tpl.region_weights, dtype=float)
     else:
-        weights = np.ones(n)
-    weights = weights / weights.sum()
+        d_w = np.ones(n)
+    d_w = d_w / d_w.sum()
 
-    demand = tpl.base_demand * weights * (1 + rng.normal(0, 0.03, n))
-    skew = rng.normal(1.0, 0.20, n)
-    supply = tpl.base_supply * weights * skew
-    supply = supply * (tpl.base_supply / supply.sum())
+    if tpl.supply_weights and len(tpl.supply_weights) == n:
+        s_w = np.array(tpl.supply_weights, dtype=float)
+        s_w = s_w / s_w.sum()
+        # tiny noise to make month-on-month deltas non-degenerate
+        supply = tpl.base_supply * s_w * (1 + rng.normal(0, 0.01, n))
+        demand = tpl.base_demand * d_w * (1 + rng.normal(0, 0.01, n))
+    else:
+        # Legacy: skewed supply from the same weights vector
+        demand = tpl.base_demand * d_w * (1 + rng.normal(0, 0.03, n))
+        skew = rng.normal(1.0, 0.20, n)
+        supply = tpl.base_supply * d_w * skew
+        supply = supply * (tpl.base_supply / supply.sum())
+
+    net_trade = supply - demand
+    market_share_d = demand / demand.sum() * 100
+    market_share_s = supply / supply.sum() * 100
     return pd.DataFrame({
-        "region": regions, "supply": supply, "demand": demand,
-        "net_trade": supply - demand,
+        "region": regions,
+        "supply": supply,
+        "demand": demand,
+        "net_trade": net_trade,
+        "supply_share_pct": market_share_s,
+        "demand_share_pct": market_share_d,
     })
 
 
@@ -847,6 +891,7 @@ def get_high_frequency(commodity_key: str, days: int = 120, seed: int = 11) -> p
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_macro_panel(months: int = 84, seed: int = 19) -> pd.DataFrame:
+    """Global macro panel (kept for backwards compatibility)."""
     rng = np.random.default_rng(seed)
     idx = pd.date_range(end=pd.Timestamp.today().normalize().replace(day=1),
                         periods=months, freq="MS")
@@ -857,6 +902,56 @@ def get_macro_panel(months: int = 84, seed: int = 19) -> pd.DataFrame:
     return pd.DataFrame({
         "date": idx, "gdp_index": gdp, "pmi": pmi,
         "usd_index": usd, "policy_rate": rates,
+    }).set_index("date")
+
+
+# Per-country macro parameters: (growth drift, growth vol, pmi base, fx drift,
+# fx vol, policy_rate base, policy_rate vol, cpi yoy base).  Calibrated to
+# typical 2020-2024 IMF / OECD / FRED levels.
+COUNTRY_MACRO_PROFILES: Dict[str, Dict[str, float]] = {
+    "🇺🇸 United States": dict(g_mu=0.0018, g_sig=0.0030, pmi=52, fx_mu=0.0,
+                              fx_sig=0.0040, rate=4.5, rate_sig=0.30, cpi=3.0),
+    "🇪🇺 Euro Area":    dict(g_mu=0.0010, g_sig=0.0030, pmi=49, fx_mu=0.0002,
+                              fx_sig=0.0050, rate=3.5, rate_sig=0.30, cpi=2.5),
+    "🇨🇳 China":         dict(g_mu=0.0040, g_sig=0.0035, pmi=50, fx_mu=-0.0003,
+                              fx_sig=0.0030, rate=2.8, rate_sig=0.15, cpi=0.5),
+    "🇯🇵 Japan":         dict(g_mu=0.0007, g_sig=0.0020, pmi=49, fx_mu=-0.0010,
+                              fx_sig=0.0060, rate=0.3, rate_sig=0.10, cpi=2.5),
+    "🇬🇧 United Kingdom": dict(g_mu=0.0011, g_sig=0.0030, pmi=51, fx_mu=-0.0005,
+                              fx_sig=0.0055, rate=4.5, rate_sig=0.30, cpi=2.8),
+    "🇮🇳 India":         dict(g_mu=0.0055, g_sig=0.0040, pmi=55, fx_mu=-0.0005,
+                              fx_sig=0.0040, rate=6.5, rate_sig=0.30, cpi=5.5),
+    "🇧🇷 Brazil":        dict(g_mu=0.0020, g_sig=0.0035, pmi=51, fx_mu=-0.0010,
+                              fx_sig=0.0080, rate=10.0, rate_sig=0.50, cpi=4.5),
+    "🇨🇦 Canada":        dict(g_mu=0.0015, g_sig=0.0025, pmi=50, fx_mu=-0.0003,
+                              fx_sig=0.0045, rate=4.0, rate_sig=0.25, cpi=2.8),
+}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_country_macro(country: str, months: int = 84,
+                      seed: int = 0) -> pd.DataFrame:
+    """
+    Per-country macro panel with GDP index, PMI, currency vs USD, policy
+    rate and CPI YoY %.
+    """
+    cfg = COUNTRY_MACRO_PROFILES.get(country, COUNTRY_MACRO_PROFILES["🇺🇸 United States"])
+    # Stable per-country seed
+    sd = seed + (abs(hash(country)) % 10000)
+    rng = np.random.default_rng(sd)
+    idx = pd.date_range(end=pd.Timestamp.today().normalize().replace(day=1),
+                        periods=months, freq="MS")
+    gdp = 100 * np.cumprod(1 + rng.normal(cfg["g_mu"], cfg["g_sig"], months))
+    pmi = np.clip(cfg["pmi"] + 3 * np.sin(np.arange(months) / 8)
+                  + rng.normal(0, 1.5, months), 40, 60)
+    fx = 100 * np.cumprod(1 + rng.normal(cfg["fx_mu"], cfg["fx_sig"], months))
+    rate = np.clip(cfg["rate"] + 1.0 * np.sin(np.arange(months) / 24)
+                    + rng.normal(0, cfg["rate_sig"], months), 0.0, 15.0)
+    cpi = np.clip(cfg["cpi"] + 1.5 * np.sin(np.arange(months) / 18 + 1)
+                  + rng.normal(0, 0.4, months), -1.0, 12.0)
+    return pd.DataFrame({
+        "date": idx, "gdp_index": gdp, "pmi": pmi,
+        "fx_vs_usd": fx, "policy_rate": rate, "cpi_yoy": cpi,
     }).set_index("date")
 
 
@@ -2518,23 +2613,41 @@ def cost_curve_chart(df: pd.DataFrame) -> go.Figure:
 # UI HELPERS
 # =============================================================================
 
-PAGES = [
-    "🏠 Dashboard",
-    "⚖️ Supply & Demand",
-    "🛢️ Inventories",
-    "🌪️ Scenarios",
-    "🌍 Regional Flows",
-    "📈 Futures Curve",
-    "🔀 Spreads & Cracks",
-    "🎯 Options & Greeks",
-    "💼 Positions & P&L",
-    "🛡️ Risk Dashboard",
-    "🏦 Macro",
-    "🎲 Monte Carlo",
-    "📉 Sensitivities",
-    "📅 Events & Reports",
-    "⚙️ Settings",
-]
+# Pages grouped into 4 top-level sections for easier navigation.
+PAGE_GROUPS: Dict[str, List[str]] = {
+    "🔍 Market Analytics": [
+        "🏠 Dashboard",
+        "⚖️ Supply & Demand",
+        "🛢️ Inventories",
+        "🌍 Regional Flows",
+        "🏦 Macro",
+    ],
+    "📊 Forecasting & Risk": [
+        "🌪️ Scenarios",
+        "🎲 Monte Carlo",
+        "📉 Sensitivities",
+        "🛡️ Risk Dashboard",
+    ],
+    "💹 Trading Desk": [
+        "📈 Futures Curve",
+        "🔀 Spreads & Cracks",
+        "🎯 Options & Greeks",
+        "💼 Positions & P&L",
+    ],
+    "🗂️ Tools": [
+        "📅 Events & Reports",
+        "⚙️ Settings",
+    ],
+}
+PAGES = [p for group in PAGE_GROUPS.values() for p in group]
+
+
+def _group_of(page: str) -> str:
+    """Return the group label that contains the given page."""
+    for grp, pages in PAGE_GROUPS.items():
+        if page in pages:
+            return grp
+    return next(iter(PAGE_GROUPS))
 
 
 # Per-page help text — simple explanations of where data comes from and what the page does.
@@ -2688,22 +2801,24 @@ backwardation, calendar spreads, storage economics.
 - Market reading: tightness score derived from days of cover.
 """,
     "🏦 Macro": """
-**What is this page for?** See how the big macro aggregates (GDP, PMI, USD,
-policy rate) drive the commodity price.
+**What is this page for?** See how country-level macro aggregates drive the
+commodity price, and compare countries side-by-side.
 
 **Where do the numbers come from?**
-- The macro panel is **simulated** over 7 years: GDP index (drift random
-  walk), PMI (mean-reverting around 50), USD index, policy rate. Can be
-  swapped for FRED, OECD series, etc.
-- Commodity price comes from the synthetic series of the Supply & Demand page.
+- For each country we simulate a 7-year panel: GDP index (drift random walk),
+  PMI (mean-reverting around 50), local FX vs USD, policy rate and CPI YoY.
+  Drift / vol / starting values are calibrated to typical 2020-2024 IMF and
+  OECD ranges. Plug in FRED, OECD or IMF feeds to use real data.
+- Supported countries: 🇺🇸 US, 🇪🇺 Euro Area, 🇨🇳 China, 🇯🇵 Japan,
+  🇬🇧 UK, 🇮🇳 India, 🇧🇷 Brazil, 🇨🇦 Canada.
 
-**Available analyses.**
-- *Correlation matrix* between price and each macro aggregate.
-- *Scatter plots* with regression line: pick two variables and confront them
-  with price.
-- *Rolling correlations* (24 months) to see how the relationship evolves.
-- *Multivariate regression*: log(price) explained by all macro factors at
-  once. Returns coefficients, intercept and R².
+**Sections.**
+- Snapshot of the primary country's latest macro reading.
+- Cross-country comparison table and indexed GDP / policy-rate charts.
+- Correlation matrix between the commodity price and the primary country's
+  macro panel.
+- Scatter plots, rolling 24-month correlations, multivariate regression of
+  log(price) on all macro factors with R².
 """,
     "🎲 Monte Carlo": """
 **What is this page for?** Generate a probabilistic range of prices and
@@ -3050,10 +3165,39 @@ def init_session_defaults() -> None:
 def sidebar_controls() -> None:
     init_session_defaults()
     with st.sidebar:
-        st.markdown("### 🛢️ Commodity S&D Desk")
+        st.markdown("### 🛢️ Commodity Trading Desk")
 
-        st.session_state["page"] = st.radio("Navigate", PAGES,
-                                            index=PAGES.index(st.session_state["page"]))
+        # Quick filter / search across pages
+        search = st.text_input("🔎 Jump to page",
+                                placeholder="Type to filter…",
+                                key="page_search").strip().lower()
+
+        if search:
+            matches = [p for p in PAGES if search in p.lower()]
+            if matches:
+                st.session_state["page"] = st.radio(
+                    "Match", matches,
+                    index=(matches.index(st.session_state["page"])
+                           if st.session_state["page"] in matches else 0),
+                    key="search_radio",
+                )
+            else:
+                st.caption("No matching page.")
+        else:
+            # Two-level navigation: pick a section, then a page within it.
+            group_names = list(PAGE_GROUPS.keys())
+            current_group = _group_of(st.session_state["page"])
+            chosen_group = st.radio(
+                "Section", group_names,
+                index=group_names.index(current_group),
+                key="nav_group",
+            )
+            pages_in_group = PAGE_GROUPS[chosen_group]
+            idx = (pages_in_group.index(st.session_state["page"])
+                   if st.session_state["page"] in pages_in_group else 0)
+            st.session_state["page"] = st.radio(
+                "Page", pages_in_group, index=idx, key="nav_page",
+            )
         st.divider()
 
         keys = list(COMMODITY_TEMPLATES.keys())
@@ -3531,42 +3675,133 @@ def page_scenarios(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
 
 
 def page_regional(tpl: CommodityTemplate) -> None:
+    """Regional balance: supply, demand, trade flows + metrics."""
     st.title(f"🌍 {tpl.name} — Regional Flows")
     render_page_help("🌍 Regional Flows")
     reg = get_regional_dataset(st.session_state["commodity_key"])
     rs = regional_summary(reg)
 
+    # ── World metrics
+    chart_intro("Global metrics",
+                "World totals and concentration. Sources: typical IEA / EIA / "
+                "USDA / WGC / ICSG values aligned to the commodity's "
+                "production-vs-consumption split.")
+    total_supply = float(reg["supply"].sum())
+    total_demand = float(reg["demand"].sum())
+    global_balance = total_supply - total_demand
+    exporters = reg[reg["net_trade"] > 0]
+    importers = reg[reg["net_trade"] < 0]
+    export_volume = float(exporters["net_trade"].sum())
+    import_volume = float(importers["net_trade"].abs().sum())
+    n_exp = int((reg["net_trade"] > 0).sum())
+    n_imp = int((reg["net_trade"] < 0).sum())
+
+    kpi_row([
+        (f"World supply ({tpl.unit})", f"{total_supply:,.1f}", None),
+        (f"World demand ({tpl.unit})", f"{total_demand:,.1f}", None),
+        (f"Global balance ({tpl.unit})", f"{global_balance:+,.1f}",
+         "+ surplus / − deficit"),
+        (f"Implied trade ({tpl.unit})", f"{export_volume:,.1f}",
+         f"{n_exp} exporters → {n_imp} importers"),
+    ])
+
+    # ── Side-by-side: bar chart & shares table
     c1, c2 = st.columns([3, 2])
     with c1:
         chart_intro("Supply vs demand by region",
-                    "Grouped bars. Direct comparison of production capacity "
-                    "and consumption for each major zone.")
+                    "Grouped bars. Green = production, red = consumption. "
+                    "When the green bar is taller than the red one, the "
+                    "region is a net exporter.")
         st.plotly_chart(regional_bar(reg), use_container_width=True)
     with c2:
-        chart_intro("Regional table",
-                    "Balance = Supply − Demand. Positive → net exporter.")
-        st.dataframe(rs.round(2), hide_index=True, use_container_width=True)
+        chart_intro("Market shares",
+                    "What % of world production and consumption each region "
+                    "accounts for.")
+        shares = reg[["region", "supply_share_pct", "demand_share_pct"]].copy()
+        shares.columns = ["Region", "Supply %", "Demand %"]
+        st.dataframe(shares.round(1), hide_index=True, use_container_width=True)
+
+    # ── Exporters / Importers split
+    st.markdown("### Exporters and Importers")
+    chart_intro("Net exporters",
+                "Regions whose production exceeds their consumption — they "
+                "feed the rest of the world. Volumes shown in flow units.")
+    if exporters.empty:
+        st.info("No net exporter region in this snapshot.")
+    else:
+        exp_view = exporters.copy()
+        exp_view["share of global exports %"] = (
+            exp_view["net_trade"] / export_volume * 100 if export_volume else 0
+        )
+        exp_view = exp_view[["region", "supply", "demand", "net_trade",
+                             "supply_share_pct", "share of global exports %"]]
+        exp_view.columns = [
+            "Region", f"Supply ({tpl.unit})", f"Demand ({tpl.unit})",
+            f"Net exports ({tpl.unit})", "Supply share %",
+            "Share of world exports %",
+        ]
+        st.dataframe(exp_view.round(2), hide_index=True,
+                     use_container_width=True)
+        # Top exporter call-out
+        top_exp = exporters.sort_values("net_trade", ascending=False).iloc[0]
+        st.success(
+            f"🥇 **Top exporter: {top_exp['region']}** — net exports of "
+            f"**{top_exp['net_trade']:,.2f} {tpl.unit}**, "
+            f"{(top_exp['net_trade'] / export_volume * 100 if export_volume else 0):.1f}% "
+            f"of world exports."
+        )
+
+    chart_intro("Net importers",
+                "Regions whose consumption exceeds their production — they "
+                "rely on cargos from exporters. A widening deficit usually "
+                "leads to higher local prices.")
+    if importers.empty:
+        st.info("No net importer region in this snapshot.")
+    else:
+        imp_view = importers.copy()
+        imp_view["share of global imports %"] = (
+            imp_view["net_trade"].abs() / import_volume * 100 if import_volume else 0
+        )
+        imp_view = imp_view[["region", "supply", "demand", "net_trade",
+                             "demand_share_pct", "share of global imports %"]]
+        imp_view["net_trade"] = imp_view["net_trade"].abs()
+        imp_view.columns = [
+            "Region", f"Supply ({tpl.unit})", f"Demand ({tpl.unit})",
+            f"Net imports ({tpl.unit})", "Demand share %",
+            "Share of world imports %",
+        ]
+        st.dataframe(imp_view.round(2), hide_index=True,
+                     use_container_width=True)
+        top_imp = importers.sort_values("net_trade").iloc[0]
+        st.warning(
+            f"🥇 **Top importer: {top_imp['region']}** — net imports of "
+            f"**{abs(top_imp['net_trade']):,.2f} {tpl.unit}**, "
+            f"{(abs(top_imp['net_trade']) / import_volume * 100 if import_volume else 0):.1f}% "
+            f"of world imports."
+        )
+
     interpretation(read_regional(rs))
 
+    # ── Sankey
     chart_intro("Implied trade flows (Sankey)",
-                "Each net exporter sends its surplus to net importers, in "
-                "proportion to each importer's deficit. Link width represents "
-                "flow volume. Visualizes trade dependency.")
+                "Each net exporter sends its surplus to net importers, "
+                "proportional to each importer's deficit. Link width = flow "
+                "volume.")
     nodes, sources, targets, values = build_trade_flows(reg)
     st.plotly_chart(sankey_chart(nodes, sources, targets, values),
                     use_container_width=True)
 
+    # ── Arbitrage
     chart_intro("Arbitrage signals",
                 "Classifies each region: *Export Arb* = surplus to ship out ; "
-                "*Import Need* = urgent cargo need. The more extreme the "
-                "balance, the wider the regional price differential.")
+                "*Import Need* = needs cargos.")
     arb = arbitrage_signals(reg)
     st.dataframe(arb[["region", "balance", "arb_signal"]].round(2),
                  hide_index=True, use_container_width=True)
     interpretation(
         "When a region flips to *Import Need*, local prices rise until enough "
-        "cargos are attracted. This mechanism explains the Brent-Dubai premium, "
-        "the TTF-Henry Hub spread, or the Chicago-Heartland corn basis."
+        "cargos are attracted. This mechanism explains premiums such as "
+        "Brent–Dubai, TTF–Henry Hub, or the Chicago–Heartland corn basis."
     )
 
 
@@ -3668,76 +3903,144 @@ def page_futures_curve(tpl: CommodityTemplate, bal: pd.DataFrame) -> None:
 
 
 def page_macro(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
+    """Country-level macro overlay with cross-country comparison."""
     st.title(f"🏦 {tpl.name} — Macro Overlay")
     render_page_help("🏦 Macro")
-    macro = get_macro_panel(months=84)
-    joined = align_macro(df, macro)
 
-    cols = ["price", "gdp_index", "pmi", "usd_index", "policy_rate"]
+    chart_intro("Country selection",
+                "Pick a primary country whose macro panel will be confronted "
+                "with the commodity price. Add others to compare side-by-side.")
+    country_list = list(COUNTRY_MACRO_PROFILES.keys())
+    c1, c2 = st.columns([1, 2])
+    primary = c1.selectbox("Primary country", country_list, index=0)
+    others = c2.multiselect("Compare with", country_list,
+                             default=[country_list[1], country_list[2]])
+
+    label_map = {"gdp_index": "GDP index", "pmi": "PMI",
+                 "fx_vs_usd": "FX vs USD", "policy_rate": "Policy rate",
+                 "cpi_yoy": "CPI YoY %"}
+    macro_p = get_country_macro(primary, months=84)
+
+    # ── Snapshot table
+    chart_intro("Snapshot — primary country",
+                "Latest reading of each macro indicator.")
+    last = macro_p.iloc[-1]
+    kpi_row([
+        ("GDP index", f"{last['gdp_index']:,.1f}",
+         f"YoY {(macro_p['gdp_index'].iloc[-1] / macro_p['gdp_index'].iloc[-13] - 1) * 100:+.1f} %"),
+        ("PMI", f"{last['pmi']:.1f}",
+         "expansion" if last['pmi'] >= 50 else "contraction"),
+        ("FX vs USD", f"{last['fx_vs_usd']:.2f}", None),
+        ("Policy rate", f"{last['policy_rate']:.2f} %", None),
+        ("CPI YoY", f"{last['cpi_yoy']:.2f} %", None),
+    ])
+
+    # ── Cross-country comparison
+    if others:
+        st.markdown("### Cross-country comparison")
+        chart_intro("Comparable macro panels",
+                    "Latest reading of each indicator for the primary country "
+                    "and the others you selected.")
+        rows = []
+        for c in [primary] + others:
+            mp = get_country_macro(c, months=84)
+            l = mp.iloc[-1]
+            rows.append({
+                "Country": c, "GDP index": l["gdp_index"],
+                "PMI": l["pmi"], "FX vs USD": l["fx_vs_usd"],
+                "Policy rate %": l["policy_rate"], "CPI YoY %": l["cpi_yoy"],
+            })
+        comp = pd.DataFrame(rows).round(2)
+        st.dataframe(comp, hide_index=True, use_container_width=True)
+
+        # GDP comparison chart
+        chart_intro("GDP index across countries",
+                    "Indexed to 100 at the start of the period for relative growth.")
+        fig = go.Figure()
+        for c in [primary] + others:
+            mp = get_country_macro(c, months=84)
+            normed = mp["gdp_index"] / mp["gdp_index"].iloc[0] * 100
+            fig.add_trace(go.Scatter(x=mp.index, y=normed, mode="lines", name=c))
+        fig.update_layout(title="GDP index (rebased to 100)", height=320)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Policy rate comparison chart
+        chart_intro("Policy rate divergence",
+                    "Tracking when central banks diverge — a key driver of FX "
+                    "and commodity carry.")
+        fig = go.Figure()
+        for c in [primary] + others:
+            mp = get_country_macro(c, months=84)
+            fig.add_trace(go.Scatter(x=mp.index, y=mp["policy_rate"],
+                                       mode="lines", name=c))
+        fig.update_layout(title="Policy rate (%)", height=320)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Joint analysis: primary-country macro vs commodity price
+    st.markdown(f"### {primary} macro vs {tpl.name} price")
+    joined = align_macro(df, macro_p)
+    cols = ["price", "gdp_index", "pmi", "fx_vs_usd", "policy_rate", "cpi_yoy"]
     corr = correlation_matrix(joined, cols)
-
     chart_intro("Correlation matrix",
-                "Linear relationship between price and each macro aggregate. "
-                "Reading: green = positive correlation, red = negative. The "
-                "closer to 1 in absolute value, the stronger the link.")
+                "Linear relationship between the commodity price and each "
+                "macro indicator for the primary country. Green = positive, "
+                "red = negative.")
     st.plotly_chart(correlation_heatmap(corr), use_container_width=True)
     interpretation(read_macro(corr))
 
-    chart_intro("Cross-diagnostic: price vs macro factor",
-                "Pick two macro variables to confront with price. The "
-                "regression line shows the average trend. Wide scatter = "
-                "weak relationship ; tight alignment = robust relationship.")
-    choices = ["gdp_index", "pmi", "usd_index", "policy_rate"]
-    label_map = {"gdp_index": "GDP index", "pmi": "PMI",
-                 "usd_index": "USD index", "policy_rate": "Policy rate"}
+    chart_intro("Scatter diagnostics",
+                "Pick two macro variables. The regression line shows the "
+                "average trend.")
+    choices = ["gdp_index", "pmi", "fx_vs_usd", "policy_rate", "cpi_yoy"]
     c1, c2 = st.columns(2)
     with c1:
         x1 = st.selectbox("Macro variable A", choices, index=0,
                           format_func=lambda x: label_map[x], key="ma")
         st.plotly_chart(scatter_with_fit(joined[x1], joined["price"],
-                                          label_map[x1], f"Price ({tpl.price_unit})"),
+                                          label_map[x1],
+                                          f"Price ({tpl.price_unit})"),
                         use_container_width=True)
     with c2:
         x2 = st.selectbox("Macro variable B", choices, index=2,
                           format_func=lambda x: label_map[x], key="mb")
         st.plotly_chart(scatter_with_fit(joined[x2], joined["price"],
-                                          label_map[x2], f"Price ({tpl.price_unit})"),
+                                          label_map[x2],
+                                          f"Price ({tpl.price_unit})"),
                         use_container_width=True)
 
     st.subheader("Rolling correlations vs price")
-    chart_intro("Stability of the relationship over time",
-                "Correlation on a rolling 24-month window. If the curve "
-                "oscillates around zero, the relationship is unstable ; if it "
-                "stays away from zero, the link is durable.")
+    chart_intro("Stability of the link over time",
+                "A 24-month rolling correlation. Stays near zero → unstable "
+                "link. Stays far from zero → durable.")
     c1, c2 = st.columns(2)
     rc1 = rolling_correlation(joined["price"], joined["gdp_index"])
-    c1.plotly_chart(rolling_corr_chart(rc1, "Price vs GDP"), use_container_width=True)
-    rc2 = rolling_correlation(joined["price"], joined["usd_index"])
-    c2.plotly_chart(rolling_corr_chart(rc2, "Price vs USD"), use_container_width=True)
-    last_usd_corr = float(rc2.dropna().iloc[-1]) if not rc2.dropna().empty else 0
+    c1.plotly_chart(rolling_corr_chart(rc1, "Price vs GDP"),
+                    use_container_width=True)
+    rc2 = rolling_correlation(joined["price"], joined["fx_vs_usd"])
+    c2.plotly_chart(rolling_corr_chart(rc2, "Price vs FX"),
+                    use_container_width=True)
+    last_fx_corr = float(rc2.dropna().iloc[-1]) if not rc2.dropna().empty else 0
     last_gdp_corr = float(rc1.dropna().iloc[-1]) if not rc1.dropna().empty else 0
     interpretation(
-        f"Recent 24m correlation: Price–GDP = {last_gdp_corr:+.2f}, Price–USD = "
-        f"{last_usd_corr:+.2f}. For most commodities, we expect a negative "
-        "correlation with USD (dollar-denominated prices) and a positive one "
-        "with GDP (demand)."
+        f"Recent 24m correlation: Price–GDP = {last_gdp_corr:+.2f}, "
+        f"Price–FX = {last_fx_corr:+.2f}. Commodities are typically negatively "
+        "correlated with the USD and positively with GDP."
     )
 
     st.subheader("Multivariate regression: log(price) ~ macro")
-    chart_intro("Multi-factor linear model",
-                "Tries to explain log-price using **all** macro factors "
-                "simultaneously. R² indicates the variance share captured by "
-                "the model (the closer to 1, the better).")
+    chart_intro("Multi-factor model",
+                "Explains log-price with all primary-country indicators. R² "
+                "shows how much of the price variance the macro panel captures.")
     joined["log_price"] = np.log(joined["price"])
     try:
         res = regression_summary(joined, "log_price",
-                                 ["gdp_index", "pmi", "usd_index", "policy_rate"])
+                                 ["gdp_index", "pmi", "fx_vs_usd",
+                                  "policy_rate", "cpi_yoy"])
         st.json(res)
         interpretation(
-            f"The model explains **{res['r_squared'] * 100:.0f} %** of price "
-            "variance. The higher, the better macro works as a shortcut for "
-            "understanding price. Above 50 %, macro indicators can reasonably "
-            "be used to anticipate moves."
+            f"The macro model explains **{res['r_squared'] * 100:.0f} %** of "
+            "price variance. Above 50 % means macro alone is a reasonable "
+            "shortcut to anticipate moves."
         )
     except ValueError as exc:
         st.warning(str(exc))
@@ -3931,8 +4234,9 @@ def page_spreads(tpl: CommodityTemplate) -> None:
                 "Long the near contract, short the far contract. Positive "
                 "spread = backwardation, negative = contango.")
     ck = st.session_state["commodity_key"]
-    curve = get_live_futures_curve(ck) or get_synthetic_futures_curve(ck, "contango",
-                                                                       months=12)
+    curve = get_live_futures_curve(ck)
+    if curve is None or curve.empty:
+        curve = get_synthetic_futures_curve(ck, "contango", months=12)
     if curve is None or len(curve) < 2:
         st.warning("Not enough curve points.")
         return
