@@ -91,8 +91,16 @@ export default function Landing() {
         </div>
       </section>
 
-      <footer className="border-t border-ink-600 py-6 text-center text-xs text-ink-300">
-        Built with Next.js + FastAPI · live data via Yahoo Finance · synthetic fallback when offline
+      <footer className="border-t border-ink-600 py-8 text-center">
+        <div className="text-xs text-ink-300 mb-2">
+          Built with Next.js + FastAPI · live data via Yahoo Finance · synthetic fallback when offline
+        </div>
+        <div className="text-sm text-ink-100 font-mono">
+          designed &amp; built by{" "}
+          <span className="font-bold bg-gradient-to-r from-accent to-violet bg-clip-text text-transparent">
+            Adam EL GBOURI
+          </span>
+        </div>
       </footer>
     </main>
   );

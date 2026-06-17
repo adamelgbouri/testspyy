@@ -2,11 +2,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, type OptionsResponse } from "@/lib/api";
 import { KPICard } from "@/components/KPICard";
+import { VolSurface } from "@/components/VolSurface";
 import {
   CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer,
-  Tooltip, XAxis, YAxis, Area, ComposedChart, Bar,
+  Tooltip, XAxis, YAxis, ComposedChart,
 } from "recharts";
-import { Activity, TrendingUp, TrendingDown, Zap } from "lucide-react";
+import { Activity, Zap, Layers } from "lucide-react";
 
 type Inputs = {
   forward: number;
@@ -26,7 +27,6 @@ export default function OptionsPage() {
   const [result, setResult] = useState<OptionsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [smileData, setSmileData] = useState<{strike: number; iv: number; price: number}[]>([]);
 
   useEffect(() => {
     const id = setTimeout(async () => {
@@ -47,35 +47,6 @@ export default function OptionsPage() {
     }, 200);
     return () => clearTimeout(id);
   }, [inputs]);
-
-  // Build volatility smile - synthetic skew around ATM
-  useEffect(() => {
-    const buildSmile = async () => {
-      const strikes: number[] = [];
-      const lo = inputs.forward * 0.7;
-      const hi = inputs.forward * 1.3;
-      for (let i = 0; i < 9; i++) {
-        strikes.push(lo + (i / 8) * (hi - lo));
-      }
-      const results = await Promise.all(strikes.map(async (K) => {
-        try {
-          const r = await api.optionsPrice({
-            forward: inputs.forward, strike: K,
-            days_to_expiry: inputs.days, sigma: inputs.sigma,
-            rate: inputs.rate, option_type: inputs.type,
-          });
-          // Synthetic smile: implied vol curves up away from ATM
-          const moneyness = Math.log(K / inputs.forward);
-          const smileIV = inputs.sigma * (1 + 0.4 * Math.abs(moneyness) + 0.1 * moneyness);
-          return { strike: K, iv: smileIV, price: r.price };
-        } catch {
-          return { strike: K, iv: inputs.sigma, price: 0 };
-        }
-      }));
-      setSmileData(results);
-    };
-    buildSmile();
-  }, [inputs.forward, inputs.days, inputs.sigma, inputs.rate, inputs.type]);
 
   // Greeks across strike for visualisation
   const [greeksGrid, setGreeksGrid] = useState<any[]>([]);
@@ -195,9 +166,8 @@ export default function OptionsPage() {
         </div>
       </div>
 
-      {/* Charts row */}
-      <div className="grid lg:grid-cols-2 gap-4">
-        {/* Payoff */}
+      {/* Payoff */}
+      <div>
         <div className="card p-5">
           <div className="flex items-center justify-between mb-2">
             <h2 className="text-sm font-semibold">Payoff at expiry</h2>
@@ -240,31 +210,20 @@ export default function OptionsPage() {
           </div>
         </div>
 
-        {/* Vol smile */}
-        <div className="card p-5">
-          <div className="flex items-center justify-between mb-2">
-            <h2 className="text-sm font-semibold">Volatility smile (synthetic)</h2>
-            <span className="text-[11px] text-ink-200 italic">
-              IV vs strike — wings up = skew premium
-            </span>
+      </div>
+
+      {/* Volatility surface (3D) */}
+      <div className="card p-5">
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-2">
+            <Layers size={15} className="text-accent" />
+            <h2 className="text-sm font-semibold">Volatility surface</h2>
           </div>
-          <ResponsiveContainer width="100%" height={280}>
-            <LineChart data={smileData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
-              <XAxis dataKey="strike" stroke="#6b7280" tick={{ fontSize: 11 }}
-                tickFormatter={(v: number) => v.toFixed(0)} />
-              <YAxis stroke="#6b7280" tick={{ fontSize: 11 }}
-                tickFormatter={(v: number) => `${(v * 100).toFixed(0)}%`} />
-              <Tooltip
-                contentStyle={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 8, fontSize: 12 }}
-                formatter={(v: number, n: string) => n === "iv" ? `${(v * 100).toFixed(1)}%` : v.toFixed(2)} />
-              <ReferenceLine x={inputs.forward} stroke="#00d4ff" strokeDasharray="2 2"
-                label={{ value: "ATM", fill: "#00d4ff", fontSize: 10, position: "top" }} />
-              <Line dataKey="iv" stroke="#a78bfa" strokeWidth={2}
-                dot={{ r: 3, fill: "#a78bfa" }} name="iv" />
-            </LineChart>
-          </ResponsiveContainer>
+          <span className="text-[11px] text-ink-200 italic">
+            3D plot: X = strike · Y = implied vol · Z = maturity
+          </span>
         </div>
+        <VolSurface forward={inputs.forward} baseSigma={inputs.sigma} rate={inputs.rate} />
       </div>
 
       {/* Greeks across strike */}

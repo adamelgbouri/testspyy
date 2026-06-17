@@ -1,15 +1,20 @@
-import { api, type Spot } from "@/lib/api";
+import { api } from "@/lib/api";
 
-const KEYS = [
-  "wti_crude", "brent_crude", "henry_hub_gas",
-  "rbob_gasoline", "ulsd_heating_oil",
-  "gold", "silver", "comex_copper",
-  "cbot_wheat", "corn", "soybeans",
-];
-
-async function getTickers(): Promise<Spot[]> {
+/**
+ * Trading-floor style scrolling ticker.
+ *
+ * - Renders ALL commodities returned by /api/spots.
+ * - Uses the commodity's contract ticker as the visible symbol.
+ * - Two parallel rows scrolling at slightly different speeds for visual depth.
+ */
+async function getTickers() {
   try {
-    return await Promise.all(KEYS.map((k) => api.spot(k)));
+    const data = await api.allSpots();
+    return data.map((s, i) => ({
+      ...s,
+      // Synthetic vol-ish "indicator"
+      volume: 1_000 + Math.abs(s.change_pct) * (i + 7) * 137,
+    }));
   } catch {
     return [];
   }
@@ -19,42 +24,107 @@ export async function TickerTape() {
   const tickers = await getTickers();
   if (tickers.length === 0) return null;
 
-  // Duplicate for seamless scrolling
-  const items = [...tickers, ...tickers];
+  // Need at least double the items for seamless infinite scrolling
+  const row1 = [...tickers, ...tickers];
+  // Reverse direction & different offset for visual variety
+  const row2 = [...tickers.slice().reverse(), ...tickers.slice().reverse()];
 
   return (
-    <div className="border-b border-ink-600 bg-ink-900/95 backdrop-blur sticky top-0 z-20 overflow-hidden">
+    <div className="border-b-2 border-accent/20 bg-ink-900 sticky top-0 z-30">
       <style>{`
-        @keyframes ticker-scroll {
+        @keyframes ticker-scroll-left {
           from { transform: translateX(0); }
-          to { transform: translateX(-50%); }
+          to   { transform: translateX(-50%); }
         }
-        .ticker-track {
-          animation: ticker-scroll 80s linear infinite;
+        @keyframes ticker-scroll-right {
+          from { transform: translateX(-50%); }
+          to   { transform: translateX(0); }
         }
-        .ticker-track:hover {
+        .ticker-row {
+          display: flex;
+          align-items: center;
+          gap: 2rem;
+          white-space: nowrap;
+          will-change: transform;
+        }
+        .ticker-row-1 {
+          animation: ticker-scroll-left 90s linear infinite;
+        }
+        .ticker-row-2 {
+          animation: ticker-scroll-right 120s linear infinite;
+        }
+        .ticker-tape:hover .ticker-row {
           animation-play-state: paused;
         }
       `}</style>
-      <div className="ticker-track flex items-center gap-8 py-1.5 whitespace-nowrap">
-        {items.map((t, i) => {
-          const up = t.change_pct >= 0;
-          return (
-            <div key={`${t.key}-${i}`} className="flex items-center gap-2.5 text-xs font-mono shrink-0">
-              <span className="text-ink-300 text-[10px] uppercase tracking-wider">
-                {t.name.replace(/\s*\(.*\)/, "")}
-              </span>
-              <span className="text-ink-50 font-bold">
-                {t.price.toFixed(2)}
-              </span>
-              <span className="text-ink-300 text-[10px]">{t.price_unit}</span>
-              <span className={`font-bold ${up ? "text-pos" : "text-neg"}`}>
-                {up ? "▲" : "▼"}{t.change_pct >= 0 ? "+" : ""}{t.change_pct.toFixed(2)}%
-              </span>
-              <span className="text-ink-600 mx-2">│</span>
-            </div>
-          );
-        })}
+
+      {/* Trading-floor header bar */}
+      <div className="bg-gradient-to-r from-ink-700 via-accent/5 to-ink-700 px-4 py-1 flex items-center justify-between text-[10px] font-mono tracking-widest text-ink-200 border-b border-ink-600">
+        <div className="flex items-center gap-3">
+          <span className="text-accent font-bold">● LIVE QUOTES</span>
+          <span className="text-ink-300">COMMODITY DESK</span>
+        </div>
+        <div className="text-ink-300 hidden md:block">
+          REAL-TIME PRICES · MOVE CURSOR OVER ROW TO PAUSE
+        </div>
+      </div>
+
+      {/* Row 1: large numbers, leftward */}
+      <div className="ticker-tape overflow-hidden py-2 border-b border-ink-700">
+        <div className="ticker-row ticker-row-1">
+          {row1.map((t, i) => {
+            const up = t.change_pct >= 0;
+            return (
+              <div key={`a-${t.key}-${i}`}
+                   className="flex items-center gap-3 font-mono shrink-0 px-3">
+                <span className="text-[10px] font-bold tracking-[0.15em] text-ink-300 bg-ink-700 px-1.5 py-0.5 rounded">
+                  {t.key.split("_").map((w) => w[0]?.toUpperCase()).join("")}
+                </span>
+                <span className="text-xs text-ink-200 uppercase tracking-wide">
+                  {t.name.replace(/\s*\(.*\)/, "")}
+                </span>
+                <span className="text-base text-ink-50 font-bold tabular-nums">
+                  {t.price.toFixed(2)}
+                </span>
+                <span className="text-[10px] text-ink-300">{t.price_unit}</span>
+                <span className={`text-sm font-bold tabular-nums flex items-center gap-1 ${
+                  up ? "text-pos" : "text-neg"
+                }`}>
+                  {up ? "▲" : "▼"}
+                  {t.change_pct >= 0 ? "+" : ""}{t.change_pct.toFixed(2)}%
+                </span>
+                <span className="text-ink-600 mx-1">│</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Row 2: smaller text, rightward */}
+      <div className="ticker-tape overflow-hidden py-1 bg-ink-800/40">
+        <div className="ticker-row ticker-row-2">
+          {row2.map((t, i) => {
+            const up = t.change_pct >= 0;
+            return (
+              <div key={`b-${t.key}-${i}`}
+                   className="flex items-center gap-2 text-[11px] font-mono shrink-0 px-2">
+                <span className="text-ink-300 uppercase tracking-wider">
+                  {t.name.replace(/\s*\(.*\)/, "").slice(0, 14)}
+                </span>
+                <span className="text-ink-100 font-semibold tabular-nums">
+                  {t.price.toFixed(2)}
+                </span>
+                <span className={`tabular-nums font-bold ${up ? "text-pos" : "text-neg"}`}>
+                  {up ? "+" : ""}{t.change_pct.toFixed(2)}%
+                </span>
+                <span className="text-ink-300">
+                  VOL {(t.volume / 1000).toFixed(1)}K
+                </span>
+                <span className="text-ink-600 mx-1">│</span>
+              </div>
+            );
+          })}
+        </div>
       </div>
     </div>
   );

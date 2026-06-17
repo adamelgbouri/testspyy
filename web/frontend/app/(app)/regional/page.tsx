@@ -1,8 +1,9 @@
 import { api } from "@/lib/api";
 import { CommoditySelector } from "@/components/CommoditySelector";
 import { KPICard } from "@/components/KPICard";
+import { WorldMap } from "@/components/WorldMap";
 import { fmtNum } from "@/lib/utils";
-import { Globe, TrendingUp, TrendingDown } from "lucide-react";
+import { Globe, TrendingUp, TrendingDown, MapPin } from "lucide-react";
 
 export const dynamic = "force-dynamic";
 
@@ -96,6 +97,20 @@ export default async function RegionalPage({ searchParams }: Props) {
             <span className="w-3 h-2.5 bg-neg rounded-sm" /> Demand share
           </span>
         </div>
+      </div>
+
+      {/* World map with trade flows */}
+      <div className="card p-5">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <MapPin size={15} className="text-accent" />
+            <h2 className="text-sm font-semibold">Global trade flow map</h2>
+          </div>
+          <span className="text-[11px] text-ink-200 italic">
+            Arrows from exporters to importers · width ∝ implied flow volume
+          </span>
+        </div>
+        <WorldMap rows={regional.rows} unit={regional.unit} />
       </div>
 
       <div className="grid lg:grid-cols-2 gap-6">

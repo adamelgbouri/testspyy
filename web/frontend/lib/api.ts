@@ -174,6 +174,21 @@ export type EventRow = {
   date: string; event: string; tags: string[]; frequency: string;
 };
 
+export type VolSurfaceRequest = {
+  forward: number;
+  base_sigma?: number;
+  rate?: number;
+  n_strikes?: number;
+  n_maturities?: number;
+};
+
+export type VolSurfaceResponse = {
+  strikes: number[];
+  maturities: number[];
+  iv_grid: number[][];
+  forward: number;
+};
+
 // ── API methods
 export const api = {
   commodities:  () => fetcher<Commodity[]>("/api/commodities"),
@@ -201,4 +216,8 @@ export const api = {
       method: "POST", body: JSON.stringify(body),
     }),
   events: () => fetcher<EventRow[]>("/api/events"),
+  volSurface: (body: VolSurfaceRequest) =>
+    fetcher<VolSurfaceResponse>("/api/options/vol-surface", {
+      method: "POST", body: JSON.stringify(body),
+    }),
 };

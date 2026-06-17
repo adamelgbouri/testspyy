@@ -96,8 +96,13 @@ export function Sidebar() {
           </div>
         ))}
       </nav>
-      <div className="text-[10px] text-ink-300 pt-4 border-t border-ink-600">
-        v0.1 · data: yahoo + synthetic fallback
+      <div className="pt-4 border-t border-ink-600 space-y-1">
+        <div className="text-[10px] text-ink-300">
+          v0.2 · data: yahoo + synthetic fallback
+        </div>
+        <div className="text-[10px] text-ink-200 font-mono tracking-wider">
+          by <span className="font-semibold text-ink-50">Adam EL GBOURI</span>
+        </div>
       </div>
     </aside>
   );

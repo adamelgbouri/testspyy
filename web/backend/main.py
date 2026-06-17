@@ -320,6 +320,57 @@ def options_price(req: OptionsRequest) -> OptionsResponse:
     return OptionsResponse(**opt.greeks())
 
 
+class VolSurfaceRequest(BaseModel):
+    forward: float = Field(gt=0)
+    base_sigma: float = Field(0.30, gt=0, lt=3)
+    rate: float = Field(0.045, ge=0, lt=0.5)
+    n_strikes: int = Field(15, ge=5, le=30)
+    n_maturities: int = Field(10, ge=4, le=20)
+
+
+class VolSurfaceResponse(BaseModel):
+    strikes: List[float]
+    maturities: List[int]   # in days
+    iv_grid: List[List[float]]   # iv_grid[m][k]
+    forward: float
+
+
+@app.post("/api/options/vol-surface", response_model=VolSurfaceResponse)
+def vol_surface(req: VolSurfaceRequest) -> VolSurfaceResponse:
+    """
+    Build a synthetic implied vol surface vs (strike, maturity).
+    SVI-style smile + maturity term structure.
+    """
+    import numpy as np
+
+    F = req.forward
+    sig0 = req.base_sigma
+    strikes = list(np.linspace(F * 0.6, F * 1.4, req.n_strikes))
+    # log-spaced maturities 15d → 2y
+    maturities_d = [int(d) for d in np.geomspace(15, 730, req.n_maturities)]
+
+    iv_grid: List[List[float]] = []
+    for d in maturities_d:
+        T = d / 365.0
+        # term-structure: short-dated higher vol of vol, ATM vol slightly inverted
+        atm = sig0 * (1.0 + 0.10 * np.exp(-T * 2))
+        # SVI-like smile in log-moneyness space
+        row: List[float] = []
+        for K in strikes:
+            k = np.log(K / F)
+            # vol = atm + a*k + b*sqrt(k^2 + c)
+            wing = 0.55 / np.sqrt(T + 0.05)        # wings rise as T → 0
+            skew = -0.18                            # negative skew
+            smile = atm + skew * k + wing * np.sqrt(k * k + 0.04) - wing * 0.20
+            row.append(float(max(0.05, smile)))
+        iv_grid.append(row)
+
+    return VolSurfaceResponse(
+        strikes=strikes, maturities=maturities_d,
+        iv_grid=iv_grid, forward=F,
+    )
+
+
 @app.get("/api/spreads", response_model=List[SpreadResponse])
 def spreads() -> List[SpreadResponse]:
     """Compute current margin for every preset spread."""
