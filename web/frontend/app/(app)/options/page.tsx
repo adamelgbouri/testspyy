@@ -17,12 +17,7 @@ type Inputs = {
 };
 
 const defaults: Inputs = {
-  forward: 70,
-  strike: 72,
-  days: 90,
-  sigma: 0.30,
-  rate: 0.045,
-  type: "call",
+  forward: 70, strike: 72, days: 90, sigma: 0.30, rate: 0.045, type: "call",
 };
 
 export default function OptionsPage() {
@@ -31,18 +26,14 @@ export default function OptionsPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  // Debounced re-pricing on input change
   useEffect(() => {
     const id = setTimeout(async () => {
       try {
         setLoading(true);
         const r = await api.optionsPrice({
-          forward: inputs.forward,
-          strike: inputs.strike,
-          days_to_expiry: inputs.days,
-          sigma: inputs.sigma,
-          rate: inputs.rate,
-          option_type: inputs.type,
+          forward: inputs.forward, strike: inputs.strike,
+          days_to_expiry: inputs.days, sigma: inputs.sigma,
+          rate: inputs.rate, option_type: inputs.type,
         });
         setResult(r);
         setError(null);
@@ -63,10 +54,9 @@ export default function OptionsPage() {
     const pts: { price: number; pnl: number }[] = [];
     for (let i = 0; i < n; i++) {
       const F = lo + ((hi - lo) * i) / (n - 1);
-      const intrinsic =
-        inputs.type === "call"
-          ? Math.max(F - inputs.strike, 0)
-          : Math.max(inputs.strike - F, 0);
+      const intrinsic = inputs.type === "call"
+        ? Math.max(F - inputs.strike, 0)
+        : Math.max(inputs.strike - F, 0);
       pts.push({ price: F, pnl: intrinsic - result.price });
     }
     return pts;
@@ -81,7 +71,6 @@ export default function OptionsPage() {
         </p>
       </div>
 
-      {/* Inputs */}
       <div className="card p-5">
         <h2 className="text-sm font-semibold mb-3">Inputs</h2>
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -116,7 +105,6 @@ export default function OptionsPage() {
         </div>
       </div>
 
-      {/* Results */}
       {error && <div className="card p-4 border-neg text-neg text-sm">{error}</div>}
       {result && (
         <>
@@ -139,10 +127,8 @@ export default function OptionsPage() {
             <ResponsiveContainer width="100%" height={320}>
               <LineChart data={payoff} margin={{ top: 12, right: 24, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
-                <XAxis
-                  dataKey="price" stroke="#6b7280" tick={{ fontSize: 11 }}
-                  tickFormatter={(v: number) => v.toFixed(0)}
-                />
+                <XAxis dataKey="price" stroke="#6b7280" tick={{ fontSize: 11 }}
+                  tickFormatter={(v: number) => v.toFixed(0)} />
                 <YAxis stroke="#6b7280" tick={{ fontSize: 11 }} />
                 <Tooltip
                   contentStyle={{
@@ -152,10 +138,8 @@ export default function OptionsPage() {
                   formatter={(v: number) => v.toFixed(3)}
                 />
                 <ReferenceLine y={0} stroke="#6b7280" strokeDasharray="3 3" />
-                <ReferenceLine
-                  x={inputs.strike} stroke="#a78bfa" strokeDasharray="4 4"
-                  label={{ value: "K", fill: "#a78bfa", fontSize: 11, position: "top" }}
-                />
+                <ReferenceLine x={inputs.strike} stroke="#a78bfa" strokeDasharray="4 4"
+                  label={{ value: "K", fill: "#a78bfa", fontSize: 11, position: "top" }} />
                 <Line dataKey="pnl" stroke="#f59e0b" dot={false} strokeWidth={2} />
               </LineChart>
             </ResponsiveContainer>
@@ -178,9 +162,7 @@ function Field({
     <div>
       <label className="metric-label">{label}</label>
       <input
-        type="number"
-        step={step}
-        value={value}
+        type="number" step={step} value={value}
         onChange={(e) => onChange(integer ? parseInt(e.target.value) : parseFloat(e.target.value))}
         className="mt-1 w-full bg-ink-700 border border-ink-500 rounded-md px-3 py-2 text-sm
                    font-mono text-ink-50 focus:outline-none focus:ring-2 focus:ring-accent"

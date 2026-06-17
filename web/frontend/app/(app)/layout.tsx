@@ -1,10 +1,7 @@
 import { Sidebar } from "@/components/Sidebar";
 import { TickerTape } from "@/components/TickerTape";
 
-/**
- * Shared layout for every app route (dashboard, balance, options…).
- * Sidebar on the left, ticker tape on top, page content on the right.
- */
+/** Shared app shell: sidebar on the left, ticker tape on top, page below. */
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex min-h-screen">

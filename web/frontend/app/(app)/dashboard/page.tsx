@@ -21,14 +21,12 @@ export default async function DashboardPage({ searchParams }: Props) {
   const commodity = commodities.find((c) => c.key === key)!;
   const upDelta = spot.change_pct >= 0;
 
-  // Last historic point for spot vs fair value
   const lastHist = [...balance.points].reverse().find((p) => !p.is_forecast);
   const fvNow = lastHist?.fair_value ?? balance.end_fair_value;
   const fvDeviation = ((spot.price - fvNow) / fvNow) * 100;
 
   return (
     <div className="space-y-6">
-      {/* Header row */}
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold">{commodity.name}</h1>
@@ -42,7 +40,6 @@ export default async function DashboardPage({ searchParams }: Props) {
         <CommoditySelector commodities={commodities} current={key} />
       </div>
 
-      {/* KPI strip */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
         <KPICard
           label="Spot price"
@@ -74,13 +71,12 @@ export default async function DashboardPage({ searchParams }: Props) {
         />
       </div>
 
-      {/* Main grid */}
       <div className="grid lg:grid-cols-3 gap-6">
         <div className="card p-5 lg:col-span-2">
           <div className="flex items-center justify-between mb-2">
             <h2 className="text-sm font-semibold">Supply, demand &amp; stocks</h2>
             <span className="text-[11px] text-ink-200 italic">
-              Forecast period highlighted on the right of the dashed line.
+              Forecast period to the right of the dashed line.
             </span>
           </div>
           <BalanceChart
@@ -90,11 +86,10 @@ export default async function DashboardPage({ searchParams }: Props) {
           />
         </div>
 
-        {/* World metrics */}
         <div className="card p-5">
           <h2 className="text-sm font-semibold mb-3">Global balance</h2>
           <p className="text-[11px] text-ink-200 italic mb-3">
-            World production vs consumption split with implied net trade.
+            World production vs consumption with implied net trade.
           </p>
           <div className="space-y-2 font-mono text-sm">
             <Row label="World supply" value={`${fmtNum(regional.world_supply, 1)} ${regional.unit}`} />
@@ -140,7 +135,6 @@ export default async function DashboardPage({ searchParams }: Props) {
         </div>
       </div>
 
-      {/* Regional table */}
       <div className="card p-5">
         <h2 className="text-sm font-semibold mb-3">Regional snapshot</h2>
         <div className="overflow-x-auto">
@@ -199,11 +193,7 @@ function Row({ label, value, tone }: { label: string; value: string; tone?: "pos
   return (
     <div className="flex justify-between">
       <span className="text-ink-200">{label}</span>
-      <span
-        className={
-          tone === "pos" ? "text-pos" : tone === "neg" ? "text-neg" : "text-ink-50"
-        }
-      >
+      <span className={tone === "pos" ? "text-pos" : tone === "neg" ? "text-neg" : "text-ink-50"}>
         {value}
       </span>
     </div>

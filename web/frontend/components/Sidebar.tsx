@@ -7,16 +7,18 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-type Item = { href: string; label: string; icon: React.ReactNode };
+type Item = { href: string; label: string; icon: React.ReactNode; live?: boolean };
 type Group = { title: string; items: Item[] };
 
+// `live: true` marks pages that are fully implemented; everything else
+// renders a Coming-Soon placeholder.
 const GROUPS: Group[] = [
   {
     title: "Market Analytics",
     items: [
-      { href: "/dashboard", label: "Dashboard", icon: <LayoutDashboard size={16} /> },
+      { href: "/dashboard", label: "Dashboard", icon: <LayoutDashboard size={16} />, live: true },
       { href: "/balance",   label: "Supply & Demand", icon: <LineChart size={16} /> },
-      { href: "/regional",  label: "Regional Flows",  icon: <Globe2 size={16} /> },
+      { href: "/regional",  label: "Regional Flows",  icon: <Globe2 size={16} />, live: true },
     ],
   },
   {
@@ -24,7 +26,7 @@ const GROUPS: Group[] = [
     items: [
       { href: "/curve",    label: "Futures Curve",    icon: <LineChart size={16} /> },
       { href: "/spreads",  label: "Spreads & Cracks", icon: <ArrowLeftRight size={16} /> },
-      { href: "/options",  label: "Options & Greeks", icon: <Target size={16} /> },
+      { href: "/options",  label: "Options & Greeks", icon: <Target size={16} />, live: true },
       { href: "/positions", label: "Positions & P&L", icon: <Briefcase size={16} /> },
     ],
   },
@@ -48,15 +50,17 @@ export function Sidebar() {
   const pathname = usePathname();
   return (
     <aside className="hidden lg:flex flex-col w-64 shrink-0 border-r border-ink-600 bg-ink-900 px-4 pb-6">
-      <div className="flex items-center gap-2 py-5">
+      <Link href="/" className="flex items-center gap-2 py-5 hover:opacity-80">
         <div className="w-7 h-7 rounded-md bg-gradient-to-br from-accent to-violet flex items-center justify-center font-bold text-ink-900">
           C
         </div>
         <div className="leading-tight">
           <div className="text-sm font-semibold text-ink-50">Commodity Desk</div>
-          <div className="text-[10px] text-ink-200 uppercase tracking-widest">trading platform</div>
+          <div className="text-[10px] text-ink-200 uppercase tracking-widest">
+            trading platform
+          </div>
         </div>
-      </div>
+      </Link>
       <nav className="flex-1 overflow-y-auto">
         {GROUPS.map((g) => (
           <div key={g.title} className="mb-1">
@@ -68,10 +72,22 @@ export function Sidebar() {
                   <li key={it.href}>
                     <Link
                       href={it.href as any}
-                      className={cn("nav-link", active && "nav-link-active")}
+                      className={cn(
+                        "nav-link group justify-between",
+                        active && "nav-link-active",
+                      )}
                     >
-                      {it.icon}
-                      <span>{it.label}</span>
+                      <span className="flex items-center gap-2">
+                        {it.icon}
+                        <span>{it.label}</span>
+                      </span>
+                      {it.live ? (
+                        <span className="w-1.5 h-1.5 rounded-full bg-pos" title="Live" />
+                      ) : (
+                        <span className="text-[9px] uppercase tracking-wider text-ink-300 group-hover:text-ink-200">
+                          soon
+                        </span>
+                      )}
                     </Link>
                   </li>
                 );
