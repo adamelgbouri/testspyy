@@ -6,22 +6,18 @@ Run locally with:
 """
 from __future__ import annotations
 import logging
-from typing import List, Optional
+from typing import List
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from commodity_engine import (
-    COMMODITY_TEMPLATES,
-    BalanceAssumptions,
-    Black76,
-    estimate_fair_value,
-    get_futures_curve,
-    get_live_spot,
-    get_regional_dataset,
-    get_sd_dataset,
-    run_balance,
+    BalanceAssumptions, Black76, COMMODITY_TEMPLATES, CRACK_SPREADS,
+    MCConfig, crack_margin, estimate_fair_value, get_futures_curve,
+    get_live_spot, get_market_events, get_regional_dataset, get_sd_dataset,
+    parametric_var, portfolio_var, run_balance, run_monte_carlo,
+    stress_scenarios,
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -29,17 +25,15 @@ logging.basicConfig(level=logging.INFO,
 
 app = FastAPI(
     title="Commodity Trading Desk API",
-    version="0.1.0",
+    version="0.2.0",
     description="Analytical backend for the commodity trading platform.",
 )
 
-# Wide-open CORS in dev — restrict to your domain in prod
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 
@@ -48,103 +42,121 @@ app.add_middleware(
 # =============================================================================
 
 class CommoditySummary(BaseModel):
-    key: str
-    name: str
-    sector: str
-    ticker: str
-    price_unit: str
-    unit: str
-    inventory_unit: str
-    base_price: float
-    days_cover_target: float
-    ideal_utilization_pct: float
+    key: str; name: str; sector: str; ticker: str; price_unit: str
+    unit: str; inventory_unit: str
+    base_price: float; days_cover_target: float; ideal_utilization_pct: float
 
 
 class SpotResponse(BaseModel):
-    key: str
-    name: str
-    price_unit: str
-    price: float
-    change_pct: float
-    asof: str
-    source: str = Field(description="'yahoo' for live, 'reference' for synthetic")
+    key: str; name: str; price_unit: str
+    price: float; change_pct: float; asof: str; source: str
 
 
 class BalancePoint(BaseModel):
-    date: str
-    supply: float
-    demand: float
-    stocks: float
-    days_cover: float
-    price: float
-    fair_value: float
-    is_forecast: bool
+    date: str; supply: float; demand: float
+    stocks: float; days_cover: float
+    price: float; fair_value: float; is_forecast: bool
 
 
 class BalanceResponse(BaseModel):
-    key: str
-    name: str
-    price_unit: str
-    unit: str
-    inventory_unit: str
-    end_stocks: float
-    end_days_cover: float
-    end_utilization_pct: float
-    end_fair_value: float
+    key: str; name: str; price_unit: str; unit: str; inventory_unit: str
+    end_stocks: float; end_days_cover: float
+    end_utilization_pct: float; end_fair_value: float
     points: List[BalancePoint]
 
 
 class RegionalRow(BaseModel):
-    region: str
-    supply: float
-    demand: float
-    net_trade: float
-    supply_share_pct: float
-    demand_share_pct: float
-    status: str
+    region: str; supply: float; demand: float; net_trade: float
+    supply_share_pct: float; demand_share_pct: float; status: str
 
 
 class RegionalResponse(BaseModel):
-    key: str
-    name: str
-    unit: str
-    world_supply: float
-    world_demand: float
-    world_balance: float
+    key: str; name: str; unit: str
+    world_supply: float; world_demand: float; world_balance: float
     rows: List[RegionalRow]
 
 
 class CurvePoint(BaseModel):
-    tenor_month: int
-    label: str
-    price: float
-    source: str
+    tenor_month: int; label: str; price: float; source: str
 
 
 class CurveResponse(BaseModel):
-    key: str
-    name: str
-    price_unit: str
-    structure: str
+    key: str; name: str; price_unit: str; structure: str
     points: List[CurvePoint]
 
 
 class OptionsRequest(BaseModel):
-    forward: float = Field(gt=0, description="Forward / futures price")
-    strike: float = Field(gt=0)
+    forward: float = Field(gt=0); strike: float = Field(gt=0)
     days_to_expiry: int = Field(ge=1, le=365 * 3)
-    sigma: float = Field(gt=0, lt=5)
-    rate: float = Field(ge=0, lt=0.5)
+    sigma: float = Field(gt=0, lt=5); rate: float = Field(ge=0, lt=0.5)
     option_type: str = Field("call", pattern="^(call|put)$")
 
 
 class OptionsResponse(BaseModel):
-    price: float
-    delta: float
-    gamma: float
-    vega: float
-    theta: float
-    rho: float
+    price: float; delta: float; gamma: float
+    vega: float; theta: float; rho: float
+
+
+class SpreadResponse(BaseModel):
+    name: str; description: str; unit: str; typical: float; margin: float
+    legs: List[dict]
+
+
+class PositionIn(BaseModel):
+    commodity_key: str; direction: str; quantity: float
+    entry_price: float; entry_date: str = ""; notes: str = ""
+
+
+class RiskRequest(BaseModel):
+    positions: List[PositionIn]
+    confidence: float = 0.95; horizon_days: int = 1
+
+
+class RiskRow(BaseModel):
+    commodity: str; sector: str; direction: str; quantity: float
+    vol_pct: float; var: float; cvar: float
+
+
+class StressRow(BaseModel):
+    scenario: str; shock_pct: float
+    new_price: float; pnl_impact: float
+
+
+class RiskResponse(BaseModel):
+    rows: List[RiskRow]
+    total_var: float; total_cvar: float
+    confidence: float; horizon_days: int
+    stress: List[StressRow]
+
+
+class MCRequest(BaseModel):
+    n_paths: int = Field(500, ge=50, le=2000)
+    supply_sigma_pct: float = 1.5; demand_sigma_pct: float = 1.2
+    weather_sigma_pct: float = 1.0
+    outage_prob: float = 0.05; outage_size_pct: float = 4.0
+    forecast_months: int = 18
+
+
+class HistBin(BaseModel):
+    x: float; count: int
+
+
+class FanPoint(BaseModel):
+    date: str; p5: float; p50: float; p95: float
+
+
+class MCResponse(BaseModel):
+    key: str; name: str; price_unit: str; inventory_unit: str
+    n_paths: int
+    median_price: float; p5_price_avg: float; p95_price_avg: float
+    median_end_stocks: float; var_95_price_drop: float
+    histogram_price: List[HistBin]
+    histogram_stocks: List[HistBin]
+    fan_chart: List[FanPoint]
+
+
+class EventRow(BaseModel):
+    date: str; event: str; tags: List[str]; frequency: str
 
 
 # =============================================================================
@@ -164,8 +176,7 @@ def list_commodities() -> List[CommoditySummary]:
             price_unit=t.price_unit, unit=t.unit, inventory_unit=t.inventory_unit,
             base_price=t.base_price, days_cover_target=t.days_cover_target,
             ideal_utilization_pct=t.ideal_utilization_pct,
-        )
-        for t in COMMODITY_TEMPLATES.values()
+        ) for t in COMMODITY_TEMPLATES.values()
     ]
 
 
@@ -197,31 +208,25 @@ def balance(
     tpl = COMMODITY_TEMPLATES[key]
     df = get_sd_dataset(key, forecast_months=forecast_months)
     a = BalanceAssumptions(
-        supply_adj_pct=supply_adj_pct,
-        demand_adj_pct=demand_adj_pct,
-        gdp_growth_pct=gdp_growth_pct,
-        forecast_months=forecast_months,
+        supply_adj_pct=supply_adj_pct, demand_adj_pct=demand_adj_pct,
+        gdp_growth_pct=gdp_growth_pct, forecast_months=forecast_months,
     )
     bal = run_balance(df, key, a)
     fv = estimate_fair_value(bal)
     last = bal.iloc[-1]
     points = [
         BalancePoint(
-            date=str(idx.date()),
-            supply=float(row["supply"]),
-            demand=float(row["demand"]),
-            stocks=float(row["stocks_model"]),
+            date=str(idx.date()), supply=float(row["supply"]),
+            demand=float(row["demand"]), stocks=float(row["stocks_model"]),
             days_cover=float(row["days_cover_model"]),
             price=float(row["price"]),
             fair_value=float(fv.loc[idx, "fair_value_price"]),
             is_forecast=bool(row["is_forecast"]),
-        )
-        for idx, row in bal.iterrows()
+        ) for idx, row in bal.iterrows()
     ]
     return BalanceResponse(
-        key=key, name=tpl.name,
-        price_unit=tpl.price_unit, unit=tpl.unit,
-        inventory_unit=tpl.inventory_unit,
+        key=key, name=tpl.name, price_unit=tpl.price_unit,
+        unit=tpl.unit, inventory_unit=tpl.inventory_unit,
         end_stocks=float(last["stocks_model"]),
         end_days_cover=float(last["days_cover_model"]),
         end_utilization_pct=float(last["capacity_pct"]),
@@ -269,10 +274,8 @@ def curve(key: str, n_max: int = Query(12, ge=2, le=24)) -> CurveResponse:
     else:
         structure = "flat"
     points = [
-        CurvePoint(
-            tenor_month=int(r["tenor_month"]), label=str(r["label"]),
-            price=float(r["price"]), source=str(r.get("source", "synthetic")),
-        )
+        CurvePoint(tenor_month=int(r["tenor_month"]), label=str(r["label"]),
+                   price=float(r["price"]), source=str(r.get("source", "synthetic")))
         for _, r in df.iterrows()
     ]
     return CurveResponse(key=key, name=tpl.name, price_unit=tpl.price_unit,
@@ -283,5 +286,74 @@ def curve(key: str, n_max: int = Query(12, ge=2, le=24)) -> CurveResponse:
 def options_price(req: OptionsRequest) -> OptionsResponse:
     opt = Black76(F=req.forward, K=req.strike, T=req.days_to_expiry / 365.0,
                   r=req.rate, sigma=req.sigma, option_type=req.option_type)
-    g = opt.greeks()
-    return OptionsResponse(**g)
+    return OptionsResponse(**opt.greeks())
+
+
+@app.get("/api/spreads", response_model=List[SpreadResponse])
+def spreads() -> List[SpreadResponse]:
+    """Compute current margin for every preset spread."""
+    out: List[SpreadResponse] = []
+    for name, spec in CRACK_SPREADS.items():
+        prices = {}
+        legs = []
+        for slot in ("F1", "F2", "F3"):
+            ck = spec.get(slot)
+            if not ck:
+                continue
+            tpl = COMMODITY_TEMPLATES[ck]
+            live = get_live_spot(ck)
+            p = float(live["price"]) if live else float(tpl.base_price)
+            prices[ck] = p
+            legs.append({
+                "key": ck, "name": tpl.name, "price": p,
+                "price_unit": tpl.price_unit,
+                "multiplier": spec.get(f"{slot}_mult", 0),
+                "source": (live["source"] if live else "reference"),
+            })
+        margin = crack_margin(spec, prices)
+        out.append(SpreadResponse(
+            name=name, description=spec["description"], unit=spec["unit"],
+            typical=spec["typical"], margin=margin, legs=legs,
+        ))
+    return out
+
+
+@app.post("/api/risk", response_model=RiskResponse)
+def risk(req: RiskRequest) -> RiskResponse:
+    if not req.positions:
+        raise HTTPException(400, "At least one position required.")
+    raw = portfolio_var(
+        [p.dict() for p in req.positions],
+        confidence=req.confidence, horizon_days=req.horizon_days,
+    )
+    # Stress on the first position
+    p0 = req.positions[0]
+    live = get_live_spot(p0.commodity_key)
+    tpl = COMMODITY_TEMPLATES[p0.commodity_key]
+    spot = float(live["price"]) if live else float(tpl.base_price)
+    stress = stress_scenarios(spot, p0.quantity, p0.direction)
+    return RiskResponse(
+        rows=[RiskRow(**r) for r in raw["rows"]],
+        total_var=raw["total_var"], total_cvar=raw["total_cvar"],
+        confidence=raw["confidence"], horizon_days=raw["horizon_days"],
+        stress=[StressRow(**s) for s in stress],
+    )
+
+
+@app.post("/api/montecarlo/{key}", response_model=MCResponse)
+def montecarlo(key: str, req: MCRequest) -> MCResponse:
+    if key not in COMMODITY_TEMPLATES:
+        raise HTTPException(404, f"Unknown commodity '{key}'")
+    cfg = MCConfig(
+        n_paths=req.n_paths, supply_sigma_pct=req.supply_sigma_pct,
+        demand_sigma_pct=req.demand_sigma_pct, weather_sigma_pct=req.weather_sigma_pct,
+        outage_prob=req.outage_prob, outage_size_pct=req.outage_size_pct,
+        forecast_months=req.forecast_months,
+    )
+    out = run_monte_carlo(key, cfg)
+    return MCResponse(**out)
+
+
+@app.get("/api/events", response_model=List[EventRow])
+def events() -> List[EventRow]:
+    return [EventRow(**e) for e in get_market_events()]

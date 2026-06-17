@@ -17,31 +17,31 @@ const GROUPS: Group[] = [
     title: "Market Analytics",
     items: [
       { href: "/dashboard", label: "Dashboard", icon: <LayoutDashboard size={16} />, live: true },
-      { href: "/balance",   label: "Supply & Demand", icon: <LineChart size={16} /> },
+      { href: "/balance",   label: "Supply & Demand", icon: <LineChart size={16} />, live: true },
       { href: "/regional",  label: "Regional Flows",  icon: <Globe2 size={16} />, live: true },
     ],
   },
   {
     title: "Trading Desk",
     items: [
-      { href: "/curve",    label: "Futures Curve",    icon: <LineChart size={16} /> },
-      { href: "/spreads",  label: "Spreads & Cracks", icon: <ArrowLeftRight size={16} /> },
+      { href: "/curve",    label: "Futures Curve",    icon: <LineChart size={16} />, live: true },
+      { href: "/spreads",  label: "Spreads & Cracks", icon: <ArrowLeftRight size={16} />, live: true },
       { href: "/options",  label: "Options & Greeks", icon: <Target size={16} />, live: true },
-      { href: "/positions", label: "Positions & P&L", icon: <Briefcase size={16} /> },
+      { href: "/positions", label: "Positions & P&L", icon: <Briefcase size={16} />, live: true },
     ],
   },
   {
     title: "Risk",
     items: [
-      { href: "/risk",         label: "Risk Dashboard", icon: <Shield size={16} /> },
-      { href: "/monte-carlo",  label: "Monte Carlo",    icon: <FlaskConical size={16} /> },
+      { href: "/risk",         label: "Risk Dashboard", icon: <Shield size={16} />, live: true },
+      { href: "/monte-carlo",  label: "Monte Carlo",    icon: <FlaskConical size={16} />, live: true },
     ],
   },
   {
     title: "Tools",
     items: [
-      { href: "/events",   label: "Events",   icon: <Calendar size={16} /> },
-      { href: "/settings", label: "Settings", icon: <Settings size={16} /> },
+      { href: "/events",   label: "Events",   icon: <Calendar size={16} />, live: true },
+      { href: "/settings", label: "Settings", icon: <Settings size={16} />, live: true },
     ],
   },
 ];
