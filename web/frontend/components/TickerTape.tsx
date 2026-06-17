@@ -31,33 +31,6 @@ export async function TickerTape() {
 
   return (
     <div className="border-b-2 border-accent/20 bg-ink-900 sticky top-0 z-30">
-      <style>{`
-        @keyframes ticker-scroll-left {
-          from { transform: translateX(0); }
-          to   { transform: translateX(-50%); }
-        }
-        @keyframes ticker-scroll-right {
-          from { transform: translateX(-50%); }
-          to   { transform: translateX(0); }
-        }
-        .ticker-row {
-          display: flex;
-          align-items: center;
-          gap: 2rem;
-          white-space: nowrap;
-          will-change: transform;
-        }
-        .ticker-row-1 {
-          animation: ticker-scroll-left 90s linear infinite;
-        }
-        .ticker-row-2 {
-          animation: ticker-scroll-right 120s linear infinite;
-        }
-        .ticker-tape:hover .ticker-row {
-          animation-play-state: paused;
-        }
-      `}</style>
-
       {/* Trading-floor header bar */}
       <div className="bg-gradient-to-r from-ink-700 via-accent/5 to-ink-700 px-4 py-1 flex items-center justify-between text-[10px] font-mono tracking-widest text-ink-200 border-b border-ink-600">
         <div className="flex items-center gap-3">

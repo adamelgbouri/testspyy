@@ -136,24 +136,24 @@
     animation: shimmer 2.5s linear infinite;
   }
 
-  /* Slide-in animation */
+  /* Slide-in animation - SAFE: opacity defaults to 1 so content is visible
+     even if the animation engine doesn't run. */
   @keyframes slide-up {
     from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
+    to   { opacity: 1; transform: translateY(0); }
   }
-  .animate-slide-up { animation: slide-up 0.3s ease forwards; }
+  .animate-slide-up { animation: slide-up 0.3s ease both; }
 
-  /* Stagger children */
+  /* Stagger children - same safety: no opacity:0 default. */
   .stagger > * {
-    opacity: 0;
-    animation: slide-up 0.4s ease forwards;
+    animation: slide-up 0.35s ease both;
   }
-  .stagger > *:nth-child(1) { animation-delay: 0.0s; }
-  .stagger > *:nth-child(2) { animation-delay: 0.05s; }
+  .stagger > *:nth-child(1) { animation-delay: 0.02s; }
+  .stagger > *:nth-child(2) { animation-delay: 0.06s; }
   .stagger > *:nth-child(3) { animation-delay: 0.10s; }
-  .stagger > *:nth-child(4) { animation-delay: 0.15s; }
-  .stagger > *:nth-child(5) { animation-delay: 0.20s; }
-  .stagger > *:nth-child(6) { animation-delay: 0.25s; }
+  .stagger > *:nth-child(4) { animation-delay: 0.14s; }
+  .stagger > *:nth-child(5) { animation-delay: 0.18s; }
+  .stagger > *:nth-child(6) { animation-delay: 0.22s; }
 
   /* Skeleton loader */
   @keyframes skeleton-pulse {
@@ -174,3 +174,23 @@
            bg-ink-600 border border-ink-500 border-b-2 rounded shadow-sm;
   }
 }
+
+/* Ticker tape global keyframes (used by server component) */
+@keyframes ticker-scroll-left {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+@keyframes ticker-scroll-right {
+  from { transform: translateX(-50%); }
+  to   { transform: translateX(0); }
+}
+.ticker-row {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+  white-space: nowrap;
+  will-change: transform;
+}
+.ticker-row-1 { animation: ticker-scroll-left 90s linear infinite; }
+.ticker-row-2 { animation: ticker-scroll-right 120s linear infinite; }
+.ticker-tape:hover .ticker-row { animation-play-state: paused; }
