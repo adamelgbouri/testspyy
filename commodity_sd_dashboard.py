@@ -1615,10 +1615,425 @@ def sentiment_label(score: float) -> str:
 
 
 # =============================================================================
+# MODELS - OPTIONS (Black-76 for commodity futures)
+# =============================================================================
+
+
+@dataclass
+class Black76:
+    """
+    Black-76 model for European options on futures.
+
+    Parameters
+    ----------
+    F : float          forward / futures price
+    K : float          strike
+    T : float          time to expiry in years
+    r : float          risk-free rate (continuous)
+    sigma : float      annualised volatility
+    option_type : str  "call" or "put"
+    """
+
+    F: float
+    K: float
+    T: float
+    r: float
+    sigma: float
+    option_type: str = "call"
+
+    def _d1_d2(self) -> Tuple[float, float]:
+        if self.sigma <= 0 or self.T <= 0:
+            return float("nan"), float("nan")
+        d1 = (np.log(self.F / self.K) + 0.5 * self.sigma ** 2 * self.T) / (
+            self.sigma * np.sqrt(self.T)
+        )
+        d2 = d1 - self.sigma * np.sqrt(self.T)
+        return d1, d2
+
+    def price(self) -> float:
+        from scipy.stats import norm
+        d1, d2 = self._d1_d2()
+        disc = np.exp(-self.r * self.T)
+        if self.option_type == "call":
+            return float(disc * (self.F * norm.cdf(d1) - self.K * norm.cdf(d2)))
+        return float(disc * (self.K * norm.cdf(-d2) - self.F * norm.cdf(-d1)))
+
+    def delta(self) -> float:
+        from scipy.stats import norm
+        d1, _ = self._d1_d2()
+        disc = np.exp(-self.r * self.T)
+        if self.option_type == "call":
+            return float(disc * norm.cdf(d1))
+        return float(disc * (norm.cdf(d1) - 1))
+
+    def gamma(self) -> float:
+        from scipy.stats import norm
+        d1, _ = self._d1_d2()
+        disc = np.exp(-self.r * self.T)
+        return float(disc * norm.pdf(d1) / (self.F * self.sigma * np.sqrt(self.T)))
+
+    def vega(self) -> float:
+        from scipy.stats import norm
+        d1, _ = self._d1_d2()
+        disc = np.exp(-self.r * self.T)
+        # per 1 vol point (i.e. 0.01)
+        return float(disc * self.F * norm.pdf(d1) * np.sqrt(self.T) / 100)
+
+    def theta(self) -> float:
+        from scipy.stats import norm
+        d1, d2 = self._d1_d2()
+        disc = np.exp(-self.r * self.T)
+        term1 = -disc * self.F * norm.pdf(d1) * self.sigma / (2 * np.sqrt(self.T))
+        if self.option_type == "call":
+            term2 = -self.r * disc * (self.F * norm.cdf(d1) - self.K * norm.cdf(d2))
+        else:
+            term2 = self.r * disc * (self.K * norm.cdf(-d2) - self.F * norm.cdf(-d1))
+        return float((term1 + term2) / 365)  # per day
+
+    def rho(self) -> float:
+        return float(-self.T * self.price())
+
+    def greeks(self) -> Dict[str, float]:
+        return {
+            "price": self.price(),
+            "delta": self.delta(),
+            "gamma": self.gamma(),
+            "vega": self.vega(),
+            "theta": self.theta(),
+            "rho": self.rho(),
+        }
+
+    def implied_vol(self, market_price: float, lo: float = 0.001,
+                    hi: float = 5.0) -> float:
+        """Bisection to back-out implied vol from a market price."""
+        try:
+            from scipy.optimize import brentq
+            def f(s: float) -> float:
+                return Black76(self.F, self.K, self.T, self.r, s,
+                               self.option_type).price() - market_price
+            return float(brentq(f, lo, hi, maxiter=200))
+        except Exception:
+            return float("nan")
+
+
+def option_payoff(F_range: np.ndarray, K: float, premium: float,
+                  option_type: str = "call", direction: str = "long") -> np.ndarray:
+    """Vector payoff at expiry. direction = 'long' or 'short'."""
+    if option_type == "call":
+        intrinsic = np.maximum(F_range - K, 0)
+    else:
+        intrinsic = np.maximum(K - F_range, 0)
+    pnl = intrinsic - premium
+    return pnl if direction == "long" else -pnl
+
+
+def strategy_payoff(F_range: np.ndarray, legs: List[Dict]) -> np.ndarray:
+    """
+    Aggregate payoff across multiple option/futures legs.
+
+    legs: list of dicts with keys
+        kind: 'call' | 'put' | 'future'
+        strike: float (ignored for futures)
+        premium: float (entry price for futures)
+        direction: 'long' | 'short'
+        qty: positive integer
+    """
+    total = np.zeros_like(F_range, dtype=float)
+    for leg in legs:
+        qty = leg.get("qty", 1)
+        if leg["kind"] == "future":
+            pnl = (F_range - leg["premium"]) * (1 if leg["direction"] == "long" else -1)
+        else:
+            pnl = option_payoff(F_range, leg["strike"], leg["premium"],
+                                 leg["kind"], leg["direction"])
+        total += qty * pnl
+    return total
+
+
+# =============================================================================
+# MODELS - SPREADS (crack, calendar, location, spark)
+# =============================================================================
+
+CRACK_SPREADS = {
+    "3-2-1 Crack (WTI → RBOB + ULSD)": {
+        "F1": "wti_crude", "F1_mult": 3.0,
+        "F2": "rbob_gasoline", "F2_mult": 2.0,
+        "F3": "ulsd_heating_oil", "F3_mult": 1.0,
+        "description": "3 bbl WTI → 2 bbl RBOB + 1 bbl Heating Oil. "
+                       "Classic US refiner margin.",
+        "typical": 22.0, "unit": "$/bbl",
+    },
+    "Simple Crack (WTI → RBOB)": {
+        "F1": "wti_crude", "F1_mult": 1.0,
+        "F2": "rbob_gasoline", "F2_mult": 1.0,
+        "F3": None, "F3_mult": 0.0,
+        "description": "1 bbl WTI → 1 bbl RBOB (heating oil ignored).",
+        "typical": 14.0, "unit": "$/bbl",
+    },
+    "Brent → Diesel (proxy)": {
+        "F1": "brent_crude", "F1_mult": 1.0,
+        "F2": "ulsd_heating_oil", "F2_mult": 1.0,
+        "F3": None, "F3_mult": 0.0,
+        "description": "Brent crude → diesel proxy (ULSD).",
+        "typical": 18.0, "unit": "$/bbl",
+    },
+    "Location: WTI − Brent": {
+        "F1": "brent_crude", "F1_mult": 1.0,
+        "F2": "wti_crude", "F2_mult": 1.0,
+        "F3": None, "F3_mult": 0.0,
+        "description": "Atlantic basin location spread (Brent-WTI).",
+        "typical": 4.0, "unit": "$/bbl",
+    },
+    "Soybean Crush (proxy)": {
+        "F1": "soybeans", "F1_mult": 1.0,
+        "F2": "corn", "F2_mult": 1.0,
+        "F3": None, "F3_mult": 0.0,
+        "description": "Soybean-corn cross-margin proxy "
+                       "(true crush uses soy meal & oil).",
+        "typical": 580.0, "unit": "¢/bu",
+    },
+}
+
+
+def crack_margin(spec: Dict, prices: Dict[str, float]) -> float:
+    """Compute the crack/spread margin from leg prices in their native units."""
+    p1 = prices.get(spec["F1"], 0)
+    p2 = prices.get(spec["F2"], 0)
+    p3 = prices.get(spec["F3"], 0) if spec["F3"] else 0
+    # F2 + F3 - F1 in product-equivalent terms (assuming unit consistency)
+    if spec["F1"] in ("wti_crude", "brent_crude") and \
+       spec["F2"] in ("rbob_gasoline", "ulsd_heating_oil"):
+        # 42 gallons per bbl
+        p2_bbl = p2 * 42
+        p3_bbl = p3 * 42 if spec["F3"] else 0
+        return (spec["F2_mult"] * p2_bbl
+                + spec["F3_mult"] * p3_bbl
+                - spec["F1_mult"] * p1) / spec["F1_mult"]
+    # Location spread (same unit) or generic
+    return (spec["F2_mult"] * p2 + spec["F3_mult"] * p3
+            - spec["F1_mult"] * p1) / max(spec["F1_mult"], 1)
+
+
+def calendar_spread_pnl(curve: pd.DataFrame, near_idx: int = 0,
+                        far_idx: int = 6) -> Dict[str, float]:
+    """Long near / short far calendar spread P&L per unit."""
+    if len(curve) <= max(near_idx, far_idx):
+        return {"entry": float("nan"), "value": float("nan"), "pnl": float("nan")}
+    near = float(curve["price"].iloc[near_idx])
+    far = float(curve["price"].iloc[far_idx])
+    return {
+        "near": near, "far": far,
+        "spread": near - far,
+        "near_label": curve["label"].iloc[near_idx] if "label" in curve.columns else f"M{near_idx + 1}",
+        "far_label": curve["label"].iloc[far_idx] if "label" in curve.columns else f"M{far_idx + 1}",
+    }
+
+
+# =============================================================================
+# MODELS - POSITION MANAGEMENT & P&L
+# =============================================================================
+
+@dataclass
+class Position:
+    """A single position record - one row of the trade blotter."""
+
+    commodity_key: str
+    direction: str          # "Long" or "Short"
+    quantity: float
+    entry_price: float
+    entry_date: str
+    notes: str = ""
+
+
+def mtm_pnl(position: Position, current_price: float) -> Dict[str, float]:
+    """Mark-to-market P&L for one position, per unit and total."""
+    sign = 1 if position.direction == "Long" else -1
+    pnl_per_unit = sign * (current_price - position.entry_price)
+    pnl_total = pnl_per_unit * position.quantity
+    return {
+        "pnl_per_unit": pnl_per_unit,
+        "pnl_total": pnl_total,
+        "notional_entry": position.quantity * position.entry_price,
+        "notional_mtm": position.quantity * current_price,
+        "return_pct": (pnl_per_unit / position.entry_price * 100
+                       if position.entry_price else 0.0),
+    }
+
+
+def portfolio_summary(positions: List[Position],
+                      mark_prices: Dict[str, float]) -> Dict[str, float]:
+    """Aggregate P&L, gross/net exposure across all positions."""
+    gross_long = 0.0
+    gross_short = 0.0
+    total_pnl = 0.0
+    for p in positions:
+        mark = mark_prices.get(p.commodity_key, p.entry_price)
+        pnl = mtm_pnl(p, mark)
+        if p.direction == "Long":
+            gross_long += pnl["notional_mtm"]
+        else:
+            gross_short += pnl["notional_mtm"]
+        total_pnl += pnl["pnl_total"]
+    return {
+        "gross_long": gross_long,
+        "gross_short": gross_short,
+        "gross_exposure": gross_long + gross_short,
+        "net_exposure": gross_long - gross_short,
+        "total_pnl": total_pnl,
+        "n_positions": len(positions),
+    }
+
+
+# =============================================================================
+# MODELS - RISK (VaR, CVaR, stress tests)
+# =============================================================================
+
+def parametric_var(price_series: pd.Series, position_size: float,
+                   confidence: float = 0.95, horizon_days: int = 1) -> Dict[str, float]:
+    """Parametric (normal) Value-at-Risk and Expected Shortfall."""
+    from scipy.stats import norm
+    rets = price_series.pct_change().dropna()
+    if rets.empty:
+        return {"var": float("nan"), "cvar": float("nan"), "vol": float("nan")}
+    mu = float(rets.mean()) * horizon_days
+    sigma = float(rets.std()) * np.sqrt(horizon_days)
+    z = float(norm.ppf(confidence))
+    var_pct = -(mu - z * sigma)
+    cvar_pct = -(mu - sigma * norm.pdf(z) / (1 - confidence))
+    notional = position_size * float(price_series.iloc[-1])
+    return {
+        "var": var_pct * notional,
+        "cvar": cvar_pct * notional,
+        "vol": sigma * 100,
+        "var_pct": var_pct * 100,
+        "cvar_pct": cvar_pct * 100,
+    }
+
+
+def historical_var(price_series: pd.Series, position_size: float,
+                   confidence: float = 0.95) -> Dict[str, float]:
+    """Historical VaR and CVaR using empirical return distribution."""
+    rets = price_series.pct_change().dropna()
+    if rets.empty:
+        return {"var": float("nan"), "cvar": float("nan")}
+    q = rets.quantile(1 - confidence)
+    cvar_pct = -rets[rets <= q].mean() if not rets[rets <= q].empty else -q
+    notional = position_size * float(price_series.iloc[-1])
+    return {
+        "var": -q * notional,
+        "cvar": cvar_pct * notional,
+        "var_pct": -q * 100,
+        "cvar_pct": cvar_pct * 100,
+    }
+
+
+def stress_scenarios(price: float, position_size: float) -> pd.DataFrame:
+    """Standard stress scenarios applied to a single position."""
+    scenarios = [
+        ("Mild correction (−5%)", -0.05),
+        ("Sharp drop (−10%)", -0.10),
+        ("Crash (−20%)", -0.20),
+        ("Black swan (−35%)", -0.35),
+        ("Rally (+10%)", +0.10),
+        ("Squeeze (+25%)", +0.25),
+    ]
+    rows = []
+    for label, shock in scenarios:
+        new_price = price * (1 + shock)
+        pnl = (new_price - price) * position_size
+        rows.append({"Scenario": label, "Shock %": f"{shock * 100:+.0f} %",
+                     "New price": new_price, "P&L impact": pnl})
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# DATA - MARKET EVENTS CALENDAR
+# =============================================================================
+
+def get_market_events() -> pd.DataFrame:
+    """Recurring high-impact events for commodity desks (typical schedule)."""
+    from datetime import datetime, timedelta
+    today = datetime.now()
+
+    def next_n_of_month(n: int, weekday: int) -> List:
+        """Next 6 occurrences of the n-th given weekday of each month."""
+        dates = []
+        for k in range(6):
+            month = today.month + k
+            year = today.year + (month - 1) // 12
+            month = ((month - 1) % 12) + 1
+            d = datetime(year, month, 1)
+            offset = (weekday - d.weekday() + 7) % 7
+            d = d + timedelta(days=offset + (n - 1) * 7)
+            if d.month == month:
+                dates.append(d)
+        return dates
+
+    # Simplified recurring schedule
+    events_def = [
+        # EIA: weekly Wednesdays
+        ("EIA Weekly Petroleum Status", "Wed", 0, ["Energy"]),
+        # USDA WASDE: ~10-12th of each month
+        ("USDA WASDE Report", "Mid-month", 11, ["Ags"]),
+        # OPEC monthly: ~10-15th
+        ("OPEC Monthly Oil Report", "Mid-month", 12, ["Energy"]),
+        # IEA monthly: ~mid-month
+        ("IEA Oil Market Report", "Mid-month", 14, ["Energy"]),
+        # FOMC: 8/year, simplified as every 6 weeks
+        ("FOMC Decision", "6-weekly", -1, ["Macro"]),
+        # ECB: every 6 weeks
+        ("ECB Rate Decision", "6-weekly", -1, ["Macro"]),
+        # NFP: first Friday
+        ("US Non-Farm Payrolls", "1st Fri", -1, ["Macro"]),
+        # CPI: ~mid-month
+        ("US CPI Release", "Mid-month", 13, ["Macro"]),
+    ]
+    rows = []
+    for name, freq, day, tags in events_def:
+        if day > 0:
+            for k in range(6):
+                month = today.month + k
+                year = today.year + (month - 1) // 12
+                month = ((month - 1) % 12) + 1
+                try:
+                    d = datetime(year, month, day)
+                    if d >= today:
+                        rows.append({"date": d.date(), "event": name,
+                                     "frequency": freq, "tags": ", ".join(tags)})
+                except ValueError:
+                    continue
+        elif freq == "Wed":
+            d = today + timedelta(days=(2 - today.weekday()) % 7)
+            for k in range(6):
+                rows.append({"date": (d + timedelta(weeks=k)).date(),
+                             "event": name, "frequency": freq,
+                             "tags": ", ".join(tags)})
+        elif freq == "1st Fri":
+            for k in range(6):
+                month = today.month + k
+                year = today.year + (month - 1) // 12
+                month = ((month - 1) % 12) + 1
+                d = datetime(year, month, 1)
+                d = d + timedelta(days=(4 - d.weekday()) % 7)
+                if d >= today:
+                    rows.append({"date": d.date(), "event": name,
+                                 "frequency": freq, "tags": ", ".join(tags)})
+        elif freq == "6-weekly":
+            d = today + timedelta(days=14)
+            for k in range(4):
+                rows.append({"date": (d + timedelta(weeks=6 * k)).date(),
+                             "event": name, "frequency": freq,
+                             "tags": ", ".join(tags)})
+    df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+    return df
+
+
+# =============================================================================
 # THEME
 # =============================================================================
 
 def register_theme() -> None:
+    """Register a dark trading-desk Plotly template as the default."""
     tpl = go.layout.Template()
     tpl.layout = go.Layout(
         paper_bgcolor=DARK_BG, plot_bgcolor=PANEL_BG,
@@ -1638,42 +2053,146 @@ def register_theme() -> None:
 
 
 def apply_page_style() -> None:
+    """Inject a polished trading-desk stylesheet."""
     st.markdown(
         """
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
         <style>
-            .block-container {padding-top: 1.5rem; padding-bottom: 1.5rem;}
-            section[data-testid="stSidebar"] > div {background: #0b0f14;}
-            div[data-testid="stMetric"] {
-                background: #161b22;
-                border: 1px solid #1f2937;
-                border-radius: 8px;
-                padding: 0.55rem 0.8rem;
+            html, body, [class*="css"]  {
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             }
-            /* Smaller KPI value font + tighter label + smaller delta */
+            .block-container {padding-top: 1.0rem; padding-bottom: 1.5rem; max-width: 1500px;}
+            section[data-testid="stSidebar"] > div {background: #0b0f14;}
+            section[data-testid="stSidebar"] h3 {
+                color: #00d4ff !important;
+                letter-spacing: 0.5px;
+            }
+            div[data-testid="stMetric"] {
+                background: linear-gradient(180deg, #1a1f2a 0%, #161b22 100%);
+                border: 1px solid #1f2937;
+                border-radius: 10px;
+                padding: 0.7rem 0.9rem;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.02);
+                transition: border-color 0.15s ease;
+            }
+            div[data-testid="stMetric"]:hover {
+                border-color: #2d3748;
+            }
             div[data-testid="stMetricValue"] {
-                color: #e5e7eb;
-                font-size: 1.15rem !important;
+                color: #f3f4f6;
+                font-size: 1.20rem !important;
                 line-height: 1.25 !important;
+                font-family: 'JetBrains Mono', monospace !important;
+                font-weight: 600;
             }
             div[data-testid="stMetricLabel"] {
-                font-size: 0.78rem !important;
+                font-size: 0.74rem !important;
                 color: #9ca3af !important;
+                text-transform: uppercase;
+                letter-spacing: 0.6px;
+                font-weight: 500;
             }
             div[data-testid="stMetricDelta"] {
                 font-size: 0.72rem !important;
             }
-            h1, h2, h3, h4 {color: #f3f4f6 !important;}
-            /* Italic light-gray chart purpose caption */
+            h1 {
+                color: #f3f4f6 !important;
+                font-weight: 700 !important;
+                letter-spacing: -0.5px;
+                margin-bottom: 0.2rem !important;
+            }
+            h2, h3, h4 {
+                color: #e5e7eb !important;
+                font-weight: 600 !important;
+                letter-spacing: -0.2px;
+            }
             .chart-purpose {
                 color: #9ca3af;
                 font-style: italic;
                 font-size: 0.85rem;
-                margin: -0.25rem 0 0.45rem 0;
+                margin: -0.25rem 0 0.6rem 0;
+            }
+            /* Ticker tape (top header bar) */
+            .desk-header {
+                background: linear-gradient(90deg, #0e1117 0%, #161b22 50%, #0e1117 100%);
+                border-bottom: 1px solid #1f2937;
+                padding: 0.45rem 0.9rem;
+                margin: -0.4rem -1rem 1rem -1rem;
+                border-radius: 0 0 6px 6px;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 0.8rem;
+                color: #d1d5db;
+                display: flex;
+                gap: 1.5rem;
+                flex-wrap: wrap;
+                overflow: hidden;
+            }
+            .desk-header .badge {
+                display: inline-flex;
+                gap: 0.35rem;
+                align-items: center;
+            }
+            .desk-header .pos {color: #22c55e;}
+            .desk-header .neg {color: #ef4444;}
+            .desk-header .ticker-name {color: #9ca3af; font-weight: 500;}
+            /* Buttons */
+            button[kind="primary"] {
+                background: linear-gradient(180deg, #0891b2 0%, #0e7490 100%) !important;
+                border: 1px solid #0891b2 !important;
+            }
+            /* Dataframes — quieter look */
+            div[data-testid="stDataFrame"] {
+                border: 1px solid #1f2937;
+                border-radius: 6px;
+            }
+            /* Info / warning / error softer backgrounds */
+            div[data-testid="stAlert"] {
+                background: #161b22 !important;
+                border-left: 3px solid #00d4ff;
             }
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_ticker_tape(ticker_data: List[Tuple[str, float, float, str]]) -> None:
+    """Render a Bloomberg-style top ticker bar.
+
+    ticker_data: list of (name, price, change_pct, unit)
+    """
+    if not ticker_data:
+        return
+    items_html = []
+    for name, price, change, unit in ticker_data:
+        cls = "pos" if change >= 0 else "neg"
+        arrow = "▲" if change >= 0 else "▼"
+        items_html.append(
+            f'<span class="badge"><span class="ticker-name">{name}</span> '
+            f'<b>{price:,.2f} {unit}</b> '
+            f'<span class="{cls}">{arrow} {change:+.2f}%</span></span>'
+        )
+    bar = '<div class="desk-header">' + "".join(items_html) + "</div>"
+    st.markdown(bar, unsafe_allow_html=True)
+
+
+def build_ticker_data() -> List[Tuple[str, float, float, str]]:
+    """Build the ticker tape using live spots if available, else references."""
+    targets = ["wti_crude", "brent_crude", "henry_hub_gas", "gold",
+               "comex_copper", "cbot_wheat"]
+    data = []
+    for ck in targets:
+        if ck not in COMMODITY_TEMPLATES:
+            continue
+        tpl = COMMODITY_TEMPLATES[ck]
+        live = get_live_spot(ck)
+        if live:
+            data.append((tpl.name, float(live["price"]),
+                         float(live["change_pct"]), tpl.price_unit))
+        else:
+            data.append((tpl.name, float(tpl.base_price), 0.0, tpl.price_unit))
+    return data
 
 
 # =============================================================================
@@ -2006,9 +2525,14 @@ PAGES = [
     "🌪️ Scenarios",
     "🌍 Regional Flows",
     "📈 Futures Curve",
+    "🔀 Spreads & Cracks",
+    "🎯 Options & Greeks",
+    "💼 Positions & P&L",
+    "🛡️ Risk Dashboard",
     "🏦 Macro",
     "🎲 Monte Carlo",
     "📉 Sensitivities",
+    "📅 Events & Reports",
     "⚙️ Settings",
 ]
 
@@ -2216,6 +2740,85 @@ metric (end stocks, average price, build/draw) the most.
   the most sensitive variable.
 - *2D stress matrix*: pick two variables, grid their values and read the
   metric in each cell. Reveals interaction effects.
+""",
+    "🔀 Spreads & Cracks": """
+**What is this page for?** Trade or hedge multi-leg structures: crack
+spreads (refiner margin), calendar spreads (term structure), location
+spreads (basis trading).
+
+**Where do the numbers come from?**
+- Live or reference prices per leg, pulled from each commodity's spot.
+- Calendar spreads built from the forward curve of the active commodity.
+- Crack-spread maths use 42 gal/bbl to convert RBOB/ULSD to $/bbl.
+
+**Sections.**
+- Preset crack/location spreads (3-2-1 Crack, Brent-WTI, soybean crush).
+- Live margin per spread.
+- Calendar spread board derived from the loaded forward curve.
+- P&L sensitivity grid for the active spread.
+""",
+    "🎯 Options & Greeks": """
+**What is this page for?** Price European commodity options with the
+Black-76 model, see the Greeks, and visualise strategy payoffs.
+
+**Where do the numbers come from?**
+- Forward price = front-month live (when available) or reference base.
+- User-entered strike, expiry, vol, risk-free rate.
+
+**Sections.**
+- Single-option pricer with all Greeks (delta, gamma, vega, theta, rho).
+- Implied vol back-solve (bisection on Black-76 price).
+- Payoff visualiser for vanilla options.
+- Multi-leg strategy builder (call/put spreads, straddles, collars).
+""",
+    "💼 Positions & P&L": """
+**What is this page for?** Track positions, mark them to market and
+monitor gross/net exposure and P&L.
+
+**Where do the numbers come from?**
+- User-entered positions kept in session (commodity, direction, size,
+  entry price).
+- Mark-to-market uses the latest live spot when available, otherwise
+  the commodity's reference price.
+
+**Sections.**
+- Position blotter with per-line P&L, return %, MTM notional.
+- Aggregated portfolio metrics: gross long, gross short, net exposure,
+  total P&L.
+- P&L attribution by commodity and by sector.
+""",
+    "🛡️ Risk Dashboard": """
+**What is this page for?** Quantify the downside risk of the loaded
+positions and stress-test under standard scenarios.
+
+**Where do the numbers come from?**
+- Returns built from the live or synthetic price history of each
+  commodity in the portfolio.
+- Parametric VaR uses a normal-distribution approximation; historical
+  VaR uses the empirical return distribution.
+- Stress scenarios apply fixed % shocks across the portfolio.
+
+**Sections.**
+- VaR / CVaR (Expected Shortfall) at 95 % and 99 %, parametric and
+  historical.
+- Single-position risk decomposition.
+- Stress test grid (−5 % / −10 % / −20 % / +10 %…).
+- Risk-budget pie by sector and by commodity.
+""",
+    "📅 Events & Reports": """
+**What is this page for?** Stay on top of upcoming high-impact events
+and export a desk report.
+
+**Where do the numbers come from?**
+- Recurring event schedule (EIA, WASDE, OPEC, IEA, FOMC, ECB, NFP,
+  CPI). Built from the typical release calendar; can be wired to a
+  real feed (Trading Economics, MarketWatch…).
+
+**Sections.**
+- Upcoming events calendar (next 6 weeks).
+- Filter by sector tag (Energy, Ags, Macro).
+- Download a daily desk report (CSV/Excel) consolidating the current
+  state of the platform.
 """,
     "⚙️ Settings": """
 **What is this page for?** Save/load assumptions, flush the cache, browse
@@ -3279,6 +3882,449 @@ def page_sensitivities(tpl: CommodityTemplate, df: pd.DataFrame) -> None:
     )
 
 
+# =============================================================================
+# NEW PAGES — Spreads, Options, Positions, Risk, Events
+# =============================================================================
+
+def page_spreads(tpl: CommodityTemplate) -> None:
+    """Crack / calendar / location spreads."""
+    st.title("🔀 Spreads & Cracks")
+    render_page_help("🔀 Spreads & Cracks")
+
+    chart_intro("Preset spread structures",
+                "Pick a preset to compute the spread margin from current spot "
+                "prices. Crack maths converts gasoline/heating oil from $/gal "
+                "to $/bbl using 42 gal/bbl.")
+    spread_name = st.selectbox("Spread structure", list(CRACK_SPREADS.keys()))
+    spec = CRACK_SPREADS[spread_name]
+
+    # Pull spot for each leg
+    legs = []
+    for key in (spec["F1"], spec["F2"], spec["F3"]):
+        if not key:
+            continue
+        t = COMMODITY_TEMPLATES[key]
+        live = get_live_spot(key)
+        spot = float(live["price"]) if live else float(t.base_price)
+        legs.append((key, t, spot, "live" if live else "ref"))
+
+    prices = {k: p for (k, _, p, _) in legs}
+    margin = crack_margin(spec, prices)
+
+    st.markdown(f"*{spec['description']}*")
+    cols = st.columns(len(legs) + 1)
+    for col, (k, t, p, src) in zip(cols[:-1], legs):
+        col.metric(f"{t.name}", fmt_price(p, t.price_unit),
+                   delta=src)
+    cols[-1].metric("Spread margin", f"{margin:,.2f} {spec['unit']}",
+                    delta=f"vs typical {spec['typical']:.1f}")
+    interpretation(
+        f"At current prices the spread is worth **{margin:,.2f} {spec['unit']}** "
+        f"vs a typical level of **{spec['typical']:.1f}**. A wide positive "
+        f"value favours the *long* side of the spread."
+    )
+
+    # Calendar spread on the loaded commodity
+    st.markdown("---")
+    st.subheader(f"Calendar spreads on {tpl.name}")
+    chart_intro("Calendar spread board",
+                "Long the near contract, short the far contract. Positive "
+                "spread = backwardation, negative = contango.")
+    ck = st.session_state["commodity_key"]
+    curve = get_live_futures_curve(ck) or get_synthetic_futures_curve(ck, "contango",
+                                                                       months=12)
+    if curve is None or len(curve) < 2:
+        st.warning("Not enough curve points.")
+        return
+
+    rows = []
+    n = len(curve)
+    pairs = [(0, 1), (0, 3), (0, 6), (0, min(11, n - 1)), (3, min(6, n - 1))]
+    for near_i, far_i in pairs:
+        if far_i >= n or near_i >= n:
+            continue
+        sp = calendar_spread_pnl(curve, near_i, far_i)
+        rows.append({
+            "Pair": f"{sp['near_label']} − {sp['far_label']}",
+            "Near": f"{sp['near']:,.2f}",
+            "Far": f"{sp['far']:,.2f}",
+            "Spread": f"{sp['spread']:+,.2f} {tpl.price_unit}",
+            "Reading": ("Backwardation" if sp["spread"] > 0
+                        else "Contango" if sp["spread"] < 0
+                        else "Flat"),
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    chart_intro("Spread P&L grid",
+                "Hypothetical P&L if the spread moves by +/- the specified amount.")
+    base_spread = curve["price"].iloc[0] - curve["price"].iloc[min(5, n - 1)]
+    shocks = np.linspace(-2.0, 2.0, 9)
+    pnl_rows = pd.DataFrame({
+        "Spread move": [f"{s:+.2f}" for s in shocks],
+        "P&L per unit": [f"{(s):+,.2f}" for s in shocks],
+        "P&L 100 lots": [f"{(s * 100):+,.2f}" for s in shocks],
+    })
+    st.dataframe(pnl_rows, hide_index=True, use_container_width=True)
+    st.caption(f"Current spread baseline: {base_spread:+.2f} {tpl.price_unit}")
+
+
+def page_options(tpl: CommodityTemplate) -> None:
+    """Black-76 options pricer + strategy builder."""
+    st.title("🎯 Options & Greeks")
+    render_page_help("🎯 Options & Greeks")
+
+    live = get_live_spot(st.session_state["commodity_key"])
+    F_default = float(live["price"]) if live else float(tpl.base_price)
+
+    chart_intro("Single-option pricer (Black-76)",
+                "European option on the front-month futures. Black-76 is the "
+                "industry standard for commodity options.")
+    c1, c2, c3 = st.columns(3)
+    F = c1.number_input(f"Forward F ({tpl.price_unit})", value=F_default, step=0.5)
+    K = c2.number_input(f"Strike K ({tpl.price_unit})", value=round(F_default * 1.05, 2),
+                        step=0.5)
+    T_days = c3.slider("Days to expiry", 7, 365, 90)
+
+    c1, c2, c3 = st.columns(3)
+    sigma = c1.slider("Volatility (annualised)", 0.05, 1.50, 0.30, 0.01)
+    r = c2.slider("Risk-free rate", 0.0, 0.10, 0.045, 0.001)
+    opt_type = c3.selectbox("Option type", ["call", "put"])
+
+    T = T_days / 365.0
+    opt = Black76(F, K, T, r, sigma, opt_type)
+    g = opt.greeks()
+
+    chart_intro("Pricing output",
+                "Theoretical price and all Greeks at the current inputs.")
+    kpi_row([
+        (f"Premium ({tpl.price_unit})", f"{g['price']:,.4f}", None),
+        ("Delta", f"{g['delta']:+.4f}", None),
+        ("Gamma", f"{g['gamma']:+.5f}", None),
+        ("Vega", f"{g['vega']:+.4f}", "per 1 vol pt"),
+        ("Theta", f"{g['theta']:+.4f}", "per day"),
+    ])
+    interpretation(
+        f"At F = {F:.2f}, K = {K:.2f}, σ = {sigma:.0%}, T = {T_days}d → "
+        f"the **{opt_type}** is worth **{g['price']:.4f} {tpl.price_unit}**. "
+        f"Delta {g['delta']:+.2f} means the option moves like ~{abs(g['delta']) * 100:.0f}% "
+        f"of an outright futures position."
+    )
+
+    # Implied vol calculator
+    st.markdown("### Implied volatility back-solve")
+    chart_intro("Solve σ given a market premium",
+                "Useful to extract market expectations from quoted prices.")
+    mkt_premium = st.number_input("Observed market premium",
+                                   value=round(g["price"] * 1.05, 4), step=0.01)
+    iv = opt.implied_vol(mkt_premium)
+    st.metric("Implied volatility", f"{iv * 100:.1f} %" if not np.isnan(iv) else "—")
+
+    # Payoff visualiser
+    st.markdown("### Payoff visualiser at expiry")
+    chart_intro("Expiry payoff",
+                "Long position payoff at expiry across a price range, minus "
+                "the premium paid.")
+    rng = np.linspace(F * 0.7, F * 1.3, 100)
+    payoff = option_payoff(rng, K, g["price"], opt_type, "long")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=rng, y=payoff, name="Long " + opt_type,
+                             line=dict(color=COLORS["price"], width=2)))
+    fig.add_hline(y=0, line=dict(color="#9ca3af", dash="dot"))
+    fig.add_vline(x=K, line=dict(color=COLORS["fair_value"], dash="dash"),
+                  annotation_text=f"Strike {K}")
+    fig.update_layout(title=f"Long {opt_type.title()} Payoff at Expiry",
+                      xaxis_title=f"Price at expiry ({tpl.price_unit})",
+                      yaxis_title=f"P&L ({tpl.price_unit})",
+                      height=380)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Strategy builder
+    st.markdown("### Multi-leg strategy builder")
+    chart_intro("Combine legs",
+                "Mix calls, puts and futures to build collars, spreads, "
+                "straddles, fences, etc. Payoff aggregated across all legs.")
+    if "strategy_legs" not in st.session_state:
+        st.session_state["strategy_legs"] = []
+    with st.form("add_leg"):
+        c1, c2, c3 = st.columns(3)
+        kind = c1.selectbox("Kind", ["call", "put", "future"])
+        direction = c2.selectbox("Direction", ["long", "short"])
+        qty = c3.number_input("Quantity", value=1, step=1, min_value=1)
+        c1, c2 = st.columns(2)
+        strike = c1.number_input("Strike (options)", value=K, step=0.5)
+        premium = c2.number_input("Premium / entry price",
+                                   value=round(g["price"], 4), step=0.05)
+        if st.form_submit_button("➕ Add leg"):
+            st.session_state["strategy_legs"].append({
+                "kind": kind, "direction": direction, "qty": int(qty),
+                "strike": float(strike), "premium": float(premium),
+            })
+    if st.session_state["strategy_legs"]:
+        legs_df = pd.DataFrame(st.session_state["strategy_legs"])
+        st.dataframe(legs_df, hide_index=True, use_container_width=True)
+        if st.button("Clear all legs"):
+            st.session_state["strategy_legs"] = []
+            st.rerun()
+
+        rng2 = np.linspace(F * 0.6, F * 1.4, 120)
+        combo_pnl = strategy_payoff(rng2, st.session_state["strategy_legs"])
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=rng2, y=combo_pnl, name="Strategy P&L",
+                                  line=dict(color=COLORS["stocks"], width=2)))
+        fig2.add_hline(y=0, line=dict(color="#9ca3af", dash="dot"))
+        fig2.update_layout(title="Strategy Payoff at Expiry",
+                           xaxis_title=f"Price at expiry ({tpl.price_unit})",
+                           yaxis_title=f"P&L ({tpl.price_unit})", height=380)
+        st.plotly_chart(fig2, use_container_width=True)
+        max_pnl = combo_pnl.max()
+        min_pnl = combo_pnl.min()
+        st.caption(f"Max profit: {max_pnl:+,.2f} {tpl.price_unit} · "
+                   f"Max loss: {min_pnl:+,.2f} {tpl.price_unit}")
+
+
+def page_positions(tpl: CommodityTemplate) -> None:
+    """Positions blotter + portfolio P&L."""
+    st.title("💼 Positions & P&L")
+    render_page_help("💼 Positions & P&L")
+
+    if "positions" not in st.session_state:
+        st.session_state["positions"] = []
+
+    chart_intro("Add a position",
+                "Each line records a single trade. Marks are pulled live when "
+                "possible.")
+    with st.form("add_position"):
+        c1, c2, c3 = st.columns(3)
+        ck = c1.selectbox("Commodity",
+                          options=list(COMMODITY_TEMPLATES.keys()),
+                          format_func=lambda k: f"[{COMMODITY_TEMPLATES[k].sector}] "
+                                                f"{COMMODITY_TEMPLATES[k].name}")
+        direction = c2.selectbox("Direction", ["Long", "Short"])
+        qty = c3.number_input("Quantity", value=100.0, step=10.0)
+        c1, c2 = st.columns(2)
+        entry_tpl = COMMODITY_TEMPLATES[ck]
+        entry_price = c1.number_input(f"Entry price ({entry_tpl.price_unit})",
+                                       value=float(entry_tpl.base_price), step=0.5)
+        entry_date = c2.text_input("Entry date",
+                                    value=pd.Timestamp.today().strftime("%Y-%m-%d"))
+        notes = st.text_input("Notes / strategy", value="")
+        if st.form_submit_button("➕ Add position"):
+            st.session_state["positions"].append(
+                Position(ck, direction, float(qty), float(entry_price),
+                         entry_date, notes)
+            )
+
+    if not st.session_state["positions"]:
+        st.info("No positions yet. Add one above to start the blotter.")
+        return
+
+    # Mark prices
+    mark_prices: Dict[str, float] = {}
+    for p in st.session_state["positions"]:
+        if p.commodity_key not in mark_prices:
+            live = get_live_spot(p.commodity_key)
+            mark_prices[p.commodity_key] = (float(live["price"]) if live
+                                             else float(COMMODITY_TEMPLATES[p.commodity_key].base_price))
+
+    # Blotter
+    rows = []
+    for p in st.session_state["positions"]:
+        mark = mark_prices[p.commodity_key]
+        pnl = mtm_pnl(p, mark)
+        t = COMMODITY_TEMPLATES[p.commodity_key]
+        rows.append({
+            "Commodity": t.name,
+            "Sector": t.sector,
+            "Side": p.direction,
+            "Qty": p.quantity,
+            "Entry": p.entry_price,
+            "Mark": mark,
+            "Unit": t.price_unit,
+            "P&L /unit": pnl["pnl_per_unit"],
+            "P&L total": pnl["pnl_total"],
+            "Return %": pnl["return_pct"],
+            "Notes": p.notes,
+        })
+    blotter = pd.DataFrame(rows)
+    chart_intro("Trade blotter",
+                "All positions with their entry, current mark, P&L per unit and total.")
+    st.dataframe(blotter.round(3), use_container_width=True, hide_index=True)
+
+    if st.button("Clear all positions"):
+        st.session_state["positions"] = []
+        st.rerun()
+
+    # Portfolio summary
+    summary = portfolio_summary(st.session_state["positions"], mark_prices)
+    chart_intro("Portfolio metrics",
+                "Aggregated exposure and P&L across all positions.")
+    kpi_row([
+        ("Gross long ($)", f"{summary['gross_long']:,.0f}", None),
+        ("Gross short ($)", f"{summary['gross_short']:,.0f}", None),
+        ("Net exposure ($)", f"{summary['net_exposure']:+,.0f}", None),
+        ("Total P&L ($)", f"{summary['total_pnl']:+,.0f}",
+         f"{summary['n_positions']} pos"),
+    ])
+
+    # P&L attribution by sector
+    chart_intro("P&L attribution by sector",
+                "Which sectors are contributing to the portfolio result.")
+    sector_pnl = blotter.groupby("Sector")["P&L total"].sum().reset_index()
+    fig = go.Figure(go.Bar(x=sector_pnl["Sector"], y=sector_pnl["P&L total"],
+                            marker_color=[COLORS["supply"] if v >= 0 else COLORS["demand"]
+                                          for v in sector_pnl["P&L total"]]))
+    fig.update_layout(title="P&L by sector", height=300)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def page_risk(tpl: CommodityTemplate, bal: pd.DataFrame) -> None:
+    """Risk dashboard - VaR, CVaR, stress tests."""
+    st.title("🛡️ Risk Dashboard")
+    render_page_help("🛡️ Risk Dashboard")
+
+    if not st.session_state.get("positions"):
+        st.info("Add positions on the *Positions & P&L* page first to populate "
+                "the risk dashboard.")
+        return
+
+    chart_intro("VaR / CVaR parameters",
+                "Confidence level and time horizon control the magnitude of "
+                "downside. 95% / 1-day is the most common quote.")
+    c1, c2 = st.columns(2)
+    conf = c1.slider("Confidence", 0.90, 0.99, 0.95, 0.01)
+    horizon = c2.slider("Horizon (days)", 1, 30, 1)
+
+    # Per-position VaR
+    rows = []
+    total_var = 0.0
+    total_cvar = 0.0
+    for p in st.session_state["positions"]:
+        t = COMMODITY_TEMPLATES[p.commodity_key]
+        df_p = get_sd_dataset(p.commodity_key, forecast_months=6)
+        bal_p = run_balance(df_p, p.commodity_key,
+                            BalanceAssumptions(forecast_months=6))
+        prices = bal_p["price"]
+        par = parametric_var(prices, p.quantity, conf, horizon)
+        rows.append({
+            "Commodity": t.name,
+            "Side": p.direction,
+            "Qty": p.quantity,
+            "Vol (ann.)": f"{par['vol']:.1f} %",
+            f"VaR {int(conf * 100)}% ($)": f"{par['var']:,.0f}",
+            f"CVaR {int(conf * 100)}% ($)": f"{par['cvar']:,.0f}",
+        })
+        total_var += par["var"]
+        total_cvar += par["cvar"]
+
+    chart_intro("Per-position risk decomposition",
+                "Volatility-based parametric VaR/CVaR. Higher vol or larger "
+                "position size pushes the numbers up.")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    kpi_row([
+        (f"Portfolio VaR {int(conf * 100)}%", f"${total_var:,.0f}",
+         f"{horizon}d horizon"),
+        (f"Portfolio CVaR {int(conf * 100)}%", f"${total_cvar:,.0f}",
+         f"{horizon}d horizon"),
+        ("Positions", f"{len(st.session_state['positions'])}", None),
+    ])
+
+    # Stress tests
+    st.markdown("### Stress scenarios")
+    chart_intro("Standard shock grid",
+                "Apply a uniform % shock to all positions and read the "
+                "aggregate P&L impact.")
+    if st.session_state["positions"]:
+        sample = st.session_state["positions"][0]
+        sample_tpl = COMMODITY_TEMPLATES[sample.commodity_key]
+        live = get_live_spot(sample.commodity_key)
+        spot = float(live["price"]) if live else sample_tpl.base_price
+        stress_df = stress_scenarios(spot, sample.quantity)
+        stress_df["New price"] = stress_df["New price"].round(2)
+        stress_df["P&L impact"] = stress_df["P&L impact"].round(0)
+        st.dataframe(stress_df, hide_index=True, use_container_width=True)
+    interpretation(
+        f"With a portfolio VaR(95%) of **${total_var:,.0f}**, you'd expect "
+        f"the loss to exceed this level on roughly 5 out of 100 trading days. "
+        f"CVaR (Expected Shortfall) of **${total_cvar:,.0f}** gives the "
+        "average loss *given* you're already in the tail."
+    )
+
+    # Risk budget pie
+    st.markdown("### Risk budget by sector")
+    risk_by_sector: Dict[str, float] = {}
+    for r in rows:
+        # parse VaR back from string
+        var_s = r[f"VaR {int(conf * 100)}% ($)"].replace(",", "")
+        var = abs(float(var_s))
+        sector = COMMODITY_TEMPLATES[
+            next(p.commodity_key for p in st.session_state["positions"]
+                 if COMMODITY_TEMPLATES[p.commodity_key].name == r["Commodity"])
+        ].sector
+        risk_by_sector[sector] = risk_by_sector.get(sector, 0) + var
+    if risk_by_sector:
+        fig = go.Figure(go.Pie(
+            labels=list(risk_by_sector.keys()),
+            values=list(risk_by_sector.values()),
+            hole=0.5,
+            marker_colors=[COLORS["price"], COLORS["stocks"], COLORS["supply"],
+                           COLORS["fair_value"], COLORS["demand"], COLORS["neutral"]],
+        ))
+        fig.update_layout(title="VaR share by sector", height=300)
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def page_events(tpl: CommodityTemplate, df: pd.DataFrame, bal: pd.DataFrame) -> None:
+    """Events calendar + downloadable desk report."""
+    st.title("📅 Events & Reports")
+    render_page_help("📅 Events & Reports")
+
+    chart_intro("Upcoming market events",
+                "Recurring high-impact data releases and central-bank "
+                "meetings over the next 6 weeks.")
+    events = get_market_events()
+    tag_filter = st.multiselect("Filter by tag",
+                                 options=sorted({t.strip()
+                                                 for tags in events["tags"]
+                                                 for t in tags.split(",")}),
+                                 default=[])
+    if tag_filter:
+        mask = events["tags"].apply(
+            lambda s: any(t.strip() in tag_filter for t in s.split(","))
+        )
+        events = events[mask]
+    st.dataframe(events, hide_index=True, use_container_width=True)
+
+    # Desk report
+    st.markdown("### Desk report")
+    chart_intro("Daily snapshot",
+                "Generate a CSV/Excel summary of the platform's current state.")
+    last_h = bal[~bal["is_forecast"]].iloc[-1]
+    last_f = bal.iloc[-1]
+    fv = estimate_fair_value(bal, st.session_state["commodity_key"])
+    fv_now = float(fv.loc[fv.index == last_h.name, "fair_value_price"].iloc[0])
+    report = pd.DataFrame([{
+        "Commodity": tpl.name,
+        "Sector": tpl.sector,
+        "Spot": f"{last_h['price']:.2f} {tpl.price_unit}",
+        "Fair value": f"{fv_now:.2f} {tpl.price_unit}",
+        "Stocks end": f"{last_f['stocks_model']:,.0f} {tpl.inventory_unit}",
+        "Days of cover": f"{last_f['days_cover_model']:.0f}",
+        "Storage util": f"{last_f['capacity_pct']:.0f} %",
+        "As of": pd.Timestamp.today().strftime("%Y-%m-%d %H:%M"),
+    }])
+    st.dataframe(report, hide_index=True, use_container_width=True)
+    c1, c2 = st.columns(2)
+    c1.download_button("Download CSV", df_to_csv_bytes(report),
+                       file_name=f"{tpl.key}_desk_report.csv",
+                       mime="text/csv")
+    c2.download_button("Download Excel",
+                       df_to_excel_bytes({"report": report, "balance": bal.tail(12),
+                                          "events": events}),
+                       file_name=f"{tpl.key}_desk_report.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
 def page_settings() -> None:
     st.title("⚙️ Settings")
     render_page_help("⚙️ Settings")
@@ -3357,11 +4403,16 @@ def page_settings() -> None:
 # =============================================================================
 
 def main() -> None:
-    st.set_page_config(page_title="Commodity S&D Desk", page_icon="🛢️",
+    """App entry point — single-page Streamlit dispatcher."""
+    st.set_page_config(page_title="Commodity Trading Desk",
+                       page_icon="🛢️",
                        layout="wide", initial_sidebar_state="expanded")
     register_theme()
     apply_page_style()
     sidebar_controls()
+
+    # Live ticker tape at the top of every page
+    render_ticker_tape(build_ticker_data())
 
     ck = st.session_state["commodity_key"]
     tpl = COMMODITY_TEMPLATES[ck]
@@ -3370,27 +4421,25 @@ def main() -> None:
     bal = run_balance(df, ck, st.session_state["assumptions"])
     fv = estimate_fair_value(bal, ck)
 
+    PAGE_DISPATCH = {
+        "🏠 Dashboard":          lambda: page_dashboard(tpl, df, bal, fv),
+        "⚖️ Supply & Demand":   lambda: page_supply_demand(tpl, df),
+        "🛢️ Inventories":       lambda: page_inventories(tpl, df, bal),
+        "🌪️ Scenarios":         lambda: page_scenarios(tpl, df),
+        "🌍 Regional Flows":     lambda: page_regional(tpl),
+        "📈 Futures Curve":      lambda: page_futures_curve(tpl, bal),
+        "🔀 Spreads & Cracks":   lambda: page_spreads(tpl),
+        "🎯 Options & Greeks":   lambda: page_options(tpl),
+        "💼 Positions & P&L":    lambda: page_positions(tpl),
+        "🛡️ Risk Dashboard":    lambda: page_risk(tpl, bal),
+        "🏦 Macro":              lambda: page_macro(tpl, df),
+        "🎲 Monte Carlo":        lambda: page_monte_carlo(tpl, df),
+        "📉 Sensitivities":      lambda: page_sensitivities(tpl, df),
+        "📅 Events & Reports":   lambda: page_events(tpl, df, bal),
+        "⚙️ Settings":           page_settings,
+    }
     page = st.session_state["page"]
-    if page == "🏠 Dashboard":
-        page_dashboard(tpl, df, bal, fv)
-    elif page == "⚖️ Supply & Demand":
-        page_supply_demand(tpl, df)
-    elif page == "🛢️ Inventories":
-        page_inventories(tpl, df, bal)
-    elif page == "🌪️ Scenarios":
-        page_scenarios(tpl, df)
-    elif page == "🌍 Regional Flows":
-        page_regional(tpl)
-    elif page == "📈 Futures Curve":
-        page_futures_curve(tpl, bal)
-    elif page == "🏦 Macro":
-        page_macro(tpl, df)
-    elif page == "🎲 Monte Carlo":
-        page_monte_carlo(tpl, df)
-    elif page == "📉 Sensitivities":
-        page_sensitivities(tpl, df)
-    elif page == "⚙️ Settings":
-        page_settings()
+    PAGE_DISPATCH.get(page, lambda: page_dashboard(tpl, df, bal, fv))()
 
 
 if __name__ == "__main__":
