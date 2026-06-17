@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap");
+
+@layer base {
+  html { color-scheme: dark; }
+  body {
+    @apply bg-ink-800 text-ink-100 antialiased min-h-screen font-sans;
+    background-image:
+      radial-gradient(800px circle at 15% -10%, rgba(0,212,255,0.06), transparent 40%),
+      radial-gradient(700px circle at 85% 20%, rgba(167,139,250,0.05), transparent 40%);
+  }
+  h1, h2, h3, h4 { @apply text-ink-50 tracking-tight; }
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-ink-600 bg-gradient-to-b from-ink-600/40 to-ink-700/60
+           shadow-card backdrop-blur-sm;
+  }
+  .metric-label {
+    @apply text-[10px] tracking-[0.08em] uppercase text-ink-200 font-medium;
+  }
+  .metric-value {
+    @apply font-mono font-semibold text-ink-50;
+  }
+  .badge {
+    @apply inline-flex items-center gap-1.5 rounded-full border border-ink-500
+           bg-ink-700 px-2 py-0.5 text-[11px] font-medium text-ink-100;
+  }
+  .nav-link {
+    @apply flex items-center gap-2 rounded-lg px-3 py-2 text-sm text-ink-200
+           hover:bg-ink-600/50 hover:text-ink-50 transition;
+  }
+  .nav-link-active {
+    @apply bg-ink-600/80 text-ink-50 border-l-2 border-accent;
+  }
+  .section-title {
+    @apply text-xs uppercase tracking-[0.12em] text-ink-200 font-semibold mt-4 mb-1.5;
+  }
+}
