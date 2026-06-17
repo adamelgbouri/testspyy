@@ -2,6 +2,7 @@ import { api } from "@/lib/api";
 import { CommoditySelector } from "@/components/CommoditySelector";
 import { KPICard } from "@/components/KPICard";
 import { fmtNum } from "@/lib/utils";
+import { Globe, TrendingUp, TrendingDown } from "lucide-react";
 
 export const dynamic = "force-dynamic";
 
@@ -23,8 +24,11 @@ export default async function RegionalPage({ searchParams }: Props) {
   const totalExports = exporters.reduce((s, r) => s + r.net_trade, 0);
   const totalImports = importers.reduce((s, r) => s + Math.abs(r.net_trade), 0);
 
+  // For bar visualisation (max share)
+  const maxShare = Math.max(...regional.rows.map((r) => Math.max(r.supply_share_pct, r.demand_share_pct)));
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 animate-slide-up">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold">Regional Flows — {commodity.name}</h1>
@@ -36,26 +40,62 @@ export default async function RegionalPage({ searchParams }: Props) {
         <CommoditySelector commodities={commodities} current={key} />
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <KPICard
-          label={`World supply (${regional.unit})`}
-          value={fmtNum(regional.world_supply, 1)}
-        />
-        <KPICard
-          label={`World demand (${regional.unit})`}
-          value={fmtNum(regional.world_demand, 1)}
-        />
-        <KPICard
-          label={`Global balance (${regional.unit})`}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 stagger">
+        <KPICard label={`World supply (${regional.unit})`}
+          value={fmtNum(regional.world_supply, 1)} icon={<Globe size={11} />} />
+        <KPICard label={`World demand (${regional.unit})`}
+          value={fmtNum(regional.world_demand, 1)} icon={<Globe size={11} />} />
+        <KPICard label={`Global balance (${regional.unit})`}
           value={`${regional.world_balance > 0 ? "+" : ""}${fmtNum(regional.world_balance, 1)}`}
           deltaTone={regional.world_balance >= 0 ? "pos" : "neg"}
-          delta="+ surplus / − deficit"
-        />
-        <KPICard
-          label={`Implied trade (${regional.unit})`}
+          delta="+ surplus / − deficit" />
+        <KPICard label={`Implied trade (${regional.unit})`}
           value={fmtNum(totalExports, 1)}
-          delta={`${exporters.length} exporters → ${importers.length} importers`}
-        />
+          delta={`${exporters.length} exporters → ${importers.length} importers`} />
+      </div>
+
+      {/* Share visualization */}
+      <div className="card p-5">
+        <h2 className="text-sm font-semibold mb-3">Market share — supply vs demand</h2>
+        <div className="space-y-2">
+          {regional.rows.map((r) => (
+            <div key={r.region} className="grid grid-cols-12 gap-3 items-center text-xs">
+              <div className="col-span-3 text-ink-50 truncate">{r.region}</div>
+              <div className="col-span-4">
+                <div className="flex items-center gap-2">
+                  <span className="text-pos font-mono w-12 text-right">{r.supply_share_pct.toFixed(1)}%</span>
+                  <div className="flex-1 h-2.5 bg-ink-700 rounded-full overflow-hidden">
+                    <div className="h-full bg-pos rounded-full transition-all"
+                      style={{ width: `${(r.supply_share_pct / maxShare) * 100}%` }} />
+                  </div>
+                </div>
+              </div>
+              <div className="col-span-4">
+                <div className="flex items-center gap-2">
+                  <span className="text-neg font-mono w-12 text-right">{r.demand_share_pct.toFixed(1)}%</span>
+                  <div className="flex-1 h-2.5 bg-ink-700 rounded-full overflow-hidden">
+                    <div className="h-full bg-neg rounded-full transition-all"
+                      style={{ width: `${(r.demand_share_pct / maxShare) * 100}%` }} />
+                  </div>
+                </div>
+              </div>
+              <div className="col-span-1">
+                <span className={`badge ${
+                  r.status === "exporter" ? "border-pos/40 text-pos" :
+                  r.status === "importer" ? "border-neg/40 text-neg" : ""
+                }`}>{r.status}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="flex items-center gap-4 mt-4 pt-3 border-t border-ink-600 text-[11px] text-ink-200">
+          <span className="flex items-center gap-1.5">
+            <span className="w-3 h-2.5 bg-pos rounded-sm" /> Supply share
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="w-3 h-2.5 bg-neg rounded-sm" /> Demand share
+          </span>
+        </div>
       </div>
 
       <div className="grid lg:grid-cols-2 gap-6">

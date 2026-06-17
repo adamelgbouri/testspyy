@@ -178,6 +178,7 @@ export type EventRow = {
 export const api = {
   commodities:  () => fetcher<Commodity[]>("/api/commodities"),
   spot:         (key: string) => fetcher<Spot>(`/api/spot/${key}`),
+  allSpots:     () => fetcher<(Spot & { sector: string })[]>("/api/spots"),
   balance:      (key: string, q?: Record<string, number>) =>
     fetcher<BalanceResponse>(
       `/api/balance/${key}` +

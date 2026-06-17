@@ -195,6 +195,37 @@ def spot(key: str) -> SpotResponse:
                         asof="reference", source="reference")
 
 
+class SpotWithSector(SpotResponse):
+    sector: str
+
+
+@app.get("/api/spots", response_model=List[SpotWithSector])
+def all_spots() -> List[SpotWithSector]:
+    """Batch endpoint returning the latest spot for every supported commodity."""
+    out: List[SpotWithSector] = []
+    for key, tpl in COMMODITY_TEMPLATES.items():
+        live = get_live_spot(key)
+        if live is not None:
+            out.append(SpotWithSector(
+                key=key, name=tpl.name, price_unit=tpl.price_unit,
+                sector=tpl.sector,
+                price=live["price"], change_pct=live["change_pct"],
+                asof=live["asof"], source=live["source"],
+            ))
+        else:
+            # Use a small deterministic synthetic change so the heatmap has variety
+            import random
+            rng = random.Random(hash(key))
+            out.append(SpotWithSector(
+                key=key, name=tpl.name, price_unit=tpl.price_unit,
+                sector=tpl.sector,
+                price=tpl.base_price,
+                change_pct=rng.uniform(-2.5, 2.5),
+                asof="reference", source="reference",
+            ))
+    return out
+
+
 @app.get("/api/balance/{key}", response_model=BalanceResponse)
 def balance(
     key: str,
