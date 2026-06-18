@@ -1,0 +1,15 @@
+# Render.com blueprint - free Python service.
+# Push this repo to GitHub then click "New +" → "Blueprint" in Render.
+services:
+  - type: web
+    name: aeg-snd-api
+    runtime: python
+    plan: free
+    rootDir: web/backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DISABLE_YF
+        value: "0"
+      - key: PYTHON_VERSION
+        value: "3.11.9"

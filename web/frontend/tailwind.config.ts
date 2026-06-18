@@ -1,27 +1,36 @@
 import type { Config } from "tailwindcss";
 
+/**
+ * Trading-floor palette — Bloomberg-Terminal-meets-modern-web.
+ *   - Deep midnight-blue background (almost black, never pure black)
+ *   - Subtle navy layers for depth
+ *   - Amber accent for highlights & live ticks
+ *   - Cyan accent for interactive elements
+ *   - Green / red for P&L
+ */
 const config: Config = {
   content: ["./app/**/*.{ts,tsx}", "./components/**/*.{ts,tsx}"],
   theme: {
     extend: {
       colors: {
-        // Trading-desk dark palette
         ink: {
-          50:  "#f8fafc",
-          100: "#e5e7eb",
-          200: "#9ca3af",
-          300: "#6b7280",
-          400: "#4b5563",
-          500: "#374151",
-          600: "#1f2937",
-          700: "#161b22",
-          800: "#0e1117",
-          900: "#0b0f14",
+          50:  "#f0f4fa",
+          100: "#dbe4f0",
+          200: "#97a8be",
+          300: "#6c809b",
+          400: "#4a5f7e",
+          500: "#2c4564",     // border bright
+          600: "#1f3553",     // border default
+          700: "#152641",     // panels elevated
+          800: "#0e1f33",     // cards
+          900: "#0a1628",     // canvas
         },
-        accent: { DEFAULT: "#00d4ff", muted: "#0891b2" },
-        pos: "#22c55e",
-        neg: "#ef4444",
-        warn: "#f59e0b",
+        // Bloomberg-style accents
+        accent: { DEFAULT: "#ffb800", muted: "#cc9400" },    // amber for highlights
+        cyan:   { DEFAULT: "#00d4ff", muted: "#0891b2" },
+        pos:    "#00d18c",
+        neg:    "#ff4757",
+        warn:   "#ffb800",
         violet: "#a78bfa",
       },
       fontFamily: {
@@ -29,7 +38,12 @@ const config: Config = {
         mono: ["JetBrains Mono", "monospace"],
       },
       boxShadow: {
-        card: "0 1px 3px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.02)",
+        card: "0 1px 0 rgba(0,212,255,0.04) inset, 0 1px 8px rgba(0,0,0,0.4)",
+        glow: "0 0 24px rgba(255,184,0,0.15)",
+      },
+      backgroundImage: {
+        "grid-pattern":
+          "linear-gradient(to right, rgba(31,53,83,0.25) 1px, transparent 1px), linear-gradient(to bottom, rgba(31,53,83,0.25) 1px, transparent 1px)",
       },
     },
   },

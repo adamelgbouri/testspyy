@@ -7,24 +7,25 @@
 @layer base {
   html { color-scheme: dark; }
   body {
-    @apply bg-ink-800 text-ink-100 antialiased min-h-screen font-sans;
+    @apply bg-ink-900 text-ink-100 antialiased min-h-screen font-sans;
     background-image:
       radial-gradient(900px circle at 12% -10%, rgba(0,212,255,0.08), transparent 45%),
-      radial-gradient(700px circle at 88% 10%, rgba(167,139,250,0.06), transparent 45%),
-      radial-gradient(600px circle at 50% 110%, rgba(34,197,94,0.04), transparent 50%);
+      radial-gradient(700px circle at 88% 10%, rgba(255,184,0,0.05), transparent 45%),
+      linear-gradient(to right, rgba(31,53,83,0.16) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(31,53,83,0.16) 1px, transparent 1px);
+    background-size: auto, auto, 60px 60px, 60px 60px;
     background-attachment: fixed;
   }
   h1, h2, h3, h4 { @apply text-ink-50 tracking-tight; }
-  /* Custom scrollbar */
+  /* Scrollbar */
   ::-webkit-scrollbar { width: 10px; height: 10px; }
-  ::-webkit-scrollbar-track { background: #0b0f14; }
+  ::-webkit-scrollbar-track { background: #0a1628; }
   ::-webkit-scrollbar-thumb {
-    background: #1f2937;
+    background: #1f3553;
     border-radius: 5px;
-    border: 2px solid #0b0f14;
+    border: 2px solid #0a1628;
   }
-  ::-webkit-scrollbar-thumb:hover { background: #374151; }
-  /* Better focus rings */
+  ::-webkit-scrollbar-thumb:hover { background: #2c4564; }
   :focus-visible {
     outline: 2px solid #00d4ff;
     outline-offset: 2px;
@@ -34,19 +35,20 @@
 
 @layer components {
   .card {
-    @apply relative rounded-xl border border-ink-600 bg-gradient-to-b from-ink-600/30 to-ink-700/60
+    @apply relative rounded-xl border border-ink-600 bg-gradient-to-b from-ink-800 to-ink-800/80
            shadow-card backdrop-blur-sm transition-all duration-200;
   }
-  .card:hover { @apply border-ink-500/80; }
+  .card:hover { @apply border-ink-500/70; }
+
   .card-glow {
-    @apply relative rounded-xl border border-ink-600 bg-gradient-to-b from-ink-600/30 to-ink-700/60
+    @apply relative rounded-xl border border-ink-600 bg-gradient-to-b from-ink-800 to-ink-800/80
            shadow-card backdrop-blur-sm;
   }
   .card-glow::before {
     content: "";
     position: absolute;
     inset: -1px;
-    background: linear-gradient(135deg, rgba(0,212,255,0.4), transparent 40%, rgba(167,139,250,0.4));
+    background: linear-gradient(135deg, rgba(255,184,0,0.35), transparent 40%, rgba(0,212,255,0.35));
     border-radius: 0.75rem;
     z-index: -1;
     opacity: 0;
@@ -55,19 +57,19 @@
   .card-glow:hover::before { opacity: 1; }
 
   .metric-label {
-    @apply text-[10px] tracking-[0.1em] uppercase text-ink-200 font-semibold;
+    @apply text-[10px] tracking-[0.12em] uppercase text-ink-200 font-semibold;
   }
   .metric-value {
     @apply font-mono font-semibold text-ink-50 tabular-nums;
   }
   .badge {
-    @apply inline-flex items-center gap-1 rounded-full border border-ink-500
+    @apply inline-flex items-center gap-1 rounded-md border border-ink-500
            bg-ink-700/60 px-2 py-0.5 text-[10px] font-semibold text-ink-100
            uppercase tracking-wider;
   }
   .nav-link {
     @apply flex items-center gap-2 rounded-lg px-3 py-1.5 text-[13px] text-ink-200
-           hover:bg-ink-600/50 hover:text-ink-50 transition-all duration-150;
+           hover:bg-ink-700/60 hover:text-ink-50 transition-all duration-150;
   }
   .nav-link-active {
     @apply bg-gradient-to-r from-accent/15 to-transparent text-ink-50 border-l-2 border-accent;
@@ -76,12 +78,12 @@
     @apply text-[10px] uppercase tracking-[0.14em] text-ink-300 font-bold mt-4 mb-2 px-2;
   }
 
-  /* Glass effect for overlays */
+  /* Glass overlay (cmd-K panel, modals) */
   .glass {
-    @apply bg-ink-700/80 backdrop-blur-xl border border-ink-500;
+    @apply bg-ink-800/85 backdrop-blur-xl border border-ink-500;
   }
 
-  /* Live data indicator */
+  /* Live tick indicator */
   .pulse-dot {
     position: relative;
     width: 8px;
@@ -98,56 +100,48 @@
     opacity: 0.5;
     animation: pulse-ring 1.6s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
   }
-  .pulse-pos { background: #22c55e; box-shadow: 0 0 8px rgba(34,197,94,0.6); }
-  .pulse-neg { background: #ef4444; box-shadow: 0 0 8px rgba(239,68,68,0.6); }
-  .pulse-accent { background: #00d4ff; box-shadow: 0 0 8px rgba(0,212,255,0.6); }
+  .pulse-pos { background: #00d18c; box-shadow: 0 0 8px rgba(0,209,140,0.6); }
+  .pulse-neg { background: #ff4757; box-shadow: 0 0 8px rgba(255,71,87,0.6); }
+  .pulse-accent { background: #ffb800; box-shadow: 0 0 10px rgba(255,184,0,0.7); }
 
   @keyframes pulse-ring {
-    0% { transform: scale(1); opacity: 0.6; }
+    0%   { transform: scale(1); opacity: 0.6; }
     100% { transform: scale(2.5); opacity: 0; }
   }
 
   @keyframes flash-pos {
-    0% { background: rgba(34,197,94,0.0); }
-    20% { background: rgba(34,197,94,0.3); }
-    100% { background: rgba(34,197,94,0.0); }
+    0%   { background: rgba(0,209,140,0.0); }
+    20%  { background: rgba(0,209,140,0.3); }
+    100% { background: rgba(0,209,140,0.0); }
   }
   @keyframes flash-neg {
-    0% { background: rgba(239,68,68,0.0); }
-    20% { background: rgba(239,68,68,0.3); }
-    100% { background: rgba(239,68,68,0.0); }
+    0%   { background: rgba(255,71,87,0.0); }
+    20%  { background: rgba(255,71,87,0.3); }
+    100% { background: rgba(255,71,87,0.0); }
   }
   .flash-pos { animation: flash-pos 0.7s ease; }
   .flash-neg { animation: flash-neg 0.7s ease; }
 
-  /* Animated gradient borders for highlights */
+  /* Shimmer for hover effects */
   @keyframes shimmer {
-    0% { background-position: -200% center; }
+    0%   { background-position: -200% center; }
     100% { background-position: 200% center; }
   }
   .shimmer {
     background: linear-gradient(
-      90deg,
-      transparent 0%,
-      rgba(0,212,255,0.15) 50%,
-      transparent 100%
+      90deg, transparent 0%, rgba(255,184,0,0.18) 50%, transparent 100%
     );
     background-size: 200% 100%;
     animation: shimmer 2.5s linear infinite;
   }
 
-  /* Slide-in animation - SAFE: opacity defaults to 1 so content is visible
-     even if the animation engine doesn't run. */
   @keyframes slide-up {
     from { opacity: 0; transform: translateY(8px); }
     to   { opacity: 1; transform: translateY(0); }
   }
   .animate-slide-up { animation: slide-up 0.3s ease both; }
 
-  /* Stagger children - same safety: no opacity:0 default. */
-  .stagger > * {
-    animation: slide-up 0.35s ease both;
-  }
+  .stagger > * { animation: slide-up 0.35s ease both; }
   .stagger > *:nth-child(1) { animation-delay: 0.02s; }
   .stagger > *:nth-child(2) { animation-delay: 0.06s; }
   .stagger > *:nth-child(3) { animation-delay: 0.10s; }
@@ -156,26 +150,29 @@
   .stagger > *:nth-child(6) { animation-delay: 0.22s; }
 
   /* Skeleton loader */
-  @keyframes skeleton-pulse {
-    0%, 100% { opacity: 0.4; }
-    50% { opacity: 0.7; }
-  }
   .skeleton {
-    background: linear-gradient(90deg, #1f2937, #374151, #1f2937);
+    background: linear-gradient(90deg, #1f3553, #2c4564, #1f3553);
     background-size: 200% 100%;
     animation: shimmer 1.4s linear infinite;
     border-radius: 4px;
   }
 
-  /* KBD style for keyboard shortcuts */
+  /* Keyboard shortcut hint */
   kbd {
     @apply inline-flex items-center justify-center min-w-[20px] h-5 px-1.5
            text-[10px] font-mono font-semibold text-ink-100
-           bg-ink-600 border border-ink-500 border-b-2 rounded shadow-sm;
+           bg-ink-700 border border-ink-500 border-b-2 rounded shadow-sm;
+  }
+
+  /* Numbers with "data tick" feel - subtle drop-shadow for Bloomberg vibes */
+  .tick-num {
+    @apply font-mono tabular-nums;
+    text-shadow: 0 0 4px currentColor;
+    opacity: 0.95;
   }
 }
 
-/* Ticker tape global keyframes (used by server component) */
+/* Ticker tape global keyframes */
 @keyframes ticker-scroll-left {
   from { transform: translateX(0); }
   to   { transform: translateX(-50%); }

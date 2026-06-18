@@ -32,7 +32,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    # Local dev + the deployed Vercel domain.  Add custom domains here later.
+    allow_origins=[
+        "http://localhost:3000", "http://127.0.0.1:3000",
+        "https://aeg-snd.vercel.app",
+    ],
+    allow_origin_regex=r"https://aeg-snd-.*\.vercel\.app",   # preview deploys
     allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
