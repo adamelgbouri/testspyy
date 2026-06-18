@@ -18,7 +18,7 @@
     "recharts": "^2.12.7",
     "class-variance-authority": "^0.7.0",
     "react-plotly.js": "^2.6.0",
-    "plotly.js-dist-min": "^2.35.2",
+    "plotly.js": "^2.35.2",
     "d3-geo": "^3.1.1",
     "topojson-client": "^3.1.0"
   },
