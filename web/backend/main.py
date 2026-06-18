@@ -14,8 +14,9 @@ from pydantic import BaseModel, Field
 
 from commodity_engine import (
     BalanceAssumptions, Black76, COMMODITY_TEMPLATES, CRACK_SPREADS,
-    MCConfig, crack_margin, estimate_fair_value, get_futures_curve,
-    get_live_spot, get_market_events, get_regional_dataset, get_sd_dataset,
+    MCConfig, crack_margin, estimate_fair_value, get_country_macro,
+    get_futures_curve, get_live_spot, get_market_events,
+    get_regional_dataset, get_sd_dataset, list_countries,
     parametric_var, portfolio_var, run_balance, run_monte_carlo,
     stress_scenarios,
 )
@@ -230,9 +231,9 @@ def all_spots() -> List[SpotWithSector]:
 def balance(
     key: str,
     forecast_months: int = Query(24, ge=6, le=36),
-    supply_adj_pct: float = Query(0.0, ge=-10, le=10),
-    demand_adj_pct: float = Query(0.0, ge=-10, le=10),
-    gdp_growth_pct: float = Query(2.5, ge=-2, le=6),
+    supply_adj_pct: float = Query(0.0, ge=-50, le=50),
+    demand_adj_pct: float = Query(0.0, ge=-50, le=50),
+    gdp_growth_pct: float = Query(2.5, ge=-10, le=20),
 ) -> BalanceResponse:
     if key not in COMMODITY_TEMPLATES:
         raise HTTPException(404, f"Unknown commodity '{key}'")
@@ -439,3 +440,40 @@ def montecarlo(key: str, req: MCRequest) -> MCResponse:
 @app.get("/api/events", response_model=List[EventRow])
 def events() -> List[EventRow]:
     return [EventRow(**e) for e in get_market_events()]
+
+
+class MacroPoint(BaseModel):
+    date: str
+    gdp_index: float
+    pmi: float
+    fx_vs_usd: float
+    policy_rate: float
+    cpi_yoy: float
+
+
+class MacroResponse(BaseModel):
+    country: str
+    points: List[MacroPoint]
+
+
+@app.get("/api/macro/countries", response_model=List[str])
+def macro_countries() -> List[str]:
+    return list_countries()
+
+
+@app.get("/api/macro/{country}", response_model=MacroResponse)
+def macro_country(country: str, months: int = Query(84, ge=12, le=240)
+                  ) -> MacroResponse:
+    df = get_country_macro(country, months=months)
+    points = [
+        MacroPoint(
+            date=str(idx.date()),
+            gdp_index=float(row["gdp_index"]),
+            pmi=float(row["pmi"]),
+            fx_vs_usd=float(row["fx_vs_usd"]),
+            policy_rate=float(row["policy_rate"]),
+            cpi_yoy=float(row["cpi_yoy"]),
+        )
+        for idx, row in df.iterrows()
+    ]
+    return MacroResponse(country=country, points=points)

@@ -165,15 +165,30 @@ function Slider({
   label: string; min: number; max: number; step: number;
   value: number; onChange: (v: number) => void; integer?: boolean;
 }) {
+  const parse = (s: string) => {
+    const n = integer ? parseInt(s, 10) : parseFloat(s);
+    return Number.isFinite(n) ? n : 0;
+  };
   return (
     <div>
-      <label className="metric-label">{label}</label>
+      <div className="flex items-baseline justify-between">
+        <label className="metric-label">{label}</label>
+        <input
+          type="number"
+          step={integer ? 1 : 0.01}
+          value={value}
+          onChange={(e) => onChange(parse(e.target.value))}
+          className="w-24 bg-ink-700 border border-ink-500 rounded px-2 py-0.5 text-xs font-mono text-ink-50 text-right focus:outline-none focus:ring-1 focus:ring-accent"
+        />
+      </div>
       <input
         type="range" min={min} max={max} step={step} value={value}
-        onChange={(e) => onChange(integer ? parseInt(e.target.value) : parseFloat(e.target.value))}
+        onChange={(e) => onChange(parse(e.target.value))}
         className="w-full mt-2 accent-accent"
       />
-      <div className="text-xs text-ink-100 font-mono mt-1">{value}</div>
+      <div className="text-[10px] text-ink-300 font-mono mt-0.5 flex justify-between">
+        <span>{min}</span><span className="text-ink-200">type any value above</span><span>{max}</span>
+      </div>
     </div>
   );
 }

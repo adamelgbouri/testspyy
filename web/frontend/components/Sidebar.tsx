@@ -3,7 +3,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   LayoutDashboard, LineChart, Globe2, ArrowLeftRight,
-  Target, Briefcase, Shield, FlaskConical, Calendar, Settings,
+  Target, Briefcase, Shield, FlaskConical, Calendar, Settings, Landmark,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -19,6 +19,7 @@ const GROUPS: Group[] = [
       { href: "/dashboard", label: "Dashboard", icon: <LayoutDashboard size={16} />, live: true },
       { href: "/balance",   label: "Supply & Demand", icon: <LineChart size={16} />, live: true },
       { href: "/regional",  label: "Regional Flows",  icon: <Globe2 size={16} />, live: true },
+      { href: "/macro",     label: "Macro Overlay",   icon: <Landmark size={16} />, live: true },
     ],
   },
   {

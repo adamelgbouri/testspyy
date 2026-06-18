@@ -189,6 +189,20 @@ export type VolSurfaceResponse = {
   forward: number;
 };
 
+export type MacroPoint = {
+  date: string;
+  gdp_index: number;
+  pmi: number;
+  fx_vs_usd: number;
+  policy_rate: number;
+  cpi_yoy: number;
+};
+
+export type MacroResponse = {
+  country: string;
+  points: MacroPoint[];
+};
+
 // ── API methods
 export const api = {
   commodities:  () => fetcher<Commodity[]>("/api/commodities"),
@@ -220,4 +234,7 @@ export const api = {
     fetcher<VolSurfaceResponse>("/api/options/vol-surface", {
       method: "POST", body: JSON.stringify(body),
     }),
+  macroCountries: () => fetcher<string[]>("/api/macro/countries"),
+  macroCountry: (country: string) =>
+    fetcher<MacroResponse>(`/api/macro/${encodeURIComponent(country)}`),
 };

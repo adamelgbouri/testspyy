@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowRight, LayoutDashboard, LineChart, Globe2, ArrowLeftRight,
-  Target, Briefcase, Shield, FlaskConical, Calendar, Settings, Search,
+  Target, Briefcase, Shield, FlaskConical, Calendar, Settings, Search, Landmark,
 } from "lucide-react";
 
 type Item = {
@@ -18,6 +18,7 @@ const ITEMS: Item[] = [
   { href: "/dashboard",  label: "Dashboard",       hint: "Market overview", icon: <LayoutDashboard size={15} />, keywords: "home overview market" },
   { href: "/balance",    label: "Supply & Demand", hint: "Balance engine", icon: <LineChart size={15} />, keywords: "s&d stock supply demand inventory" },
   { href: "/regional",   label: "Regional Flows",  hint: "Trade flows", icon: <Globe2 size={15} />, keywords: "regions world country export import" },
+  { href: "/macro",      label: "Macro Overlay",   hint: "Country panels", icon: <Landmark size={15} />, keywords: "gdp pmi fx usd policy rate cpi country" },
   { href: "/curve",      label: "Futures Curve",   hint: "Forward curve", icon: <LineChart size={15} />, keywords: "forward term structure contango backwardation" },
   { href: "/spreads",    label: "Spreads & Cracks", hint: "Crack spreads", icon: <ArrowLeftRight size={15} />, keywords: "crack 3-2-1 ratio location" },
   { href: "/options",    label: "Options & Greeks", hint: "Black-76 pricer", icon: <Target size={15} />, keywords: "delta gamma vega black scholes call put" },
