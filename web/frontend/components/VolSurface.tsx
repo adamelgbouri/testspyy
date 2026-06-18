@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import { api, type VolSurfaceResponse } from "@/lib/api";
 
-const Plot = dynamic(() => import("react-plotly.js"), {
+const Plot = dynamic(() => import("./PlotlyChart"), {
   ssr: false,
   loading: () => (
     <div className="h-[520px] flex items-center justify-center text-sm text-ink-200">
