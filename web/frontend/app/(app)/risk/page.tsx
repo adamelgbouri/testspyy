@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api, type Position, type RiskResponse } from "@/lib/api";
 import { KPICard } from "@/components/KPICard";
+import { KPICardSkeleton, TableSkeleton } from "@/components/Skeleton";
 import { fmtNum } from "@/lib/utils";
 
 const STORAGE_KEY = "trading_desk_positions";
@@ -94,7 +95,14 @@ export default function RiskPage() {
       </div>
 
       {error && <div className="card p-4 border-neg text-neg text-sm">{error}</div>}
-      {loading && !data && <p className="text-sm text-ink-200">Computing risk metrics…</p>}
+      {loading && !data && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            {Array.from({ length: 4 }).map((_, i) => <KPICardSkeleton key={i} />)}
+          </div>
+          <TableSkeleton rows={Math.min(positions.length, 6)} />
+        </>
+      )}
 
       {data && (
         <>

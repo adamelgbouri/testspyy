@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { api, type Commodity, type Position } from "@/lib/api";
 import { KPICard } from "@/components/KPICard";
+import { useToast } from "@/components/Toast";
 import { fmtNum, fmtPrice } from "@/lib/utils";
 import { Plus, Trash2 } from "lucide-react";
 
@@ -10,6 +11,7 @@ const STORAGE_KEY = "trading_desk_positions";
 type Mark = { price: number; source: string };
 
 export default function PositionsPage() {
+  const toast = useToast();
   const [commodities, setCommodities] = useState<Commodity[]>([]);
   const [positions, setPositions] = useState<Position[]>([]);
   const [marks, setMarks] = useState<Record<string, Mark>>({});
@@ -54,12 +56,31 @@ export default function PositionsPage() {
 
   const handleAdd = () => {
     setPositions([...positions, { ...form }]);
+    const c = commodities.find((x) => x.key === form.commodity_key);
+    toast.push({
+      tone: "success",
+      title: "Position added",
+      message: `${form.direction} ${form.quantity} × ${c?.name ?? form.commodity_key} @ ${form.entry_price}`,
+    });
   };
   const handleRemove = (idx: number) => {
+    const removed = positions[idx];
     setPositions(positions.filter((_, i) => i !== idx));
+    if (removed) {
+      const c = commodities.find((x) => x.key === removed.commodity_key);
+      toast.push({
+        tone: "info",
+        title: "Position removed",
+        message: `${c?.name ?? removed.commodity_key}`,
+      });
+    }
   };
   const handleClear = () => {
-    if (confirm("Clear all positions?")) setPositions([]);
+    if (confirm("Clear all positions?")) {
+      const n = positions.length;
+      setPositions([]);
+      toast.push({ tone: "warning", title: "Blotter cleared", message: `${n} positions removed` });
+    }
   };
 
   // Compute P&L

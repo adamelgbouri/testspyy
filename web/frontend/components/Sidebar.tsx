@@ -47,10 +47,13 @@ const GROUPS: Group[] = [
   },
 ];
 
-export function Sidebar() {
+export function Sidebar({ mobile = false }: { mobile?: boolean } = {}) {
   const pathname = usePathname();
+  const wrapperClass = mobile
+    ? "flex flex-col w-64 h-full border-r border-ink-600 bg-ink-900 px-4 pb-6"
+    : "hidden lg:flex flex-col w-64 shrink-0 border-r border-ink-600 bg-ink-900 px-4 pb-6";
   return (
-    <aside className="hidden lg:flex flex-col w-64 shrink-0 border-r border-ink-600 bg-ink-900 px-4 pb-6">
+    <aside className={wrapperClass}>
       <Link href="/" className="flex items-center gap-2 py-5 hover:opacity-80">
         <div className="w-7 h-7 rounded-md bg-gradient-to-br from-accent to-violet flex items-center justify-center font-bold text-ink-900">
           C

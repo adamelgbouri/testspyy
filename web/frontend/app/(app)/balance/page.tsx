@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { api, type BalanceResponse, type Commodity } from "@/lib/api";
 import { BalanceChart } from "@/components/BalanceChart";
 import { KPICard } from "@/components/KPICard";
+import { KPICardSkeleton, ChartSkeleton } from "@/components/Skeleton";
 import { fmtNum, fmtPrice } from "@/lib/utils";
 import {
   Bar, BarChart, CartesianGrid, ResponsiveContainer,
@@ -154,7 +155,14 @@ export default function BalancePage() {
         </>
       )}
 
-      {loading && !data && <p className="text-sm text-ink-200">Loading…</p>}
+      {loading && !data && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            {Array.from({ length: 4 }).map((_, i) => <KPICardSkeleton key={i} />)}
+          </div>
+          <ChartSkeleton height={360} />
+        </>
+      )}
     </div>
   );
 }

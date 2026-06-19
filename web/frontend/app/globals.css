@@ -141,6 +141,34 @@
   }
   .animate-slide-up { animation: slide-up 0.3s ease both; }
 
+  /* Page transition - fires via app/(app)/template.tsx */
+  @keyframes page-fade-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .page-transition { animation: page-fade-in 0.28s ease both; }
+
+  /* Top progress bar */
+  @keyframes nav-progress {
+    0%   { transform: translateX(-100%); }
+    35%  { transform: translateX(-20%); }
+    100% { transform: translateX(105%); }
+  }
+  .animate-nav-progress { animation: nav-progress 0.7s ease both; }
+
+  /* Toast in */
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateX(20px); }
+    to   { opacity: 1; transform: translateX(0); }
+  }
+  .animate-toast-in { animation: toast-in 0.22s ease both; }
+
+  /* Drawer slide */
+  @keyframes slide-in-left {
+    from { transform: translateX(-100%); }
+    to   { transform: translateX(0); }
+  }
+
   .stagger > * { animation: slide-up 0.35s ease both; }
   .stagger > *:nth-child(1) { animation-delay: 0.02s; }
   .stagger > *:nth-child(2) { animation-delay: 0.06s; }

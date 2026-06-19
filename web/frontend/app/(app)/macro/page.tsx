@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { api, type MacroResponse } from "@/lib/api";
 import { KPICard } from "@/components/KPICard";
+import { KPICardSkeleton, ChartSkeleton } from "@/components/Skeleton";
 import {
   CartesianGrid, Line, LineChart, ResponsiveContainer,
   Tooltip, XAxis, YAxis,
@@ -124,7 +125,14 @@ export default function MacroPage() {
         </div>
       </div>
 
-      {loading && <p className="text-sm text-ink-200">Loading macro data…</p>}
+      {loading && !primaryData && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            {Array.from({ length: 5 }).map((_, i) => <KPICardSkeleton key={i} />)}
+          </div>
+          <ChartSkeleton height={320} />
+        </>
+      )}
 
       {primaryData && (
         <>

@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { api, type Commodity } from "@/lib/api";
+import { useToast } from "@/components/Toast";
 import { Check, Database, Globe, Trash2 } from "lucide-react";
 
 type Prefs = {
@@ -21,6 +22,7 @@ const DEFAULTS: Prefs = {
 };
 
 export default function SettingsPage() {
+  const toast = useToast();
   const [commodities, setCommodities] = useState<Commodity[]>([]);
   const [prefs, setPrefs] = useState<Prefs>(DEFAULTS);
   const [apiStatus, setApiStatus] = useState<"ok" | "down" | "checking">("checking");
@@ -46,14 +48,25 @@ export default function SettingsPage() {
     localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
+    toast.push({
+      tone: "success",
+      title: "Preferences saved",
+      message: "Your settings now persist in this browser.",
+    });
   };
 
   const clearAllData = () => {
     if (confirm("This will erase all positions and reset preferences. Continue?")) {
+      const n = positionsCount;
       localStorage.removeItem(POSITIONS_KEY);
       localStorage.removeItem(PREFS_KEY);
       setPrefs(DEFAULTS);
       setPositionsCount(0);
+      toast.push({
+        tone: "warning",
+        title: "Local data cleared",
+        message: `${n} position(s) and preferences removed.`,
+      });
     }
   };
 
@@ -66,6 +79,11 @@ export default function SettingsPage() {
     a.download = "positions.json";
     a.click();
     URL.revokeObjectURL(url);
+    toast.push({
+      tone: "success",
+      title: "Export ready",
+      message: `${positionsCount} position(s) downloaded as positions.json`,
+    });
   };
 
   return (

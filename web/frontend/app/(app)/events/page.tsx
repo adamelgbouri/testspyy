@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useMemo, useState } from "react";
 import { api, type EventRow } from "@/lib/api";
+import { TableSkeleton } from "@/components/Skeleton";
 import { Calendar, Filter } from "lucide-react";
 
 const TAG_COLORS: Record<string, string> = {
@@ -90,7 +91,7 @@ export default function EventsPage() {
         </div>
       </div>
 
-      {loading && <p className="text-sm text-ink-200">Loading…</p>}
+      {loading && <TableSkeleton rows={5} />}
 
       {grouped.map(([weekStart, evs]) => (
         <div key={weekStart} className="card p-5">
