@@ -710,7 +710,7 @@ def run_streamlit_app():
     PANEL="#161B22"; BG="#0D1117"; BORDER="#30363D"; TEXT="#E6EDF3"
 
     st.set_page_config(
-        page_title="CODAP — Commodity Options & Derivatives Pricer",
+        page_title="CODAP - Commodity Options & Derivatives Pricer",
         page_icon="📈", layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -870,7 +870,7 @@ def run_streamlit_app():
                 st.session_state["opcap_combo"] = combo
                 spot_default = float(live_df["price"].iloc[0])
             except Exception as e:
-                st.warning(f"Live download failed — synthetic prices used. ({e})")
+                st.warning(f"Live download failed - synthetic prices used. ({e})")
                 live_df = None
 
     live_df = st.session_state.get("live_df")
@@ -973,7 +973,7 @@ def run_streamlit_app():
     with t1:
         _tab_title(st, "Black-76 European Option Pricer", "#F0A500", "📉")
         _tab_desc(st, "Black-76 is the industry standard for commodity options. "
-            "It prices European options on <b>futures prices</b> — directly observable and tradeable. "
+            "It prices European options on <b>futures prices</b> - directly observable and tradeable. "
             "All Greeks are computed analytically. Put-call parity is verified.")
 
         _hdr1, _hdr2, _hdr3 = st.columns([2,2,2])
@@ -1002,7 +1002,7 @@ def run_streamlit_app():
 
         with col_g:
             st.markdown('<div style="font-size:0.78rem;font-weight:500;color:#E6EDF3;'
-                'margin-bottom:8px">Greeks — Call vs Put</div>', unsafe_allow_html=True)
+                'margin-bottom:8px">Greeks - Call vs Put</div>', unsafe_allow_html=True)
             call=Black76(F_T,K,T,r,vol,"call"); put=Black76(F_T,K,T,r,vol,"put")
             gc2=call.greeks(); gp2=put.greeks()
             greek_meta = {
@@ -1120,7 +1120,7 @@ def run_streamlit_app():
         _tab_title(st, "Asian (Average Price) Option Pricer", "#BC8CFF", "🎲")
         _tab_desc(st, "Asian options pay off on the <b>average price</b> over their life. "
             "Used by airlines, refiners and consumers whose procurement is priced on monthly averages. "
-            "No closed-form for arithmetic — Monte Carlo simulation with Kemna-Vorst benchmark.")
+            "No closed-form for arithmetic - Monte Carlo simulation with Kemna-Vorst benchmark.")
 
         ca1,ca2,ca3 = st.columns([2,2,2])
         with ca1:
@@ -1239,7 +1239,7 @@ def run_streamlit_app():
 
     # ── TAB 3 — CRACK SPREAD OPTIONS ─────────────────────────────────────────
     with t3:
-        _tab_title(st, "Crack Spread Option Pricer — Kirk (1995)", "#FF7B72", "🏭")
+        _tab_title(st, "Crack Spread Option Pricer - Kirk (1995)", "#FF7B72", "🏭")
         _tab_desc(st, "Options on the <b>gross refining margin</b> (crack spread). "
             "A refiner long crude and short refined products hedges margin compression with a put. "
             "Kirk (1995) converts the two-asset spread into an effective single-asset Black-76 problem.")
@@ -1345,7 +1345,7 @@ def run_streamlit_app():
                     font=dict(color=RED,size=11,family="JetBrains Mono"),
                     bgcolor="#2D0A09",bordercolor=RED,borderwidth=1))
             fig_cr.update_layout(template="plotly_dark",height=330,
-                title=dict(text="Crack Spread — P&L at Expiry",y=0.97,x=0.5,
+                title=dict(text="Crack Spread - P&L at Expiry",y=0.97,x=0.5,
                            xanchor="center",font=dict(size=12,color="#8B949E")),
                 xaxis=dict(title="Crack spread at expiry ($/bbl)"),
                 yaxis=dict(title="P&L ($/bbl)"),
@@ -1372,7 +1372,7 @@ def run_streamlit_app():
 
     # ── TAB 4 — CALENDAR SPREAD OPTIONS ──────────────────────────────────────
     with t4:
-        _tab_title(st, "Calendar Spread Option Pricer — Kirk Approximation", "#F0A500", "📅")
+        _tab_title(st, "Calendar Spread Option Pricer - Kirk Approximation", "#F0A500", "📅")
         _tab_desc(st, "Options on the <b>slope of the forward curve</b> (M_near − M_far). "
             "A call pays off when backwardation widens; a put when contango deepens. "
             "Used to hedge roll yield risk or to trade curve steepening/flattening.")
@@ -1462,7 +1462,7 @@ def run_streamlit_app():
                     font=dict(color=RED,size=11,family="JetBrains Mono"),
                     bgcolor="#2D0A09",bordercolor=RED,borderwidth=1))
             fig_csp.update_layout(template="plotly_dark",height=330,
-                title=dict(text=f"Calendar Spread {near_m}−{far_m} — P&L at Expiry",
+                title=dict(text=f"Calendar Spread {near_m}−{far_m} - P&L at Expiry",
                            y=0.97,x=0.5,xanchor="center",font=dict(size=12,color="#8B949E")),
                 xaxis=dict(title=f"{near_m}−{far_m} spread ({unit})"),
                 yaxis=dict(title=f"P&L ({unit})"),
@@ -1661,10 +1661,10 @@ def run_streamlit_app():
     # TAB 7 — BARRIER OPTIONS
     # ══════════════════════════════════════════════════════════════════════════
     with t7:
-        _tab_title(st, "Barrier Options — Knock-In / Knock-Out", "#F0A500", "🚧")
+        _tab_title(st, "Barrier Options - Knock-In / Knock-Out", "#F0A500", "🚧")
         _tab_desc(st, "Barrier options activate (knock-in) or expire worthless (knock-out) "
             "if the underlying hits a barrier level during the option's life. "
-            "Cheaper than vanilla — used by airlines (KO calls) and producers (KI puts). "
+            "Cheaper than vanilla - used by airlines (KO calls) and producers (KI puts). "
             "Priced via daily Monte Carlo simulation.")
 
         _b1, _b2, _b3 = st.columns(3)
@@ -1767,7 +1767,7 @@ def run_streamlit_app():
                 font=dict(color=GREEN,size=11,family="JetBrains Mono"),
                 bgcolor="#0D2819",bordercolor=GREEN,borderwidth=1,borderpad=4)
             fig_bar.update_layout(template="plotly_dark", height=320,
-                title=_title("MC Paths — Alive (amber) vs Knocked (gray)"),
+                title=_title("MC Paths - Alive (amber) vs Knocked (gray)"),
                 xaxis=dict(title="Time (yr)"),
                 yaxis=dict(title=f"Price ({unit})"),
                 margin=dict(l=60,r=20,t=75,b=50))
@@ -1831,7 +1831,7 @@ def run_streamlit_app():
             annotation=dict(font=dict(color=GREEN,size=11,family="JetBrains Mono"),
                 bgcolor="#0D2819",bordercolor=GREEN,borderwidth=1,borderpad=4))
         fig_bp.update_layout(template="plotly_dark",height=280,
-            title=_title("P&L at Expiry — Barrier vs Vanilla"),
+            title=_title("P&L at Expiry - Barrier vs Vanilla"),
             xaxis=dict(title=f"Price at expiry ({unit})"),
             yaxis=dict(title=f"P&L ({unit})"),
             legend=dict(orientation="h",yanchor="bottom",y=1.02),
@@ -1964,5 +1964,5 @@ if __name__ == "__main__" or _is_streamlit():
     if _is_streamlit():
         run_streamlit_app()
     else:
-        print("OCDAP — Options & Commodity Derivatives Analytics Platform")
+        print("OCDAP - Options & Commodity Derivatives Analytics Platform")
         print("Run with: streamlit run opcap.py")
