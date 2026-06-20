@@ -5,10 +5,19 @@ import { PulseDot } from "./PulseDot";
 
 export function StatusBar() {
   const [now, setNow] = useState("");
+  const [tz, setTz] = useState("");
   const [api, setApi] = useState<"ok" | "down" | "checking">("checking");
   const [latency, setLatency] = useState<number | null>(null);
 
   useEffect(() => {
+    // Compute timezone label once on the client to avoid SSR/CSR mismatch
+    const offsetMin = new Date().getTimezoneOffset();
+    const sign = offsetMin <= 0 ? "+" : "-";
+    const abs = Math.abs(offsetMin);
+    const hh = String(Math.floor(abs / 60)).padStart(2, "0");
+    const mm = String(abs % 60).padStart(2, "0");
+    setTz(offsetMin === 0 ? "UTC" : `UTC${sign}${hh}${mm === "00" ? "" : `:${mm}`}`);
+
     const tick = () => {
       const d = new Date();
       setNow(d.toLocaleTimeString("en-US", { hour12: false }));
@@ -59,8 +68,8 @@ export function StatusBar() {
       </div>
       <div className="flex items-center gap-1.5 ml-auto">
         <Clock size={11} />
-        <span className="text-ink-100">{now}</span>
-        <span className="text-ink-300">UTC{new Date().getTimezoneOffset() === 0 ? "" : new Date().toString().match(/GMT[-+]\d{4}/)?.[0]?.replace("GMT", "")}</span>
+        <span className="text-ink-100">{now || "--:--:--"}</span>
+        <span className="text-ink-300">{tz}</span>
       </div>
       <div className="hidden md:flex items-center gap-1.5">
         <span className="text-ink-300">PRESS</span>

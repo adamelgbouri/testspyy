@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { api } from "@/lib/api";
 import { CommoditySelector } from "@/components/CommoditySelector";
 import { KPICard } from "@/components/KPICard";
@@ -5,14 +6,20 @@ import { BalanceChart } from "@/components/BalanceChart";
 import { MarketHeatmap } from "@/components/MarketHeatmap";
 import { SentimentGauge } from "@/components/SentimentGauge";
 import { PulseDot } from "@/components/PulseDot";
+import { DashboardBrief } from "@/components/DashboardBrief";
+import { Freshness } from "@/components/Freshness";
 import { fmtNum, fmtPct, fmtPrice } from "@/lib/utils";
-import { TrendingUp, TrendingDown, BarChart3, Box, Droplets, Globe } from "lucide-react";
+import {
+  TrendingUp, TrendingDown, BarChart3, Box, Droplets, Globe,
+  Activity, LineChart, ShieldAlert, Briefcase, ArrowRight,
+} from "lucide-react";
 
 export const dynamic = "force-dynamic";
 
 type Props = { searchParams: { c?: string } };
 
 export default async function DashboardPage({ searchParams }: Props) {
+  const fetchedAt = new Date().toISOString();
   const commodities = await api.commodities();
   const key = searchParams.c ?? commodities[0]?.key ?? "wti_crude";
 
@@ -37,7 +44,6 @@ export default async function DashboardPage({ searchParams }: Props) {
   const sparkUtil = histPoints.map((p) => p.stocks / commodity.days_cover_target * 100);
 
   // Top movers
-  const movers = [...allSpots].sort((a, b) => Math.abs(b.change_pct) - Math.abs(a.change_pct)).slice(0, 5);
   const gainers = [...allSpots].filter((s) => s.change_pct > 0).sort((a, b) => b.change_pct - a.change_pct).slice(0, 3);
   const losers = [...allSpots].filter((s) => s.change_pct < 0).sort((a, b) => a.change_pct - b.change_pct).slice(0, 3);
 
@@ -46,31 +52,81 @@ export default async function DashboardPage({ searchParams }: Props) {
   const sentiment = (upCount / allSpots.length) * 100;
   const avgChange = allSpots.reduce((s, x) => s + x.change_pct, 0) / allSpots.length;
 
+  // Quick-jump destinations that pre-select this commodity where possible
+  const quickJumps = [
+    { href: `/balance?c=${key}`,  icon: <BarChart3 size={12} />,   label: "Supply & demand" },
+    { href: `/curve?c=${key}`,    icon: <LineChart size={12} />,   label: "Futures curve" },
+    { href: `/options`,           icon: <Activity size={12} />,    label: "Options pricer" },
+    { href: `/risk`,              icon: <ShieldAlert size={12} />, label: "Risk" },
+    { href: `/positions`,         icon: <Briefcase size={12} />,   label: "Positions" },
+  ];
+
   return (
-    <div className="space-y-6 animate-slide-up">
+    <div className="space-y-6">
       {/* Header */}
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <div className="flex items-center gap-2 mb-1">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2 mb-1.5">
             <PulseDot tone={upDelta ? "pos" : "neg"} />
             <span className="badge">LIVE</span>
             <span className="text-[11px] text-ink-200 font-mono">
-              {spot.source === "yahoo" ? `Yahoo Finance · as of ${spot.asof}` : "Reference data"}
+              {spot.source === "yahoo" ? `Yahoo · as of ${spot.asof}` : "Reference data"}
             </span>
+            <span className="text-ink-500">·</span>
+            <Freshness since={fetchedAt} />
           </div>
-          <h1 className="text-3xl font-bold tracking-tight">{commodity.name}</h1>
+          <h1 className="text-3xl font-bold tracking-tight truncate">{commodity.name}</h1>
           <p className="text-sm text-ink-200 mt-1">
-            <span className="text-ink-100">{commodity.sector}</span> ·{" "}
-            <span className="font-mono text-ink-100">{commodity.ticker}</span> ·{" "}
-            Flow {commodity.unit} · Stocks {commodity.inventory_unit} ·{" "}
+            <span className="text-ink-100">{commodity.sector}</span>
+            <span className="text-ink-500 mx-1.5">·</span>
+            <span className="font-mono text-ink-100">{commodity.ticker}</span>
+            <span className="text-ink-500 mx-1.5">·</span>
+            Flow {commodity.unit}
+            <span className="text-ink-500 mx-1.5">·</span>
+            Stocks {commodity.inventory_unit}
+            <span className="text-ink-500 mx-1.5">·</span>
             Quote {commodity.price_unit}
           </p>
         </div>
         <CommoditySelector commodities={commodities} current={key} />
       </div>
 
+      {/* Quick jumps */}
+      <div className="flex items-center gap-2 flex-wrap text-[11px]">
+        <span className="text-ink-300 uppercase tracking-widest font-semibold mr-1">
+          Jump to
+        </span>
+        {quickJumps.map((q) => (
+          <Link
+            key={q.href}
+            href={q.href as any}
+            className="inline-flex items-center gap-1.5 rounded-md border border-ink-500 bg-ink-700/40
+                       px-2.5 py-1 text-ink-100 hover:text-ink-50 hover:bg-ink-600 hover:border-accent/50
+                       transition font-mono"
+          >
+            <span className="text-accent">{q.icon}</span>
+            {q.label}
+            <ArrowRight size={10} className="opacity-50" />
+          </Link>
+        ))}
+      </div>
+
+      {/* Trader brief — auto-generated narrative */}
+      <DashboardBrief
+        commodityName={commodity.name}
+        price={spot.price}
+        priceUnit={spot.price_unit ?? commodity.price_unit}
+        changePct={spot.change_pct}
+        fairValue={fvNow}
+        fvDeviation={fvDeviation}
+        daysCover={balance.end_days_cover}
+        daysCoverTarget={commodity.days_cover_target}
+        utilizationPct={balance.end_utilization_pct}
+        idealUtilization={commodity.ideal_utilization_pct}
+      />
+
       {/* KPI strip with sparklines */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-3 stagger">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 stagger">
         <KPICard
           label="Spot price"
           icon={<TrendingUp size={11} />}
@@ -121,9 +177,12 @@ export default async function DashboardPage({ searchParams }: Props) {
       <div className="grid lg:grid-cols-5 gap-4">
         <div className="card p-5 lg:col-span-3">
           <div className="flex items-center justify-between mb-3">
-            <h2 className="text-sm font-semibold">Supply, demand & stocks</h2>
-            <span className="text-[11px] text-ink-200 italic">
-              Dashed line marks the start of the forecast
+            <h2 className="text-sm font-semibold flex items-center gap-2">
+              <LineChart size={14} className="text-accent" />
+              Supply, demand &amp; stocks
+            </h2>
+            <span className="text-[11px] text-ink-300 italic">
+              Dashed line = forecast start
             </span>
           </div>
           <BalanceChart
@@ -143,11 +202,16 @@ export default async function DashboardPage({ searchParams }: Props) {
             </h3>
             <ul className="space-y-1.5">
               {gainers.length > 0 ? gainers.map((g) => (
-                <li key={g.key} className="flex justify-between items-center text-xs">
-                  <span className="text-ink-100 truncate">{g.name}</span>
-                  <span className="text-pos font-mono font-semibold">
-                    +{g.change_pct.toFixed(2)}%
-                  </span>
+                <li key={g.key}>
+                  <Link
+                    href={`/dashboard?c=${g.key}` as any}
+                    className="flex justify-between items-center text-xs py-0.5 rounded hover:bg-pos/5 px-1 -mx-1 transition"
+                  >
+                    <span className="text-ink-100 truncate">{g.name}</span>
+                    <span className="text-pos font-mono font-semibold tabular-nums">
+                      +{g.change_pct.toFixed(2)}%
+                    </span>
+                  </Link>
                 </li>
               )) : <li className="text-xs text-ink-300">No gainer in the session.</li>}
             </ul>
@@ -157,11 +221,16 @@ export default async function DashboardPage({ searchParams }: Props) {
             </h3>
             <ul className="space-y-1.5">
               {losers.length > 0 ? losers.map((g) => (
-                <li key={g.key} className="flex justify-between items-center text-xs">
-                  <span className="text-ink-100 truncate">{g.name}</span>
-                  <span className="text-neg font-mono font-semibold">
-                    {g.change_pct.toFixed(2)}%
-                  </span>
+                <li key={g.key}>
+                  <Link
+                    href={`/dashboard?c=${g.key}` as any}
+                    className="flex justify-between items-center text-xs py-0.5 rounded hover:bg-neg/5 px-1 -mx-1 transition"
+                  >
+                    <span className="text-ink-100 truncate">{g.name}</span>
+                    <span className="text-neg font-mono font-semibold tabular-nums">
+                      {g.change_pct.toFixed(2)}%
+                    </span>
+                  </Link>
                 </li>
               )) : <li className="text-xs text-ink-300">No loser in the session.</li>}
             </ul>
@@ -172,11 +241,11 @@ export default async function DashboardPage({ searchParams }: Props) {
       {/* Market Heatmap */}
       <div className="card p-5">
         <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
+          <h2 className="text-sm font-semibold flex items-center gap-2">
             <Globe size={15} className="text-accent" />
-            <h2 className="text-sm font-semibold">Market heatmap</h2>
-          </div>
-          <span className="text-[11px] text-ink-200 italic">
+            Market heatmap
+          </h2>
+          <span className="text-[11px] text-ink-300 italic">
             Click any tile to switch commodity · colour intensity ∝ 1d %
           </span>
         </div>
@@ -186,7 +255,18 @@ export default async function DashboardPage({ searchParams }: Props) {
       {/* Regional snapshot */}
       <div className="grid lg:grid-cols-3 gap-4">
         <div className="card p-5 lg:col-span-2">
-          <h2 className="text-sm font-semibold mb-3">Regional snapshot — {commodity.name}</h2>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-semibold flex items-center gap-2">
+              <Globe size={14} className="text-accent" />
+              Regional snapshot — {commodity.name}
+            </h2>
+            <Link
+              href={`/regional?c=${key}` as any}
+              className="text-[11px] text-accent hover:underline inline-flex items-center gap-1"
+            >
+              full regional view <ArrowRight size={10} />
+            </Link>
+          </div>
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
               <thead>
@@ -204,15 +284,15 @@ export default async function DashboardPage({ searchParams }: Props) {
                 {regional.rows.map((r) => (
                   <tr key={r.region} className="border-b border-ink-700/60 hover:bg-ink-600/20 transition">
                     <td className="py-2 text-ink-50">{r.region}</td>
-                    <td className="text-right">{fmtNum(r.supply, 2)}</td>
-                    <td className="text-right">{fmtNum(r.demand, 2)}</td>
-                    <td className={`text-right font-semibold ${
+                    <td className="text-right tabular-nums">{fmtNum(r.supply, 2)}</td>
+                    <td className="text-right tabular-nums">{fmtNum(r.demand, 2)}</td>
+                    <td className={`text-right font-semibold tabular-nums ${
                       r.net_trade > 0 ? "text-pos" : r.net_trade < 0 ? "text-neg" : ""
                     }`}>
                       {r.net_trade > 0 ? "+" : ""}{fmtNum(r.net_trade, 2)}
                     </td>
-                    <td className="text-right text-ink-200">{r.supply_share_pct.toFixed(1)}</td>
-                    <td className="text-right text-ink-200">{r.demand_share_pct.toFixed(1)}</td>
+                    <td className="text-right text-ink-200 tabular-nums">{r.supply_share_pct.toFixed(1)}</td>
+                    <td className="text-right text-ink-200 tabular-nums">{r.demand_share_pct.toFixed(1)}</td>
                     <td className="pl-3">
                       <span className={`badge ${
                         r.status === "exporter" ? "border-pos/40 text-pos" :
@@ -282,7 +362,7 @@ function Stat({ label, value, unit, tone, big }: {
   return (
     <div className="flex justify-between items-baseline">
       <span className="metric-label">{label}</span>
-      <span className={`${big ? "text-lg" : "text-sm"} ${
+      <span className={`${big ? "text-lg" : "text-sm"} tabular-nums ${
         tone === "pos" ? "text-pos" : tone === "neg" ? "text-neg" : "text-ink-50"
       }`}>
         {value} <span className="text-[10px] text-ink-300">{unit}</span>

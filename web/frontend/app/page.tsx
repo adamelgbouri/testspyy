@@ -4,6 +4,8 @@ import {
   Github, Linkedin, Mail, ExternalLink, Sparkles, Activity,
 } from "lucide-react";
 
+const YEAR = new Date().getFullYear();
+
 const FEATURES = [
   {
     icon: <BarChart3 size={20} />,
@@ -82,7 +84,7 @@ export default function Landing() {
         <div className="max-w-3xl mx-auto text-center">
           <div className="flex items-center justify-center gap-2 mb-6">
             <span className="pulse-dot pulse-accent" />
-            <span className="badge border-accent/40 text-accent">PORTFOLIO PROJECT · 2025</span>
+            <span className="badge border-accent/40 text-accent">PORTFOLIO PROJECT · {YEAR}</span>
           </div>
           <h1 className="text-5xl md:text-6xl font-bold tracking-tight mb-6 leading-[1.05]">
             A commodity trading desk{" "}
@@ -239,7 +241,7 @@ export default function Landing() {
 
       <footer className="border-t border-ink-600 py-6 text-center">
         <div className="text-[10px] text-ink-300 font-mono tracking-wider">
-          BUILT WITH NEXT.JS · FASTAPI · YAHOO FINANCE · 2025
+          BUILT WITH NEXT.JS · FASTAPI · YAHOO FINANCE · {YEAR}
         </div>
       </footer>
     </main>
