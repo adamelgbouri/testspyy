@@ -1,5 +1,5 @@
 """
-Commodity Trading Desk - single-file Streamlit app.
+Commodity Trading Desk — single-file Streamlit app.
 by Adam EL GBOURI
 
 Reuses the analytics engine in web/backend/commodity_engine/* so we don't
@@ -43,7 +43,7 @@ from commodity_engine import (  # noqa: E402
 # Page configuration & global styles
 # ----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Commodity Trading Desk - Adam EL GBOURI",
+    page_title="Commodity Trading Desk — Adam EL GBOURI",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -189,7 +189,7 @@ def page_dashboard() -> None:
     st.info(
         f"**{tpl.name}** is {direction} **{change_pct:+.2f}%** at "
         f"`{price_now:,.2f} {tpl.price_unit}`. "
-        f"Fair-value model puts it at `{fv_now:,.2f}` - **{fv_flag}** "
+        f"Fair-value model puts it at `{fv_now:,.2f}` — **{fv_flag}** "
         f"({fv_dev:+.1f}% vs spot). Inventory at `{dc_now:.1f}d` cover vs "
         f"`{tpl.days_cover_target:.0f}d` target reads as **{dc_flag}**.",
         icon="🎯",
@@ -263,7 +263,7 @@ def page_dashboard() -> None:
 def page_balance() -> None:
     key = commodity_selector("bal_")
     tpl = COMMODITY_TEMPLATES[key]
-    st.title(f"Supply & Demand - {tpl.name}")
+    st.title(f"Supply & Demand — {tpl.name}")
     st.caption("Editable assumptions feed the forecast portion of the balance.")
 
     c1, c2, c3, c4 = st.columns(4)
@@ -319,7 +319,7 @@ def page_balance() -> None:
 def page_regional() -> None:
     key = commodity_selector("reg_")
     tpl = COMMODITY_TEMPLATES[key]
-    st.title(f"Regional flows - {tpl.name}")
+    st.title(f"Regional flows — {tpl.name}")
 
     reg = get_regional_dataset(key)
     reg = reg.assign(status=np.where(reg["net_trade"] > 0.5, "exporter",
@@ -364,7 +364,7 @@ def page_regional() -> None:
 def page_curve() -> None:
     key = commodity_selector("curve_")
     tpl = COMMODITY_TEMPLATES[key]
-    st.title(f"Futures curve - {tpl.name}")
+    st.title(f"Futures curve — {tpl.name}")
 
     curve = get_futures_curve(key)
     if curve.empty:
@@ -398,7 +398,7 @@ def page_curve() -> None:
 def page_options() -> None:
     key = commodity_selector("opt_")
     tpl = COMMODITY_TEMPLATES[key]
-    st.title(f"Options & Greeks - {tpl.name}")
+    st.title(f"Options & Greeks — {tpl.name}")
     st.caption("Black-76 European pricer on futures.")
 
     spot = get_live_spot(key)
@@ -565,7 +565,7 @@ def page_risk() -> None:
 def page_monte_carlo() -> None:
     key = commodity_selector("mc_")
     tpl = COMMODITY_TEMPLATES[key]
-    st.title(f"Monte Carlo - {tpl.name}")
+    st.title(f"Monte Carlo — {tpl.name}")
     st.caption("Stochastic balance shocks → distribution of forecast prices & stocks.")
 
     c1, c2, c3, c4 = st.columns(4)
@@ -678,15 +678,15 @@ def page_events() -> None:
 def page_about() -> None:
     st.title("About")
     st.markdown("""
-    **Commodity Trading Desk** - solo-built portfolio project showcasing
+    **Commodity Trading Desk** — solo-built portfolio project showcasing
     full-stack quantitative finance:
 
-    - **Analytics** (Python · NumPy · SciPy · scikit-learn) - S&D balance,
+    - **Analytics** (Python · NumPy · SciPy · scikit-learn) — S&D balance,
       log-linear fair value, Black-76 option pricing & Greeks, parametric VaR
       / CVaR, Monte Carlo with fan charts, futures curve construction.
-    - **Live data** - Yahoo Finance via `yfinance`, with deterministic
+    - **Live data** — Yahoo Finance via `yfinance`, with deterministic
       synthetic fallback so the app never breaks when Yahoo is rate-limited.
-    - **10 commodities tracked** - WTI, Brent, Henry Hub, RBOB, ULSD, Gold,
+    - **10 commodities tracked** — WTI, Brent, Henry Hub, RBOB, ULSD, Gold,
       Silver, Copper, Wheat, Corn.
 
     The same analytics engine also powers a Next.js + FastAPI version at
