@@ -798,11 +798,11 @@ def page_regional(commodity, live_prices):
     fig2 = go.Figure(go.Bar(
         x=reg["region"], y=reg["net"],
         marker_color=np.where(reg["net"] >= 0, GREEN, RED),
-        text=[f"{v:+.1f} {ru}" for v in reg["net"]], textposition="outside",
+        text=[f"{v:+.1f}" for v in reg["net"]], textposition="outside",
     ))
     fig2.update_layout(
         title=f"Net Trade (Supply − Demand) — {ru}",
-        yaxis_title=f"{rl} ({ru})",
+        yaxis_title=f"{rl}",
     )
     st.plotly_chart(_styled(fig2, 300), use_container_width=True)
 
