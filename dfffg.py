@@ -173,7 +173,6 @@ COUNTRIES = ["USA", "China", "Germany", "Japan", "UK", "Brazil", "India", "Franc
 # ══════════════════════════════════════════════════════════════════════════════
 def black76(F: float, K: float, T: float, r: float, sigma: float,
             option_type: str = "call") -> dict:
-    """Black-76 pricer for European options on futures."""
     if T <= 0 or sigma <= 0 or F <= 0 or K <= 0:
         return dict(price=0, delta=0, gamma=0, vega=0, theta=0, rho=0)
     d1 = (math.log(F / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
@@ -187,15 +186,13 @@ def black76(F: float, K: float, T: float, r: float, sigma: float,
         delta = -disc * norm.cdf(-d1)
     gamma = disc * norm.pdf(d1) / (F * sigma * math.sqrt(T))
     vega  = disc * F * norm.pdf(d1) * math.sqrt(T) / 100
-    theta = (-(disc * F * norm.pdf(d1) * sigma) / (2 * math.sqrt(T))
-             - r * price) / 365
+    theta = (-(disc * F * norm.pdf(d1) * sigma) / (2 * math.sqrt(T)) - r * price) / 365
     rho   = -T * price / 100
     return dict(price=price, delta=delta, gamma=gamma, vega=vega, theta=theta, rho=rho)
 
 
 def implied_vol(F: float, K: float, T: float, r: float,
                 market_price: float, option_type: str = "call") -> Optional[float]:
-    """Brent-bracketed implied volatility solver."""
     try:
         f = lambda s: black76(F, K, T, r, s, option_type)["price"] - market_price
         return brentq(f, 1e-4, 10.0, xtol=1e-6)
@@ -205,7 +202,6 @@ def implied_vol(F: float, K: float, T: float, r: float,
 
 def forward_curve(spot: float, r: float, storage: float, conv: float,
                   vol: float, months: int = 24) -> pd.DataFrame:
-    """Cost-of-carry forward curve with stochastic noise."""
     rng = np.random.default_rng(42)
     rows = []
     today = date.today()
@@ -221,7 +217,6 @@ def forward_curve(spot: float, r: float, storage: float, conv: float,
 
 def vol_surface(F: float, atm_vol: float, skew: float = -0.05,
                 curv: float = 0.02, vov: float = 0.15) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Parametric vol surface: σ(K,T) = σ_ATM·(1+vov·√T) + skew·ln(K/F) + curv·ln(K/F)²"""
     maturities = np.array([1/12, 2/12, 3/12, 6/12, 9/12, 1.0, 1.5, 2.0])
     moneyness  = np.linspace(-0.40, 0.40, 25)
     Kgrid = F * np.exp(moneyness)
@@ -235,7 +230,6 @@ def vol_surface(F: float, atm_vol: float, skew: float = -0.05,
 
 
 def sd_dataset(commodity: str, months: int = 36) -> pd.DataFrame:
-    """Synthetic supply/demand balance dataset."""
     rng = np.random.default_rng(hash(commodity) % 2**32)
     c   = COMMODITIES[commodity]
     spot = c["spot"]
@@ -258,7 +252,6 @@ def sd_dataset(commodity: str, months: int = 36) -> pd.DataFrame:
 
 def run_mc(commodity: str, n_paths: int = 500, horizon: int = 18,
            sup_sig: float = 1.5, dem_sig: float = 1.2) -> dict:
-    """GBM Monte Carlo with fan chart output."""
     rng = np.random.default_rng(0)
     c   = COMMODITIES[commodity]
     S0  = c["spot"]
@@ -286,9 +279,7 @@ def run_mc(commodity: str, n_paths: int = 500, horizon: int = 18,
                 unit=c["unit"])
 
 
-def portfolio_var(positions: list, conf: float = 0.95,
-                  horizon: int = 1) -> dict:
-    """Parametric VaR / CVaR per position."""
+def portfolio_var(positions: list, conf: float = 0.95, horizon: int = 1) -> dict:
     z = norm.ppf(conf)
     rows, total_var, total_cvar = [], 0.0, 0.0
     for p in positions:
@@ -309,7 +300,6 @@ def portfolio_var(positions: list, conf: float = 0.95,
 
 
 def macro_data(country: str, months: int = 48) -> pd.DataFrame:
-    """Synthetic macro dataset per country."""
     rng   = np.random.default_rng(hash(country) % 2**32)
     today = date.today().replace(day=1)
     dates = [today - timedelta(days=30*(months-i)) for i in range(months)]
@@ -340,7 +330,7 @@ def _styled(fig: go.Figure, h: int = 380) -> go.Figure:
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=10, r=10, t=30, b=10), height=h,
         font=dict(family="Inter,system-ui", size=12, color=TEXT),
-        legend=dict(bgcolor=f"rgba(22,27,34,0.8)", bordercolor=BORDER, borderwidth=1),
+        legend=dict(bgcolor="rgba(22,27,34,0.8)", bordercolor=BORDER, borderwidth=1),
     )
     fig.update_xaxes(gridcolor=PANEL, zerolinecolor=BORDER)
     fig.update_yaxes(gridcolor=PANEL, zerolinecolor=BORDER)
@@ -490,7 +480,7 @@ def page_dashboard(commodity: str) -> None:
                              line=dict(color=RED,   width=2)))
     fig.add_trace(go.Scatter(x=df.index, y=df["stocks"], name="Stocks",
                              line=dict(color=TEAL, width=1.5),
-                             fill="tozeroy", fillcolor=f"rgba(57,208,216,0.08)",
+                             fill="tozeroy", fillcolor="rgba(57,208,216,0.08)",
                              yaxis="y2"))
     fc_start = df[df["is_forecast"]].index.min() if df["is_forecast"].any() else None
     if fc_start:
@@ -518,6 +508,7 @@ def page_dashboard(commodity: str) -> None:
         custom_data=["spot", "change"],
     )
     fig_hm.update_traces(
+        # ── FIXED: both tile label and hover now show exactly 2 decimal places ──
         texttemplate="<b>%{label}</b><br>%{customdata[0]:.2f}<br>%{customdata[1]:+.2f}%",
         hovertemplate="<b>%{label}</b><br>Spot: %{customdata[0]:.2f}<br>"
                       "Chg: %{customdata[1]:+.2f}%<extra></extra>",
@@ -575,7 +566,6 @@ def page_balance(commodity: str) -> None:
 def page_regional(commodity: str) -> None:
     st.title(f"Regional Flows — {commodity}")
     st.caption("🌍 **What this page does:** Shows who produces and who consumes this commodity around the world. Green bubbles = net exporters (they sell to the world). Red bubbles = net importers (they buy from the world). The size of the bubble shows how large the imbalance is.")
-    # Pick closest dataset
     key = commodity if commodity in REGIONAL_DATA else list(REGIONAL_DATA.keys())[0]
     reg = pd.DataFrame(REGIONAL_DATA[key])
     reg["net"] = reg["supply"] - reg["demand"]
@@ -589,7 +579,6 @@ def page_regional(commodity: str) -> None:
     cols[2].metric("Balance",       f"{ws-wd:+,.2f}", "surplus" if ws > wd else "deficit")
     cols[3].metric("Regions",       str(len(reg)))
 
-    # Bubble map
     fig_map = go.Figure()
     for _, r in reg.iterrows():
         color = GREEN if r["net"] >= 0 else RED
@@ -623,7 +612,6 @@ def page_regional(commodity: str) -> None:
     )
     st.plotly_chart(fig_map, use_container_width=True)
 
-    # Net trade bar
     fig2 = go.Figure(go.Bar(
         x=reg["region"], y=reg["net"],
         marker_color=np.where(reg["net"] >= 0, GREEN, RED),
@@ -654,10 +642,10 @@ def page_curve(commodity: str) -> None:
     s_color = RED if structure == "CONTANGO" else GREEN if structure == "BACKWARDATION" else AMBER
 
     cols = st.columns(4)
-    cols[0].metric("Spot",           f"{c['spot']:,.2f} {c['unit']}")
-    cols[1].metric("Front Month",    f"{front:,.2f}")
-    cols[2].metric("12M Forward",    f"{float(curve[curve['month']<=12]['price'].iloc[-1]):,.2f}")
-    cols[3].metric("Structure", structure, f"{(back-front)/front*100:+.2f}%")
+    cols[0].metric("Spot",        f"{c['spot']:,.2f} {c['unit']}")
+    cols[1].metric("Front Month", f"{front:,.2f}")
+    cols[2].metric("12M Forward", f"{float(curve[curve['month']<=12]['price'].iloc[-1]):,.2f}")
+    cols[3].metric("Structure",   structure, f"{(back-front)/front*100:+.2f}%")
     st.markdown(
         f'<span class="badge" style="border-color:{s_color};color:{s_color};">'
         f'⚡ {structure}</span>', unsafe_allow_html=True,
@@ -669,8 +657,7 @@ def page_curve(commodity: str) -> None:
                              line=dict(color=AMBER, width=2.5),
                              marker=dict(size=7, color=AMBER),
                              name="Forward curve"))
-    fig.add_trace(go.Scatter(x=curve["label"],
-                             y=[c["spot"]]*len(curve),
+    fig.add_trace(go.Scatter(x=curve["label"], y=[c["spot"]]*len(curve),
                              mode="lines", name="Spot",
                              line=dict(color=TEXT, dash="dot", width=1.5)))
     fig.update_layout(title=f"{commodity} Forward Curve")
@@ -687,7 +674,7 @@ def page_options(commodity: str) -> None:
     st.title(f"Options & Greeks — {commodity}")
     st.caption("🎯 **What this page does:** Prices a call or put option on this commodity using the Black-76 model (the industry standard for commodity options). A *call* profits if price rises above your strike. A *put* profits if price falls below. The Greeks measure sensitivities: Delta = how much the option moves per $1 move in the commodity; Vega = sensitivity to volatility; Theta = time decay per day.")
     c = COMMODITIES[commodity]
-    F_def = c["spot"]
+    F_def    = c["spot"]
     T_months = st.session_state.get("opt_T_months", 6)
     K_pct    = st.session_state.get("opt_K_pct", 100)
     vol_pct  = st.session_state.get("opt_vol_pct", int(c["vol"]*100))
@@ -729,8 +716,7 @@ def page_options(commodity: str) -> None:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Payoff diagram
-    strikes = np.linspace(F * 0.55, F * 1.45, 80)
+    strikes  = np.linspace(F * 0.55, F * 1.45, 80)
     call_pnl = np.maximum(strikes - K, 0) - call["price"]
     put_pnl  = np.maximum(K - strikes, 0) - put["price"]
 
@@ -747,9 +733,8 @@ def page_options(commodity: str) -> None:
     fig.update_layout(title="Payoff at Expiry (net of premium)")
     st.plotly_chart(_styled(fig, 360), use_container_width=True)
 
-    # Greeks vs Strike
     st.subheader("Greeks vs Strike")
-    ks  = np.linspace(F*0.7, F*1.3, 60)
+    ks = np.linspace(F*0.7, F*1.3, 60)
     tab1, tab2, tab3 = st.tabs(["Delta", "Gamma", "Vega"])
     for tab, gk, col_ in [(tab1,"delta",AMBER),(tab2,"gamma",PURPLE),(tab3,"vega",TEAL)]:
         with tab:
@@ -770,9 +755,9 @@ def page_options(commodity: str) -> None:
 def page_vol_surface(commodity: str) -> None:
     st.title(f"Implied Vol Surface — {commodity}")
     st.caption("📉 **What this page does:** Shows how volatility varies by strike price and expiry date. In a perfect world vol would be flat (a horizontal plane). In reality it forms a 'smile' — out-of-the-money options are more expensive because traders pay a premium for tail protection. *Skew* tilts the smile (puts are usually pricier than calls in commodities). *Curvature* controls how curved the smile is. *Vol-of-vol* makes the surface steeper for longer maturities.")
-    c   = COMMODITIES[commodity]
+    c = COMMODITIES[commodity]
     col1, col2, col3, col4 = st.columns(4)
-    atm  = col1.slider("ATM vol %",    5,  120, int(c["vol"]*100), key="vs_atm") / 100
+    atm  = col1.slider("ATM vol %",     5, 120, int(c["vol"]*100), key="vs_atm")  / 100
     skew = col2.slider("Skew ×100",   -20,  20, -5,               key="vs_skew") / 100
     curv = col3.slider("Curvature×100", 0,  10,  2,               key="vs_curv") / 100
     vov  = col4.slider("Vol-of-vol",    0, 100, 15,               key="vs_vov")  / 100
@@ -799,7 +784,6 @@ def page_vol_surface(commodity: str) -> None:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Smile slices
     st.subheader("Vol Smile by Maturity")
     fig2 = go.Figure()
     pal = [AMBER, BLUE, GREEN, RED, PURPLE, TEAL, GRAY, TEXT]
@@ -811,7 +795,6 @@ def page_vol_surface(commodity: str) -> None:
     fig2.update_layout(xaxis_title="ln(K/F)", yaxis_title="Impl. Vol %")
     st.plotly_chart(_styled(fig2, 360), use_container_width=True)
 
-    # ATM term structure
     atm_ts = Z[:, Z.shape[1]//2] * 100
     fig3 = go.Figure(go.Bar(x=mat_labels, y=atm_ts, marker_color=AMBER))
     fig3.update_layout(title="ATM Vol Term Structure (%)", yaxis_title="σ %")
@@ -848,13 +831,13 @@ def page_positions() -> None:
 
     rows, total_pnl, total_long, total_short = [], 0.0, 0.0, 0.0
     for p in positions:
-        c   = COMMODITIES[p["commodity"]]
+        c    = COMMODITIES[p["commodity"]]
         mark = c["spot"]
         sign = 1 if p["side"] == "Long" else -1
         pnl  = sign * (mark - p["entry_price"]) * p["quantity"]
         total_pnl += pnl
-        if p["side"] == "Long":  total_long  += mark * p["quantity"]
-        else:                    total_short += mark * p["quantity"]
+        if p["side"] == "Long": total_long  += mark * p["quantity"]
+        else:                   total_short += mark * p["quantity"]
         rows.append(dict(
             Commodity=p["commodity"], Side=p["side"],
             Qty=p["quantity"], Entry=p["entry_price"], Mark=mark,
@@ -864,10 +847,10 @@ def page_positions() -> None:
         ))
 
     cols = st.columns(4)
-    cols[0].metric("Gross Long",    f"${total_long:,.0f}")
-    cols[1].metric("Gross Short",   f"${total_short:,.0f}")
-    cols[2].metric("Net Exposure",  f"${total_long-total_short:+,.0f}")
-    cols[3].metric("Total P&L",     f"${total_pnl:+,.0f}", f"{len(positions)} trades")
+    cols[0].metric("Gross Long",   f"${total_long:,.0f}")
+    cols[1].metric("Gross Short",  f"${total_short:,.0f}")
+    cols[2].metric("Net Exposure", f"${total_long-total_short:+,.0f}")
+    cols[3].metric("Total P&L",    f"${total_pnl:+,.0f}", f"{len(positions)} trades")
 
     df = pd.DataFrame(rows)
 
@@ -907,10 +890,8 @@ def page_risk() -> None:
 
     risk = portfolio_var(positions, conf=conf, horizon=horizon)
     cols = st.columns(3)
-    cols[0].metric(f"VaR {int(conf*100)}%",  f"${risk['total_var']:,.0f}",
-                   f"{horizon}d horizon")
-    cols[1].metric(f"CVaR {int(conf*100)}%", f"${risk['total_cvar']:,.0f}",
-                   "Expected shortfall")
+    cols[0].metric(f"VaR {int(conf*100)}%",  f"${risk['total_var']:,.0f}",  f"{horizon}d horizon")
+    cols[1].metric(f"CVaR {int(conf*100)}%", f"${risk['total_cvar']:,.0f}", "Expected shortfall")
     cols[2].metric("Positions", str(len(positions)))
 
     st.subheader("Per-Position Decomposition")
@@ -920,9 +901,8 @@ def page_risk() -> None:
         "spot": "{:.2f}", "quantity": "{:.0f}"}),
         use_container_width=True)
 
-    # Stress scenarios on first position
-    p   = positions[0]
-    c_  = COMMODITIES.get(p["commodity"], {})
+    p    = positions[0]
+    c_   = COMMODITIES.get(p["commodity"], {})
     base = c_.get("spot", p["entry_price"])
     shocks = [-30, -20, -10, -5, 5, 10, 20, 30]
     sign = 1 if p["side"] == "Long" else -1
@@ -961,10 +941,10 @@ def page_mc(commodity: str) -> None:
         res = run_mc(commodity, n_paths, horizon, sup_sig, dem_sig)
 
     cols = st.columns(4)
-    cols[0].metric("Median end price",  f"{res['median']:,.2f} {res['unit']}")
-    cols[1].metric("P5  (bear case)",   f"{res['p5']:,.2f}")
-    cols[2].metric("P95 (bull case)",   f"{res['p95']:,.2f}")
-    cols[3].metric("P95/P5 ratio",      f"{res['p95']/res['p5']:.2f}×")
+    cols[0].metric("Median end price", f"{res['median']:,.2f} {res['unit']}")
+    cols[1].metric("P5  (bear case)",  f"{res['p5']:,.2f}")
+    cols[2].metric("P95 (bull case)",  f"{res['p95']:,.2f}")
+    cols[3].metric("P95/P5 ratio",     f"{res['p95']/res['p5']:.2f}×")
 
     fan = res["fan"]
     fig = go.Figure()
@@ -987,14 +967,10 @@ def page_mc(commodity: str) -> None:
 
     st.subheader("Distribution of Simulated End Prices")
     fig_h = go.Figure(go.Bar(x=res["hist_x"], y=res["hist_y"],
-                             marker_color=AMBER, opacity=0.75,
-                             name="Frequency"))
-    fig_h.add_vline(x=res["median"], line=dict(color=TEXT, dash="dash"),
-                    annotation_text="Median")
-    fig_h.add_vline(x=res["p5"],  line=dict(color=RED, dash="dot"),
-                    annotation_text="P5")
-    fig_h.add_vline(x=res["p95"], line=dict(color=GREEN, dash="dot"),
-                    annotation_text="P95")
+                             marker_color=AMBER, opacity=0.75, name="Frequency"))
+    fig_h.add_vline(x=res["median"], line=dict(color=TEXT,  dash="dash"), annotation_text="Median")
+    fig_h.add_vline(x=res["p5"],    line=dict(color=RED,   dash="dot"),  annotation_text="P5")
+    fig_h.add_vline(x=res["p95"],   line=dict(color=GREEN, dash="dot"),  annotation_text="P95")
     st.plotly_chart(_styled(fig_h, 280), use_container_width=True)
 
 
@@ -1086,15 +1062,15 @@ def page_about() -> None:
 **{len(COMMODITIES)} commodities** across Energy, Metals, Agriculture, Freight sectors.
 
 ---
-### 🔗 My Other Projecs
+### 🔗 My Other Projects
 
 You may also find these two companion platforms useful:
 
-**🎯 Commodity Options & Derivatives Analytics Platform (CODAP)**  
+**⚗️ Commodity Options & Derivatives Analytics Platform (CODAP)**  
 A dedicated platform for commodity options pricing, Greeks, vol surfaces, exotic derivatives (Asian, barrier, crack spreads), and swap analytics.  
 👉 [aeg-codap.streamlit.app](https://aeg-codap.streamlit.app)
 
-**📈 Commodity Forward Curve Analytics Platform (CFCAP)**  
+**〽️ Commodity Forward Curve Analytics Platform (CFCAP)**  
 A dedicated platform for forward curve construction, Nelson-Siegel fitting, calendar spreads, curve interpolation, and term structure analysis across all major commodity markets.  
 👉 [aeg-cfcap.streamlit.app](https://aeg-cfcap.streamlit.app)
 
@@ -1102,6 +1078,7 @@ A dedicated platform for forward curve construction, Nelson-Siegel fitting, cale
 **Author:** Adam EL GBOURI  
 GitHub · [github.com/adamelgbouri](https://github.com/adamelgbouri)
 """)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROUTER
@@ -1111,18 +1088,18 @@ def main() -> None:
     render_header(page, commodity)
 
     dispatch = {
-        "📊 Dashboard":     lambda: page_dashboard(commodity),
-        "⚖️ Supply & Demand": lambda: page_balance(commodity),
-        "🌍 Regional Flows":  lambda: page_regional(commodity),
-        "📈 Futures Curve":   lambda: page_curve(commodity),
+        "📊 Dashboard":        lambda: page_dashboard(commodity),
+        "⚖️ Supply & Demand":  lambda: page_balance(commodity),
+        "🌍 Regional Flows":   lambda: page_regional(commodity),
+        "📈 Futures Curve":    lambda: page_curve(commodity),
         "🎯 Options & Greeks": lambda: page_options(commodity),
-        "📉 Vol Surface":    lambda: page_vol_surface(commodity),
-        "💼 Positions & P&L": page_positions,
-        "🛡️ Risk":           page_risk,
-        "🎲 Monte Carlo":    lambda: page_mc(commodity),
-        "🌐 Macro Overlay":  page_macro,
-        "📅 Events":         page_events,
-        "ℹ️ About":          page_about,
+        "📉 Vol Surface":      lambda: page_vol_surface(commodity),
+        "💼 Positions & P&L":  page_positions,
+        "🛡️ Risk":             page_risk,
+        "🎲 Monte Carlo":      lambda: page_mc(commodity),
+        "🌐 Macro Overlay":    page_macro,
+        "📅 Events":           page_events,
+        "ℹ️ About":            page_about,
     }
     dispatch.get(page, lambda: st.error("Page not found"))()
 
