@@ -43,8 +43,8 @@ TEXT   = "#E6EDF3"
 #  PAGE CONFIG & GLOBAL CSS
 # ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="Commodity Trading Desk",
-    page_icon="📈",
+    page_title="S&D - Supply & Demand",
+    page_icon="🌐",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -1086,11 +1086,11 @@ def page_about() -> None:
 **{len(COMMODITIES)} commodities** across Energy, Metals, Agriculture, Freight sectors.
 
 ---
-### 🔗 Other Projects by Adam EL GBOURI
+### 🔗 My Other Projecs
 
 You may also find these two companion platforms useful:
 
-**📉 Commodity Options & Derivatives Analytics Platform (CODAP)**  
+**🎯 Commodity Options & Derivatives Analytics Platform (CODAP)**  
 A dedicated platform for commodity options pricing, Greeks, vol surfaces, exotic derivatives (Asian, barrier, crack spreads), and swap analytics.  
 👉 [aeg-codap.streamlit.app](https://aeg-codap.streamlit.app)
 
