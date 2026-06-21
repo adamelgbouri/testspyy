@@ -711,7 +711,7 @@ def run_streamlit_app():
 
     st.set_page_config(
         page_title="CODAP - Commodity Options & Derivatives Pricer",
-        page_icon="📈", layout="wide",
+        page_icon="🎯", layout="wide",
         initial_sidebar_state="expanded",
     )
     st.markdown("""<style>
