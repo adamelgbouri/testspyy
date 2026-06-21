@@ -406,7 +406,7 @@ def render_sidebar() -> str:
         f'<div style="font-size:9px;color:{GRAY};font-family:JetBrains Mono,monospace;'
         f'letter-spacing:0.08em;text-transform:uppercase;margin-top:20px;">'
         f'{now}<br>by Adam EL GBOURI · {date.today().year}<br>'
-        f'aeg-snd.vercel.app</div>',
+        f'aeg-snd.streamlit.app</div>',
         unsafe_allow_html=True,
     )
     return page, commodity
@@ -1085,12 +1085,22 @@ def page_about() -> None:
 
 **{len(COMMODITIES)} commodities** across Energy, Metals, Agriculture, Freight sectors.
 
-**Color palette:** tst3.py CODAP style — `{BG}` bg, `{AMBER}` amber accent,
-`{GREEN}` pos, `{RED}` neg, `{BLUE}` blue, `{PURPLE}` purple.
+---
+### 🔗 Other Projects by Adam EL GBOURI
+
+You may also find these two companion platforms useful:
+
+**📉 Commodity Options & Derivatives Analytics Platform (CODAP)**  
+A dedicated platform for commodity options pricing, Greeks, vol surfaces, exotic derivatives (Asian, barrier, crack spreads), and swap analytics.  
+👉 [aeg-codap.streamlit.app](https://aeg-codap.streamlit.app)
+
+**📈 Commodity Forward Curve Analytics Platform (CFCAP)**  
+A dedicated platform for forward curve construction, Nelson-Siegel fitting, calendar spreads, curve interpolation, and term structure analysis across all major commodity markets.  
+👉 [aeg-cfcap.streamlit.app](https://aeg-cfcap.streamlit.app)
 
 ---
 **Author:** Adam EL GBOURI  
-GitHub · [aeg-snd.vercel.app](https://aeg-snd.vercel.app)
+GitHub · [github.com/adamelgbouri](https://github.com/adamelgbouri)
 """)
 
 # ══════════════════════════════════════════════════════════════════════════════
