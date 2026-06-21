@@ -481,6 +481,7 @@ def page_dashboard(commodity: str) -> None:
 
     # S&D chart
     st.subheader("Supply, Demand & Stocks")
+    st.caption("📦 How much is being produced (supply) vs consumed (demand), and how much is sitting in storage (stocks). When supply > demand, stocks build up and prices tend to fall. When demand > supply, stocks draw down and prices tend to rise.")
     df  = sd_dataset(commodity, 36)
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df.index, y=df["supply"], name="Supply",
@@ -501,6 +502,7 @@ def page_dashboard(commodity: str) -> None:
 
     # Market heatmap
     st.subheader("Market Heatmap")
+    st.caption("🟢🔴 A snapshot of all commodities at once. Green = price up today, red = price down. Bigger boxes = bigger sectors. Click any cell to dig into that commodity.")
     rng2 = np.random.default_rng(int(datetime.now().minute))
     rows = []
     for name, info in COMMODITIES.items():
@@ -516,7 +518,7 @@ def page_dashboard(commodity: str) -> None:
         custom_data=["spot", "change"],
     )
     fig_hm.update_traces(
-        texttemplate="<b>%{label}</b><br>%{customdata[0]:.2f}<br>%{customdata[1]:+.1f}%",
+        texttemplate="<b>%{label}</b><br>%{customdata[0]:.2f}<br>%{customdata[1]:+.2f}%",
         hovertemplate="<b>%{label}</b><br>Spot: %{customdata[0]:.2f}<br>"
                       "Chg: %{customdata[1]:+.2f}%<extra></extra>",
     )
@@ -528,6 +530,7 @@ def page_dashboard(commodity: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 def page_balance(commodity: str) -> None:
     st.title(f"Supply & Demand — {commodity}")
+    st.caption("⚖️ **What this page does:** Models the market balance — how much of this commodity is produced, consumed, and stored each month. Use the sliders to stress-test scenarios (e.g. what if supply drops 10%?). The fair value is the price the model thinks is justified given current stock levels.")
     c1, c2, c3, c4 = st.columns(4)
     sup_adj  = c1.slider("Supply adj %",   -20, 20,  0, 1, key="bal_sup")
     dem_adj  = c2.slider("Demand adj %",   -20, 20,  0, 1, key="bal_dem")
@@ -571,6 +574,7 @@ def page_balance(commodity: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 def page_regional(commodity: str) -> None:
     st.title(f"Regional Flows — {commodity}")
+    st.caption("🌍 **What this page does:** Shows who produces and who consumes this commodity around the world. Green bubbles = net exporters (they sell to the world). Red bubbles = net importers (they buy from the world). The size of the bubble shows how large the imbalance is.")
     # Pick closest dataset
     key = commodity if commodity in REGIONAL_DATA else list(REGIONAL_DATA.keys())[0]
     reg = pd.DataFrame(REGIONAL_DATA[key])
@@ -638,6 +642,7 @@ def page_regional(commodity: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 def page_curve(commodity: str) -> None:
     st.title(f"Futures Curve — {commodity}")
+    st.caption("📈 **What this page does:** Shows what the market expects this commodity to cost in the future. *Contango* = futures prices rise with maturity (market expects higher prices later, common when storage is cheap). *Backwardation* = futures prices fall with maturity (market expects lower prices later, common when supply is tight right now).")
     c   = COMMODITIES[commodity]
     mnths = st.session_state.get("curve_months", 18)
     curve = forward_curve(c["spot"], 0.05, c["storage"], c["conv"], c["vol"], mnths)
@@ -680,7 +685,7 @@ def page_curve(commodity: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 def page_options(commodity: str) -> None:
     st.title(f"Options & Greeks — {commodity}")
-    st.caption("Black-76 European pricer on futures. Put-call parity verified.")
+    st.caption("🎯 **What this page does:** Prices a call or put option on this commodity using the Black-76 model (the industry standard for commodity options). A *call* profits if price rises above your strike. A *put* profits if price falls below. The Greeks measure sensitivities: Delta = how much the option moves per $1 move in the commodity; Vega = sensitivity to volatility; Theta = time decay per day.")
     c = COMMODITIES[commodity]
     F_def = c["spot"]
     T_months = st.session_state.get("opt_T_months", 6)
@@ -764,6 +769,7 @@ def page_options(commodity: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 def page_vol_surface(commodity: str) -> None:
     st.title(f"Implied Vol Surface — {commodity}")
+    st.caption("📉 **What this page does:** Shows how volatility varies by strike price and expiry date. In a perfect world vol would be flat (a horizontal plane). In reality it forms a 'smile' — out-of-the-money options are more expensive because traders pay a premium for tail protection. *Skew* tilts the smile (puts are usually pricier than calls in commodities). *Curvature* controls how curved the smile is. *Vol-of-vol* makes the surface steeper for longer maturities.")
     c   = COMMODITIES[commodity]
     col1, col2, col3, col4 = st.columns(4)
     atm  = col1.slider("ATM vol %",    5,  120, int(c["vol"]*100), key="vs_atm") / 100
@@ -817,7 +823,7 @@ def page_vol_surface(commodity: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 def page_positions() -> None:
     st.title("Positions & P&L")
-    st.caption("Trade blotter with live mark-to-market. Lives in session only.")
+    st.caption("💼 **What this page does:** Your trade blotter. Add a position (Long = you profit if price rises, Short = you profit if price falls), enter your entry price, and the app calculates your live P&L based on current market prices. All positions are stored in your browser session — they reset on refresh.")
 
     if "positions" not in st.session_state:
         st.session_state["positions"] = []
@@ -875,7 +881,7 @@ def page_positions() -> None:
           .format({"Entry": "{:.2f}", "Mark": "{:.2f}",
                    "P&L/unit": "{:+.3f}", "P&L Total": "{:+,.0f}",
                    "Return %": "{:+.1f}%"})
-          .applymap(_color_pnl, subset=["P&L/unit", "P&L Total", "Return %"]),
+          .map(_color_pnl, subset=["P&L/unit", "P&L Total", "Return %"]),
         use_container_width=True,
     )
 
@@ -889,6 +895,7 @@ def page_positions() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 def page_risk() -> None:
     st.title("Risk Dashboard")
+    st.caption("🛡️ **What this page does:** Measures how much money you could lose. *VaR (Value at Risk)* = the maximum loss you'd expect on X% of trading days (e.g. 95% VaR = you'd lose more than this amount only 5% of the time). *CVaR* = the average loss in the worst 5% of cases. Stress scenarios show the impact of extreme price shocks (+/-10%, +/-20%, +/-30%).")
     positions = st.session_state.get("positions", [])
     if not positions:
         st.warning("Add positions on the Positions page first.")
@@ -942,7 +949,7 @@ def page_risk() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 def page_mc(commodity: str) -> None:
     st.title(f"Monte Carlo — {commodity}")
-    st.caption("Geometric Brownian Motion with fan chart (P5/P25/P50/P75/P95).")
+    st.caption("🎲 **What this page does:** Simulates thousands of possible price paths into the future using random shocks (Geometric Brownian Motion). The fan chart shows the range of outcomes: the thick amber line is the median (50% of paths end here), the green/red bands show the bull and bear extremes. Wider bands = more uncertain outlook. Useful for option pricing, hedging, and scenario planning.")
 
     col1, col2, col3, col4 = st.columns(4)
     n_paths = col1.slider("Paths",          100, 2000, 500, 50,  key="mc_n")
@@ -996,6 +1003,7 @@ def page_mc(commodity: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 def page_macro() -> None:
     st.title("Macro Overlay")
+    st.caption("🌐 **What this page does:** Overlays macroeconomic data on top of commodity analysis. Commodity prices are heavily influenced by the global economy — rising GDP drives energy and metals demand; high inflation erodes real returns; rate hikes strengthen the dollar (which tends to push commodity prices down). Compare countries side by side to spot divergences.")
     col1, col2 = st.columns([2, 5])
     primary = col1.selectbox("Country", COUNTRIES, key="macro_primary")
     compare = col2.multiselect("Compare with",
@@ -1033,7 +1041,7 @@ def page_macro() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 def page_events() -> None:
     st.title("Market Events Calendar")
-    st.caption("Auto-rolling 6-week window of EIA / WASDE / OPEC / IEA / central-bank releases.")
+    st.caption("📅 **What this page does:** Lists upcoming scheduled events that typically move commodity prices. EIA reports (oil inventory data), WASDE (crop supply/demand), OPEC meetings (production decisions), and central bank decisions all cause volatility. Knowing when they're coming helps traders avoid being caught offside.")
     today = date.today()
     df = pd.DataFrame([
         dict(Date=str(e["date"]),
@@ -1044,12 +1052,17 @@ def page_events() -> None:
         for e in EVENTS
     ])
 
+    today_mask = df["Today"].tolist()
+    display_df = df.drop(columns=["Today"])
+
     def _style(r):
-        if r["Today"]: return ["background-color:#1a2744"]*len(r)
-        return [""]*len(r)
+        idx = int(r.name)
+        if today_mask[idx]:
+            return ["background-color:#1a2744"] * len(r)
+        return [""] * len(r)
 
     st.dataframe(
-        df.drop(columns=["Today"]).style.apply(_style, axis=1),
+        display_df.style.apply(_style, axis=1),
         use_container_width=True, hide_index=True,
     )
 
