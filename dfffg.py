@@ -91,35 +91,38 @@ hr {{ border-color:{BORDER}; }}
 # ══════════════════════════════════════════════════════════════════════════════
 COMMODITIES: Dict[str, dict] = {
     # ── Energy ────────────────────────────────────────────────────────────────
-    "WTI Crude Oil":         dict(sector="Energy",      unit="$/bbl",      yf_ticker="CL=F",  vol=0.32, storage=0.096, conv=0.08,  ticker="CL",  fallback=67.50),
-    "Brent Crude Oil":       dict(sector="Energy",      unit="$/bbl",      yf_ticker="BZ=F",  vol=0.30, storage=0.096, conv=0.07,  ticker="BZ",  fallback=71.20),
-    "Natural Gas":           dict(sector="Energy",      unit="$/MMBtu",    yf_ticker="NG=F",  vol=0.55, storage=0.120, conv=0.10,  ticker="NG",  fallback=3.15),
-    "RBOB Gasoline":         dict(sector="Energy",      unit="$/gallon",   yf_ticker="RB=F",  vol=0.36, storage=0.084, conv=0.07,  ticker="RB",  fallback=2.48),
-    "Heating Oil (ULSD)":    dict(sector="Energy",      unit="$/gallon",   yf_ticker="HO=F",  vol=0.34, storage=0.084, conv=0.07,  ticker="HO",  fallback=2.62),
-    "Gasoil ICE":            dict(sector="Energy",      unit="$/mt",       yf_ticker="LGO=F", vol=0.32, storage=0.072, conv=0.07,  ticker="GO",  fallback=770.0),
-    "European Carbon (EUA)": dict(sector="Energy",      unit="EUR/tCO2",   yf_ticker=None,    vol=0.35, storage=0.024, conv=0.02,  ticker="EUA", fallback=63.0),
-    "Coal API2":             dict(sector="Energy",      unit="$/mt",       yf_ticker=None,    vol=0.30, storage=0.048, conv=0.04,  ticker="MTF", fallback=108.0),
+    # yf_fmt: Yahoo Finance dated contract format, e.g. CLN25.NYM
+    # active_months: valid delivery months (FGHJKMNQUVXZ = Jan..Dec)
+    # reg_unit: unit used in regional flow tables
+    "WTI Crude Oil":         dict(sector="Energy",      unit="$/bbl",      yf_ticker="CL=F",  yf_fmt="CL{M}{YY}.NYM", active_months="FGHJKMNQUVXZ", liquid_months=18, vol=0.32, storage=0.096, conv=0.08,  ticker="CL",  fallback=67.50,  reg_unit="mb/d",    reg_label="Million barrels per day"),
+    "Brent Crude Oil":       dict(sector="Energy",      unit="$/bbl",      yf_ticker="BZ=F",  yf_fmt="BZ{M}{YY}.NYM", active_months="FGHJKMNQUVXZ", liquid_months=18, vol=0.30, storage=0.096, conv=0.07,  ticker="BZ",  fallback=71.20,  reg_unit="mb/d",    reg_label="Million barrels per day"),
+    "Natural Gas":           dict(sector="Energy",      unit="$/MMBtu",    yf_ticker="NG=F",  yf_fmt="NG{M}{YY}.NYM", active_months="FGHJKMNQUVXZ", liquid_months=12, vol=0.55, storage=0.120, conv=0.10,  ticker="NG",  fallback=3.15,   reg_unit="bcf/d",   reg_label="Billion cubic feet per day"),
+    "RBOB Gasoline":         dict(sector="Energy",      unit="$/gallon",   yf_ticker="RB=F",  yf_fmt="RB{M}{YY}.NYM", active_months="FGHJKMNQUVXZ", liquid_months=12, vol=0.36, storage=0.084, conv=0.07,  ticker="RB",  fallback=2.48,   reg_unit="mb/d",    reg_label="Million barrels per day"),
+    "Heating Oil (ULSD)":    dict(sector="Energy",      unit="$/gallon",   yf_ticker="HO=F",  yf_fmt="HO{M}{YY}.NYM", active_months="FGHJKMNQUVXZ", liquid_months=12, vol=0.34, storage=0.084, conv=0.07,  ticker="HO",  fallback=2.62,   reg_unit="mb/d",    reg_label="Million barrels per day"),
+    "Gasoil ICE":            dict(sector="Energy",      unit="$/mt",       yf_ticker="LGO=F", yf_fmt=None,            active_months="FGHJKMNQUVXZ", liquid_months=12, vol=0.32, storage=0.072, conv=0.07,  ticker="GO",  fallback=770.0,  reg_unit="mt/y",    reg_label="Million tonnes per year"),
+    "European Carbon (EUA)": dict(sector="Energy",      unit="EUR/tCO2",   yf_ticker=None,    yf_fmt=None,            active_months="HMNUZ",         liquid_months=8,  vol=0.35, storage=0.024, conv=0.02,  ticker="EUA", fallback=63.0,   reg_unit="MtCO2",   reg_label="Million tonnes CO2"),
+    "Coal API2":             dict(sector="Energy",      unit="$/mt",       yf_ticker=None,    yf_fmt=None,            active_months="FGHJKMNQUVXZ", liquid_months=12, vol=0.30, storage=0.048, conv=0.04,  ticker="MTF", fallback=108.0,  reg_unit="mt/y",    reg_label="Million tonnes per year"),
     # ── Metals ────────────────────────────────────────────────────────────────
-    "Gold":                  dict(sector="Metals",      unit="$/troy oz",  yf_ticker="GC=F",  vol=0.15, storage=0.024, conv=0.005, ticker="GC",  fallback=3310.0),
-    "Silver":                dict(sector="Metals",      unit="$/troy oz",  yf_ticker="SI=F",  vol=0.28, storage=0.036, conv=0.010, ticker="SI",  fallback=32.8),
-    "Copper (COMEX)":        dict(sector="Metals",      unit="$/lb",       yf_ticker="HG=F",  vol=0.22, storage=0.048, conv=0.030, ticker="HG",  fallback=4.55),
-    "Platinum":              dict(sector="Metals",      unit="$/troy oz",  yf_ticker="PL=F",  vol=0.20, storage=0.030, conv=0.015, ticker="PL",  fallback=1010.0),
-    "Palladium":             dict(sector="Metals",      unit="$/troy oz",  yf_ticker="PA=F",  vol=0.30, storage=0.030, conv=0.020, ticker="PA",  fallback=1090.0),
-    "LME Copper":            dict(sector="Metals",      unit="$/mt",       yf_ticker="HG=F",  vol=0.22, storage=0.048, conv=0.030, ticker="LP",  fallback=9750.0),
-    "LME Aluminum":          dict(sector="Metals",      unit="$/mt",       yf_ticker=None,    vol=0.20, storage=0.048, conv=0.025, ticker="LA",  fallback=2390.0),
-    "LME Nickel":            dict(sector="Metals",      unit="$/mt",       yf_ticker=None,    vol=0.30, storage=0.048, conv=0.035, ticker="LN",  fallback=15800.0),
+    "Gold":                  dict(sector="Metals",      unit="$/troy oz",  yf_ticker="GC=F",  yf_fmt="GC{M}{YY}.CMX", active_months="GJMQVZ",        liquid_months=8,  vol=0.15, storage=0.024, conv=0.005, ticker="GC",  fallback=3310.0, reg_unit="t/y",     reg_label="Tonnes per year"),
+    "Silver":                dict(sector="Metals",      unit="$/troy oz",  yf_ticker="SI=F",  yf_fmt="SI{M}{YY}.CMX", active_months="HKNUZ",         liquid_months=6,  vol=0.28, storage=0.036, conv=0.010, ticker="SI",  fallback=32.8,   reg_unit="Moz/y",   reg_label="Million troy oz per year"),
+    "Copper (COMEX)":        dict(sector="Metals",      unit="$/lb",       yf_ticker="HG=F",  yf_fmt="HG{M}{YY}.CMX", active_months="HKNUZ",         liquid_months=8,  vol=0.22, storage=0.048, conv=0.030, ticker="HG",  fallback=4.55,   reg_unit="kt/y",    reg_label="Thousand tonnes per year"),
+    "Platinum":              dict(sector="Metals",      unit="$/troy oz",  yf_ticker="PL=F",  yf_fmt="PL{M}{YY}.NYM", active_months="FJNV",          liquid_months=6,  vol=0.20, storage=0.030, conv=0.015, ticker="PL",  fallback=1010.0, reg_unit="Moz/y",   reg_label="Million troy oz per year"),
+    "Palladium":             dict(sector="Metals",      unit="$/troy oz",  yf_ticker="PA=F",  yf_fmt="PA{M}{YY}.NYM", active_months="HMUZ",          liquid_months=6,  vol=0.30, storage=0.030, conv=0.020, ticker="PA",  fallback=1090.0, reg_unit="Moz/y",   reg_label="Million troy oz per year"),
+    "LME Copper":            dict(sector="Metals",      unit="$/mt",       yf_ticker="HG=F",  yf_fmt=None,            active_months="FGHJKMNQUVXZ", liquid_months=15, vol=0.22, storage=0.048, conv=0.030, ticker="LP",  fallback=9750.0, reg_unit="kt/y",    reg_label="Thousand tonnes per year"),
+    "LME Aluminum":          dict(sector="Metals",      unit="$/mt",       yf_ticker=None,    yf_fmt=None,            active_months="FGHJKMNQUVXZ", liquid_months=15, vol=0.20, storage=0.048, conv=0.025, ticker="LA",  fallback=2390.0, reg_unit="kt/y",    reg_label="Thousand tonnes per year"),
+    "LME Nickel":            dict(sector="Metals",      unit="$/mt",       yf_ticker=None,    yf_fmt=None,            active_months="FGHJKMNQUVXZ", liquid_months=15, vol=0.30, storage=0.048, conv=0.035, ticker="LN",  fallback=15800.0,reg_unit="kt/y",    reg_label="Thousand tonnes per year"),
     # ── Agriculture ───────────────────────────────────────────────────────────
-    "Corn":                  dict(sector="Agriculture", unit="c/bushel",   yf_ticker="ZC=F",  vol=0.25, storage=0.060, conv=0.04,  ticker="ZC",  fallback=468.0),
-    "Wheat (CBOT)":          dict(sector="Agriculture", unit="c/bushel",   yf_ticker="ZW=F",  vol=0.28, storage=0.060, conv=0.04,  ticker="ZW",  fallback=558.0),
-    "Soybeans":              dict(sector="Agriculture", unit="c/bushel",   yf_ticker="ZS=F",  vol=0.23, storage=0.060, conv=0.05,  ticker="ZS",  fallback=1002.0),
-    "Sugar #11":             dict(sector="Agriculture", unit="c/lb",       yf_ticker="SB=F",  vol=0.30, storage=0.048, conv=0.04,  ticker="SB",  fallback=18.9),
-    "Coffee (Arabica)":      dict(sector="Agriculture", unit="c/lb",       yf_ticker="KC=F",  vol=0.35, storage=0.048, conv=0.05,  ticker="KC",  fallback=345.0),
-    "Cocoa":                 dict(sector="Agriculture", unit="$/mt",       yf_ticker="CC=F",  vol=0.32, storage=0.048, conv=0.04,  ticker="CC",  fallback=7850.0),
-    "Live Cattle":           dict(sector="Agriculture", unit="c/lb",       yf_ticker="LE=F",  vol=0.18, storage=0.036, conv=0.03,  ticker="LE",  fallback=183.0),
-    "Lean Hogs":             dict(sector="Agriculture", unit="c/lb",       yf_ticker="HE=F",  vol=0.25, storage=0.036, conv=0.03,  ticker="HE",  fallback=91.5),
+    "Corn":                  dict(sector="Agriculture", unit="c/bushel",   yf_ticker="ZC=F",  yf_fmt="ZC{M}{YY}.CBT", active_months="HKNUZ",         liquid_months=8,  vol=0.25, storage=0.060, conv=0.04,  ticker="ZC",  fallback=468.0,  reg_unit="Mbu/y",   reg_label="Million bushels per year"),
+    "Wheat (CBOT)":          dict(sector="Agriculture", unit="c/bushel",   yf_ticker="ZW=F",  yf_fmt="ZW{M}{YY}.CBT", active_months="HKNUZ",         liquid_months=8,  vol=0.28, storage=0.060, conv=0.04,  ticker="ZW",  fallback=558.0,  reg_unit="Mbu/y",   reg_label="Million bushels per year"),
+    "Soybeans":              dict(sector="Agriculture", unit="c/bushel",   yf_ticker="ZS=F",  yf_fmt="ZS{M}{YY}.CBT", active_months="FHKNQUX",       liquid_months=8,  vol=0.23, storage=0.060, conv=0.05,  ticker="ZS",  fallback=1002.0, reg_unit="Mbu/y",   reg_label="Million bushels per year"),
+    "Sugar #11":             dict(sector="Agriculture", unit="c/lb",       yf_ticker="SB=F",  yf_fmt="SB{M}{YY}.NYB", active_months="HKNV",          liquid_months=6,  vol=0.30, storage=0.048, conv=0.04,  ticker="SB",  fallback=18.9,   reg_unit="Mt/y",    reg_label="Million tonnes per year"),
+    "Coffee (Arabica)":      dict(sector="Agriculture", unit="c/lb",       yf_ticker="KC=F",  yf_fmt="KC{M}{YY}.NYB", active_months="HKNUZ",         liquid_months=6,  vol=0.35, storage=0.048, conv=0.05,  ticker="KC",  fallback=345.0,  reg_unit="M bags/y",reg_label="Million 60-kg bags per year"),
+    "Cocoa":                 dict(sector="Agriculture", unit="$/mt",       yf_ticker="CC=F",  yf_fmt="CC{M}{YY}.NYB", active_months="HKNUZ",         liquid_months=6,  vol=0.32, storage=0.048, conv=0.04,  ticker="CC",  fallback=7850.0, reg_unit="kt/y",    reg_label="Thousand tonnes per year"),
+    "Live Cattle":           dict(sector="Agriculture", unit="c/lb",       yf_ticker="LE=F",  yf_fmt="LE{M}{YY}.CME", active_months="GJMQVZ",        liquid_months=8,  vol=0.18, storage=0.036, conv=0.03,  ticker="LE",  fallback=183.0,  reg_unit="Mlb/y",   reg_label="Million pounds per year"),
+    "Lean Hogs":             dict(sector="Agriculture", unit="c/lb",       yf_ticker="HE=F",  yf_fmt="HE{M}{YY}.CME", active_months="GJKMNQVZ",      liquid_months=6,  vol=0.25, storage=0.036, conv=0.03,  ticker="HE",  fallback=91.5,   reg_unit="Mlb/y",   reg_label="Million pounds per year"),
     # ── Freight ───────────────────────────────────────────────────────────────
-    "Capesize (BCI 5TC)":    dict(sector="Freight",     unit="$/day",      yf_ticker=None,    vol=0.55, storage=0.0,   conv=0.00,  ticker="BCI", fallback=17500.0),
-    "Panamax (BPI 4TC)":     dict(sector="Freight",     unit="$/day",      yf_ticker=None,    vol=0.50, storage=0.0,   conv=0.00,  ticker="BPI", fallback=11800.0),
+    "Capesize (BCI 5TC)":    dict(sector="Freight",     unit="$/day",      yf_ticker=None,    yf_fmt=None,            active_months="FGHJKMNQUVXZ", liquid_months=12, vol=0.55, storage=0.0,   conv=0.00,  ticker="BCI", fallback=17500.0,reg_unit="vessels",  reg_label="Number of vessels"),
+    "Panamax (BPI 4TC)":     dict(sector="Freight",     unit="$/day",      yf_ticker=None,    yf_fmt=None,            active_months="FGHJKMNQUVXZ", liquid_months=12, vol=0.50, storage=0.0,   conv=0.00,  ticker="BPI", fallback=11800.0,reg_unit="vessels",  reg_label="Number of vessels"),
 }
 
 ALL_SECTORS = sorted({v["sector"] for v in COMMODITIES.values()})
@@ -189,6 +192,86 @@ def fetch_price_at_date(yf_ticker: str, target_date: date) -> Optional[float]:
         return float(df["Close"].iloc[-1]) if not df.empty else None
     except Exception:
         return None
+
+
+@st.cache_data(ttl=3600)
+def fetch_real_curve(commodity: str) -> pd.DataFrame:
+    """
+    Download real futures curve prices by building dated contract tickers.
+    e.g. for WTI: CLN25.NYM, CLQ25.NYM, CLU25.NYM ...
+    Returns DataFrame with columns: label, month, T, price, source.
+    Falls back to cost-of-carry model if Yahoo fails.
+    """
+    MONTH_CODES = list("FGHJKMNQUVXZ")
+    MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun",
+                   "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+    c      = COMMODITIES[commodity]
+    yf_fmt = c.get("yf_fmt")
+    spot   = c["fallback"]
+    r      = 0.05
+    liquid = c.get("liquid_months", 12)
+    active = c.get("active_months", "FGHJKMNQUVXZ")
+    now    = datetime.now()
+
+    # ── Build list of valid upcoming contract months ──────────────────────────
+    contracts = []
+    offset = 0
+    while len(contracts) < liquid and offset < liquid * 4:
+        m    = (now.month - 1 + offset) % 12
+        year = now.year + (now.month - 1 + offset) // 12
+        offset += 1
+        if MONTH_CODES[m] not in active:
+            continue
+        # Skip already-expired: expiry ~20th of month before delivery
+        exp_m = m - 1 if m > 0 else 11
+        exp_y = year if m > 0 else year - 1
+        if now > datetime(exp_y, exp_m + 1, 20):
+            continue
+        yr2   = str(year)[-2:]
+        label = f"{MONTH_NAMES[m]}-{year}"
+        T     = round(len(contracts) / 12 + 1 / 12, 4)
+        if yf_fmt:
+            tk = yf_fmt.replace("{M}", MONTH_CODES[m]).replace("{YY}", yr2)
+        else:
+            tk = None
+        contracts.append(dict(label=label, month=len(contracts)+1,
+                              T=T, ticker=tk, month_idx=m, year=year))
+
+    if not contracts:
+        return pd.DataFrame()
+
+    # ── Download all contract tickers at once ─────────────────────────────────
+    rows = []
+    if YF_AVAILABLE and yf_fmt:
+        valid_tickers = [c_["ticker"] for c_ in contracts if c_["ticker"]]
+        try:
+            raw = yf.download(valid_tickers, period="5d",
+                              auto_adjust=True, progress=False, threads=True)
+            if isinstance(raw.columns, pd.MultiIndex):
+                closes = raw["Close"].iloc[-1]
+            else:
+                closes = raw.iloc[-1]
+
+            for c_ in contracts:
+                tk = c_["ticker"]
+                if tk and tk in closes.index and pd.notna(closes[tk]):
+                    rows.append(dict(label=c_["label"], month=c_["month"],
+                                     T=c_["T"], price=round(float(closes[tk]), 4),
+                                     source="yfinance"))
+        except Exception:
+            rows = []
+
+    # ── Fallback: cost-of-carry model if not enough real data ────────────────
+    if len(rows) < 2:
+        rows = []
+        for c_ in contracts:
+            F = spot * math.exp((r + c["storage"] - c["conv"]) * c_["T"])
+            rows.append(dict(label=c_["label"], month=c_["month"],
+                              T=c_["T"], price=round(F, 4),
+                              source="model (cost-of-carry)"))
+
+    return pd.DataFrame(rows)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -651,51 +734,91 @@ def page_balance(commodity, live_prices):
 #  PAGE: REGIONAL FLOWS
 # ══════════════════════════════════════════════════════════════════════════════
 def page_regional(commodity, live_prices):
+    c       = COMMODITIES[commodity]
+    ru      = c.get("reg_unit", "units")          # short unit, e.g. "mb/d"
+    rl      = c.get("reg_label", "units")         # long label, e.g. "Million barrels per day"
+
     st.title(f"Regional Flows — {commodity}")
-    st.caption("🌍 **What this page does:** Regional supply/demand fundamentals (IEA/USDA-style). Data is based on published estimates — not real-time. Green = net exporter, red = net importer.")
+    st.caption(
+        f"🌍 **What this page does:** Regional supply/demand fundamentals (IEA/USDA-style estimates). "
+        f"All values are in **{rl} ({ru})**. "
+        f"Green bubbles = net exporters (supply > demand). "
+        f"Red bubbles = net importers (demand > supply). "
+        f"Bubble size = magnitude of the imbalance. Data is not real-time."
+    )
+
     key = commodity if commodity in REGIONAL_DATA else list(REGIONAL_DATA.keys())[0]
+    if key != commodity:
+        st.info(f"No regional breakdown available for {commodity}. Showing {key} as reference.")
+
     reg = pd.DataFrame(REGIONAL_DATA[key])
     reg["net"]    = reg["supply"] - reg["demand"]
-    reg["status"] = np.where(reg["net"]>0, "Exporter", "Importer")
+    reg["status"] = np.where(reg["net"] > 0, "Exporter", "Importer")
 
-    ws,wd = float(reg["supply"].sum()), float(reg["demand"].sum())
+    ws, wd = float(reg["supply"].sum()), float(reg["demand"].sum())
     cols = st.columns(4)
-    cols[0].metric("World Supply", f"{ws:,.1f} {COMMODITIES[commodity]['unit']}")
-    cols[1].metric("World Demand", f"{wd:,.1f} {COMMODITIES[commodity]['unit']}")
-    cols[2].metric("Balance",      f"{ws-wd:+,.2f}", "surplus" if ws>wd else "deficit")
-    cols[3].metric("Regions",      str(len(reg)))
+    cols[0].metric(f"World Supply ({ru})", f"{ws:,.1f}")
+    cols[1].metric(f"World Demand ({ru})", f"{wd:,.1f}")
+    cols[2].metric(f"Balance ({ru})",      f"{ws-wd:+,.2f}", "surplus" if ws > wd else "deficit")
+    cols[3].metric("Regions tracked",      str(len(reg)))
+
+    st.markdown(
+        f'<div style="font-size:11px;color:{GRAY};font-family:JetBrains Mono,monospace;'
+        f'margin:4px 0 12px;">Unit: <b style="color:{AMBER};">{rl} ({ru})</b></div>',
+        unsafe_allow_html=True,
+    )
 
     fig_map = go.Figure()
     for _, r in reg.iterrows():
-        color = GREEN if r["net"]>=0 else RED
+        color = GREEN if r["net"] >= 0 else RED
         fig_map.add_trace(go.Scattergeo(
             lat=[r["lat"]], lon=[r["lon"]], mode="markers+text",
-            marker=dict(size=abs(r["net"])**0.5*4+8, color=color, opacity=0.75,
-                        line=dict(color=BORDER,width=1)),
+            marker=dict(size=abs(r["net"])**0.5 * 4 + 8, color=color, opacity=0.75,
+                        line=dict(color=BORDER, width=1)),
             text=r["region"], textposition="top center",
-            textfont=dict(size=10,color=TEXT,family="JetBrains Mono"),
+            textfont=dict(size=10, color=TEXT, family="JetBrains Mono"),
             name=r["region"],
-            hovertemplate=f"<b>{r['region']}</b><br>Supply:{r['supply']:.1f}<br>"
-                          f"Demand:{r['demand']:.1f}<br>Net:{r['net']:+.1f}<extra></extra>",
+            hovertemplate=(
+                f"<b>{r['region']}</b><br>"
+                f"Supply: {r['supply']:.1f} {ru}<br>"
+                f"Demand: {r['demand']:.1f} {ru}<br>"
+                f"Net: {r['net']:+.1f} {ru}<br>"
+                f"Status: {r['status']}<extra></extra>"
+            ),
         ))
     fig_map.update_layout(
-        geo=dict(bgcolor=BG,showframe=False,showcoastlines=True,
-                 coastlinecolor=BORDER,landcolor=PANEL,oceancolor=BG,
-                 showocean=True,showland=True,projection_type="natural earth"),
-        paper_bgcolor="rgba(0,0,0,0)", height=420, margin=dict(l=0,r=0,t=0,b=0),
-        showlegend=False,
+        geo=dict(bgcolor=BG, showframe=False, showcoastlines=True,
+                 coastlinecolor=BORDER, landcolor=PANEL, oceancolor=BG,
+                 showocean=True, showland=True, projection_type="natural earth"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        height=420, margin=dict(l=0,r=0,t=0,b=0), showlegend=False,
     )
     st.plotly_chart(fig_map, use_container_width=True)
 
     fig2 = go.Figure(go.Bar(
         x=reg["region"], y=reg["net"],
-        marker_color=np.where(reg["net"]>=0, GREEN, RED),
-        text=[f"{v:+.1f}" for v in reg["net"]], textposition="outside",
+        marker_color=np.where(reg["net"] >= 0, GREEN, RED),
+        text=[f"{v:+.1f} {ru}" for v in reg["net"]], textposition="outside",
     ))
-    fig2.update_layout(title="Net Trade (Supply − Demand)")
-    st.plotly_chart(_styled(fig2,300), use_container_width=True)
-    st.dataframe(reg.style.format({"supply":"{:,.2f}","demand":"{:,.2f}","net":"{:+,.2f}"}),
-                 use_container_width=True)
+    fig2.update_layout(
+        title=f"Net Trade (Supply − Demand) — {ru}",
+        yaxis_title=f"{rl} ({ru})",
+    )
+    st.plotly_chart(_styled(fig2, 300), use_container_width=True)
+
+    display = reg[["region","supply","demand","net","status"]].copy()
+    display.columns = [
+        "Region",
+        f"Supply ({ru})", f"Demand ({ru})", f"Net ({ru})", "Status"
+    ]
+    st.dataframe(
+        display.style.format({
+            f"Supply ({ru})": "{:,.2f}",
+            f"Demand ({ru})": "{:,.2f}",
+            f"Net ({ru})":    "{:+,.2f}",
+        }),
+        use_container_width=True, hide_index=True,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -703,49 +826,85 @@ def page_regional(commodity, live_prices):
 # ══════════════════════════════════════════════════════════════════════════════
 def page_curve(commodity, live_prices):
     st.title(f"Futures Curve — {commodity}")
-    st.caption("📈 **What this page does:** Cost-of-carry forward curve anchored to the real live spot price. *Contango* = upward-sloping (storage cost > convenience yield). *Backwardation* = downward-sloping (supply tight).")
-    c     = COMMODITIES[commodity]
-    spot  = live_prices.get(commodity, c["fallback"])
-    mnths = st.session_state.get("curve_months",18)
-    r     = st.session_state.get("opt_r_pct",5) / 100
+    st.caption(
+        "📈 **What this page does:** Real futures prices for each delivery month, "
+        "downloaded from Yahoo Finance (dated contracts e.g. CLN25.NYM). "
+        "*Contango* = curve slopes up (storage cost > convenience yield). "
+        "*Backwardation* = curve slopes down (supply tight, spot premium). "
+        "Falls back to cost-of-carry model for commodities not on Yahoo Finance."
+    )
+    c    = COMMODITIES[commodity]
+    spot = live_prices.get(commodity, c["fallback"])
 
-    rng = np.random.default_rng(42)
-    rows = []
-    today = date.today()
-    for i in range(1, mnths+1):
-        T = i/12
-        F = spot * math.exp((r + c["storage"] - c["conv"])*T)
-        F += rng.normal(0, c["vol"]*math.sqrt(T/12)*0.3)*spot*0.01
-        label = (today.replace(day=1)+timedelta(days=32*i)).strftime("%b %y")
-        rows.append(dict(month=i, label=label, T=T, price=F))
-    curve = pd.DataFrame(rows)
+    with st.spinner("Fetching real futures curve…"):
+        curve = fetch_real_curve(commodity)
+
+    if curve.empty:
+        st.warning("No curve data available for this commodity.")
+        return
+
+    # Data source badge
+    sources = curve["source"].unique().tolist()
+    src_str = " | ".join(sources)
+    is_real = any("yfinance" in s for s in sources)
+    src_color = GREEN if is_real else AMBER
+    st.markdown(
+        f'<span class="badge" style="color:{src_color};border-color:{src_color}50;">'
+        f'📡 {src_str}</span>',
+        unsafe_allow_html=True,
+    )
 
     front = float(curve["price"].iloc[0])
     back  = float(curve["price"].iloc[-1])
-    structure = ("CONTANGO" if back>front*1.005
-                 else "BACKWARDATION" if back<front*0.995 else "FLAT")
-    s_color = RED if structure=="CONTANGO" else GREEN if structure=="BACKWARDATION" else AMBER
+    n_real = int((curve["source"] == "yfinance").sum())
 
-    cols = st.columns(4)
-    cols[0].metric("Live Spot",    f"{spot:,.2f} {c['unit']}")
-    cols[1].metric("Front Month",  f"{front:,.2f}")
-    cols[2].metric("12M Forward",  f"{float(curve[curve['month']<=12]['price'].iloc[-1]):,.2f}")
-    cols[3].metric("Structure",    structure, f"{(back-front)/front*100:+.2f}%")
-    st.markdown(f'<span class="badge" style="border-color:{s_color};color:{s_color};">⚡ {structure}</span>',
-                unsafe_allow_html=True)
+    structure = ("CONTANGO"     if back > front * 1.005
+                 else "BACKWARDATION" if back < front * 0.995
+                 else "FLAT")
+    s_color = RED if structure == "CONTANGO" else GREEN if structure == "BACKWARDATION" else AMBER
+
+    cols = st.columns(5)
+    cols[0].metric("Live Spot",      f"{spot:,.4f} {c['unit']}")
+    cols[1].metric("Front Month",    f"{front:,.4f}", curve["label"].iloc[0])
+    cols[2].metric("Back Contract",  f"{back:,.4f}",  curve["label"].iloc[-1])
+    cols[3].metric("Structure",      structure,       f"{(back-front)/front*100:+.2f}%")
+    cols[4].metric("Real contracts", f"{n_real}/{len(curve)}", "from yfinance")
+
+    st.markdown(
+        f'<span class="badge" style="border-color:{s_color};color:{s_color};">⚡ {structure}</span>',
+        unsafe_allow_html=True,
+    )
+
+    # Colour-code by source: real = amber dots, model = gray dots
+    real_mask  = curve["source"] == "yfinance"
+    model_mask = ~real_mask
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=curve["label"], y=curve["price"],
-                             mode="lines+markers", line=dict(color=AMBER,width=2.5),
-                             marker=dict(size=7,color=AMBER), name="Forward curve"))
-    fig.add_trace(go.Scatter(x=curve["label"], y=[spot]*len(curve),
-                             mode="lines", name="Live Spot",
-                             line=dict(color=TEXT,dash="dot",width=1.5)))
-    fig.update_layout(title=f"{commodity} Forward Curve (anchored to live spot)")
-    st.plotly_chart(_styled(fig,380), use_container_width=True)
-    st.dataframe(curve[["label","T","price"]].rename(
-        columns={"label":"Contract","T":"Maturity (yr)","price":"Price"}),
-        use_container_width=True)
+    if real_mask.any():
+        fig.add_trace(go.Scatter(
+            x=curve.loc[real_mask, "label"], y=curve.loc[real_mask, "price"],
+            mode="lines+markers", name="Real (yfinance)",
+            line=dict(color=AMBER, width=2.5),
+            marker=dict(size=8, color=AMBER, symbol="circle"),
+        ))
+    if model_mask.any():
+        fig.add_trace(go.Scatter(
+            x=curve.loc[model_mask, "label"], y=curve.loc[model_mask, "price"],
+            mode="lines+markers", name="Model (cost-of-carry)",
+            line=dict(color=GRAY, width=1.5, dash="dot"),
+            marker=dict(size=6, color=GRAY, symbol="diamond"),
+        ))
+    fig.add_hline(y=spot, line=dict(color=TEXT, dash="dot", width=1.2),
+                  annotation_text="Live Spot", annotation_position="right")
+    fig.update_layout(title=f"{commodity} Futures Curve — real contract prices",
+                      yaxis_title=c["unit"])
+    st.plotly_chart(_styled(fig, 400), use_container_width=True)
+
+    display = curve[["label","T","price","source"]].rename(columns={
+        "label": "Contract", "T": "Maturity (yr)",
+        "price": f"Price ({c['unit']})", "source": "Source",
+    })
+    st.dataframe(display, use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
