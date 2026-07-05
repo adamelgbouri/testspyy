@@ -264,53 +264,191 @@ def page_balance() -> None:
     key = commodity_selector("bal_")
     tpl = COMMODITY_TEMPLATES[key]
     st.title(f"Supply & Demand — {tpl.name}")
-    st.caption("Editable assumptions feed the forecast portion of the balance.")
+    st.caption(
+        "Editable assumptions feed the **forecast** portion of the balance. "
+        "Move the sliders and watch the amber region change — history stays "
+        "fixed because it's actuals."
+    )
 
     c1, c2, c3, c4 = st.columns(4)
-    sup_adj = c1.slider("Supply adj %", -20, 20, 0, 1, key="bal_sup")
-    dem_adj = c2.slider("Demand adj %", -20, 20, 0, 1, key="bal_dem")
-    gdp = c3.slider("GDP growth %", -2.0, 6.0, 2.5, 0.1, key="bal_gdp")
+    sup_adj = c1.slider("Supply adj %", -20, 20, 0, 1, key="bal_sup",
+                        help="Applied to forecast supply only")
+    dem_adj = c2.slider("Demand adj %", -20, 20, 0, 1, key="bal_dem",
+                        help="Applied to forecast demand only")
+    gdp = c3.slider("GDP growth %", -2.0, 6.0, 2.5, 0.1, key="bal_gdp",
+                    help="Above 2.5% pulls extra demand into the forecast")
     horizon = c4.slider("Forecast months", 6, 36, 18, 3, key="bal_h")
 
     df = get_sd_dataset(key, forecast_months=horizon)
-    bal = run_balance(df, key, BalanceAssumptions(
+    # Baseline (no slider adjustments) — reference to compare against
+    base = estimate_fair_value(run_balance(
+        df, key, BalanceAssumptions(forecast_months=horizon),
+    ))
+    # Adjusted with slider values
+    adj = estimate_fair_value(run_balance(df, key, BalanceAssumptions(
         supply_adj_pct=sup_adj, demand_adj_pct=dem_adj, gdp_growth_pct=gdp,
         forecast_months=horizon,
-    ))
-    fv = estimate_fair_value(bal)
-    last_hist = fv[~fv["is_forecast"]].iloc[-1]
-    last_fc = fv.iloc[-1] if fv["is_forecast"].any() else last_hist
+    )))
 
+    last_hist = adj[~adj["is_forecast"]].iloc[-1]
+    last_fc = adj.iloc[-1] if adj["is_forecast"].any() else last_hist
+    base_last_fc = base.iloc[-1] if base["is_forecast"].any() else last_hist
+
+    # KPIs — show slider impact as deltas
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("End stocks (hist.)", f"{float(last_hist['stocks_model']):,.0f}")
-    k2.metric("End stocks (forecast)", f"{float(last_fc['stocks_model']):,.0f}",
-              f"{float(last_fc['stocks_model']) - float(last_hist['stocks_model']):+,.0f}")
-    k3.metric("Fair value (forecast)", f"{float(last_fc['fair_value_price']):,.2f}")
-    k4.metric("Avg surplus/deficit",
-              f"{float(fv[fv['is_forecast']]['surplus_deficit'].mean()):+.2f}")
+    stocks_delta = float(last_fc["stocks_model"]) - float(base_last_fc["stocks_model"])
+    fv_delta = float(last_fc["fair_value_price"]) - float(base_last_fc["fair_value_price"])
+    dc_delta = float(last_fc["days_cover_model"]) - float(base_last_fc["days_cover_model"])
+    k1.metric("End stocks (forecast)", f"{float(last_fc['stocks_model']):,.0f}",
+              f"{stocks_delta:+,.0f} vs baseline")
+    k2.metric("Days of cover (fc.)", f"{float(last_fc['days_cover_model']):.1f}",
+              f"{dc_delta:+.1f}d vs baseline")
+    k3.metric("Fair value (forecast)",
+              f"{float(last_fc['fair_value_price']):,.2f} {tpl.price_unit}",
+              f"{fv_delta:+.2f} vs baseline")
+    k4.metric("Avg fc. surplus/deficit",
+              f"{float(adj[adj['is_forecast']]['surplus_deficit'].mean()):+.2f}")
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=fv.index, y=fv["supply"], name="Supply",
-                             line=dict(color=COLORS["supply"], width=2)))
-    fig.add_trace(go.Scatter(x=fv.index, y=fv["demand"], name="Demand",
-                             line=dict(color=COLORS["demand"], width=2)))
-    fig.add_trace(go.Bar(x=fv.index, y=fv["surplus_deficit"], name="Surplus / Deficit",
-                         marker_color=np.where(fv["surplus_deficit"] >= 0,
-                                               COLORS["pos"], COLORS["neg"]),
-                         opacity=0.6, yaxis="y2"))
-    fig.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False))
-    forecast_start = fv[fv["is_forecast"]].index.min() if fv["is_forecast"].any() else None
+    # --- Focus x-axis: last 24 months of history + entire forecast ---
+    forecast_start = adj[adj["is_forecast"]].index.min() if adj["is_forecast"].any() else None
     if forecast_start is not None:
-        fig.add_vline(x=forecast_start, line=dict(color="#6b7280", dash="dash"))
-    st.plotly_chart(_styled_chart(fig), use_container_width=True)
+        x_start = forecast_start - pd.DateOffset(months=24)
+        x_end = adj.index[-1] + pd.DateOffset(months=1)
+    else:
+        x_start, x_end = adj.index[0], adj.index[-1]
 
+    hist_mask = ~adj["is_forecast"]
+    fc_mask = adj["is_forecast"]
+
+    # ---------------------------------------------------------------
+    # Chart 1: Supply & Demand — baseline vs adjusted forecast overlay
+    # ---------------------------------------------------------------
+    st.subheader("Supply, demand & inventories")
+    st.caption("Dashed = baseline forecast (sliders at 0). Solid amber region = your scenario.")
+    fig = go.Figure()
+
+    # Shaded forecast region
+    if forecast_start is not None:
+        fig.add_vrect(x0=forecast_start, x1=x_end,
+                      fillcolor="rgba(255,184,0,0.06)", line_width=0,
+                      annotation_text="FORECAST", annotation_position="top left",
+                      annotation=dict(font=dict(color="#ffb800", size=10)))
+
+    # Historical (shared between baseline and adjusted)
+    fig.add_trace(go.Scatter(
+        x=adj[hist_mask].index, y=adj[hist_mask]["supply"],
+        name="Supply (history)", line=dict(color=COLORS["supply"], width=2),
+    ))
+    fig.add_trace(go.Scatter(
+        x=adj[hist_mask].index, y=adj[hist_mask]["demand"],
+        name="Demand (history)", line=dict(color=COLORS["demand"], width=2),
+    ))
+
+    # Baseline forecast — dashed, muted
+    fig.add_trace(go.Scatter(
+        x=base[fc_mask].index, y=base[fc_mask]["supply"],
+        name="Supply baseline", line=dict(color=COLORS["supply"], width=1.5, dash="dash"),
+        opacity=0.55, hovertemplate="Baseline supply<br>%{y:.2f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=base[fc_mask].index, y=base[fc_mask]["demand"],
+        name="Demand baseline", line=dict(color=COLORS["demand"], width=1.5, dash="dash"),
+        opacity=0.55, hovertemplate="Baseline demand<br>%{y:.2f}<extra></extra>",
+    ))
+
+    # Adjusted forecast — solid, bright
+    fig.add_trace(go.Scatter(
+        x=adj[fc_mask].index, y=adj[fc_mask]["supply"],
+        name="Supply adjusted", line=dict(color=COLORS["supply"], width=3),
+        hovertemplate="Adjusted supply<br>%{y:.2f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=adj[fc_mask].index, y=adj[fc_mask]["demand"],
+        name="Demand adjusted", line=dict(color=COLORS["demand"], width=3),
+        hovertemplate="Adjusted demand<br>%{y:.2f}<extra></extra>",
+    ))
+
+    # Stocks on secondary axis
+    fig.add_trace(go.Scatter(
+        x=adj.index, y=adj["stocks_model"], name=f"Stocks ({tpl.inventory_unit})",
+        line=dict(color=COLORS["stocks"], width=1.5),
+        yaxis="y2", fill="tozeroy", fillcolor="rgba(0,212,255,0.08)",
+    ))
+    fig.update_layout(
+        yaxis=dict(title=f"Flow ({tpl.unit})"),
+        yaxis2=dict(title="Stocks", overlaying="y", side="right", showgrid=False,
+                    color=COLORS["stocks"]),
+        xaxis=dict(range=[x_start, x_end]),
+    )
+    if forecast_start is not None:
+        fig.add_vline(x=forecast_start, line=dict(color="#ffb800", dash="dash", width=1.5))
+    st.plotly_chart(_styled_chart(fig, 420), use_container_width=True)
+
+    # ---------------------------------------------------------------
+    # Chart 2: Slider impact — delta series
+    # ---------------------------------------------------------------
+    st.subheader("Slider impact vs baseline")
+    st.caption("Zero line = no change. Bars show how much your assumptions shift stocks and fair value each month.")
+    diff = pd.DataFrame({
+        "stocks_delta": adj["stocks_model"] - base["stocks_model"],
+        "fv_delta": adj["fair_value_price"] - base["fair_value_price"],
+    }, index=adj.index)
+    diff_fc = diff[fc_mask]
+
+    if diff_fc.empty or (abs(diff_fc["stocks_delta"]).max() < 1e-6
+                          and abs(diff_fc["fv_delta"]).max() < 1e-6):
+        st.info("Move any slider off 0 to see its impact plotted here.")
+    else:
+        fig_d = go.Figure()
+        fig_d.add_hline(y=0, line=dict(color="#4a5f7e", width=1))
+        fig_d.add_trace(go.Bar(
+            x=diff_fc.index, y=diff_fc["stocks_delta"],
+            name=f"Stocks Δ ({tpl.inventory_unit})",
+            marker_color=np.where(diff_fc["stocks_delta"] >= 0,
+                                  COLORS["pos"], COLORS["neg"]),
+            opacity=0.75,
+        ))
+        fig_d.add_trace(go.Scatter(
+            x=diff_fc.index, y=diff_fc["fv_delta"],
+            name=f"Fair value Δ ({tpl.price_unit})",
+            line=dict(color=COLORS["accent"], width=3),
+            yaxis="y2",
+        ))
+        fig_d.update_layout(
+            yaxis=dict(title=f"Stocks Δ ({tpl.inventory_unit})"),
+            yaxis2=dict(title=f"Fair value Δ ({tpl.price_unit})",
+                        overlaying="y", side="right", showgrid=False,
+                        color=COLORS["accent"]),
+        )
+        st.plotly_chart(_styled_chart(fig_d, 300), use_container_width=True)
+
+    # ---------------------------------------------------------------
+    # Chart 3: Fair value model — spot vs adjusted fair value
+    # ---------------------------------------------------------------
     st.subheader("Fair-value model")
+    st.caption("Fair value = exp(a + b × days-of-cover), fit on history. Forecast fair value moves with your sliders.")
     fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=fv.index, y=fv["price"], name="Spot",
-                              line=dict(color=COLORS["price"], width=2)))
-    fig2.add_trace(go.Scatter(x=fv.index, y=fv["fair_value_price"], name="Fair value",
-                              line=dict(color=COLORS["fair_value"], width=2, dash="dot")))
-    st.plotly_chart(_styled_chart(fig2, 320), use_container_width=True)
+    if forecast_start is not None:
+        fig2.add_vrect(x0=forecast_start, x1=x_end,
+                       fillcolor="rgba(255,184,0,0.06)", line_width=0)
+    # Baseline fair value on forecast (reference)
+    fig2.add_trace(go.Scatter(
+        x=base[fc_mask].index, y=base[fc_mask]["fair_value_price"],
+        name="Fair value baseline",
+        line=dict(color=COLORS["fair_value"], width=1.5, dash="dash"), opacity=0.55,
+    ))
+    fig2.add_trace(go.Scatter(
+        x=adj.index, y=adj["price"], name="Spot",
+        line=dict(color=COLORS["price"], width=2),
+    ))
+    fig2.add_trace(go.Scatter(
+        x=adj.index, y=adj["fair_value_price"], name="Fair value adjusted",
+        line=dict(color=COLORS["fair_value"], width=2.5, dash="dot"),
+    ))
+    if forecast_start is not None:
+        fig2.add_vline(x=forecast_start, line=dict(color="#ffb800", dash="dash", width=1.5))
+    fig2.update_layout(xaxis=dict(range=[x_start, x_end]))
+    st.plotly_chart(_styled_chart(fig2, 340), use_container_width=True)
 
 
 # ----------------------------------------------------------------------------
