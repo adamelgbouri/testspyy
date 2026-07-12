@@ -1,17 +1,17 @@
 """
-Commodity Trading Desk — single-file Streamlit app.
-by Adam EL GBOURI
+CSDAP — Commodity Supply & Demand Analytics Platform.
+Single-file Streamlit app, by Adam EL GBOURI.
 
 Reuses the analytics engine in web/backend/commodity_engine/* so we don't
 duplicate ~3000 lines of pricing / risk / fair-value logic.
 
 Run locally:
     pip install -r requirements.txt
-    streamlit run streamlit_app.py
+    streamlit run dsse.py
 
 Deploy free on Streamlit Cloud:
     1. https://share.streamlit.io  →  Sign in with GitHub
-    2. New app  →  pick this repo, branch `main`, file `streamlit_app.py`
+    2. New app  →  pick this repo, file `dsse.py`
     3. Deploy  →  done.  URL: https://<your-slug>.streamlit.app
 """
 from __future__ import annotations
@@ -33,17 +33,32 @@ if str(_ENGINE_PATH) not in sys.path:
 
 from commodity_engine import (  # noqa: E402
     BalanceAssumptions, Black76, COMMODITY_TEMPLATES, MCConfig,
-    estimate_fair_value, get_country_macro, get_futures_curve,
-    get_live_spot, get_market_events, get_regional_dataset,
-    get_sd_dataset, list_countries, parametric_var, portfolio_var,
-    run_balance, run_monte_carlo, stress_scenarios,
+    estimate_fair_value, get_country_macro, get_market_events,
+    get_regional_dataset, get_sd_dataset, list_countries,
+    parametric_var, portfolio_var, run_balance, run_monte_carlo,
+    stress_scenarios,
 )
+from commodity_engine import get_futures_curve as _get_futures_curve  # noqa: E402
+from commodity_engine import get_live_spot as _get_live_spot  # noqa: E402
+
+
+# Yahoo calls are slow (network) — cache them 5 min so page switches and
+# slider moves don't refetch. The synthetic engine calls are already lru_cached.
+@st.cache_data(ttl=300, show_spinner=False)
+def get_live_spot(commodity_key: str):
+    return _get_live_spot(commodity_key)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_futures_curve(commodity_key: str, n_max: int = 12):
+    return _get_futures_curve(commodity_key, n_max)
+
 
 # ----------------------------------------------------------------------------
 # Page configuration & global styles
 # ----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Commodity Trading Desk — Adam EL GBOURI",
+    page_title="CSDAP — Commodity S&D Analytics · Adam EL GBOURI",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -134,7 +149,8 @@ def render_header() -> None:
                             color:#0a1628; font-weight:800; font-size:16px;'>C</div>
                 <div>
                     <div style='font-size:18px; font-weight:700; color:#f0f4fa;'>
-                        Commodity Trading Desk</div>
+                        CSDAP <span style='font-weight:400; color:#97a8be; font-size:13px;'>
+                        — Commodity Supply &amp; Demand Analytics Platform</span></div>
                     <div style='font-size:10px; color:#97a8be; letter-spacing:0.18em;
                                 font-family:JetBrains Mono,monospace; text-transform:uppercase;'>
                         by Adam EL GBOURI · {date.today().year}</div>
@@ -816,8 +832,8 @@ def page_events() -> None:
 def page_about() -> None:
     st.title("About")
     st.markdown("""
-    **Commodity Trading Desk** — solo-built portfolio project showcasing
-    full-stack quantitative finance:
+    **CSDAP — Commodity Supply & Demand Analytics Platform** — solo-built
+    portfolio project showcasing full-stack quantitative finance:
 
     - **Analytics** (Python · NumPy · SciPy · scikit-learn) — S&D balance,
       log-linear fair value, Black-76 option pricing & Greeks, parametric VaR
