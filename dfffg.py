@@ -15,7 +15,9 @@ EIA fundamentals (optional): set an API key in the sidebar. Free at eia.gov/open
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -680,9 +682,6 @@ EVENTS = [
     dict(date=date.today()+timedelta(days=38), event="USDA Grain Stocks",                   tags=["Grains"]),
 ]
 
-COUNTRIES = ["USA", "China", "Germany", "Japan", "UK", "Brazil", "India", "France"]
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  ANALYTICS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -884,29 +883,382 @@ def seasonality(yf_ticker: str, years: int = 10) -> pd.DataFrame:
     return out
 
 
-def macro_data(country, months=48):
-    """Model-estimated. Placeholder for a real FRED/OECD feed."""
-    rng   = np.random.default_rng(abs(hash(country)) % 2**32)
-    today = date.today().replace(day=1)
-    dates = [today - timedelta(days=30*(months-i)) for i in range(months)]
-    base  = dict(
-        USA=dict(gdp=100, cpi=3.2, rate=5.25, pmi=52.1),
-        China=dict(gdp=100, cpi=0.8, rate=3.45, pmi=50.4),
-        Germany=dict(gdp=100, cpi=2.9, rate=3.50, pmi=47.2),
-        Japan=dict(gdp=100, cpi=2.5, rate=0.50, pmi=49.8),
-        UK=dict(gdp=100, cpi=3.4, rate=5.25, pmi=51.3),
-        Brazil=dict(gdp=100, cpi=4.8, rate=10.75, pmi=50.9),
-        India=dict(gdp=100, cpi=4.5, rate=6.50, pmi=57.5),
-        France=dict(gdp=100, cpi=2.7, rate=3.50, pmi=48.6),
-    )
-    b = base.get(country, dict(gdp=100, cpi=2.5, rate=4.0, pmi=50.0))
-    return pd.DataFrame(dict(
-        date=dates,
-        gdp_index=b["gdp"] + np.cumsum(rng.normal(0.5, 0.3, months)),
-        cpi_yoy=np.clip(b["cpi"] + np.cumsum(rng.normal(0, 0.08, months)), -2, 20),
-        policy_rate=np.clip(b["rate"] + np.cumsum(rng.normal(0, 0.05, months)), 0, 20),
-        pmi=np.clip(b["pmi"] + rng.normal(0, 1.2, months), 30, 70),
-    )).set_index("date")
+@st.cache_data(ttl=3600)
+def fetch_fred(series_id: str, api_key: str, start: str = "2015-01-01") -> pd.DataFrame:
+    """
+    One FRED series. Real data or nothing — same contract as the price feed.
+    Free key: fred.stlouisfed.org/docs/api/api_key.html
+    """
+    if not REQUESTS_AVAILABLE or not api_key or not series_id:
+        return pd.DataFrame()
+    try:
+        r = requests.get(
+            "https://api.stlouisfed.org/fred/series/observations",
+            params={"series_id": series_id, "api_key": api_key, "file_type": "json",
+                    "observation_start": start},
+            timeout=15)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        obs = r.json().get("observations", [])
+        if not obs:
+            return pd.DataFrame()
+        df = pd.DataFrame(obs)
+        df["date"]  = pd.to_datetime(df["date"])
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        return df[["date", "value"]].dropna().set_index("date")
+    except Exception:
+        return pd.DataFrame()
+
+
+def macro_series(country: str, metric: str, api_key: str) -> pd.DataFrame:
+    """Resolve a (country, metric) pair to a FRED series and pull it."""
+    sid = FRED_SERIES.get(country, {}).get(metric)
+    if not sid:
+        return pd.DataFrame()
+    return fetch_fred(sid, api_key)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FRED SERIES MAP  (free key at fred.stlouisfed.org)
+# ══════════════════════════════════════════════════════════════════════════════
+#  Macro was the last model-generated page on this desk. It is now live or empty,
+#  same rule as everything else. FRED carries non-US series too, so the country
+#  list is real rather than a set of invented base levels.
+FRED_SERIES = {
+    "USA":     dict(cpi_yoy="CPIAUCSL", policy_rate="DFF",       gdp="GDPC1",     pmi="MANEMP"),
+    "Euro Area": dict(cpi_yoy="CP0000EZ19M086NEST", policy_rate="ECBDFR", gdp="CLVMNACSCAB1GQEA19", pmi=None),
+    "Germany": dict(cpi_yoy="DEUCPIALLMINMEI", policy_rate="ECBDFR", gdp="CLVMNACSCAB1GQDE", pmi=None),
+    "France":  dict(cpi_yoy="FRACPIALLMINMEI", policy_rate="ECBDFR", gdp="CLVMNACSCAB1GQFR", pmi=None),
+    "UK":      dict(cpi_yoy="GBRCPIALLMINMEI", policy_rate="IUDSOIA", gdp="NGDPRSAXDCGBQ", pmi=None),
+    "Japan":   dict(cpi_yoy="JPNCPIALLMINMEI", policy_rate="IRSTCI01JPM156N", gdp="JPNRGDPEXP", pmi=None),
+    "China":   dict(cpi_yoy="CHNCPIALLMINMEI", policy_rate=None,  gdp="NGDPRSAXDCCNQ", pmi=None),
+    "Brazil":  dict(cpi_yoy="BRACPIALLMINMEI", policy_rate="INTDSRBRM193N", gdp="NGDPRSAXDCBRQ", pmi=None),
+    "India":   dict(cpi_yoy="INDCPIALLMINMEI", policy_rate="INTDSRINM193N", gdp="NGDPRSAXDCINQ", pmi=None),
+}
+
+MACRO_METRICS = {
+    "cpi_yoy":     dict(label="CPI (index)",      note="Index level. YoY % is derived below."),
+    "policy_rate": dict(label="Policy rate (%)",  note="Central bank target / overnight rate."),
+    "gdp":         dict(label="Real GDP",         note="Real GDP, local units. Quarterly."),
+}
+
+# Commodity-relevant FRED series — the ones a commodity desk actually watches.
+FRED_COMMODITY_CONTEXT = {
+    "US Dollar Index (DXY proxy)": "DTWEXBGS",
+    "US 10Y Treasury Yield":       "DGS10",
+    "US 10Y Breakeven Inflation":  "T10YIE",
+    "US Industrial Production":    "INDPRO",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BLOTTER PERSISTENCE
+# ══════════════════════════════════════════════════════════════════════════════
+#  st.session_state dies on refresh. A book that vanishes when you close the tab
+#  is not a book. Positions are serialised to JSON so they survive a reload, and
+#  can be exported / re-imported to move a book between machines.
+BLOTTER_FILE = "blotter.json"
+
+
+def blotter_save(positions: List[dict]) -> bool:
+    try:
+        with open(BLOTTER_FILE, "w") as f:
+            json.dump(positions, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def blotter_load() -> List[dict]:
+    try:
+        if os.path.exists(BLOTTER_FILE):
+            with open(BLOTTER_FILE) as f:
+                data = json.load(f)
+            # Drop any line referencing a contract no longer on the desk.
+            return [p for p in data if p.get("commodity") in COMMODITIES]
+    except Exception:
+        pass
+    return []
+
+
+def blotter_serialise(positions: List[dict]) -> str:
+    return json.dumps(positions, indent=2)
+
+
+def blotter_deserialise(raw: str) -> Optional[List[dict]]:
+    """Parse an uploaded book. Returns None if it is not a valid blotter."""
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            return None
+        out = []
+        for p in data:
+            if p.get("commodity") not in COMMODITIES:
+                continue
+            if p.get("kind", "future") == "option":
+                out.append(dict(
+                    kind="option", commodity=p["commodity"], side=p["side"],
+                    lots=int(p["lots"]), entry=float(p["entry"]),
+                    opt_type=p.get("opt_type", "call"), strike=float(p["strike"]),
+                    tenor=float(p["tenor"]), vol=float(p.get("vol", 0.3))))
+            else:
+                out.append(dict(
+                    kind="future", commodity=p["commodity"], side=p["side"],
+                    lots=int(p["lots"]), entry=float(p["entry"]),
+                    vol=float(p.get("vol", COMMODITIES[p["commodity"]]["vol"]))))
+        return out
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BOOK ANALYTICS — Greeks, roll P&L, historical VaR
+# ══════════════════════════════════════════════════════════════════════════════
+def book_greeks(positions: List[dict], marks: Dict[str, Optional[float]],
+                r: float = 0.05) -> dict:
+    """
+    Net Greeks across the whole book, in cash.
+
+    Futures carry delta 1.0 per unit and nothing else. Options carry the full set.
+    This answers the question a real options desk lives by — "how much vega am I
+    actually short?" — which a per-option pricer cannot.
+    """
+    tot = dict(delta=0.0, gamma=0.0, vega=0.0, theta=0.0)
+    rows = []
+    for p in positions:
+        n = p["commodity"]
+        mark = marks.get(n)
+        if mark is None:
+            continue
+        mult = price_multiplier(n)
+        sign = 1 if p["side"] == "Long" else -1
+        lots = p["lots"]
+
+        if p.get("kind", "future") == "option":
+            g = black76(mark, p["strike"], p["tenor"], r, p["vol"], p["opt_type"])
+            d = g["delta"] * mult * lots * sign
+            gm = g["gamma"] * mult * lots * sign
+            v  = g["vega"]  * mult * lots * sign
+            th = g["theta"] * mult * lots * sign
+            label = f"{n} {p['opt_type'][:1].upper()}{p['strike']:g}"
+        else:
+            d, gm, v, th = 1.0 * mult * lots * sign, 0.0, 0.0, 0.0
+            label = f"{n} fut"
+
+        tot["delta"] += d
+        tot["gamma"] += gm
+        tot["vega"]  += v
+        tot["theta"] += th
+        rows.append(dict(Position=label, Side=p["side"], Lots=lots,
+                         Delta=d, Gamma=gm, Vega=v, Theta=th))
+    return dict(total=tot, rows=rows)
+
+
+def roll_pnl(positions: List[dict], marks: Dict[str, Optional[float]]) -> List[dict]:
+    """
+    Split P&L into price and carry.
+
+    Price P&L  = (mark - entry) x multiplier x lots
+    Roll P&L   = (M1 - M2) x multiplier x lots, sign-adjusted
+
+    A long position in backwardation earns the roll; in contango it bleeds. A book
+    that only reports a single P&L number cannot tell a trader which of the two is
+    actually happening, and they have opposite implications for whether to stay in.
+    """
+    out = []
+    for p in positions:
+        if p.get("kind", "future") == "option":
+            continue
+        n = p["commodity"]
+        mark = marks.get(n)
+        if mark is None:
+            continue
+        mult = price_multiplier(n)
+        sign = 1 if p["side"] == "Long" else -1
+        price_p = sign * (mark - p["entry"]) * mult * p["lots"]
+
+        strip = fetch_forward_strip(n)
+        if strip.empty or len(strip) < 2:
+            roll_p, m1m2, ann = 0.0, None, None
+        else:
+            m1 = float(strip["price"].iloc[0])
+            m2 = float(strip["price"].iloc[1])
+            m1m2 = m1 - m2
+            roll_p = sign * m1m2 * mult * p["lots"]
+            ann = (m1m2 / m2 * 12 * 100) if m2 else None
+
+        out.append(dict(Contract=n, Side=p["side"], Lots=p["lots"],
+                        PricePnL=price_p, MonthlyRoll=roll_p,
+                        M1M2=m1m2, RollAnnPct=ann))
+    return out
+
+
+def historical_var(positions: List[dict], marks: Dict[str, Optional[float]],
+                   conf: float = 0.95, horizon: int = 1,
+                   lookback: int = 500) -> dict:
+    """
+    Historical simulation VaR. Replays actual daily return vectors on today's book.
+
+    Makes NO distributional assumption — no normality, no correlation matrix. The
+    joint behaviour, including the fat tails and the way correlations snapped to 1
+    on the worst days, is already in the data.
+
+    Parametric VaR understates the tail precisely when it matters. Showing both, and
+    the gap between them, is the honest presentation.
+    """
+    panel = fetch_panel("3y")
+    if panel.empty:
+        return dict(available=False)
+
+    names, w = [], []
+    for p in positions:
+        if p.get("kind", "future") == "option":
+            continue                      # delta-equivalent only; options need a full reval
+        n = p["commodity"]
+        mark = marks.get(n)
+        if mark is None or n not in panel.columns:
+            continue
+        sign = 1 if p["side"] == "Long" else -1
+        names.append(n)
+        w.append(notional_per_lot(n, mark) * p["lots"] * sign)
+
+    if not names:
+        return dict(available=False)
+
+    rets = panel[names].pct_change().dropna().tail(lookback)
+    if len(rets) < 100:
+        return dict(available=False)
+
+    pnl = (rets.values @ np.array(w)) * math.sqrt(horizon)
+    var = float(-np.percentile(pnl, (1 - conf) * 100))
+    tail = pnl[pnl <= -var]
+    es = float(-tail.mean()) if len(tail) else var
+
+    worst_i = int(np.argmin(pnl))
+    return dict(available=True, var=var, es=es, pnl=pnl, n_days=len(pnl),
+                worst_date=rets.index[worst_i].date(),
+                worst_pnl=float(pnl[worst_i]))
+
+
+# ── Historical stress episodes ───────────────────────────────────────────────
+#  A parallel +/-30% shock is a weak test: real dislocations are not parallel.
+#  These replay dated windows against the current book. Only episodes within the
+#  Yahoo history window are usable — the 2022 LME nickel squeeze is deliberately
+#  absent because nickel is not on this desk and never will be on a free feed.
+STRESS_EPISODES = {
+    "COVID crash (Feb–Mar 2020)":        ("2020-02-19", "2020-03-23"),
+    "WTI negative print (Apr 2020)":     ("2020-04-01", "2020-04-30"),
+    "Ukraine invasion (Feb–Mar 2022)":   ("2022-02-21", "2022-03-09"),
+    "2022 energy peak → bust (Jun–Sep)": ("2022-06-08", "2022-09-26"),
+    "Banking wobble (Mar 2023)":         ("2023-03-08", "2023-03-24"),
+}
+
+
+def stress_replay(positions: List[dict], marks: Dict[str, Optional[float]],
+                  start: str, end: str) -> dict:
+    """Apply the actual move of a dated episode to the current book, per contract."""
+    panel = fetch_panel("5y")
+    if panel.empty:
+        return dict(available=False)
+
+    try:
+        window = panel.loc[start:end]
+    except Exception:
+        return dict(available=False)
+    if window.empty or len(window) < 2:
+        return dict(available=False)
+
+    rows, total = [], 0.0
+    for p in positions:
+        if p.get("kind", "future") == "option":
+            continue
+        n = p["commodity"]
+        mark = marks.get(n)
+        if mark is None or n not in window.columns:
+            continue
+        s = window[n].dropna()
+        if len(s) < 2:
+            continue
+        move = float(s.iloc[-1] / s.iloc[0] - 1)
+        sign = 1 if p["side"] == "Long" else -1
+        pnl  = sign * mark * move * price_multiplier(n) * p["lots"]
+        total += pnl
+        rows.append(dict(Contract=n, Side=p["side"], Lots=p["lots"],
+                         Move=move*100, PnL=pnl))
+    if not rows:
+        return dict(available=False)
+    return dict(available=True, rows=rows, total=total,
+                start=str(window.index[0].date()), end=str(window.index[-1].date()))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SIGNAL SCANNER
+# ══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=900)
+def build_signals() -> pd.DataFrame:
+    """
+    One row per contract, one column per signal. Pure aggregation of what the other
+    pages already compute — the desk had sixteen screens and no single place that
+    said "where should I be looking today". This is that place.
+
+    Every column is live-derived. Nothing here is modelled.
+    """
+    panel = fetch_panel("3y")
+    rows = []
+    this_month = date.today().month
+
+    for name, c in COMMODITIES.items():
+        row = dict(Contract=name, Sector=c["sector"])
+
+        # ── Curve structure & carry ──
+        strip = fetch_forward_strip(name)
+        if not strip.empty and len(strip) >= 2:
+            f1 = float(strip["price"].iloc[0])
+            f2 = float(strip["price"].iloc[1])
+            fn = float(strip["price"].iloc[-1])
+            row["Mark"]      = f1
+            row["Carry%"]    = (fn - f1) / f1 * 100
+            row["Structure"] = ("CONTANGO" if row["Carry%"] > 0.5
+                                else "BACKWARD" if row["Carry%"] < -0.5 else "FLAT")
+            row["M1M2"] = f1 - f2
+        else:
+            row.update(Mark=np.nan, **{"Carry%": np.nan}, Structure="n/a", M1M2=np.nan)
+
+        # ── Vol regime: is realised vol above or below its own 1y norm? ──
+        h = fetch_history(c["yf_ticker"], "1y")
+        if not h.empty and len(h) > 130:
+            lr = np.log(h["Close"] / h["Close"].shift(1)).dropna()
+            rv60  = float(lr.tail(60).std() * math.sqrt(252))
+            rv252 = float(lr.std() * math.sqrt(252))
+            row["RV60"]      = rv60 * 100
+            row["VolRegime"] = rv60 / rv252 if rv252 > 0 else np.nan
+        else:
+            row["RV60"], row["VolRegime"] = np.nan, np.nan
+
+        # ── Momentum ──
+        if not h.empty and len(h) > 60:
+            px = h["Close"]
+            row["Chg1M"] = float(px.iloc[-1] / px.iloc[-21] - 1) * 100 if len(px) > 21 else np.nan
+            row["Chg3M"] = float(px.iloc[-1] / px.iloc[-63] - 1) * 100 if len(px) > 63 else np.nan
+            row["Px%ile1y"] = float((px < px.iloc[-1]).mean() * 100)
+        else:
+            row["Chg1M"] = row["Chg3M"] = row["Px%ile1y"] = np.nan
+
+        # ── Seasonal bias for the current calendar month ──
+        if c.get("seasonal"):
+            s = seasonality(c["yf_ticker"], 10)
+            if not s.empty:
+                d = s[s["month"] == this_month]["ret"]
+                row["SeasonMed"] = float(d.median()) if len(d) else np.nan
+                row["SeasonHit"] = float((d > 0).mean() * 100) if len(d) else np.nan
+            else:
+                row["SeasonMed"] = row["SeasonHit"] = np.nan
+        else:
+            row["SeasonMed"] = row["SeasonHit"] = np.nan
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -973,12 +1325,18 @@ def render_sidebar(marks):
         unsafe_allow_html=True,
     )
     pages = [
-        "📊 Dashboard", "📈 Forward Curve", "🔀 Spreads & Roll",
-        "⚗️ Crack & Crush", "🔗 Correlation", "🗓️ Seasonality",
-        "🛢️ EIA Fundamentals", "🌍 Regional Balances",
+        # ── Market ──
+        "📡 Signals", "📊 Dashboard", "📈 Forward Curve",
+        # ── Relative value ──
+        "🔀 Spreads & Roll", "⚗️ Crack & Crush", "🔗 Correlation",
+        # ── Fundamentals ──
+        "🛢️ EIA Fundamentals", "🗓️ Seasonality", "🌍 Regional Balances", "📅 Calendar",
+        # ── Derivatives ──
         "🎯 Options & Greeks", "📉 Vol Surface",
+        # ── Book ──
         "💼 Blotter", "🛡️ Risk", "🎲 Monte Carlo",
-        "🌐 Macro", "📅 Calendar", "ℹ️ About",
+        # ── System ──
+        "🌐 Macro", "ℹ️ About",
     ]
     page = st.sidebar.radio("Pages", pages, label_visibility="collapsed")
     st.sidebar.markdown("---")
@@ -1006,12 +1364,15 @@ def render_sidebar(marks):
     st.sidebar.markdown("---")
     st.sidebar.markdown(
         f'<div style="font-size:10px;color:{GRAY};font-family:JetBrains Mono,monospace;'
-        f'letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;">EIA Feed</div>',
+        f'letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;">Data Keys</div>',
         unsafe_allow_html=True,
     )
-    st.sidebar.text_input("API key", type="password", key="eia_key",
+    st.sidebar.text_input("EIA key", type="password", key="eia_key",
                           help="Free at eia.gov/opendata. Enables real US crude, "
                                "product and gas inventories on the Fundamentals page.")
+    st.sidebar.text_input("FRED key", type="password", key="fred_key",
+                          help="Free at fred.stlouisfed.org. Enables real CPI, policy rates, "
+                               "GDP, the dollar index and real yields on the Macro page.")
 
     n_live = sum(1 for v in marks.values() if v is not None)
     ok = n_live == len(COMMODITIES)
@@ -1917,13 +2278,22 @@ def page_vol_surface(commodity, marks):
 # ══════════════════════════════════════════════════════════════════════════════
 def page_blotter(marks):
     st.title("Blotter")
-    st.caption("Positions in **lots**, marked to the live front month. "
-               "P&L is cash: (mark − entry) × contract size × lots, sign-adjusted.")
+    st.caption(
+        "Futures and options, in **lots**, marked to the live front month. P&L is cash. "
+        "The book persists to disk — it survives a refresh, and can be exported to move "
+        "between machines."
+    )
 
+    # Load from disk once per session.
     if "positions" not in st.session_state:
-        st.session_state["positions"] = []
+        st.session_state["positions"] = blotter_load()
+        if st.session_state["positions"]:
+            st.success(f"Restored {len(st.session_state['positions'])} position(s) from disk.",
+                       icon="💾")
 
-    with st.expander("New Trade", expanded=True):
+    tab_f, tab_o = st.tabs(["Book future", "Book option"])
+
+    with tab_f:
         c1, c2, c3, c4, c5 = st.columns(5)
         name = c1.selectbox("Contract", list(COMMODITIES.keys()), key="pos_name")
         side = c2.selectbox("Side", ["Long", "Short"], key="pos_side")
@@ -1931,23 +2301,66 @@ def page_blotter(marks):
         mk   = marks.get(name)
         entry = c4.number_input("Entry", value=float(mk) if mk else 0.0, step=0.01,
                                 format="%.4f", key="pos_entry", disabled=(mk is None))
-        if c5.button("Book", use_container_width=True, type="primary", disabled=(mk is None)):
+        if c5.button("Book", use_container_width=True, type="primary",
+                     disabled=(mk is None), key="book_fut"):
             st.session_state["positions"].append(dict(
-                commodity=name, side=side, lots=int(lots), entry=float(entry),
-                vol=COMMODITIES[name]["vol"]))
+                kind="future", commodity=name, side=side, lots=int(lots),
+                entry=float(entry), vol=COMMODITIES[name]["vol"]))
+            blotter_save(st.session_state["positions"])
             st.rerun()
         if mk is None:
             st.caption(f"⚠️ {name} has no live mark — cannot book.")
         else:
-            st.caption(f"{name}: 1 lot = {COMMODITIES[name]['contract_size']:,} "
+            st.caption(f"1 lot = {COMMODITIES[name]['contract_size']:,} "
                        f"{COMMODITIES[name]['size_unit']} ≈ "
                        f"${notional_per_lot(name, mk):,.0f} notional at {mk:,.4f}")
+
+    with tab_o:
+        st.caption(
+            "Options are priced Black-76 off the live forward. **σ is your input** — no listed "
+            "chain exists on a free feed, so the vol you book is an assumption, not a market."
+        )
+        o1, o2, o3, o4 = st.columns(4)
+        oname = o1.selectbox("Contract", list(COMMODITIES.keys()), key="opt_name")
+        oside = o2.selectbox("Side", ["Long", "Short"], key="opt_side")
+        otype = o3.selectbox("Type", ["call", "put"], key="opt_type")
+        olots = o4.number_input("Lots", value=1, step=1, min_value=1, key="opt_lots")
+
+        omk = marks.get(oname)
+        p1, p2, p3, p4 = st.columns(4)
+        ostrike = p1.number_input("Strike", value=float(omk) if omk else 0.0,
+                                  step=0.01, format="%.4f", key="opt_strike",
+                                  disabled=(omk is None))
+        otenor = p2.slider("Tenor (months)", 1, 24, 6, key="opt_tenor") / 12
+        orv = realised_vol(COMMODITIES[oname]["yf_ticker"], 60) if omk else None
+        ovol = p3.number_input("σ (%)", value=int((orv or COMMODITIES[oname]["vol"])*100),
+                               step=1, key="opt_vol") / 100
+
+        prem = 0.0
+        if omk:
+            prem = black76(omk, ostrike, otenor, 0.05, ovol, otype)["price"]
+        oentry = p4.number_input("Premium paid", value=float(round(prem, 4)),
+                                 step=0.0001, format="%.4f", key="opt_entry",
+                                 disabled=(omk is None))
+
+        if st.button("Book option", type="primary", disabled=(omk is None), key="book_opt"):
+            st.session_state["positions"].append(dict(
+                kind="option", commodity=oname, side=oside, lots=int(olots),
+                entry=float(oentry), opt_type=otype, strike=float(ostrike),
+                tenor=float(otenor), vol=float(ovol)))
+            blotter_save(st.session_state["positions"])
+            st.rerun()
+        if omk:
+            st.caption(f"Theoretical premium at σ={ovol*100:.0f}%: {prem:,.4f} "
+                       f"→ ${prem*price_multiplier(oname):,.0f} per lot")
 
     positions = st.session_state["positions"]
     if not positions:
         st.info("Blotter empty.")
+        _blotter_io()
         return
 
+    # ── Mark the book ────────────────────────────────────────────────────────
     rows, tot, gl, gs = [], 0.0, 0.0, 0.0
     for p in positions:
         n = p["commodity"]
@@ -1956,16 +2369,30 @@ def page_blotter(marks):
             continue
         sign = 1 if p["side"] == "Long" else -1
         mult = price_multiplier(n)
-        pnl  = sign * (mark - p["entry"]) * mult * p["lots"]
-        notl = notional_per_lot(n, mark) * p["lots"]
+
+        if p.get("kind", "future") == "option":
+            theo = black76(mark, p["strike"], p["tenor"], 0.05, p["vol"], p["opt_type"])["price"]
+            pnl  = sign * (theo - p["entry"]) * mult * p["lots"]
+            notl = theo * mult * p["lots"]
+            label = f"{n} {p['opt_type'][:1].upper()}{p['strike']:g} {p['tenor']*12:.0f}m"
+            entry_disp, mark_disp = p["entry"], theo
+        else:
+            pnl  = sign * (mark - p["entry"]) * mult * p["lots"]
+            notl = notional_per_lot(n, mark) * p["lots"]
+            label = n
+            entry_disp, mark_disp = p["entry"], mark
+
         tot += pnl
         if sign > 0:
-            gl += notl
+            gl += abs(notl)
         else:
-            gs += notl
-        rows.append({"Contract": n, "Side": p["side"], "Lots": p["lots"],
-                     "Entry": p["entry"], "Mark": mark, "Notional": notl, "P&L": pnl,
-                     "Return %": sign*(mark - p["entry"])/p["entry"]*100})
+            gs += abs(notl)
+        rows.append({
+            "Position": label, "Kind": p.get("kind", "future"), "Side": p["side"],
+            "Lots": p["lots"], "Entry": entry_disp, "Mark": mark_disp,
+            "Notional": notl, "P&L": pnl,
+            "Return %": sign*(mark_disp - entry_disp)/entry_disp*100 if entry_disp else 0.0,
+        })
 
     cols = st.columns(4)
     cols[0].metric("Gross long", f"${gl:,.0f}")
@@ -1986,9 +2413,123 @@ def page_blotter(marks):
           .map(_c, subset=["P&L", "Return %"]),
         use_container_width=True, hide_index=True)
 
-    if st.button("Flatten book"):
-        st.session_state["positions"] = []
-        st.rerun()
+    # ── Price vs roll decomposition ──────────────────────────────────────────
+    st.subheader("P&L Attribution — Price vs Carry")
+    st.caption(
+        "A single P&L number hides which of two opposite things is happening. **Price P&L** is "
+        "the mark moving. **Roll P&L** is what the curve pays (or charges) you to hold the "
+        "position: a long in backwardation earns it, a long in contango bleeds it. They have "
+        "opposite implications for whether to stay in the trade."
+    )
+    with st.spinner("Pulling strips for carry attribution…"):
+        rp = roll_pnl(positions, marks)
+
+    if not rp:
+        st.info("No futures positions to attribute (options carry no roll).")
+    else:
+        rpdf = pd.DataFrame(rp)
+        tot_price = float(rpdf["PricePnL"].sum())
+        tot_roll  = float(rpdf["MonthlyRoll"].sum())
+
+        m = st.columns(3)
+        m[0].markdown(kpi("Price P&L", f"${tot_price:+,.0f}", "mark vs entry",
+                          GREEN if tot_price >= 0 else RED), unsafe_allow_html=True)
+        m[1].markdown(kpi("Roll P&L (1 month)", f"${tot_roll:+,.0f}",
+                          "curve carry if held & rolled",
+                          GREEN if tot_roll >= 0 else RED), unsafe_allow_html=True)
+        m[2].markdown(kpi("Combined", f"${tot_price + tot_roll:+,.0f}", "",
+                          GREEN if tot_price + tot_roll >= 0 else RED), unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        st.dataframe(
+            rpdf.style.format({"PricePnL": "${:+,.0f}", "MonthlyRoll": "${:+,.0f}",
+                               "M1M2": "{:+,.4f}", "RollAnnPct": "{:+.1f}%"})
+                .map(_c, subset=["PricePnL", "MonthlyRoll"]),
+            use_container_width=True, hide_index=True)
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=rpdf["Contract"], y=rpdf["PricePnL"], name="Price P&L",
+                             marker_color=AMBER))
+        fig.add_trace(go.Bar(x=rpdf["Contract"], y=rpdf["MonthlyRoll"], name="Roll P&L (1m)",
+                             marker_color=TEAL))
+        fig.add_hline(y=0, line=dict(color=GRAY, dash="dash"))
+        fig.update_layout(barmode="group", yaxis_title="$")
+        st.plotly_chart(_styled(fig, 320), use_container_width=True)
+
+    # ── Aggregate Greeks ─────────────────────────────────────────────────────
+    has_opt = any(p.get("kind") == "option" for p in positions)
+    st.subheader("Net Book Greeks")
+    if not has_opt:
+        st.info(
+            "No options booked. Futures carry delta 1.0 and nothing else — net delta is "
+            "simply the signed notional. Book an option to see gamma, vega and theta.",
+            icon="ℹ️")
+
+    bg = book_greeks(positions, marks)
+    t = bg["total"]
+    g = st.columns(4)
+    g[0].markdown(kpi("Net Delta", f"${t['delta']:+,.0f}", "per 1 unit move", AMBER),
+                  unsafe_allow_html=True)
+    g[1].markdown(kpi("Net Gamma", f"${t['gamma']:+,.0f}", "per unit²",
+                      GREEN if t["gamma"] >= 0 else RED), unsafe_allow_html=True)
+    g[2].markdown(kpi("Net Vega", f"${t['vega']:+,.0f}", "per vol point",
+                      GREEN if t["vega"] >= 0 else RED), unsafe_allow_html=True)
+    g[3].markdown(kpi("Net Theta", f"${t['theta']:+,.0f}", "per day",
+                      GREEN if t["theta"] >= 0 else RED), unsafe_allow_html=True)
+
+    if has_opt:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if t["gamma"] < 0:
+            st.warning(
+                f"**Short gamma.** The book loses on large moves in either direction and is "
+                f"collecting ${t['theta']:+,.0f}/day of theta to compensate. That trade works "
+                f"until it doesn't.", icon="⚠️")
+        elif t["gamma"] > 0:
+            st.info(
+                f"**Long gamma.** The book gains on large moves either way and pays "
+                f"${abs(t['theta']):,.0f}/day of theta for the privilege.", icon="ℹ️")
+        st.dataframe(
+            pd.DataFrame(bg["rows"]).style.format({
+                "Delta": "${:+,.0f}", "Gamma": "${:+,.2f}",
+                "Vega": "${:+,.0f}", "Theta": "${:+,.0f}"}),
+            use_container_width=True, hide_index=True)
+
+    _blotter_io()
+
+
+def _blotter_io():
+    """Export / import / flatten controls."""
+    st.markdown("---")
+    st.subheader("Book Management")
+    positions = st.session_state.get("positions", [])
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.download_button(
+            "⬇ Export book (JSON)", data=blotter_serialise(positions),
+            file_name=f"blotter_{date.today().isoformat()}.json",
+            mime="application/json", use_container_width=True,
+            disabled=not positions)
+    with c2:
+        up = st.file_uploader("⬆ Import book", type="json", key="blotter_up",
+                              label_visibility="collapsed")
+        if up is not None:
+            parsed = blotter_deserialise(up.read().decode("utf-8"))
+            if parsed is None:
+                st.error("Not a valid blotter file.")
+            else:
+                st.session_state["positions"] = parsed
+                blotter_save(parsed)
+                st.success(f"Imported {len(parsed)} position(s).")
+                st.rerun()
+    with c3:
+        if st.button("🗑 Flatten book", use_container_width=True, disabled=not positions):
+            st.session_state["positions"] = []
+            blotter_save([])
+            st.rerun()
+
+    st.caption(f"Book auto-saves to `{BLOTTER_FILE}` on every trade. "
+               f"Positions in contracts no longer on the desk are dropped on load.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2083,14 +2624,105 @@ def page_risk(marks):
             fig2.update_xaxes(tickangle=-45)
             st.plotly_chart(fig2, use_container_width=True)
 
+    # ── Historical VaR — no distributional assumption ────────────────────────
+    st.subheader("Historical Simulation VaR")
+    st.caption(
+        "Replays the last 500 actual daily return vectors onto today's book. **No normality "
+        "assumption, no correlation matrix** — the real joint behaviour, fat tails included, "
+        "is already in the data. The gap against the parametric number is the information: "
+        "where parametric is lower, it is understating the tail."
+    )
+    with st.spinner("Replaying history…"):
+        hv = historical_var(positions, marks, conf=conf, horizon=horizon)
+
+    if not hv.get("available"):
+        st.info("Insufficient overlapping history for a historical simulation.")
+    else:
+        ratio_var = hv["var"] / risk["var"] if risk["var"] else 0
+        ratio_es  = hv["es"] / risk["es"] if risk["es"] else 0
+
+        h = st.columns(4)
+        h[0].markdown(kpi(f"Historical VaR {int(conf*100)}", f"${hv['var']:,.0f}",
+                          f"{hv['n_days']} days replayed", AMBER), unsafe_allow_html=True)
+        h[1].markdown(kpi(f"Historical ES {int(conf*100)}", f"${hv['es']:,.0f}",
+                          "mean of the tail", PURPLE), unsafe_allow_html=True)
+        h[2].markdown(kpi("Hist / Param VaR", f"{ratio_var:.2f}×",
+                          "parametric understates" if ratio_var > 1.05 else "broadly agree",
+                          RED if ratio_var > 1.05 else GREEN), unsafe_allow_html=True)
+        h[3].markdown(kpi("Worst day in sample", f"${hv['worst_pnl']:+,.0f}",
+                          str(hv["worst_date"]), RED), unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if ratio_var > 1.05:
+            st.warning(
+                f"**The parametric model is understating this book by {(ratio_var-1)*100:.0f}%.** "
+                f"Its normality assumption cannot see the tail that actually happened. Trust the "
+                f"historical number, and the ES over the VaR.", icon="⚠️")
+
+        fig_h = go.Figure(go.Histogram(x=hv["pnl"], nbinsx=60, marker_color=BLUE, opacity=0.75,
+                                       name="Daily P&L"))
+        fig_h.add_vline(x=-hv["var"], line=dict(color=AMBER, width=2),
+                        annotation_text=f"Hist VaR {int(conf*100)}")
+        fig_h.add_vline(x=-risk["var"], line=dict(color=GREEN, width=2, dash="dot"),
+                        annotation_text="Param VaR")
+        fig_h.add_vline(x=-hv["es"], line=dict(color=RED, width=2, dash="dash"),
+                        annotation_text="Hist ES")
+        fig_h.update_layout(title="Distribution of replayed daily book P&L", xaxis_title="$")
+        st.plotly_chart(_styled(fig_h, 340), use_container_width=True)
+
+    # ── Dated stress episodes ────────────────────────────────────────────────
+    st.subheader("Historical Stress Episodes")
+    st.caption(
+        "A parallel ±30% shock is a weak test — real dislocations are not parallel. These replay "
+        "the **actual, per-contract** moves of dated windows onto the current book. Note the "
+        "2022 LME nickel squeeze is absent: nickel is not on this desk and never will be on a "
+        "free feed."
+    )
+    ep = st.selectbox("Episode", list(STRESS_EPISODES.keys()), key="stress_ep")
+    s_start, s_end = STRESS_EPISODES[ep]
+
+    with st.spinner(f"Replaying {ep}…"):
+        sr = stress_replay(positions, marks, s_start, s_end)
+
+    if not sr.get("available"):
+        st.info(
+            f"No overlapping history for **{ep}**. Contracts added recently, or a feed gap, "
+            f"can leave a window empty. Nothing is extrapolated to fill it."
+        )
+    else:
+        srdf = pd.DataFrame(sr["rows"])
+        st.markdown(
+            kpi(f"Book P&L — {ep}", f"${sr['total']:+,.0f}",
+                f"{sr['start']} → {sr['end']}",
+                GREEN if sr["total"] >= 0 else RED),
+            unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        fig_s = go.Figure(go.Bar(
+            x=srdf["Contract"], y=srdf["PnL"],
+            marker_color=np.where(srdf["PnL"] >= 0, GREEN, RED),
+            text=[f"{m:+.1f}%" for m in srdf["Move"]], textposition="outside"))
+        fig_s.update_layout(title="P&L by leg (label = actual move in the episode)",
+                            yaxis_title="$")
+        st.plotly_chart(_styled(fig_s, 320), use_container_width=True)
+
+        st.dataframe(
+            srdf.style.format({"Move": "{:+.2f}%", "PnL": "${:+,.0f}"})
+                .map(lambda v: (f"color:{GREEN}" if v >= 0 else f"color:{RED}")
+                     if isinstance(v, (int, float)) else "", subset=["PnL"]),
+            use_container_width=True, hide_index=True)
+
+    # ── Parallel shock (kept, but framed honestly) ───────────────────────────
     st.subheader("Book-Wide Parallel Shock")
-    st.caption("Every mark shocked by the same percentage. Note this ignores correlation — "
-               "a parallel move is itself an assumption, and a conservative one.")
+    st.caption("Every mark moved by the same percentage. Kept for reference, but a parallel "
+               "move is itself a strong assumption — the dated episodes above are the better test.")
     shocks = [-30, -20, -10, -5, 0, 5, 10, 20, 30]
     pnls = []
     for sh in shocks:
         t = 0.0
         for p in positions:
+            if p.get("kind") == "option":
+                continue
             mark = marks.get(p["commodity"])
             if mark is None:
                 continue
@@ -2203,34 +2835,228 @@ def page_mc(commodity, marks):
 # ══════════════════════════════════════════════════════════════════════════════
 #  PAGE: MACRO
 # ══════════════════════════════════════════════════════════════════════════════
+def page_signals(marks):
+    st.title("Signals")
+    st.caption(
+        "Every contract, every signal, one screen. This desk had sixteen pages and no single "
+        "place that answered *where should I be looking today*. Nothing here is new maths — it "
+        "is the curve, vol, momentum and seasonal pages, aggregated. All of it is live-derived."
+    )
+
+    with st.spinner("Scanning the board… (first run pulls every strip — ~30s)"):
+        sig = build_signals()
+
+    if sig.empty:
+        st.error("Scanner returned nothing — the feed is down.")
+        return
+
+    sectors = st.multiselect("Sectors", ALL_SECTORS, default=ALL_SECTORS, key="sig_sectors")
+    view = sig[sig["Sector"].isin(sectors)].copy() if sectors else sig.copy()
+    if view.empty:
+        return
+
+    # ── Headline reads ───────────────────────────────────────────────────────
+    backw   = view[view["Structure"] == "BACKWARD"]
+    conta   = view[view["Structure"] == "CONTANGO"]
+    vol_up  = view[view["VolRegime"] > 1.2]
+    stretch = view[(view["Px%ile1y"] > 90) | (view["Px%ile1y"] < 10)]
+
+    c = st.columns(4)
+    c[0].markdown(kpi("Backwardated", str(len(backw)),
+                      "tight prompt — physical squeeze", GREEN), unsafe_allow_html=True)
+    c[1].markdown(kpi("Contango", str(len(conta)),
+                      "carry market — storage pays", RED), unsafe_allow_html=True)
+    c[2].markdown(kpi("Vol expanding", str(len(vol_up)),
+                      "RV60 > 1.2× RV252", PURPLE), unsafe_allow_html=True)
+    c[3].markdown(kpi("Price stretched", str(len(stretch)),
+                      ">90th or <10th %ile of 1y", AMBER), unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── The board ────────────────────────────────────────────────────────────
+    st.subheader("The Board")
+    disp = view[["Contract", "Sector", "Mark", "Structure", "Carry%", "M1M2",
+                 "RV60", "VolRegime", "Chg1M", "Chg3M", "Px%ile1y",
+                 "SeasonMed", "SeasonHit"]].copy()
+    disp.columns = ["Contract", "Sector", "Mark", "Structure", "Carry %", "M1–M2",
+                    "RV60 %", "Vol regime", "1M %", "3M %", "Px %ile 1y",
+                    "Season med %", "Season hit %"]
+
+    def _struct(v):
+        if v == "BACKWARD":
+            return f"color:{GREEN};font-weight:600"
+        if v == "CONTANGO":
+            return f"color:{RED};font-weight:600"
+        return f"color:{GRAY}"
+
+    def _signed(v):
+        if isinstance(v, (int, float)) and pd.notna(v):
+            return f"color:{GREEN}" if v >= 0 else f"color:{RED}"
+        return ""
+
+    def _regime(v):
+        if isinstance(v, (int, float)) and pd.notna(v):
+            if v > 1.2:
+                return f"color:{PURPLE};font-weight:600"
+            if v < 0.8:
+                return f"color:{GRAY}"
+        return ""
+
+    def _pctile(v):
+        if isinstance(v, (int, float)) and pd.notna(v):
+            if v > 90:
+                return f"color:{RED};font-weight:600"
+            if v < 10:
+                return f"color:{GREEN};font-weight:600"
+        return ""
+
+    st.dataframe(
+        disp.style
+            .format({"Mark": "{:,.4f}", "Carry %": "{:+.2f}", "M1–M2": "{:+,.4f}",
+                     "RV60 %": "{:.1f}", "Vol regime": "{:.2f}×",
+                     "1M %": "{:+.1f}", "3M %": "{:+.1f}", "Px %ile 1y": "{:.0f}",
+                     "Season med %": "{:+.1f}", "Season hit %": "{:.0f}"}, na_rep="—")
+            .map(_struct, subset=["Structure"])
+            .map(_signed, subset=["Carry %", "M1–M2", "1M %", "3M %", "Season med %"])
+            .map(_regime, subset=["Vol regime"])
+            .map(_pctile, subset=["Px %ile 1y"]),
+        use_container_width=True, hide_index=True, height=560)
+
+    st.caption(
+        "**Vol regime** = RV60 ÷ RV252. Above 1.2× (purple) vol is expanding; below 0.8× it is "
+        "compressing. **Px %ile** red above 90 / green below 10 flags a stretched level. "
+        "**Season** columns are the 10-year median return and hit-rate for the *current* "
+        "calendar month, and are blank for contracts with no real seasonality."
+    )
+
+    # ── Cross-sectional views ────────────────────────────────────────────────
+    st.subheader("Cross-Section")
+    t1, t2, t3 = st.tabs(["Carry", "Momentum vs Vol", "Seasonal (this month)"])
+
+    with t1:
+        cv = view.dropna(subset=["Carry%"]).sort_values("Carry%")
+        fig = go.Figure(go.Bar(
+            x=cv["Contract"], y=cv["Carry%"],
+            marker_color=np.where(cv["Carry%"] >= 0, RED, GREEN),
+            text=[f"{v:+.1f}%" for v in cv["Carry%"]], textposition="outside"))
+        fig.add_hline(y=0, line=dict(color=GRAY, dash="dash"))
+        fig.update_layout(title="Curve carry, M1 → back (green = backwardation, pays the long)",
+                          yaxis_title="%")
+        fig.update_xaxes(tickangle=-45)
+        st.plotly_chart(_styled(fig, 400), use_container_width=True)
+
+    with t2:
+        mv = view.dropna(subset=["Chg3M", "RV60"])
+        fig2 = go.Figure()
+        for s in mv["Sector"].unique():
+            d = mv[mv["Sector"] == s]
+            fig2.add_trace(go.Scatter(
+                x=d["RV60"], y=d["Chg3M"], mode="markers+text", name=s,
+                text=[COMMODITIES[n]["ticker"] for n in d["Contract"]],
+                textposition="top center", textfont=dict(size=9),
+                marker=dict(size=12, line=dict(color=BORDER, width=1))))
+        fig2.add_hline(y=0, line=dict(color=GRAY, dash="dash"))
+        fig2.update_layout(title="3-month return vs realised vol",
+                           xaxis_title="RV60 (%)", yaxis_title="3M return (%)")
+        st.plotly_chart(_styled(fig2, 400), use_container_width=True)
+        st.caption("Top-right = trending and volatile. Bottom-right = falling hard. "
+                   "Left = quiet, and quiet markets are where carry trades live.")
+
+    with t3:
+        sv = view.dropna(subset=["SeasonMed"]).sort_values("SeasonMed")
+        if sv.empty:
+            st.info("No seasonal contracts in the current sector filter.")
+        else:
+            fig3 = go.Figure(go.Bar(
+                x=sv["Contract"], y=sv["SeasonMed"],
+                marker_color=np.where(sv["SeasonMed"] >= 0, GREEN, RED),
+                text=[f"{h:.0f}% hit" for h in sv["SeasonHit"]], textposition="outside"))
+            fig3.add_hline(y=0, line=dict(color=GRAY, dash="dash"))
+            fig3.update_layout(
+                title=f"10y median return for {MONTH_NAMES[date.today().month-1]}",
+                yaxis_title="%")
+            fig3.update_xaxes(tickangle=-45)
+            st.plotly_chart(_styled(fig3, 380), use_container_width=True)
+            st.caption("A strong median with a 55% hit rate is noise. Look for both together.")
+
+
 def page_macro():
     st.title("Macro")
-    st.warning(
-        "**Model-estimated series.** No live macro feed is wired in. Framing only — "
-        "wire FRED / OECD / Eurostat to make this decision-grade.", icon="⚠️")
-    col1, col2 = st.columns([2, 5])
-    primary = col1.selectbox("Country", COUNTRIES, key="macro_primary")
-    compare = col2.multiselect("Compare", [c for c in COUNTRIES if c != primary],
-                               default=[c for c in COUNTRIES if c != primary][:2],
-                               key="macro_cmp")
-    series = [(primary, macro_data(primary))] + [(c, macro_data(c)) for c in compare]
 
-    snap = series[0][1].iloc[-1]
-    cols = st.columns(4)
-    for col, m, lab in zip(cols, ["gdp_index", "cpi_yoy", "policy_rate", "pmi"],
-                           ["GDP index", "CPI YoY (%)", "Policy rate (%)", "PMI"]):
-        col.metric(lab, f"{snap[m]:.2f}")
+    key = st.session_state.get("fred_key", "")
+    if not key:
+        st.warning(
+            "**No FRED API key set.** Enter one in the sidebar to pull real CPI, policy rates "
+            "and GDP. The key is free at "
+            "[fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html). "
+            "Without it this page stays empty — **this desk no longer ships model-generated "
+            "macro series.** They were the last fabricated data here, and they are gone.",
+            icon="🔑")
+        return
 
-    metrics = dict(gdp_index="GDP index", cpi_yoy="CPI YoY (%)",
-                   policy_rate="Policy rate (%)", pmi="PMI")
-    for tab, (mk, ml) in zip(st.tabs(list(metrics.values())), metrics.items()):
-        with tab:
+    if not REQUESTS_AVAILABLE:
+        st.error("`requests` is not installed. Run `pip install requests`.")
+        return
+
+    st.caption("Live FRED series. Same rule as the price feed: real data, or an empty screen.")
+
+    tab_c, tab_x = st.tabs(["By country", "Commodity context"])
+
+    with tab_c:
+        col1, col2 = st.columns([2, 5])
+        primary = col1.selectbox("Country", list(FRED_SERIES.keys()), key="macro_primary")
+        compare = col2.multiselect(
+            "Compare", [c for c in FRED_SERIES if c != primary],
+            default=[c for c in FRED_SERIES if c != primary][:2], key="macro_cmp")
+
+        countries = [primary] + compare
+        for metric, meta in MACRO_METRICS.items():
+            st.subheader(meta["label"])
+            st.caption(meta["note"])
             fig = go.Figure()
-            for i, (nm, df) in enumerate(series):
-                fig.add_trace(go.Scatter(x=df.index, y=df[mk], name=nm,
-                                         line=dict(color=[AMBER, BLUE, GREEN, RED][i % 4], width=2)))
-            fig.update_layout(title=ml, yaxis_title=ml)
-            st.plotly_chart(_styled(fig, 360), use_container_width=True)
+            any_data = False
+            for i, ctry in enumerate(countries):
+                sid = FRED_SERIES.get(ctry, {}).get(metric)
+                if not sid:
+                    continue
+                df = fetch_fred(sid, key)
+                if df.empty:
+                    continue
+                any_data = True
+                y = df["value"]
+                # CPI comes as an index; a commodity desk wants the YoY rate.
+                if metric == "cpi_yoy":
+                    y = df["value"].pct_change(12) * 100
+                fig.add_trace(go.Scatter(
+                    x=df.index, y=y, name=ctry,
+                    line=dict(color=[AMBER, BLUE, GREEN, RED, PURPLE, TEAL][i % 6], width=2)))
+            if not any_data:
+                st.info(f"FRED has no **{meta['label']}** series mapped for the selected "
+                        f"countries. Nothing is substituted.")
+                continue
+            ylab = "YoY %" if metric == "cpi_yoy" else meta["label"]
+            fig.update_layout(yaxis_title=ylab)
+            st.plotly_chart(_styled(fig, 340), use_container_width=True)
+
+    with tab_x:
+        st.caption(
+            "The macro series a commodity desk actually watches. The dollar and real yields "
+            "drive the whole complex — a stronger dollar is a headwind for every dollar-priced "
+            "commodity, and breakevens are the market's own inflation view."
+        )
+        for label, sid in FRED_COMMODITY_CONTEXT.items():
+            df = fetch_fred(sid, key, start="2018-01-01")
+            if df.empty:
+                st.error(f"**{label}** — FRED returned nothing for `{sid}`.")
+                continue
+            last = float(df["value"].iloc[-1])
+            chg = last - float(df["value"].iloc[-22]) if len(df) > 22 else 0.0
+
+            cc = st.columns([1, 4])
+            cc[0].metric(label, f"{last:,.2f}", f"{chg:+.2f} (1m)")
+            with cc[1]:
+                fig = go.Figure(go.Scatter(x=df.index, y=df["value"],
+                                           line=dict(color=AMBER, width=2)))
+                st.plotly_chart(_styled(fig, 200), use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2343,21 +3169,22 @@ def main():
     render_header(commodity, marks.get(commodity))
 
     dispatch = {
+        "📡 Signals":           lambda: page_signals(marks),
         "📊 Dashboard":         lambda: page_dashboard(commodity, marks),
         "📈 Forward Curve":     lambda: page_curve(commodity, marks),
         "🔀 Spreads & Roll":    lambda: page_spreads(commodity, marks),
         "⚗️ Crack & Crush":     lambda: page_structures(marks),
         "🔗 Correlation":       page_correlation,
-        "🗓️ Seasonality":       lambda: page_seasonality(commodity, marks),
         "🛢️ EIA Fundamentals":  lambda: page_eia(commodity, marks),
+        "🗓️ Seasonality":       lambda: page_seasonality(commodity, marks),
         "🌍 Regional Balances": lambda: page_regional(commodity, marks),
+        "📅 Calendar":          page_events,
         "🎯 Options & Greeks":  lambda: page_options(commodity, marks),
         "📉 Vol Surface":       lambda: page_vol_surface(commodity, marks),
         "💼 Blotter":           lambda: page_blotter(marks),
         "🛡️ Risk":              lambda: page_risk(marks),
         "🎲 Monte Carlo":       lambda: page_mc(commodity, marks),
         "🌐 Macro":             page_macro,
-        "📅 Calendar":          page_events,
         "ℹ️ About":             page_about,
     }
     dispatch.get(page, lambda: st.error("Page not found"))()
