@@ -156,6 +156,22 @@ div[data-testid="stHorizontalBlock"] {{ gap:10px; }}
 .kpi-value {{ font-size:1.3rem; color:{TEXT}; font-family:'JetBrains Mono',monospace; font-weight:600; }}
 .kpi-sub   {{ font-size:0.68rem; color:{GRAY}; margin-top:3px; }}
 hr {{ border-color:{BORDER}; }}
+/* ── sectioned sidebar navigation ── */
+section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] {{ gap:0.15rem; }}
+.nav-sec {{ font-size:9px; color:{GRAY}; font-family:'JetBrains Mono',monospace;
+    letter-spacing:0.2em; text-transform:uppercase; margin:14px 0 3px 4px;
+    border-bottom:1px solid {BORDER}; padding-bottom:3px; }}
+.nav-active {{ background:rgba(240,165,0,0.13); border-left:2px solid {AMBER};
+    color:{AMBER}; padding:5px 10px; border-radius:0 6px 6px 0;
+    font-family:'JetBrains Mono',monospace; font-size:0.78rem; font-weight:600; }}
+section[data-testid="stSidebar"] button[kind="tertiary"],
+section[data-testid="stSidebar"] [data-testid="stBaseButton-tertiary"] {{
+    justify-content:flex-start; text-align:left; color:{GRAY};
+    font-family:'JetBrains Mono',monospace; font-size:0.78rem;
+    padding:4px 10px; min-height:0; border-radius:6px; }}
+section[data-testid="stSidebar"] button[kind="tertiary"]:hover,
+section[data-testid="stSidebar"] [data-testid="stBaseButton-tertiary"]:hover {{
+    color:{AMBER}; background:rgba(240,165,0,0.07); }}
 </style>
 """
 
@@ -1486,6 +1502,11 @@ def build_signals() -> pd.DataFrame:
     grouped strip download (~250 requests -> 3)."""
     strips = fetch_all_strips()
     panel  = panel_years(1.2)
+    try:
+        cot = fetch_cot_all()          # one batched CFTC request, cached 6h
+    except Exception as e:
+        LOG.warning("COT unavailable for scanner: %s", e)
+        cot = {}
     rows = []
     this_month = date.today().month
 
@@ -1536,6 +1557,14 @@ def build_signals() -> pd.DataFrame:
                 row["SeasonMed"] = row["SeasonHit"] = np.nan
         else:
             row["SeasonMed"] = row["SeasonHit"] = np.nan
+
+        cdf = cot.get(name)
+        if cdf is not None and not cdf.empty:
+            row["MMnet%OI"] = float(cdf["mm_net_pct_oi"].iloc[-1])
+            h3 = cdf.tail(156)
+            row["COT%ile"] = float((h3["mm_net"] < cdf["mm_net"].iloc[-1]).mean() * 100)
+        else:
+            row["MMnet%OI"] = row["COT%ile"] = np.nan
 
         rows.append(row)
 
@@ -1756,26 +1785,60 @@ def require_mark(marks: MarkBoard, commodity: str) -> Optional[float]:
 # ══════════════════════════════════════════════════════════════════════════════
 #  SIDEBAR & HEADER
 # ══════════════════════════════════════════════════════════════════════════════
-PAGES = [
-    "📊  Dashboard", "📈  Forward Curves", "🔀  Calendar Spreads",
-    "🏭  Cracks, Crush & Arbs", "🔗  Correlation", "🌡️  Seasonality",
-    "🛢️  EIA Fundamentals", "🗺️  Regional Balances", "🎯  Options Pricer",
-    "🌊  Vol Surface", "📒  Trade Blotter", "⚠️  Portfolio Risk",
-    "🎲  Monte Carlo", "🌍  Macro Rates", "📡  Signal Scanner",
-    "📅  Event Calendar", "ℹ️  About",
-]
+# Navigation grouped the way a desk thinks: read the market, check the physical
+# story, price the optionality, run the book, then the reference shelf.
+NAV_SECTIONS = {
+    "Markets": [
+        "📊  Dashboard", "📈  Forward Curves", "🔀  Calendar Spreads",
+        "🏭  Cracks, Crush & Arbs", "📡  Signal Scanner",
+    ],
+    "Fundamentals & Flows": [
+        "📦  Storage & Carry", "🧭  COT Positioning", "🛢️  EIA Fundamentals",
+        "🗺️  Regional Balances", "📅  Event Calendar",
+    ],
+    "Analytics": [
+        "🔗  Correlation", "🌡️  Seasonality", "🎲  Monte Carlo",
+    ],
+    "Volatility & Options": [
+        "🎯  Options Pricer", "🌊  Vol Surface",
+    ],
+    "Book & Risk": [
+        "📒  Trade Blotter", "⚠️  Portfolio Risk",
+    ],
+    "Reference": [
+        "🌍  Macro Rates", "ℹ️  About",
+    ],
+}
+ALL_PAGES = [p for ps in NAV_SECTIONS.values() for p in ps]
+DEFAULT_PAGE = ALL_PAGES[0]
+
+
+def _nav_to(page_name: str) -> None:
+    st.session_state.nav_page = page_name
 
 
 def render_sidebar(marks: MarkBoard) -> str:
+    if st.session_state.get("nav_page") not in ALL_PAGES:
+        st.session_state.nav_page = DEFAULT_PAGE
+    current = st.session_state.nav_page
+
     with st.sidebar:
         st.markdown(f"""
-        <div style="padding:6px 0 14px 0">
+        <div style="padding:6px 0 10px 0">
           <span style="font-family:'JetBrains Mono',monospace;font-size:1.05rem;
           font-weight:700;color:{AMBER}">S&D DESK</span><br>
           <span style="font-size:0.68rem;color:{GRAY}">COMMODITY TRADING &nbsp;·&nbsp; LIVE MTM</span>
         </div>""", unsafe_allow_html=True)
 
-        page = st.radio("Navigation", PAGES, label_visibility="collapsed")
+        for section, pages in NAV_SECTIONS.items():
+            st.markdown(f'<div class="nav-sec">{section}</div>', unsafe_allow_html=True)
+            for p in pages:
+                if p == current:
+                    st.markdown(f'<div class="nav-active">{p}</div>', unsafe_allow_html=True)
+                else:
+                    st.button(p, key=f"nav_{p}", type="tertiary",
+                              use_container_width=True, on_click=_nav_to, args=(p,))
+        page = current
         st.markdown("---")
 
         n_ok  = sum(1 for v in marks.values() if v is not None)
@@ -2656,7 +2719,8 @@ def page_signals(marks: MarkBoard) -> None:
     df = df[df["Sector"].isin(sectors)]
     fmt = {"Mark": "{:,.2f}", "Carry%": "{:+.2f}", "M1M2": "{:+,.3f}", "RV60": "{:.1f}",
            "VolRegime": "{:.2f}", "Chg1M": "{:+.1f}", "Chg3M": "{:+.1f}",
-           "Px%ile1y": "{:.0f}", "SeasonMed": "{:+.2f}", "SeasonHit": "{:.0f}"}
+           "Px%ile1y": "{:.0f}", "SeasonMed": "{:+.2f}", "SeasonHit": "{:.0f}",
+           "MMnet%OI": "{:+.1f}", "COT%ile": "{:.0f}"}
     st.dataframe(df.style.format(fmt, na_rep="—"), use_container_width=True,
                  hide_index=True, height=680)
     st.markdown("""
@@ -2665,8 +2729,11 @@ longs get paid to roll). `M1M2`: front spread in price units. `RV60` vs `VolRegi
 realised vol and its ratio to the 1y norm (>1.3 = stressed regime). `Chg1M/3M`:
 momentum. `Px%ile1y`: where the mark sits in its own 1y range. `SeasonMed/Hit`: this
 calendar month's median return and hit-rate over 10y (seasonal contracts only).
-Everything is computed off the shared live panel and strip download — nothing here is
-modelled, and the whole scan costs three requests, not 250.
+`MMnet%OI` / `COT%ile`: Managed Money net as % of open interest and its 3y percentile
+(CFTC weekly — crowded longs at high percentiles are washout fuel; BZ blank on purpose,
+ICE Brent is not CFTC-reported). Everything is computed off the shared live panel, the
+single strip download and one batched CFTC request — nothing here is modelled, and the
+whole scan costs four requests, not 250.
 """)
 
 
@@ -2698,6 +2765,20 @@ screen says NO MARK and the analytics stand down. Nothing is interpolated into t
 **What is honestly NOT live** (each labelled on its page): regional balances (static
 IEA/USDA-style estimates), the vol surface (a stated parametrisation — no options feed),
 monthly event dates (approximate anchors), and the stress episodes (historical, dated).
+
+### Revision 3 — from reading the market to pricing the trade
+
+**📦 Storage & Cash-and-Carry** — the curve minus financing (live SOFR off FRED, or
+manual) gives the MARKET-IMPLIED storage rate with zero assumptions; your editable
+all-in storage cost turns it into an arb verdict (net margin per lot, annualised ROI,
+% of full carry). Backwardation reads as a convenience yield; livestock is flagged
+non-storable rather than pretending a carry arb exists on live animals.
+**🧭 COT Positioning** — CFTC Disaggregated in ONE batched Socrata request: Managed
+Money net vs price, net %OI with 3y crowdedness bands, commercials net, plus
+`MMnet%OI` / `COT%ile` columns in the Signal Scanner. BZ is deliberately absent (ICE
+Brent reports to ICE Europe, not the CFTC — no proxying).
+**Navigation** — pages grouped the way a desk thinks: Markets · Fundamentals & Flows ·
+Analytics · Volatility & Options · Book & Risk · Reference.
 
 ### Revision 2 — what changed and why
 
@@ -2737,11 +2818,446 @@ Related: [CFCAP](https://cfcap.streamlit.app) · [CODAP](https://codap.streamlit
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  STORAGE & CASH-AND-CARRY — the trade behind the curve
+# ══════════════════════════════════════════════════════════════════════════════
+#  The contango/backwardation label says WHAT the curve looks like; this page says
+#  WHETHER IT PAYS. Split cleanly in two, per the desk's honesty contract:
+#    • MARKET-IMPLIED numbers (implied net storage, implied carry) come straight off
+#      the live strip minus financing — no assumptions at all.
+#    • The ARB VERDICT needs a physical storage cost, which is YOURS: defaults below
+#      are indicative and editable, and the page says so.
+#  Livestock is flagged non-storable: its curve is expectations, not carry — knowing
+#  where the framework stops applying is part of the framework.
+STORAGE_ASSUMPTIONS: Dict[str, dict] = {
+    # mode: per_unit -> quote-units per month; pct_year -> % of mark per year (vaulting)
+    "WTI Crude (CL)":         dict(mode="per_unit", value=0.40,
+                                   note="Cushing tank lease, all-in ~$0.25–0.60/bbl/mo depending on cycle"),
+    "Brent Crude (BZ)":       dict(mode="per_unit", value=0.45,
+                                   note="onshore NWE tankage; floating storage costs more"),
+    "Henry Hub Nat Gas (NG)": dict(mode="per_unit", value=0.06,
+                                   note="salt-dome cycling ~$0.04–0.10/MMBtu/mo incl. fuel; seasonal capacity"),
+    "RBOB Gasoline (RB)":     dict(mode="per_unit", value=0.011,
+                                   note="~$0.45/bbl/mo ÷ 42 gal; RVP spec changes limit season-crossing storage"),
+    "ULSD Heating Oil (HO)":  dict(mode="per_unit", value=0.011,
+                                   note="~$0.45/bbl/mo ÷ 42 gal, clean tankage"),
+    "Gold (GC)":              dict(mode="pct_year", value=0.0015,
+                                   note="allocated vaulting + insurance ~10–20 bp/yr — financing dominates"),
+    "Silver (SI)":            dict(mode="pct_year", value=0.0030,
+                                   note="bulkier per $ than gold: ~25–40 bp/yr vaulting"),
+    "Copper (HG)":            dict(mode="per_unit", value=0.004,
+                                   note="exchange warehouse rent ~$0.003–0.006/lb/mo"),
+    "Platinum (PL)":          dict(mode="pct_year", value=0.0020, note="vaulting ~15–25 bp/yr"),
+    "Palladium (PA)":         dict(mode="pct_year", value=0.0020, note="vaulting ~15–25 bp/yr"),
+    "Corn (ZC)":              dict(mode="per_unit", value=5.5,
+                                   note="commercial elevator ~5–6 c/bu/mo; on-farm cheaper"),
+    "Wheat CBOT SRW (ZW)":    dict(mode="per_unit", value=5.5,
+                                   note="elevator tariff ~5–6 c/bu/mo (VSR can move it)"),
+    "Soybeans (ZS)":          dict(mode="per_unit", value=6.0, note="elevator ~5–7 c/bu/mo"),
+    "Soybean Meal (ZM)":      dict(mode="per_unit", value=2.0,
+                                   note="~$2/short-ton/mo; meal cakes — real shelf-life limits"),
+    "Soybean Oil (ZL)":       dict(mode="per_unit", value=0.15, note="~0.15 c/lb/mo bulk liquid"),
+    "Sugar #11 (SB)":         dict(mode="per_unit", value=0.12, note="~0.12 c/lb/mo warehouse, raw bulk"),
+    "Arabica Coffee (KC)":    dict(mode="per_unit", value=0.50,
+                                   note="certified warehouse ~0.4–0.7 c/lb/mo incl. handling"),
+    "Cocoa (CC)":             dict(mode="per_unit", value=8.0, note="~$6–10/mt/mo certified warehouse"),
+    "Live Cattle (LE)":       dict(mode="none", value=0.0,
+                                   note="live animals: feeding is not storage — curve is expectations"),
+    "Lean Hogs (HE)":         dict(mode="none", value=0.0,
+                                   note="live animals: no carry arb exists — curve is expectations"),
+}
+
+
+def default_storage_pm(commodity: str, mark: float) -> Tuple[Optional[float], str]:
+    """Default all-in storage cost per QUOTE UNIT per month, or (None, note) if the
+    commodity is not storable. Indicative and user-editable — stated on screen."""
+    a = STORAGE_ASSUMPTIONS.get(commodity)
+    if a is None or a["mode"] == "none":
+        return None, (a["note"] if a else "no storage assumption on file")
+    if a["mode"] == "pct_year":
+        return mark * a["value"] / 12.0, a["note"]
+    return float(a["value"]), a["note"]
+
+
+def live_sofr() -> Optional[Tuple[float, date]]:
+    """Latest SOFR print off FRED (decimal, with its date). None without a key —
+    the page then takes a manual rate, clearly labelled manual."""
+    key = fred_key()
+    if not key:
+        return None
+    df = fetch_fred("SOFR", key, start=(date.today() - timedelta(days=45)).isoformat())
+    if df.empty:
+        return None
+    return float(df["value"].iloc[-1]) / 100.0, df.index[-1].date()
+
+
+def carry_economics(f1: float, fn: float, t1: float, tn: float,
+                    r: float, storage_pm: float) -> dict:
+    """
+    Pure cash-and-carry arithmetic between two strip points (quote units per unit
+    of commodity). Conventions, stated: simple interest on F1 over calendar dT;
+    storage charged per month on the assumed all-in rate; returns on full price
+    notional (futures margin would gear the cash ROI up — stated, not modelled).
+
+      gross            = Fn − F1                      (what the curve pays)
+      financing        = F1 · r · dT
+      implied_stor_pm  = (gross − financing) / months (market-implied, no assumptions)
+      implied_carry_ann= (gross − financing)/F1/dT    (negative = convenience yield)
+      net              = gross − financing − storage  (YOUR economics)
+      full_carry_pct   = gross / (financing + storage)
+    """
+    dT = tn - t1
+    months = dT * 12.0
+    gross = fn - f1
+    fin = f1 * r * dT
+    stor_total = storage_pm * months
+    net = gross - fin - stor_total
+    denom = fin + stor_total
+    return dict(
+        dT=dT, months=months, gross=gross, financing=fin,
+        storage_total=stor_total, net=net,
+        implied_storage_pm=(gross - fin) / months if months > 0 else float("nan"),
+        implied_carry_ann_pct=(gross - fin) / f1 / dT * 100 if dT > 0 else float("nan"),
+        full_carry_pct=gross / denom * 100 if denom > 1e-12 else float("nan"),
+        ann_roi_pct=net / f1 / dT * 100 if dT > 0 else float("nan"),
+    )
+
+
+def page_storage(marks: MarkBoard) -> None:
+    render_header(marks, "Storage & Cash-and-Carry",
+                  "What the curve pays for storage — market-implied first, your assumptions second")
+    sel = st.selectbox("Contract", list(COMMODITIES))
+    mark = require_mark(marks, sel)
+    if mark is None:
+        return
+    strip = fetch_forward_strip(sel)
+    if strip.empty or len(strip) < 2:
+        st.error("**NO LIVE STRIP** — carry economics need at least two dated contracts.")
+        return
+
+    c = COMMODITIES[sel]
+    unit = c["unit"]
+    stor_default, stor_note = default_storage_pm(sel, mark)
+    storable = stor_default is not None
+
+    f1, t1 = float(strip["price"].iloc[0]), float(strip["T"].iloc[0])
+
+    # ── Inputs: financing + horizon + storage assumption ─────────────────────
+    i1, i2, i3 = st.columns(3)
+    sofr = live_sofr()
+    r_pct = i1.number_input("Financing rate (ann. %, simple)", 0.0, 20.0,
+                            float(round((sofr[0] * 100) if sofr else 4.00, 2)), 0.05)
+    if sofr:
+        i1.caption(f"Seeded with **live SOFR {sofr[0]*100:.2f}%** (FRED, {sofr[1]}). Editable.")
+    else:
+        i1.caption("Manual rate — set a FRED key in the sidebar for live SOFR.")
+    r = r_pct / 100.0
+
+    far_i = i2.selectbox("Carry M1 →", range(1, len(strip)), index=len(strip) - 2,
+                         format_func=lambda i: f"{strip['label'].iloc[i]}  (T={strip['T'].iloc[i]:.2f}y)")
+    fn, tn = float(strip["price"].iloc[far_i]), float(strip["T"].iloc[far_i])
+
+    if storable:
+        stor = i3.number_input(f"All-in storage ({unit} per month)",
+                               value=float(round(stor_default, 4)), min_value=0.0,
+                               step=max(stor_default * 0.05, 1e-4), format="%.4f")
+        i3.caption(f"Default: {stor_note}. **Indicative — edit to your economics.** "
+                   "Everything above the verdict line is pure market.")
+    else:
+        stor = 0.0
+        i3.markdown('<span class="badge badge-red">NON-STORABLE</span>', unsafe_allow_html=True)
+        i3.caption(stor_note)
+
+    eco = carry_economics(f1, fn, t1, tn, r, stor)
+    mult = price_multiplier(sel)
+
+    # ── Market-implied block (no assumptions) ────────────────────────────────
+    k1, k2, k3, k4 = st.columns(4)
+    kpi(k1, "Front", f"{f1:,.2f}", f"{strip['label'].iloc[0]} · {unit}")
+    kpi(k2, "Gross carry to " + str(strip['label'].iloc[far_i]),
+        f"{eco['gross']:+,.2f}", f"{unit} over {eco['months']:.1f} months",
+        RED if eco["gross"] > 0 else GREEN)
+    isp = eco["implied_storage_pm"]
+    kpi(k3, "Implied net storage", f"{isp:+,.4f}",
+        f"{unit}/month the market pays after financing",
+        AMBER if isp > 0 else GREEN)
+    ica = eco["implied_carry_ann_pct"]
+    kpi(k4, "Implied carry (ann.)" if ica >= 0 else "Convenience yield (ann.)",
+        f"{abs(ica):.2f}%", "market pays storage" if ica >= 0 else "market pays for scarcity",
+        AMBER if ica >= 0 else GREEN)
+
+    # ── Verdict block (your assumptions) ─────────────────────────────────────
+    if storable:
+        st.markdown("### The arb, on your numbers")
+        v1, v2, v3, v4 = st.columns(4)
+        net_lot = eco["net"] * mult
+        pays = eco["net"] > 0
+        kpi(v1, "Net C&C margin", f"{eco['net']:+,.4f}",
+            f"{unit} per unit · buy {strip['label'].iloc[0]}, store, deliver {strip['label'].iloc[far_i]}",
+            GREEN if pays else RED)
+        kpi(v2, "Per lot", f"${net_lot:+,.0f}",
+            f"financing ${eco['financing']*mult:,.0f} · storage ${eco['storage_total']*mult:,.0f}",
+            GREEN if pays else RED)
+        kpi(v3, "Ann. return on notional", f"{eco['ann_roi_pct']:+.2f}%",
+            "unlevered — futures margin gears cash ROI up", GREEN if pays else RED)
+        fc = eco["full_carry_pct"]
+        kpi(v4, "% of full carry", f"{fc:,.0f}%" if not math.isnan(fc) else "n/a",
+            "100% = curve exactly covers financing + storage",
+            RED if (not math.isnan(fc) and fc >= 95) else AMBER)
+        badge = ('<span class="badge badge-green">CASH-AND-CARRY PAYS</span>' if pays
+                 else '<span class="badge badge-red">CARRY DOES NOT COVER COSTS</span>')
+        st.markdown(badge, unsafe_allow_html=True)
+        if eco["gross"] < 0:
+            st.caption("Curve is **backwardated**: there is no cash-and-carry here. The market "
+                       "is paying a convenience premium to whoever holds inventory NOW — the "
+                       "trade, if you own physical, is the reverse: sell spot, buy the deferred.")
+    else:
+        st.info("**No storage arb exists for live animals.** The deferred price is an "
+                "expectation of future cash cattle/hogs (feed costs, weights, slaughter "
+                "capacity), not spot plus carry. The implied-carry numbers above describe "
+                "the curve's shape; they are not an arbitrage.")
+
+    # ── Charts ───────────────────────────────────────────────────────────────
+    fin_curve = [f1 * (1 + r * (float(t) - t1)) for t in strip["T"]]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=strip["label"], y=strip["price"], mode="lines+markers",
+                             name="Live strip", line=dict(color=AMBER, width=2),
+                             marker=dict(size=7)))
+    fig.add_trace(go.Scatter(x=strip["label"], y=fin_curve, mode="lines",
+                             name=f"Financing only ({r_pct:.2f}%)",
+                             line=dict(color=BLUE, width=1.4, dash="dash")))
+    fig.update_layout(title=f"{sel} — strip vs financing-only forward ({unit}). "
+                            "Gap above dashed = market-paid storage; below = convenience.")
+    st.plotly_chart(_styled(fig, 400), use_container_width=True)
+
+    rows = []
+    for i in range(1, len(strip)):
+        e = carry_economics(f1, float(strip["price"].iloc[i]), t1,
+                            float(strip["T"].iloc[i]), r, 0.0)
+        rows.append(dict(Month=strip["label"].iloc[i], T=float(strip["T"].iloc[i]),
+                         Price=float(strip["price"].iloc[i]), Gross=e["gross"],
+                         Financing=e["financing"], ImplStorPM=e["implied_storage_pm"],
+                         ImplAnnPct=e["implied_carry_ann_pct"]))
+    idf = pd.DataFrame(rows)
+    fig2 = go.Figure(go.Bar(x=idf["Month"], y=idf["ImplStorPM"],
+                            marker_color=[AMBER if v >= 0 else GREEN for v in idf["ImplStorPM"]]))
+    fig2.add_hline(y=0, line=dict(color=BORDER))
+    if storable:
+        fig2.add_hline(y=stor, line=dict(color=RED, dash="dot"),
+                       annotation_text=f"your storage cost {stor:,.4f}")
+    fig2.update_layout(title=f"Market-implied net storage, M1 → each month ({unit}/month). "
+                             "Bars above the red dotted line = the arb window.")
+    st.plotly_chart(_styled(fig2, 340), use_container_width=True)
+
+    st.markdown("### Carry table (market-implied, no assumptions)")
+    st.dataframe(idf.style.format({"T": "{:.2f}", "Price": "{:,.2f}", "Gross": "{:+,.3f}",
+                                   "Financing": "{:+,.3f}", "ImplStorPM": "{:+,.4f}",
+                                   "ImplAnnPct": "{:+.2f}"}),
+                 use_container_width=True, hide_index=True)
+    st.caption("Conventions, stated: simple interest on M1 over calendar dT (T is real "
+               "year-fraction to delivery); storage charged monthly; returns on full price "
+               "notional. Not modelled — and said so: in/out pump fees, quality/location "
+               "basis between the paper and your tank, margin financing, insurance beyond "
+               "the vault rate. The implied columns are pure market; only the verdict "
+               "uses your storage number.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COT POSITIONING — CFTC Disaggregated report, one batched request
+# ══════════════════════════════════════════════════════════════════════════════
+#  Third pillar next to fundamentals and price: WHO is positioned, and how crowded.
+#  Managed Money = the speculative flow; Producer/Merchant = the physical hedgers.
+#  Weekly, released Friday ~15:30 ET, data as of the prior Tuesday. Source is the
+#  CFTC's public Socrata API — keyless, and fetched for the WHOLE board in a single
+#  request (rev-2 batching discipline). ICE Brent is reported under ICE Europe's own
+#  COT, not the CFTC — so BZ is honestly not wired rather than proxied off WTI.
+COT_MARKET_CODES: Dict[str, Optional[str]] = {
+    "WTI Crude (CL)": "067651",  "Brent Crude (BZ)": None,
+    "Henry Hub Nat Gas (NG)": "023651", "RBOB Gasoline (RB)": "111659",
+    "ULSD Heating Oil (HO)": "022651",
+    "Gold (GC)": "088691", "Silver (SI)": "084691", "Copper (HG)": "085692",
+    "Platinum (PL)": "076651", "Palladium (PA)": "075651",
+    "Corn (ZC)": "002602", "Wheat CBOT SRW (ZW)": "001602", "Soybeans (ZS)": "005602",
+    "Soybean Meal (ZM)": "026603", "Soybean Oil (ZL)": "007601",
+    "Sugar #11 (SB)": "080732", "Arabica Coffee (KC)": "083731", "Cocoa (CC)": "073732",
+    "Live Cattle (LE)": "057642", "Lean Hogs (HE)": "054642",
+}
+# Disaggregated futures-only first; futures+options combined as fallback.
+COT_DATASETS = ["72hh-3qpy", "kh3c-gbw2"]
+_COT_SELECT = ("report_date_as_yyyy_mm_dd,cftc_contract_market_code,"
+               "open_interest_all,m_money_positions_long_all,m_money_positions_short_all,"
+               "prod_merc_positions_long_all,prod_merc_positions_short_all")
+
+
+def _first_col(df: pd.DataFrame, *names: str) -> Optional[str]:
+    """Socrata field names have historical quirks (double underscores…). Pick the
+    first variant that exists instead of hard-failing on one spelling."""
+    return next((n for n in names if n in df.columns), None)
+
+
+@st.cache_data(ttl=6 * 3600, persist="disk")
+def fetch_cot_all(years: int = 5) -> Dict[str, pd.DataFrame]:
+    """Disaggregated COT for every wired contract — ONE request. Tries the dataset
+    candidates in order, with and without a $select (a schema drift then degrades to
+    a bigger payload, not a dead page). Empty dict on failure, logged, page says so."""
+    if not REQUESTS_AVAILABLE:
+        return {}
+    codes = {c: n for n, c in COT_MARKET_CODES.items() if c}
+    since = (date.today() - timedelta(days=int(years * 365.25))).isoformat()
+    in_list = ",".join(f"'{c}'" for c in codes)
+    where = (f"report_date_as_yyyy_mm_dd >= '{since}' "
+             f"AND cftc_contract_market_code in({in_list})")
+    rows = None
+    for ds in COT_DATASETS:
+        url = f"https://publicreporting.cftc.gov/resource/{ds}.json"
+        for params in ({"$where": where, "$select": _COT_SELECT,
+                        "$order": "report_date_as_yyyy_mm_dd", "$limit": 9000},
+                       {"$where": where,
+                        "$order": "report_date_as_yyyy_mm_dd", "$limit": 9000}):
+            try:
+                resp = requests.get(url, params=params, timeout=25)
+                if resp.status_code != 200:
+                    LOG.warning("COT %s -> HTTP %s", ds, resp.status_code)
+                    continue
+                payload = resp.json()
+                if payload:
+                    rows = payload
+                    LOG.info("COT dataset %s: %d rows", ds, len(rows))
+                    break
+                LOG.warning("COT %s -> empty payload", ds)
+            except requests.RequestException as e:
+                LOG.warning("COT %s request failed: %s", ds, e)
+            except Exception as e:
+                LOG.warning("COT %s parse failed: %s", ds, e)
+        if rows:
+            break
+    if not rows:
+        return {}
+
+    df = pd.DataFrame(rows)
+    c_date = _first_col(df, "report_date_as_yyyy_mm_dd")
+    c_code = _first_col(df, "cftc_contract_market_code")
+    c_oi   = _first_col(df, "open_interest_all")
+    c_mml  = _first_col(df, "m_money_positions_long_all")
+    c_mms  = _first_col(df, "m_money_positions_short_all")
+    c_pml  = _first_col(df, "prod_merc_positions_long_all")
+    c_pms  = _first_col(df, "prod_merc_positions_short_all")
+    if not all([c_date, c_code, c_oi, c_mml, c_mms]):
+        LOG.warning("COT schema unexpected — columns: %s", list(df.columns)[:12])
+        return {}
+
+    df["date"] = pd.to_datetime(df[c_date])
+    for col in [c_oi, c_mml, c_mms, c_pml, c_pms]:
+        if col:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    out: Dict[str, pd.DataFrame] = {}
+    for code, name in codes.items():
+        sub = df[df[c_code] == code].sort_values("date")
+        if sub.empty:
+            LOG.warning("COT: no rows for %s (%s)", name, code)
+            continue
+        g = pd.DataFrame({
+            "oi": sub[c_oi].values,
+            "mm_long": sub[c_mml].values, "mm_short": sub[c_mms].values,
+            "pm_long": (sub[c_pml].values if c_pml else np.nan),
+            "pm_short": (sub[c_pms].values if c_pms else np.nan),
+        }, index=pd.DatetimeIndex(sub["date"]))
+        g = g[~g.index.duplicated(keep="last")]
+        g["mm_net"] = g["mm_long"] - g["mm_short"]
+        g["pm_net"] = g["pm_long"] - g["pm_short"]
+        g["mm_net_pct_oi"] = np.where(g["oi"] > 0, g["mm_net"] / g["oi"] * 100, np.nan)
+        out[name] = g
+    return out
+
+
+def page_cot(marks: MarkBoard) -> None:
+    render_header(marks, "COT Positioning",
+                  "CFTC Disaggregated — who holds the risk, and how crowded it is")
+    covered = [n for n, c in COT_MARKET_CODES.items() if c]
+    sel = st.selectbox("Contract", covered)
+    if COT_MARKET_CODES.get("Brent Crude (BZ)") is None:
+        st.caption("BZ is absent on purpose: ICE Brent reports under ICE Europe's COT, "
+                   "not the CFTC — proxying it off WTI would be a fabricated position.")
+
+    data = fetch_cot_all()
+    cot = data.get(sel, pd.DataFrame())
+    if cot.empty:
+        st.error("**COT feed unavailable** (CFTC Socrata API returned nothing — see "
+                 "sidebar diagnostics). Nothing is shown in its place.")
+        return
+
+    last, prev = cot.iloc[-1], cot.iloc[-2] if len(cot) > 1 else cot.iloc[-1]
+    hist3y = cot.tail(156)
+    pctile = float((hist3y["mm_net"] < last["mm_net"]).mean() * 100)
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    kpi(k1, "Managed Money net", f"{last['mm_net']:+,.0f}",
+        f"contracts · report {cot.index[-1].date()}",
+        GREEN if last["mm_net"] > 0 else RED)
+    kpi(k2, "WoW change", f"{last['mm_net'] - prev['mm_net']:+,.0f}",
+        "specs adding" if last["mm_net"] > prev["mm_net"] else "specs cutting",
+        GREEN if last["mm_net"] > prev["mm_net"] else RED)
+    kpi(k3, "MM net / OI", f"{last['mm_net_pct_oi']:+.1f}%",
+        f"open interest {last['oi']:,.0f}")
+    kpi(k4, "3y crowdedness", f"{pctile:.0f}th %ile",
+        "of MM net positioning",
+        RED if pctile >= 85 else GREEN if pctile <= 15 else AMBER)
+    kpi(k5, "Commercials net", f"{last['pm_net']:+,.0f}" if not math.isnan(last["pm_net"]) else "n/a",
+        "Producer/Merchant — the physical side",
+        BLUE)
+    st.markdown(pctile_badge(pctile), unsafe_allow_html=True)
+
+    # MM net vs price
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=cot.index, y=cot["mm_net"], name="MM net (contracts)",
+                         marker_color=[GREEN if v >= 0 else RED for v in cot["mm_net"]],
+                         opacity=0.55))
+    panel = panel_years(5.2)
+    if not panel.empty and sel in panel.columns:
+        px_w = panel[sel].dropna().reindex(cot.index, method="ffill")
+        fig.add_trace(go.Scatter(x=cot.index, y=px_w, name="Price (front)",
+                                 yaxis="y2", line=dict(color=AMBER, width=1.6)))
+    fig.update_layout(
+        title=f"{sel} — Managed Money net vs price, 5y",
+        yaxis=dict(title="MM net, contracts"),
+        yaxis2=dict(title="Price", overlaying="y", side="right", showgrid=False))
+    st.plotly_chart(_styled(fig, 430), use_container_width=True)
+
+    # Crowdedness bands
+    p20, p80 = hist3y["mm_net_pct_oi"].quantile([0.20, 0.80])
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=cot.index, y=cot["mm_net_pct_oi"], name="MM net %OI",
+                              line=dict(color=TEAL, width=1.5)))
+    fig2.add_hline(y=float(p80), line=dict(color=RED, dash="dash"),
+                   annotation_text="3y p80 — crowded long")
+    fig2.add_hline(y=float(p20), line=dict(color=GREEN, dash="dash"),
+                   annotation_text="3y p20 — crowded short / washed out")
+    fig2.update_layout(title="Speculative intensity — MM net as % of open interest")
+    st.plotly_chart(_styled(fig2, 340), use_container_width=True)
+
+    st.markdown("### Last 8 reports")
+    tail = cot.tail(8).iloc[::-1].reset_index().rename(columns={"index": "Report"})
+    tail["Report"] = tail["Report"].dt.date
+    show = tail[["Report", "oi", "mm_long", "mm_short", "mm_net", "mm_net_pct_oi", "pm_net"]]
+    show.columns = ["Report", "Open Int", "MM Long", "MM Short", "MM Net", "MM %OI", "PM Net"]
+    st.dataframe(show.style.format({"Open Int": "{:,.0f}", "MM Long": "{:,.0f}",
+                                    "MM Short": "{:,.0f}", "MM Net": "{:+,.0f}",
+                                    "MM %OI": "{:+.1f}", "PM Net": "{:+,.0f}"}, na_rep="—"),
+                 use_container_width=True, hide_index=True)
+    st.caption("CFTC Disaggregated report (futures-only), weekly: released Friday "
+               "~15:30 ET with positions as of Tuesday — the print is always 3 days "
+               "stale, which matters in fast tape. Crowded longs at high percentiles are "
+               "fuel for washouts; commercials leaning the other way is the classic tell. "
+               "Reading, not gospel: COT is positioning, not a signal by itself.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 ROUTES = {
     "📊  Dashboard": page_dashboard, "📈  Forward Curves": page_curve,
     "🔀  Calendar Spreads": page_spreads, "🏭  Cracks, Crush & Arbs": page_structures,
+    "📦  Storage & Carry": page_storage, "🧭  COT Positioning": page_cot,
     "🔗  Correlation": page_correlation, "🌡️  Seasonality": page_seasonality,
     "🛢️  EIA Fundamentals": page_eia, "🗺️  Regional Balances": page_regional,
     "🎯  Options Pricer": page_options, "🌊  Vol Surface": page_vol_surface,
