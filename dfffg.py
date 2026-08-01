@@ -1641,6 +1641,210 @@ def roll_pnl(positions: List[dict], marks) -> List[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  CURVE EVOLUTION — how the curve MOVED, not just where it is
+# ══════════════════════════════════════════════════════════════════════════════
+#  A single strip is a photograph. The desk trades the MOVEMENT: three markets can
+#  share the same front price and tell three opposite stories — a parallel shift
+#  (macro), a front steepening (prompt physical tightness), or the back repricing
+#  (a structural change in production economics).
+#
+#  Every historical point is the settle of the SAME dated contract on that past
+#  date — not a continuous stitched series. No roll artefacts, no proxying: the
+#  Dec-26 contract's price last Tuesday is exactly that, or the point is absent.
+@st.cache_data(ttl=1800, persist="disk")
+def fetch_strip_history(commodity: str, period: str = "6mo") -> pd.DataFrame:
+    """Close history for every dated contract of one commodity — ONE grouped call.
+    Columns = tickers, index = dates. Empty frame if the feed returns nothing."""
+    specs = strip_contract_specs(commodity)
+    tickers = [s["ticker"] for s in specs]
+    closes = _yf_closes(tickers, period=period)
+    if closes.empty:
+        LOG.warning("strip history empty: %s", commodity)
+        return pd.DataFrame()
+    keep = [t for t in tickers if t in closes.columns]
+    return closes[keep].dropna(how="all")
+
+
+def curve_on_date(strip: pd.DataFrame, hist: pd.DataFrame,
+                  asof: date) -> Optional[pd.DataFrame]:
+    """Rebuild the same strip as it settled on (or just before) `asof`.
+    Returns None if that date predates the available history. Each row keeps its
+    own settle date, so a thin deferred month that last traded earlier is visible
+    rather than silently carried."""
+    if strip.empty or hist.empty:
+        return None
+    idx = hist.index[hist.index.date <= asof]
+    if len(idx) == 0:
+        return None
+    cutoff = idx[-1]
+    rows = []
+    for r in strip.itertuples():
+        if r.ticker not in hist.columns:
+            continue
+        s = hist[r.ticker].loc[:cutoff].dropna()
+        if s.empty:
+            continue
+        rows.append(dict(label=r.label, delivery=r.delivery, T=r.T,
+                         ticker=r.ticker, price=float(s.iloc[-1]),
+                         asof=s.index[-1].date().isoformat()))
+    if not rows:
+        return None
+    return pd.DataFrame(rows)
+
+
+def curve_move(now: pd.DataFrame, then: pd.DataFrame) -> pd.DataFrame:
+    """Per-delivery-month change between two curves, matched on delivery month
+    (never on position: the front rolls, so position i is not the same contract)."""
+    if now is None or then is None or now.empty or then.empty:
+        return pd.DataFrame()
+    m = now.merge(then[["delivery", "price"]], on="delivery",
+                  suffixes=("", "_then"), how="inner")
+    if m.empty:
+        return pd.DataFrame()
+    m["change"] = m["price"] - m["price_then"]
+    m["change_pct"] = np.where(m["price_then"] != 0,
+                               m["change"] / m["price_then"] * 100, np.nan)
+    return m
+
+
+def decompose_move(move: pd.DataFrame) -> dict:
+    """Split a curve move into level and slope — the two things a trader reads.
+
+      shift = average change across the curve      (parallel: macro, currency, rates)
+      twist = front change − back change           (>0: front outperformed = prompt
+                                                    tightness; <0: the back repriced)
+
+    A front-led move is usually temporary and physical; a back-led move is a
+    structural reassessment and matters more. The label below says which happened,
+    and it deliberately calls a move 'parallel' only when the twist is small
+    relative to the shift."""
+    if move.empty:
+        return dict(available=False)
+    ch = move["change"].astype(float)
+    shift = float(ch.mean())
+    front, back = float(ch.iloc[0]), float(ch.iloc[-1])
+    twist = front - back
+    if abs(twist) < max(abs(shift) * 0.35, 1e-9):
+        shape = "PARALLEL SHIFT"
+        read = "whole curve moved together — macro, currency or rates, not a physical story"
+    elif twist > 0:
+        shape = "FRONT-LED (steepening)"
+        read = ("prompt outperformed the deferred — physical tightness now; the back "
+                "does not believe it lasts")
+    else:
+        shape = "BACK-LED (flattening)"
+        read = ("the deferred repriced more than the prompt — a structural reassessment "
+                "of long-run supply or cost")
+    return dict(available=True, shift=shift, twist=twist, front=front, back=back,
+                shape=shape, read=read,
+                shift_pct=float(move["change_pct"].mean()))
+
+
+# ── Curve-shape stress: the twist that actually kills physical books ──────────
+def shape_shock_factors(Ts: Sequence[float], front_pct: float, back_pct: float,
+                        pivot_years: float = 1.0) -> np.ndarray:
+    """Per-contract shock, interpolated on CALENDAR tenor between a front shock and
+    a back shock. Linear in T up to `pivot_years`, flat beyond — deferred months
+    move together once you are far enough out the curve.
+
+    A parallel shock is the special case front == back. Books that are flat outright
+    but long the front spread survive parallel shocks and die on twists, which is
+    exactly why this exists next to the parallel slider."""
+    Ts = np.asarray(Ts, dtype=float)
+    w = np.clip(Ts / max(pivot_years, 1e-6), 0.0, 1.0)
+    return (front_pct + (back_pct - front_pct) * w) / 100.0
+
+
+def stress_curve_shape(positions: List[dict], marks, front_pct: float,
+                       back_pct: float, pivot_years: float = 1.0) -> dict:
+    """Revalue the book under a curve TWIST.
+
+    Each position is shocked by the factor at ITS OWN tenor: a dated future uses its
+    strip T, an option its remaining tenor, a front-month future the front shock.
+    Options are fully revalued at the shocked forward (Black-76), never linearised —
+    same discipline as the historical episodes."""
+    rows, total = [], 0.0
+    for p in positions:
+        base = position_base_price(p, marks)
+        if base is None:
+            continue
+        if p.get("kind", "future") == "option":
+            T = option_time_remaining(p)
+        elif p.get("strip_ticker"):
+            dm = dated_mark(p["strip_ticker"])
+            T = dm["T"] if dm else 0.0
+        else:
+            T = 0.0
+        f = float(shape_shock_factors([T], front_pct, back_pct, pivot_years)[0])
+        pnl = position_pnl_at(p, base, f)
+        total += pnl
+        rows.append(dict(Position=_position_label(p), Tenor=T, Shock=f * 100, PnL=pnl))
+    if not rows:
+        return dict(available=False)
+    return dict(available=True, rows=rows, total=total)
+
+
+# ── Roll calendar: an operational task, not an analytic ──────────────────────
+def roll_calendar(positions: List[dict], marks,
+                  today: Optional[date] = None) -> List[dict]:
+    """When does each position have to roll, and what does the roll cost today?
+
+    Front-month futures must be rolled before the front contract's last trading day
+    or they go to delivery — an operational deadline, not a market view. The cost is
+    today's M1−M2 spread applied to the position's size and direction.
+
+    Dated futures are shown with their own expiry and no roll cost: not rolling is
+    the reason you booked them. Options show days to expiry instead.
+    """
+    today = today or date.today()
+    strips = fetch_all_strips()
+    out = []
+    for p in positions:
+        n = p["commodity"]
+        c = COMMODITIES[n]
+        mult = price_multiplier(n)
+        sign = 1 if p["side"] == "Long" else -1
+        kind = p.get("kind", "future")
+
+        if kind == "option":
+            days = int(round(option_time_remaining(p, today) * 365.25))
+            out.append(dict(Position=_position_label(p), Kind="Option", Lots=p["lots"],
+                            Contract=n, Expiry=None, Days=days, RollCost=None,
+                            Action="expires — exercise or close before then"))
+            continue
+
+        if p.get("strip_ticker"):
+            dm = dated_mark(p["strip_ticker"])
+            exp = None
+            if dm:
+                y, m = (int(x) for x in
+                        strips[n][strips[n]["ticker"] == p["strip_ticker"]]["delivery"].iloc[0].split("-"))
+                exp = estimate_expiry(c["expiry_rule"], y, m)
+            out.append(dict(Position=_position_label(p), Kind="Dated future",
+                            Lots=p["lots"], Contract=n, Expiry=exp,
+                            Days=((exp - today).days if exp else None), RollCost=None,
+                            Action="no roll — dated line held to its own expiry"))
+            continue
+
+        strip = strips.get(n, pd.DataFrame())
+        if strip.empty:
+            continue
+        dy, dm_ = (int(x) for x in str(strip["delivery"].iloc[0]).split("-"))
+        exp = estimate_expiry(c["expiry_rule"], dy, dm_)
+        days = (exp - today).days
+        cost = None
+        if len(strip) > 1:
+            m1, m2 = float(strip["price"].iloc[0]), float(strip["price"].iloc[1])
+            cost = sign * (m1 - m2) * mult * p["lots"]
+        action = ("ROLL NOW — front expires within a week" if days <= 7 else
+                  "roll this week" if days <= 14 else "monitor")
+        out.append(dict(Position=_position_label(p), Kind="Front future",
+                        Lots=p["lots"], Contract=n, Expiry=exp, Days=days,
+                        RollCost=cost, Action=action))
+    return sorted(out, key=lambda r: (r["Days"] is None, r["Days"]))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  BLOTTER PERSISTENCE — per-book files keyed by a ?book= id in the URL
 # ══════════════════════════════════════════════════════════════════════════════
 BLOTTER_DIR = ".blotters"
@@ -1893,7 +2097,10 @@ PAGE_HELP: Dict[str, str] = {
         "different delivery months. <b>M1</b> = the first month (the 'front'). "
         "<b>Contango</b> = later months cost more. <b>Backwardation</b> = later months "
         "cost less. <b>Roll yield</b> = the yearly gain or loss from holding a position "
-        "as it moves from one month to the next. <b>T</b> = time to delivery, in years.",
+        "as it moves from one month to the next. <b>T</b> = time to delivery, in years. "
+        "The <b>Evolution</b> tab compares today's curve with earlier dates: a "
+        "<b>parallel shift</b> means the whole curve moved together (a macro story), a "
+        "<b>twist</b> means the front and the back moved differently (a physical one).",
     "Calendar Spreads":
         "A <b>calendar spread</b> is the price difference between two delivery months "
         "of the same commodity (for example M1 − M2). The <b>percentile</b> shows where "
@@ -1945,13 +2152,16 @@ PAGE_HELP: Dict[str, str] = {
         "<b>entry</b> = your trade price; <b>P&L</b> = profit and loss against today's "
         "mark. Options lose time value every day and expire at intrinsic value. The book "
         "is stored under the <b>?book=</b> id in the URL — export the JSON as your "
-        "durable backup.",
+        "durable backup. The <b>roll calendar</b> at the bottom shows when each front "
+        "contract must be rolled and what rolling costs today.",
     "Portfolio Risk":
         "How much the book can lose. <b>VaR</b> (Value at Risk) = the loss you should "
         "not exceed on most days, at the chosen confidence level. <b>ES</b> (Expected "
         "Shortfall) = the average loss on the bad days beyond VaR. Options are counted "
         "at <b>delta-cash</b>: their futures-equivalent size. The stress section replays "
-        "real historical episodes (dated) on today's book.",
+        "real historical episodes (dated) on today's book, and the <b>curve-shape</b> "
+        "(twist) test moves the front and the back by different amounts — the shock a "
+        "spread book actually fears.",
     "Monte Carlo":
         "Simulates thousands of possible price paths. <b>GBM</b> = a random walk with "
         "no anchor (fits gold). <b>Schwartz / OU</b> = prices pulled back toward a "
@@ -2106,6 +2316,15 @@ def page_curve(marks: MarkBoard) -> None:
         return
 
     c = COMMODITIES[sel]
+    tab_now, tab_evo = st.tabs(["CURRENT STRIP", "EVOLUTION"])
+
+    with tab_now:
+        _curve_snapshot(sel, strip, c)
+    with tab_evo:
+        _curve_evolution(sel, strip, c)
+
+
+def _curve_snapshot(sel: str, strip: pd.DataFrame, c: dict) -> None:
     carry = implied_carry(strip)
     f1, fn = float(strip["price"].iloc[0]), float(strip["price"].iloc[-1])
     slope = (fn / f1 - 1) * 100 if f1 else 0.0
@@ -2140,6 +2359,99 @@ def page_curve(marks: MarkBoard) -> None:
     st.caption("T is calendar year-fraction to mid-delivery. Deferred months trade thin — "
                "each settle date is shown because a two-day-old settle is still a settle, "
                "not today's price.")
+
+
+def _curve_evolution(sel: str, strip: pd.DataFrame, c: dict) -> None:
+    """Compare today's strip against the SAME dated contracts on earlier dates."""
+    st.markdown("A strip is a photograph; the desk trades the movement. Each past curve "
+                "below is the settle of the **same dated contracts** on that date — no "
+                "continuous series, no roll artefacts.")
+
+    hist = fetch_strip_history(sel, "1y")
+    if hist.empty:
+        st.error("**NO STRIP HISTORY** — dated contracts returned no history. "
+                 "Nothing is drawn in its place.")
+        return
+
+    today = date.today()
+    hmin = hist.index[0].date()
+    c1, c2 = st.columns([2, 1])
+    presets = {"1 week ago": 7, "2 weeks ago": 14, "1 month ago": 30,
+               "3 months ago": 91, "Custom…": None}
+    choice = c1.radio("Compare with", list(presets), horizontal=True, index=0)
+    if presets[choice] is None:
+        cmp_dates = c1.multiselect(
+            "Pick dates", options=[d.date() for d in hist.index[::-1]],
+            default=[hist.index[-1].date()],
+            format_func=lambda d: d.isoformat(), max_selections=3)
+    else:
+        cmp_dates = [max(today - timedelta(days=presets[choice]), hmin)]
+    show_pct = c2.toggle("Show change in %", value=False)
+    c2.caption(f"History available from **{hmin}**.")
+
+    curves = []
+    for d0 in cmp_dates:
+        past = curve_on_date(strip, hist, d0)
+        if past is None:
+            st.warning(f"No settles on or before {d0} — that date predates the history.")
+            continue
+        curves.append((d0, past))
+    if not curves:
+        return
+
+    # ── Overlay ─────────────────────────────────────────────────────────────
+    fig = go.Figure()
+    shades = [BLUE, PURPLE, TEAL]
+    for i, (d0, past) in enumerate(curves):
+        fig.add_trace(go.Scatter(x=past["label"], y=past["price"], mode="lines+markers",
+                                 name=f"{d0}", line=dict(color=shades[i % 3], width=1.5,
+                                                         dash="dot"),
+                                 marker=dict(size=5)))
+    fig.add_trace(go.Scatter(x=strip["label"], y=strip["price"], mode="lines+markers",
+                             name="Today", line=dict(color=AMBER, width=2.4),
+                             marker=dict(size=7)))
+    fig.update_layout(title=f"{sel} forward strip — today vs earlier ({c['unit']})")
+    st.plotly_chart(_styled(fig, 420), use_container_width=True)
+
+    # ── Decomposition against the FIRST comparison date ──────────────────────
+    d0, past = curves[0]
+    move = curve_move(strip, past)
+    if move.empty:
+        st.info("No delivery months in common with that date — nothing to decompose.")
+        return
+    dec = decompose_move(move)
+
+    k1, k2, k3, k4 = st.columns(4)
+    kpi(k1, "Parallel shift", f"{dec['shift']:+,.3f}",
+        f"average across the curve · {dec['shift_pct']:+.2f}%",
+        GREEN if dec["shift"] > 0 else RED)
+    kpi(k2, "Twist (front − back)", f"{dec['twist']:+,.3f}",
+        "positive = front outperformed", AMBER)
+    kpi(k3, "Front move", f"{dec['front']:+,.3f}", str(move["label"].iloc[0]))
+    kpi(k4, "Back move", f"{dec['back']:+,.3f}", str(move["label"].iloc[-1]))
+    st.markdown(f'<span class="badge badge-amber">{dec["shape"]}</span> '
+                f'<span style="color:{GRAY};font-size:0.8rem">{dec["read"]}</span>',
+                unsafe_allow_html=True)
+
+    col = "change_pct" if show_pct else "change"
+    unit_lbl = "%" if show_pct else c["unit"]
+    fig2 = go.Figure(go.Bar(x=move["label"], y=move[col],
+                            marker_color=[GREEN if v >= 0 else RED for v in move[col]]))
+    fig2.add_hline(y=0, line=dict(color=BORDER))
+    fig2.update_layout(title=f"Change by delivery month vs {d0} ({unit_lbl}) — "
+                             "the shape of the move")
+    st.plotly_chart(_styled(fig2, 340), use_container_width=True)
+
+    tbl = move[["label", "delivery", "T", "price_then", "price", "change", "change_pct"]].copy()
+    tbl.columns = ["Contract", "Delivery", "T (yrs)", f"Price {d0}", "Price today",
+                   "Change", "Change %"]
+    st.dataframe(tbl.style.format({"T (yrs)": "{:.2f}", f"Price {d0}": "{:,.2f}",
+                                   "Price today": "{:,.2f}", "Change": "{:+,.3f}",
+                                   "Change %": "{:+.2f}"}),
+                 use_container_width=True, hide_index=True)
+    st.caption("Months are matched on DELIVERY, never on position — the front rolls, so "
+               "'M1 today' and 'M1 last month' are different contracts. Missing months "
+               "(expired, or not yet listed on the earlier date) are simply absent.")
 
 
 def page_spreads(marks: MarkBoard) -> None:
@@ -2613,6 +2925,36 @@ def page_blotter(marks: MarkBoard) -> None:
     kpi(g4, "Theta ($/day)", f"{t['theta']:+,.0f}", "options age daily now",
         RED if t["theta"] < 0 else GREEN)
 
+    st.markdown("### Roll calendar")
+    rc = roll_calendar(positions, marks)
+    if not rc:
+        st.caption("Nothing to roll.")
+        return
+    urgent = [r for r in rc if r["Days"] is not None and r["Days"] <= 7
+              and r["Kind"] == "Front future"]
+    tot_roll = sum(r["RollCost"] for r in rc if r["RollCost"] is not None)
+    r1, r2, r3 = st.columns(3)
+    kpi(r1, "Rolls due within 7d", f"{len(urgent)}",
+        "front contracts approaching expiry", RED if urgent else GREEN)
+    kpi(r2, "Cost of rolling today", f"${tot_roll:+,.0f}",
+        "M1−M2 carry across front lines", GREEN if tot_roll >= 0 else RED)
+    nxt = next((r for r in rc if r["Days"] is not None), None)
+    kpi(r3, "Next deadline", f"{nxt['Days']}d" if nxt else "—",
+        (f"{nxt['Contract']} · {nxt['Expiry']}" if nxt and nxt["Expiry"] else ""))
+    if urgent:
+        st.warning("**Roll now:** " + ", ".join(r["Position"] for r in urgent) +
+                   " — a front future not rolled before its last trading day goes to "
+                   "delivery. This is an operational deadline, not a view.")
+    rdf = pd.DataFrame(rc)
+    rdf["Expiry"] = rdf["Expiry"].apply(lambda d: d.isoformat() if d else "—")
+    st.dataframe(rdf.style.format({"RollCost": "{:+,.0f}", "Days": "{:.0f}"}, na_rep="—"),
+                 use_container_width=True, hide_index=True)
+    st.caption("Expiry dates are the desk's per-contract estimates (generous by design — "
+               "see About). Roll cost is today's M1−M2 spread applied to your size and "
+               "direction: negative means the roll costs you, positive means backwardation "
+               "pays you to roll. Dated lines show no roll cost — not rolling is why you "
+               "booked them. Options show days to expiry instead.")
+
 
 def page_risk(marks: MarkBoard) -> None:
     render_header(marks, "Portfolio Risk", "Delta-equivalent VaR/ES, historical replay, dated stress")
@@ -2713,6 +3055,34 @@ def page_risk(marks: MarkBoard) -> None:
             "options revalued, not linearised", RED if tot < 0 else GREEN)
         st.dataframe(pd.DataFrame(srows).style.format({"PnL": "{:+,.0f}"}),
                      use_container_width=True, hide_index=True)
+
+    st.markdown("### Curve-shape stress (twist)")
+    st.caption("A parallel shock leaves a spread book untouched — and spread books are "
+               "exactly what dies when the curve TWISTS. Each position is shocked at its "
+               "own calendar tenor: front-month legs take the front shock, dated legs and "
+               "options take the interpolated one.")
+    t1, t2, t3 = st.columns(3)
+    front_pct = t1.slider("Front shock", -40, 40, 10, 1, format="%d%%")
+    back_pct  = t2.slider("Back shock", -40, 40, -5, 1, format="%d%%")
+    pivot     = t3.slider("Pivot tenor (yrs)", 0.25, 3.0, 1.0, 0.25,
+                          help="Shock interpolates linearly from front to back up to this "
+                               "tenor, then stays flat further out the curve.")
+    sh = stress_curve_shape(pos, marks, front_pct, back_pct, pivot)
+    if sh.get("available"):
+        label = ("steepening" if front_pct > back_pct else
+                 "flattening" if front_pct < back_pct else "parallel")
+        kpi(st.columns(3)[0], f"P&L on {label}", f"${sh['total']:+,.0f}",
+            f"front {front_pct:+d}% → back {back_pct:+d}%",
+            RED if sh["total"] < 0 else GREEN)
+        st.dataframe(pd.DataFrame(sh["rows"]).style.format(
+            {"Tenor": "{:.2f}", "Shock": "{:+.1f}%", "PnL": "{:+,.0f}"}),
+            use_container_width=True, hide_index=True)
+        curve_note = ("Front-led moves are usually physical and temporary; back-led moves "
+                      "reprice long-run economics. Compare this number with the parallel "
+                      "shock above — a large gap means your risk is in the SHAPE, not the level.")
+        st.caption(curve_note)
+    else:
+        st.info("Curve-shape stress unavailable — no position could be marked.")
 
 
 def page_mc(marks: MarkBoard) -> None:
@@ -2888,6 +3258,21 @@ screen says NO MARK and the analytics stand down. Nothing is interpolated into t
 **What is honestly NOT live** (each labelled on its page): regional balances (static
 IEA/USDA-style estimates), the vol surface (a stated parametrisation — no options feed),
 monthly event dates (approximate anchors), and the stress episodes (historical, dated).
+
+### Revision 4 — the curve through time
+
+**Forward Curves → Evolution tab** — today's strip against any earlier date (one week
+back by default, or your own dates), rebuilt from the SAME dated contracts, so there
+are no roll artefacts. The move is decomposed into a **parallel shift** and a
+**twist** (front minus back), and labelled: front-led moves are physical and usually
+temporary, back-led moves reprice long-run economics. Months are matched on delivery,
+never on position.
+**Curve-shape stress** (Portfolio Risk) — front and back shocked by different amounts,
+interpolated on calendar tenor, options fully revalued. A spread book survives every
+parallel shock and dies on the twist; now that shows up in the numbers.
+**Roll calendar** (Trade Blotter) — days to expiry for every front line, what rolling
+costs at today's M1−M2, and an alert inside seven days. Dated lines show no roll cost;
+options show days to expiry. An operational deadline, not a view.
 
 ### Revision 3 — from reading the market to pricing the trade
 
