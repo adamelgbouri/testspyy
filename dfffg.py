@@ -156,22 +156,18 @@ div[data-testid="stHorizontalBlock"] {{ gap:10px; }}
 .kpi-value {{ font-size:1.3rem; color:{TEXT}; font-family:'JetBrains Mono',monospace; font-weight:600; }}
 .kpi-sub   {{ font-size:0.68rem; color:{GRAY}; margin-top:3px; }}
 hr {{ border-color:{BORDER}; }}
-/* ── sectioned sidebar navigation ── */
-section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] {{ gap:0.15rem; }}
-.nav-sec {{ font-size:9px; color:{GRAY}; font-family:'JetBrains Mono',monospace;
-    letter-spacing:0.2em; text-transform:uppercase; margin:14px 0 3px 4px;
-    border-bottom:1px solid {BORDER}; padding-bottom:3px; }}
-.nav-active {{ background:rgba(240,165,0,0.13); border-left:2px solid {AMBER};
-    color:{AMBER}; padding:5px 10px; border-radius:0 6px 6px 0;
-    font-family:'JetBrains Mono',monospace; font-size:0.78rem; font-weight:600; }}
-section[data-testid="stSidebar"] button[kind="tertiary"],
-section[data-testid="stSidebar"] [data-testid="stBaseButton-tertiary"] {{
-    justify-content:flex-start; text-align:left; color:{GRAY};
-    font-family:'JetBrains Mono',monospace; font-size:0.78rem;
-    padding:4px 10px; min-height:0; border-radius:6px; }}
-section[data-testid="stSidebar"] button[kind="tertiary"]:hover,
-section[data-testid="stSidebar"] [data-testid="stBaseButton-tertiary"]:hover {{
-    color:{AMBER}; background:rgba(240,165,0,0.07); }}
+/* ── sidebar navigation: native radios, typography only (layout stays Streamlit's) ── */
+section[data-testid="stSidebar"] div[data-testid="stRadio"] [data-testid="stWidgetLabel"] p {{
+    font-family:'JetBrains Mono',monospace; font-size:9.5px; color:{GRAY};
+    letter-spacing:0.2em; text-transform:uppercase;
+    border-bottom:1px solid {BORDER}; padding-bottom:4px; width:100%; }}
+section[data-testid="stSidebar"] div[data-testid="stRadio"] label[data-baseweb="radio"] p {{
+    font-family:'JetBrains Mono',monospace; font-size:0.78rem; }}
+/* ── per-page intro box rendered by render_header ── */
+.page-help {{ background:{PANEL}; border:1px solid {BORDER}; border-left:3px solid {BLUE};
+    border-radius:8px; padding:10px 14px; margin:6px 0 4px 0;
+    font-size:0.78rem; line-height:1.6; color:#B9C4CF; }}
+.page-help b {{ color:{TEXT}; }}
 </style>
 """
 
@@ -1813,8 +1809,17 @@ ALL_PAGES = [p for ps in NAV_SECTIONS.values() for p in ps]
 DEFAULT_PAGE = ALL_PAGES[0]
 
 
-def _nav_to(page_name: str) -> None:
-    st.session_state.nav_page = page_name
+def _on_nav(section: str) -> None:
+    """Radio-sync: selecting a page in one section clears the other sections'
+    radios and records the destination. Native widgets only — the previous
+    HTML-in-flow nav collided with Streamlit's internal markdown margins."""
+    val = st.session_state.get(f"navsec_{section}")
+    if val is None:
+        return
+    st.session_state.nav_page = val
+    for s in NAV_SECTIONS:
+        if s != section:
+            st.session_state[f"navsec_{s}"] = None
 
 
 def render_sidebar(marks: MarkBoard) -> str:
@@ -1831,14 +1836,11 @@ def render_sidebar(marks: MarkBoard) -> str:
         </div>""", unsafe_allow_html=True)
 
         for section, pages in NAV_SECTIONS.items():
-            st.markdown(f'<div class="nav-sec">{section}</div>', unsafe_allow_html=True)
-            for p in pages:
-                if p == current:
-                    st.markdown(f'<div class="nav-active">{p}</div>', unsafe_allow_html=True)
-                else:
-                    st.button(p, key=f"nav_{p}", type="tertiary",
-                              use_container_width=True, on_click=_nav_to, args=(p,))
-        page = current
+            k = f"navsec_{section}"
+            if k not in st.session_state:
+                st.session_state[k] = current if current in pages else None
+            st.radio(section, pages, key=k, on_change=_on_nav, args=(section,))
+        page = st.session_state.nav_page
         st.markdown("---")
 
         n_ok  = sum(1 for v in marks.values() if v is not None)
@@ -1878,6 +1880,124 @@ def render_sidebar(marks: MarkBoard) -> str:
     return page
 
 
+# ── Per-page explanations, rendered by render_header under the title ─────────
+#  Plain English (B2/C1): short sentences, every abbreviation defined where used.
+PAGE_HELP: Dict[str, str] = {
+    "Trading Dashboard":
+        "The overview page. It shows the last traded price (the <b>mark</b>) for every "
+        "contract, the date of that settle, and the daily change. <b>MTM</b> = "
+        "mark-to-market: everything is valued with real market prices, never estimates. "
+        "<b>MA50 / MA200</b> = the average price of the last 50 / 200 trading days.",
+    "Forward Curves":
+        "A <b>forward curve</b> (the 'strip') is the price of the same commodity for "
+        "different delivery months. <b>M1</b> = the first month (the 'front'). "
+        "<b>Contango</b> = later months cost more. <b>Backwardation</b> = later months "
+        "cost less. <b>Roll yield</b> = the yearly gain or loss from holding a position "
+        "as it moves from one month to the next. <b>T</b> = time to delivery, in years.",
+    "Calendar Spreads":
+        "A <b>calendar spread</b> is the price difference between two delivery months "
+        "of the same commodity (for example M1 − M2). The <b>percentile</b> shows where "
+        "today's spread sits inside its own 2-year history: high = historically "
+        "expensive, low = historically cheap.",
+    "Cracks, Crush & Arbs":
+        "Margin trades between related products. A <b>crack</b> = the refinery margin "
+        "(fuel prices minus crude, in $ per barrel, <b>bbl</b>). The <b>crush</b> = the "
+        "soybean processing margin (meal + oil − beans). An <b>arb</b> (arbitrage) = the "
+        "price gap between two markets for the same thing. Being long a structure means "
+        "being long that processing margin.",
+    "Correlation":
+        "How contracts move together, from daily <b>log returns</b> (percentage "
+        "changes). <b>+1</b> = they move the same way, <b>−1</b> = opposite ways, "
+        "<b>0</b> = no link. The Portfolio Risk page uses this matrix to net long and "
+        "short positions against each other.",
+    "Seasonality":
+        "Some commodities repeat a pattern every year: heating gas in winter, driving "
+        "gasoline in summer. Each box shows the spread of returns for that calendar "
+        "month over the lookback. <b>Hit rate</b> = the share of years where the month "
+        "was positive. Read the roll-bias warning at the bottom before trading this.",
+    "EIA Fundamentals":
+        "<b>EIA</b> = the US Energy Information Administration, the official source of "
+        "US energy data. Weekly <b>inventories</b> (stocks in storage) and production. "
+        "<b>WoW</b> = week over week change; <b>vs 1y ago</b> = against the same week "
+        "last year. Falling stocks usually support prices; building stocks weigh on them.",
+    "Regional Balances":
+        "A simple map of who produces and who consumes. <b>S&D</b> = supply and demand. "
+        "Green = net exporter (supply above demand); red = net importer. These are "
+        "static yearly estimates for orientation — the one page here that is not live, "
+        "and it says so.",
+    "Options Pricer":
+        "Prices a European option on a future with the <b>Black-76</b> model. "
+        "<b>F</b> = forward price, <b>K</b> = strike, <b>T</b> = time to expiry in "
+        "years, <b>σ</b> (sigma) = volatility. The Greeks: <b>delta</b> = how much the "
+        "option moves when the future moves; <b>gamma</b> = how fast delta itself "
+        "changes; <b>vega</b> = sensitivity to volatility; <b>theta</b> = value lost "
+        "per day. <b>RV</b> = realised volatility (measured from history), used as the "
+        "starting value for σ.",
+    "Vol Surface":
+        "A 3D picture of volatility across strikes and expiries. <b>ATM</b> = "
+        "at-the-money, a strike close to the forward. <b>Skew</b> = the tilt of the "
+        "curve (downside protection priced differently from upside). The <b>smile</b> = "
+        "its curvature. This surface is a stated formula seeded from realised vol, not "
+        "market quotes — use it to reason about shape.",
+    "Trade Blotter":
+        "Your book of positions. Book a <b>future</b> (the continuous front month, or a "
+        "specific dated month) or an <b>option</b>. <b>Lots</b> = number of contracts; "
+        "<b>entry</b> = your trade price; <b>P&L</b> = profit and loss against today's "
+        "mark. Options lose time value every day and expire at intrinsic value. The book "
+        "is stored under the <b>?book=</b> id in the URL — export the JSON as your "
+        "durable backup.",
+    "Portfolio Risk":
+        "How much the book can lose. <b>VaR</b> (Value at Risk) = the loss you should "
+        "not exceed on most days, at the chosen confidence level. <b>ES</b> (Expected "
+        "Shortfall) = the average loss on the bad days beyond VaR. Options are counted "
+        "at <b>delta-cash</b>: their futures-equivalent size. The stress section replays "
+        "real historical episodes (dated) on today's book.",
+    "Monte Carlo":
+        "Simulates thousands of possible price paths. <b>GBM</b> = a random walk with "
+        "no anchor (fits gold). <b>Schwartz / OU</b> = prices pulled back toward a "
+        "level over time (<b>mean reversion</b>); the <b>half-life</b> = the time to "
+        "close half of any gap. Paths are centred on the live forward curve, so the "
+        "average path equals the market's own forward. <b>P5 / P95</b> = the 5% and "
+        "95% levels of the fan.",
+    "Macro Rates":
+        "The macro backdrop from <b>FRED</b> (the Federal Reserve's economic database). "
+        "<b>CPI</b> = consumer price inflation; <b>GDP</b> = economic output; the "
+        "policy rate = the central bank's rate. The commodity tab adds the dollar index "
+        "(<b>DXY</b> proxy), the 10-year yield and <b>breakeven inflation</b> — a "
+        "stronger dollar with higher real yields is the classic headwind for gold.",
+    "Signal Scanner":
+        "One row per contract, one column per signal: carry, momentum, volatility "
+        "regime, seasonality and positioning. Nothing here is a model — every number "
+        "comes from live market data. The legend under the table explains each column "
+        "and its abbreviations.",
+    "Event Calendar":
+        "The scheduled reports that move these markets. Weekly prints (EIA, rig count) "
+        "follow a fixed weekday and are computed. Monthly reports are anchored to their "
+        "usual date and marked approximate: <b>WASDE</b> = the USDA's world "
+        "supply-and-demand report; <b>MOMR</b> = OPEC's monthly oil market report. "
+        "Always verify against the official calendar before carrying risk into a print.",
+    "Storage & Cash-and-Carry":
+        "The trade behind the curve. <b>Cash-and-carry (C&C)</b> = buy the commodity "
+        "now, store it, and sell it forward — it pays when the forward premium covers "
+        "financing plus storage. First the page shows what the market implies with zero "
+        "assumptions (the strip minus financing at <b>SOFR</b>, the US overnight rate); "
+        "then your verdict with an editable storage cost. <b>Full carry</b> = the curve "
+        "exactly covers all costs. <b>Convenience yield</b> = the premium the market "
+        "pays to whoever holds physical now (seen in backwardation).",
+    "COT Positioning":
+        "<b>COT</b> = Commitments of Traders, the weekly <b>CFTC</b> (US regulator) "
+        "report on who holds futures. <b>MM</b> = Managed Money — funds, the "
+        "speculators. <b>PM</b> / commercials = Producers and Merchants — the physical "
+        "players. <b>OI</b> = open interest, the total contracts outstanding. "
+        "<b>Net</b> = long minus short. A very high percentile = a crowded trade that "
+        "can unwind fast. Positions are as of Tuesday, published Friday.",
+    "About":
+        "The design contract of this desk: what is live, what is honestly not, what was "
+        "excluded and why, the full revision changelog, and the known limits — stated "
+        "plainly.",
+}
+
+
 def render_header(marks: MarkBoard, title: str, subtitle: str) -> None:
     n_ok = sum(1 for v in marks.values() if v is not None)
     live = n_ok > 0
@@ -1891,6 +2011,9 @@ def render_header(marks: MarkBoard, title: str, subtitle: str) -> None:
         <span style="color:{GRAY};font-size:0.8rem">{subtitle}</span></div>
         <div>{badge}</div></div>""",
         unsafe_allow_html=True)
+    help_txt = PAGE_HELP.get(title)
+    if help_txt:
+        st.markdown(f'<div class="page-help">{help_txt}</div>', unsafe_allow_html=True)
     st.markdown("")
 
 
@@ -3161,13 +3284,26 @@ def fetch_cot_all(years: int = 5) -> Dict[str, pd.DataFrame]:
             "mm_long": sub[c_mml].values, "mm_short": sub[c_mms].values,
             "pm_long": (sub[c_pml].values if c_pml else np.nan),
             "pm_short": (sub[c_pms].values if c_pms else np.nan),
-        }, index=pd.DatetimeIndex(sub["date"]))
+        }, index=pd.DatetimeIndex(sub["date"].values))   # .values: index stays UNNAMED
         g = g[~g.index.duplicated(keep="last")]
         g["mm_net"] = g["mm_long"] - g["mm_short"]
         g["pm_net"] = g["pm_long"] - g["pm_short"]
         g["mm_net_pct_oi"] = np.where(g["oi"] > 0, g["mm_net"] / g["oi"] * 100, np.nan)
         out[name] = g
     return out
+
+
+def cot_tail_table(cot: pd.DataFrame, n: int = 8) -> pd.DataFrame:
+    """Display table of the last n reports, newest first. The date column is taken
+    by POSITION after reset_index — the production KeyError came from renaming a
+    column literally called 'index' while the index was actually named 'date'
+    (DatetimeIndex built from a named Series keeps that name)."""
+    tail = cot.tail(n).iloc[::-1].reset_index()
+    tail = tail.rename(columns={tail.columns[0]: "Report"})
+    tail["Report"] = pd.to_datetime(tail["Report"]).dt.date
+    show = tail[["Report", "oi", "mm_long", "mm_short", "mm_net", "mm_net_pct_oi", "pm_net"]].copy()
+    show.columns = ["Report", "Open Int", "MM Long", "MM Short", "MM Net", "MM %OI", "PM Net"]
+    return show
 
 
 def page_cot(marks: MarkBoard) -> None:
@@ -3236,10 +3372,7 @@ def page_cot(marks: MarkBoard) -> None:
     st.plotly_chart(_styled(fig2, 340), use_container_width=True)
 
     st.markdown("### Last 8 reports")
-    tail = cot.tail(8).iloc[::-1].reset_index().rename(columns={"index": "Report"})
-    tail["Report"] = tail["Report"].dt.date
-    show = tail[["Report", "oi", "mm_long", "mm_short", "mm_net", "mm_net_pct_oi", "pm_net"]]
-    show.columns = ["Report", "Open Int", "MM Long", "MM Short", "MM Net", "MM %OI", "PM Net"]
+    show = cot_tail_table(cot, 8)
     st.dataframe(show.style.format({"Open Int": "{:,.0f}", "MM Long": "{:,.0f}",
                                     "MM Short": "{:,.0f}", "MM Net": "{:+,.0f}",
                                     "MM %OI": "{:+.1f}", "PM Net": "{:+,.0f}"}, na_rep="—"),
