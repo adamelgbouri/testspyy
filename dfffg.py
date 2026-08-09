@@ -68,6 +68,7 @@ import json
 import logging
 import math
 import os
+import traceback
 import uuid
 from calendar import monthrange
 from collections import deque
@@ -1863,16 +1864,22 @@ def roll_calendar(positions: List[dict], marks,
             continue
 
         if p.get("strip_ticker"):
-            dm = dated_mark(p["strip_ticker"])
             exp = None
-            if dm:
-                y, m = (int(x) for x in
-                        strips[n][strips[n]["ticker"] == p["strip_ticker"]]["delivery"].iloc[0].split("-"))
-                exp = estimate_expiry(c["expiry_rule"], y, m)
+            sdf = strips.get(n, pd.DataFrame())
+            if not sdf.empty:
+                hit = sdf[sdf["ticker"] == p["strip_ticker"]]
+                if not hit.empty:
+                    try:
+                        y, m = (int(x) for x in str(hit["delivery"].iloc[0]).split("-"))
+                        exp = estimate_expiry(c["expiry_rule"], y, m)
+                    except (ValueError, TypeError) as e:
+                        LOG.warning("roll calendar: bad delivery for %s: %s",
+                                    p["strip_ticker"], e)
             out.append(dict(Position=_position_label(p), Kind="Dated future",
                             Lots=p["lots"], Contract=n, Expiry=exp,
                             Days=((exp - today).days if exp else None), RollCost=None,
-                            Action="no roll — dated line held to its own expiry"))
+                            Action=("no roll — dated line held to its own expiry" if exp
+                                    else "contract no longer listed — verify manually")))
             continue
 
         strip = strips.get(n, pd.DataFrame())
@@ -4670,6 +4677,29 @@ ROUTES = {
 }
 
 
+def render_page(page: str, marks: MarkBoard) -> None:
+    """Run one page inside a guard.
+
+    Without this, any exception anywhere takes the whole app down: the sidebar
+    disappears and every other page becomes unreachable behind a red traceback. A
+    page is not the application — one broken page should cost you that page, not
+    the desk. The failure is logged into Feed diagnostics so it is never silent."""
+    try:
+        ROUTES[page](marks)
+    except Exception as e:                                    # noqa: BLE001
+        # One entry, not two: the ring handler behind LOG already feeds the sidebar
+        # diagnostics panel, so the message carries the detail itself.
+        LOG.exception("PAGE ERROR %s: %s: %s", page, type(e).__name__, e)
+        st.error(f"**This page hit an error and stopped.** The rest of the desk still "
+                 f"works — pick another page in the sidebar.\n\n"
+                 f"`{type(e).__name__}: {e}`")
+        with st.expander("Details for debugging"):
+            st.code(traceback.format_exc(), language="text")
+        st.caption("If this persists, clear the caches from **🔧 Feed diagnostics** in "
+                   "the sidebar — a stale cached frame from an earlier version is the "
+                   "most common cause after a redeploy.")
+
+
 def main() -> None:
     _setup_page()
     if not YF_AVAILABLE:
@@ -4683,7 +4713,7 @@ def main() -> None:
         st.warning("Dated (stale) settles in use for: " + ", ".join(
             COMMODITIES[n]["ticker"] for n in stale) +
             " — shown with their dates, never passed off as today's prints.")
-    ROUTES[page](marks)
+    render_page(page, marks)
 
 
 if __name__ == "__main__":
