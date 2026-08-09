@@ -1273,6 +1273,9 @@ def delta_cash(p: dict, marks: MarkBoard, r: float = 0.05) -> Optional[float]:
 
 def _position_label(p: dict) -> str:
     n = p["commodity"]
+    if p.get("cargo_id"):
+        tag = "physical" if p.get("physical") else "hedge"
+        return f"{n} {p.get('strip_label') or 'fut'} · {tag} {p['cargo_id']}"
     if p.get("kind", "future") == "option":
         rem = option_time_remaining(p) * 12
         return f"{n} {p['opt_type'][:1].upper()}{p['strike']:g} ({rem:.1f}m left)"
@@ -1286,7 +1289,8 @@ def _position_label(p: dict) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 def portfolio_var(positions: List[dict], marks, corr: pd.DataFrame,
                   conf: float = 0.95, horizon: int = 1,
-                  diversified: bool = True) -> dict:
+                  diversified: bool = True,
+                  basis_legs: Optional[List[dict]] = None) -> dict:
     """
     Parametric VaR / ES on the delta-equivalent book.
 
@@ -1301,6 +1305,13 @@ def portfolio_var(positions: List[dict], marks, corr: pd.DataFrame,
                          the conservative sum and says so. The old zero-fill silently
                          assumed independence, which UNDERSTATES risk for same-sign
                          correlated legs — the opposite of a safe default.
+    basis_legs        -> differential risk carried by physical cargoes: cash exposure
+                         per 1.0 move of the diff, with an annual vol in quote units.
+                         Added as an INDEPENDENT variance block (σ² = σ_futures² +
+                         Σσ_basis²) because this desk has no differential history to
+                         estimate a correlation from. Stated, not buried: a hedged
+                         cargo whose flat price nets to zero is NOT riskless, and the
+                         basis is exactly the risk a merchant is left holding.
     """
     z = norm.ppf(conf)
     rows, names = [], []
@@ -1321,11 +1332,29 @@ def portfolio_var(positions: List[dict], marks, corr: pd.DataFrame,
                          Lots=p["lots"], DeltaCash=w, Vol=vol * 100,
                          StandaloneVaR=sd_var, StandaloneES=sd_es, _dvol=dvol))
 
-    if not rows:
-        return dict(rows=[], var=0.0, es=0.0, undiversified=0.0,
-                    gross=0.0, benefit=0.0, corr_used=False, reason="no marked positions")
+    basis_rows, basis_var_sq = [], 0.0
+    for bl in (basis_legs or []):
+        sd = abs(float(bl["exposure"])) * float(bl["vol"]) / math.sqrt(252)
+        basis_var_sq += sd ** 2
+        basis_rows.append(dict(Factor=bl["label"], DailySigma=sd,
+                               StandaloneVaR=sd * z * math.sqrt(horizon), _sd=sd))
 
-    undiversified = sum(r["StandaloneVaR"] for r in rows)
+    if not rows and not basis_rows:
+        return dict(rows=[], basis_rows=[], var=0.0, es=0.0, undiversified=0.0,
+                    gross=0.0, benefit=0.0, corr_used=False, basis_var=0.0,
+                    reason="no marked positions")
+
+    if not rows:
+        sigma = math.sqrt(basis_var_sq)
+        var = sigma * z * math.sqrt(horizon)
+        return dict(rows=[], basis_rows=basis_rows, var=var,
+                    es=sigma * norm.pdf(z) / (1 - conf) * math.sqrt(horizon),
+                    undiversified=sum(b["StandaloneVaR"] for b in basis_rows),
+                    gross=0.0, benefit=0.0, corr_used=False, basis_var=var,
+                    reason="basis risk only — no futures position marked")
+
+    undiversified = (sum(r["StandaloneVaR"] for r in rows)
+                     + sum(b["StandaloneVaR"] for b in basis_rows))
     sigma_vec = np.array([abs(r["DeltaCash"]) * r["_dvol"] for r in rows])
     sgn       = np.array([1 if r["DeltaCash"] >= 0 else -1 for r in rows])
     w_vec     = sigma_vec * sgn
@@ -1344,27 +1373,47 @@ def portfolio_var(positions: List[dict], marks, corr: pd.DataFrame,
         reason = "correlation matrix unavailable for one or more legs"
 
     if not corr_used:
-        port_sigma = float(np.abs(w_vec).sum())
+        port_sigma_f = float(np.abs(w_vec).sum())
+    else:
+        port_sigma_f = port_sigma
+
+    # Independent variance block: total σ² = σ_futures² + Σ σ_basis².
+    port_sigma = (math.sqrt(port_sigma_f ** 2 + basis_var_sq) if corr_used
+                  else port_sigma_f + math.sqrt(basis_var_sq))
 
     var = port_sigma * z * math.sqrt(horizon)
     es  = port_sigma * norm.pdf(z) / (1 - conf) * math.sqrt(horizon)
 
     if corr_used and port_sigma > 0:
+        # Euler decomposition on the TOTAL sigma, so futures and basis components
+        # still sum exactly to VaR.
         mcv = (R @ w_vec) / port_sigma
         for i, rrow in enumerate(rows):
             comp = w_vec[i] * mcv[i] / port_sigma * var
             rrow["ComponentVaR"] = float(comp)
             rrow["PctOfVaR"] = float(comp / var * 100) if var else 0.0
+        for brow in basis_rows:
+            comp = brow["_sd"] ** 2 / port_sigma ** 2 * var
+            brow["ComponentVaR"] = float(comp)
+            brow["PctOfVaR"] = float(comp / var * 100) if var else 0.0
     else:
         for rrow in rows:
             rrow["ComponentVaR"] = rrow["StandaloneVaR"]
             rrow["PctOfVaR"] = (rrow["StandaloneVaR"] / undiversified * 100
                                 if undiversified else 0.0)
+        for brow in basis_rows:
+            brow["ComponentVaR"] = brow["StandaloneVaR"]
+            brow["PctOfVaR"] = (brow["StandaloneVaR"] / undiversified * 100
+                                if undiversified else 0.0)
+    for brow in basis_rows:
+        brow.pop("_sd", None)
 
     for rrow in rows:
         rrow.pop("_dvol", None)
 
-    return dict(rows=rows, var=var, es=es, undiversified=undiversified, gross=gross,
+    return dict(rows=rows, basis_rows=basis_rows, var=var, es=es,
+                undiversified=undiversified, gross=gross,
+                basis_var=math.sqrt(basis_var_sq) * z * math.sqrt(horizon),
                 benefit=(undiversified - var) / undiversified * 100 if undiversified else 0.0,
                 corr_used=corr_used, reason=reason)
 
@@ -1845,6 +1894,310 @@ def roll_calendar(positions: List[dict], marks,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  PHYSICAL CARGO — the merchant layer
+# ══════════════════════════════════════════════════════════════════════════════
+#  A physical cargo is automatically long flat price. This module books the cargo,
+#  DERIVES its futures hedge, and splits the result into the components a merchant
+#  is actually paid for: basis, freight, carry and the residual flat price.
+#
+#  Three design rules, and they are the whole point:
+#
+#  1. ONE MODEL, NO SPECIAL CASES. A cargo is a buy leg, an optional sell leg and a
+#     hedge. An outright ("fixed price") purchase is not a separate mode: the desk
+#     computes the differential it implies against the pricing month and runs the
+#     same arithmetic. Flexibility comes from empty fields, not from branches.
+#
+#  2. THE COMPONENTS MUST RECONCILE. Attribution is computed twice — once by
+#     component, once directly from the legs — and the difference is displayed as
+#     UNEXPLAINED RESIDUAL. It is zero by algebra, so any non-zero value is a real
+#     implementation defect made visible rather than rounded away.
+#
+#  3. ASSESSMENTS ARE NOT MARKET DATA. Differentials and freight are user inputs
+#     (Platts/Argus/Baltic are licensed and this desk has no feed). Every number
+#     derived from them is tagged, and an unrealised basis P&L is labelled a MARK
+#     against the user's own assessment — never presented as a fact.
+
+# Native units per one trade unit. Density and test weight are grade-dependent, so
+# these are INDICATIVE defaults: the booking form shows the factor and lets the user
+# overwrite it, and the factor used is stored with the cargo.
+CARGO_UNIT_FACTORS: Dict[str, Dict[str, float]] = {
+    "WTI Crude (CL)":         {"bbl": 1.0, "mt": 7.33, "m3": 6.2898},
+    "Brent Crude (BZ)":       {"bbl": 1.0, "mt": 7.45, "m3": 6.2898},
+    "RBOB Gasoline (RB)":     {"gal": 1.0, "bbl": 42.0, "mt": 333.4},
+    "ULSD Heating Oil (HO)":  {"gal": 1.0, "bbl": 42.0, "mt": 309.0},
+    "Henry Hub Nat Gas (NG)": {"MMBtu": 1.0, "therm": 0.1, "MWh": 3.412},
+    "Gold (GC)":              {"troy oz": 1.0, "kg": 32.1507},
+    "Silver (SI)":            {"troy oz": 1.0, "kg": 32.1507, "mt": 32150.7},
+    "Copper (HG)":            {"lb": 1.0, "mt": 2204.62, "short ton": 2000.0},
+    "Platinum (PL)":          {"troy oz": 1.0, "kg": 32.1507},
+    "Palladium (PA)":         {"troy oz": 1.0, "kg": 32.1507},
+    "Corn (ZC)":              {"bu": 1.0, "mt": 39.3680, "short ton": 35.714},
+    "Wheat CBOT SRW (ZW)":    {"bu": 1.0, "mt": 36.7437, "short ton": 33.333},
+    "Soybeans (ZS)":          {"bu": 1.0, "mt": 36.7437, "short ton": 33.333},
+    "Soybean Meal (ZM)":      {"short ton": 1.0, "mt": 1.10231},
+    "Soybean Oil (ZL)":       {"lb": 1.0, "mt": 2204.62, "short ton": 2000.0},
+    "Sugar #11 (SB)":         {"lb": 1.0, "mt": 2204.62},
+    "Arabica Coffee (KC)":    {"lb": 1.0, "mt": 2204.62, "bag (60kg)": 132.277},
+    "Cocoa (CC)":             {"mt": 1.0, "short ton": 0.907185},
+    "Live Cattle (LE)":       {"lb": 1.0, "head (1,350lb)": 1350.0},
+    "Lean Hogs (HE)":         {"lb": 1.0, "head (285lb)": 285.0},
+}
+# The native unit must map to itself, or the booking form would offer a conversion
+# that silently rescales the cargo. Checked at import, like the contract registry.
+for _n, _u in CARGO_UNIT_FACTORS.items():
+    assert _n in COMMODITIES, f"cargo units: unknown contract {_n}"
+    assert _u.get(COMMODITIES[_n]["size_unit"]) == 1.0, (
+        f"cargo units: {_n} is missing an identity factor for its native unit "
+        f"{COMMODITIES[_n]['size_unit']!r}")
+assert set(CARGO_UNIT_FACTORS) == set(COMMODITIES), "cargo units: registry mismatch"
+
+CARGO_STAGES = ["Booked", "In transit", "Priced", "Sold", "Settled"]
+INCOTERMS = ["FOB", "CFR", "CIF", "DAP", "EXW"]
+
+
+def cargo_trade_units(commodity: str) -> Dict[str, float]:
+    """Trade units offered for a commodity, native unit first."""
+    return CARGO_UNIT_FACTORS.get(
+        commodity, {COMMODITIES[commodity]["size_unit"]: 1.0})
+
+
+def cargo_money(commodity: str, price_qu: float, vol_native: float) -> float:
+    """Cash value of `price_qu` (in QUOTE units) applied to `vol_native` native
+    units. The cents divisor is applied here and nowhere else: corn at 18 c/bu over
+    100,000 bu is $18,000, not $1.8m."""
+    div = COMMODITIES[commodity].get("price_divisor", 1.0)
+    return price_qu * vol_native / div
+
+
+def cargo_volume_native(cg: dict) -> float:
+    return float(cg["volume"]) * float(cg.get("unit_factor", 1.0))
+
+
+def cargo_hedge_lots(commodity: str, vol_native: float, ratio: float = 1.0) -> int:
+    """Whole lots closest to the requested hedge ratio. The leftover is NEVER
+    rounded away silently — cargo_attribution reports it as residual flat price."""
+    cs = COMMODITIES[commodity]["contract_size"]
+    return int(round(vol_native * ratio / cs))
+
+
+def cargo_carries_freight(side: str, incoterm: str) -> bool:
+    """Who pays the freight, by Incoterm. A buyer pays it on FOB/EXW terms; on
+    CFR/CIF/DAP it is inside the seller's price. Seeded, and overridable — real
+    contracts are messier than the three-letter code suggests."""
+    if side == "Buy":
+        return incoterm in ("FOB", "EXW")
+    return incoterm in ("CFR", "CIF", "DAP")
+
+
+def default_basis_vol(commodity: str, price: float) -> float:
+    """Indicative annual volatility of the DIFFERENTIAL, in quote units. Differential
+    histories are licensed data this desk does not have, so this is a stated default
+    (a small fraction of flat-price vol) and the page invites the user to replace it
+    with their own number."""
+    c = COMMODITIES[commodity]
+    return abs(price) * c["vol"] * 0.05
+
+
+def cargo_pricing_price(cg: dict, marks) -> Optional[float]:
+    """Live price of the cargo's PRICING contract. None => the cargo cannot be
+    marked and its attribution stands down (no proxying)."""
+    if cg.get("pricing_ticker"):
+        dm = dated_mark(cg["pricing_ticker"])
+        return dm["price"] if dm else None
+    return marks.get(cg["commodity"])
+
+
+def cargo_hedge_price(cg: dict, marks) -> Optional[float]:
+    if not cg.get("hedge_lots"):
+        return None
+    if cg.get("hedge_ticker"):
+        dm = dated_mark(cg["hedge_ticker"])
+        return dm["price"] if dm else None
+    return marks.get(cg["commodity"])
+
+
+def cargo_attribution(cg: dict, marks) -> dict:
+    """
+    Exact P&L decomposition of one cargo plus its hedge.
+
+    Notation, per trade unit and in quote units:
+        B0, B1  pricing-benchmark price at purchase / now (or at sale, if realised)
+        d0, d1  purchase differential / sale differential (realised) or user mark
+        H0, H1  hedge contract price at entry / now
+        V       cargo volume in native units,  Vh = hedged volume (lots × size)
+
+    Physical P&L = [(B1+d1) − (B0+d0)] · V · sgn
+    Hedge P&L    = −(H1−H0) · Vh · sgn                       (short hedge for a buy)
+
+    Which splits EXACTLY into three readable pieces:
+        flat_residual = (B1−B0)·(V−Vh)·sgn        unhedged volume only
+        carry_timing  = −[(H1−H0) − (B1−B0)]·Vh·sgn   hedge month ≠ pricing month
+        basis         = (d1−d0)·V·sgn             the trade the merchant is paid for
+    (expand and the B- and H-terms cancel: the sum is Physical + Hedge, identically).
+
+    Costs — freight, storage, financing, other — are then subtracted. `residual` is
+    NET computed directly minus the sum of the components: zero by algebra, shown
+    anyway so that a missing leg is visible instead of silent.
+    """
+    name = cg["commodity"]
+    sgn = 1.0 if cg["side"] == "Buy" else -1.0
+    V = cargo_volume_native(cg)
+    cs = COMMODITIES[name]["contract_size"]
+    Vh = float(cg.get("hedge_lots", 0)) * cs
+
+    realised = (cg.get("stage") in ("Sold", "Settled")
+                and cg.get("diff_sell") is not None
+                and cg.get("bench_sell") is not None)
+
+    B0 = float(cg["bench_buy"])
+    d0 = float(cg["diff_buy"])
+
+    if realised:
+        B1 = float(cg["bench_sell"])
+        d1 = float(cg["diff_sell"])
+    else:
+        live = cargo_pricing_price(cg, marks)
+        if live is None:
+            return dict(available=False,
+                        reason="pricing contract has no mark — cargo cannot be valued")
+        B1 = float(live)
+        d1 = float(cg.get("diff_mark", d0))
+
+    H0 = float(cg.get("hedge_entry", B0))
+    if Vh == 0:
+        H1 = H0                       # no hedge: the hedge legs vanish, not error
+    elif cg.get("hedge_exit") is not None:
+        H1 = float(cg["hedge_exit"])
+    elif realised and (cg.get("hedge_ticker") == cg.get("pricing_ticker")):
+        # Same contract: the hedge must be marked at the same price as the pricing
+        # leg, or a phantom carry appears out of nothing.
+        H1 = B1
+    else:
+        hp = cargo_hedge_price(cg, marks)
+        if hp is None:
+            return dict(available=False,
+                        reason="hedge contract has no mark — cargo cannot be valued")
+        H1 = float(hp)
+
+    # ── Components ───────────────────────────────────────────────────────────
+    flat_residual = cargo_money(name, B1 - B0, V - Vh) * sgn
+    carry_timing = -cargo_money(name, (H1 - H0) - (B1 - B0), Vh) * sgn
+    basis = cargo_money(name, d1 - d0, V) * sgn
+
+    freight_used = cg.get("freight_actual")
+    freight_is_actual = freight_used is not None
+    if not freight_is_actual:
+        freight_used = cg.get("freight_budget", 0.0) or 0.0
+    freight_cost = (cargo_money(name, float(freight_used), V)
+                    if cg.get("carries_freight") else 0.0)
+
+    months = float(cg.get("storage_days", 0) or 0) / 30.4375
+    storage_cost = cargo_money(name, float(cg.get("storage_rate", 0.0) or 0.0) * months, V)
+    fin_days = float(cg.get("finance_days", 0) or 0)
+    fin_rate = float(cg.get("finance_rate", 0.0) or 0.0)
+    finance_cost = cargo_money(name, (B0 + d0) * fin_rate * fin_days / 365.0, V)
+    other_cost = float(cg.get("other_cost", 0.0) or 0.0)
+
+    # ── Direct computation, for reconciliation ───────────────────────────────
+    physical = cargo_money(name, (B1 + d1) - (B0 + d0), V) * sgn
+    hedge = -cargo_money(name, H1 - H0, Vh) * sgn
+    costs = freight_cost + storage_cost + finance_cost + other_cost
+    net_direct = physical + hedge - costs
+
+    comps = [
+        dict(label="Flat price — residual (unhedged volume)", value=flat_residual,
+             source="live" if not realised else "realised", kind="market"),
+        dict(label="Carry / timing (hedge vs pricing month)", value=carry_timing,
+             source="live" if not realised else "realised", kind="market"),
+        dict(label="Basis (differential)", value=basis,
+             source="realised" if realised else "USER MARK", kind="basis"),
+        dict(label=f"Freight ({'actual' if freight_is_actual else 'budget'})",
+             value=-freight_cost, source="USER INPUT", kind="cost"),
+        dict(label="Storage", value=-storage_cost, source="USER INPUT", kind="cost"),
+        dict(label="Financing", value=-finance_cost, source="SOFR + user terms", kind="cost"),
+        dict(label="Demurrage / other", value=-other_cost, source="USER INPUT", kind="cost"),
+    ]
+    comp_sum = sum(c["value"] for c in comps)
+    residual = net_direct - comp_sum
+
+    gross_abs = sum(abs(c["value"]) for c in comps) or 1.0
+    for c in comps:
+        c["share"] = abs(c["value"]) / gross_abs * 100
+
+    landed = (B0 + d0
+              + (float(freight_used) if cg.get("carries_freight") else 0.0)
+              + float(cg.get("storage_rate", 0.0) or 0.0) * months
+              + (B0 + d0) * fin_rate * fin_days / 365.0)
+
+    return dict(available=True, realised=realised, components=comps,
+                net=net_direct, residual=residual, physical=physical, hedge=hedge,
+                costs=costs, flat_net=physical + hedge,
+                B0=B0, B1=B1, d0=d0, d1=d1, H0=H0, H1=H1,
+                V=V, Vh=Vh, residual_volume=V - Vh, landed_cost=landed,
+                basis_value=basis, hedge_ratio=(Vh / V * 100 if V else 0.0))
+
+
+def cargo_hedge_positions(cargos: List[dict]) -> List[dict]:
+    """Futures legs DERIVED from the cargo book — never stored separately.
+
+    Storing the hedge as its own blotter row would let it drift out of sync with the
+    cargo it hedges (edit the volume, forget the leg). Deriving it makes that class
+    of bug impossible: the hedge is a view of the cargo, tagged and read-only in the
+    Blotter, and it flows into the risk engine like any other position."""
+    out = []
+    for cg in cargos:
+        lots = int(cg.get("hedge_lots", 0) or 0)
+        if lots <= 0:
+            continue
+        out.append(dict(
+            commodity=cg["commodity"], kind="future",
+            side="Short" if cg["side"] == "Buy" else "Long",
+            lots=lots, entry=float(cg.get("hedge_entry", 0.0)),
+            strip_ticker=cg.get("hedge_ticker"),
+            strip_label=cg.get("hedge_label", ""),
+            trade_date=cg.get("booked_date"),
+            cargo_id=cg["id"], derived=True))
+    return out
+
+
+def cargo_risk_legs(cargos: List[dict], marks) -> Tuple[List[dict], List[dict]]:
+    """Risk representation of the PHYSICAL side.
+
+    Returns (flat_legs, basis_legs):
+      • flat_legs  — synthetic futures positions carrying the cargo's flat-price
+        exposure at its pricing month. Netted against the derived hedge legs by the
+        VaR engine, they leave exactly the unhedged residual — which is the honest
+        answer, not zero.
+      • basis_legs — the differential's own risk, in cash per 1.0 move, with an
+        annual vol in quote units. Treated as INDEPENDENT of the futures book because
+        this desk has no differential history to estimate a correlation from; the
+        assumption is stated on the page rather than buried.
+    """
+    flat, basis = [], []
+    for cg in cargos:
+        name = cg["commodity"]
+        V = cargo_volume_native(cg)
+        if V <= 0:
+            continue
+        cs = COMMODITIES[name]["contract_size"]
+        px = cargo_pricing_price(cg, marks)
+        if px is None:
+            continue
+        flat.append(dict(commodity=name, kind="future",
+                         side="Long" if cg["side"] == "Buy" else "Short",
+                         lots=V / cs, entry=float(cg["bench_buy"]),
+                         strip_ticker=cg.get("pricing_ticker"),
+                         strip_label=cg.get("pricing_label", ""),
+                         cargo_id=cg["id"], physical=True, derived=True))
+        bvol = cg.get("basis_vol")
+        if bvol is None:
+            bvol = default_basis_vol(name, px)
+        basis.append(dict(label=f"{cg.get('grade') or name} basis ({cg['id']})",
+                          exposure=cargo_money(name, 1.0, V), vol=float(bvol)))
+    return flat, basis
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  BLOTTER PERSISTENCE — per-book files keyed by a ?book= id in the URL
 # ══════════════════════════════════════════════════════════════════════════════
 BLOTTER_DIR = ".blotters"
@@ -1904,31 +2257,102 @@ def blotter_deserialise(payload) -> List[dict]:
     return out
 
 
-def blotter_save(positions: List[dict]) -> None:
+def book_serialise(positions: List[dict], cargos: List[dict]) -> str:
+    """Whole-book payload. The legacy format was a bare list of positions; this one
+    is a dict so cargoes travel with the book, and the loader still accepts a list."""
+    return json.dumps(dict(version=2, positions=positions, cargos=cargos),
+                      indent=2, default=str)
+
+
+def cargo_deserialise(raw) -> List[dict]:
+    """Validate imported cargoes. Unknown contracts are dropped (the registry may
+    have changed); every numeric field is coerced with a safe default so a truncated
+    file degrades into a valid cargo rather than crashing a page."""
+    out = []
+    for c in (raw or []):
+        if c.get("commodity") not in COMMODITIES:
+            continue
+        def f(k, d=0.0):
+            try:
+                v = c.get(k)
+                return d if v is None else float(v)
+            except (TypeError, ValueError):
+                return d
+        cg = dict(
+            id=str(c.get("id") or f"c{uuid.uuid4().hex[:6]}"),
+            commodity=c["commodity"],
+            side="Buy" if c.get("side", "Buy") == "Buy" else "Sell",
+            grade=str(c.get("grade") or ""),
+            volume=f("volume"), trade_unit=str(c.get("trade_unit") or
+                                               COMMODITIES[c["commodity"]]["size_unit"]),
+            unit_factor=f("unit_factor", 1.0) or 1.0,
+            pricing_ticker=c.get("pricing_ticker"),
+            pricing_label=str(c.get("pricing_label") or ""),
+            pricing_basis=str(c.get("pricing_basis") or "Single settle"),
+            pricing_window=c.get("pricing_window"),
+            bench_buy=f("bench_buy"), diff_buy=f("diff_buy"),
+            diff_mark=(f("diff_mark") if c.get("diff_mark") is not None else f("diff_buy")),
+            diff_mark_date=str(c.get("diff_mark_date") or date.today().isoformat()),
+            diff_sell=(float(c["diff_sell"]) if c.get("diff_sell") is not None else None),
+            bench_sell=(float(c["bench_sell"]) if c.get("bench_sell") is not None else None),
+            hedge_lots=int(f("hedge_lots")), hedge_ticker=c.get("hedge_ticker"),
+            hedge_label=str(c.get("hedge_label") or ""),
+            hedge_entry=f("hedge_entry"),
+            hedge_exit=(float(c["hedge_exit"]) if c.get("hedge_exit") is not None else None),
+            incoterm=str(c.get("incoterm") or "FOB"),
+            carries_freight=bool(c.get("carries_freight", False)),
+            freight_budget=f("freight_budget"),
+            freight_actual=(float(c["freight_actual"])
+                            if c.get("freight_actual") is not None else None),
+            finance_rate=f("finance_rate"), finance_days=int(f("finance_days")),
+            storage_rate=f("storage_rate"), storage_days=int(f("storage_days")),
+            other_cost=f("other_cost"),
+            basis_vol=(float(c["basis_vol"]) if c.get("basis_vol") is not None else None),
+            stage=(c.get("stage") if c.get("stage") in CARGO_STAGES else "Booked"),
+            booked_date=str(c.get("booked_date") or date.today().isoformat()),
+            notes=str(c.get("notes") or ""))
+        out.append(cg)
+    return out
+
+
+def book_deserialise(payload) -> Tuple[List[dict], List[dict]]:
+    raw = json.loads(payload) if isinstance(payload, str) else payload
+    if isinstance(raw, list):                       # legacy: positions only
+        return blotter_deserialise(raw), []
+    return (blotter_deserialise(raw.get("positions", [])),
+            cargo_deserialise(raw.get("cargos", [])))
+
+
+def book_save(positions: List[dict], cargos: List[dict]) -> None:
     try:
         os.makedirs(BLOTTER_DIR, exist_ok=True)
         with open(_blotter_path(_book_id()), "w") as f:
-            f.write(blotter_serialise(positions))
+            f.write(book_serialise(positions, cargos))
     except Exception as e:
-        LOG.warning("blotter save failed: %s", e)
+        LOG.warning("book save failed: %s", e)
 
 
-def blotter_load() -> List[dict]:
+def book_load() -> Tuple[List[dict], List[dict]]:
     path = _blotter_path(_book_id())
     try:
         if os.path.exists(path):
             with open(path) as f:
-                return blotter_deserialise(f.read())
-        # One-time migration from the legacy shared file.
+                return book_deserialise(f.read())
         if os.path.exists(LEGACY_BLOTTER):
             with open(LEGACY_BLOTTER) as f:
-                pos = blotter_deserialise(f.read())
-            if pos:
-                LOG.info("migrated %d position(s) from legacy blotter.json", len(pos))
-            return pos
+                return book_deserialise(f.read())
     except Exception as e:
-        LOG.warning("blotter load failed: %s", e)
-    return []
+        LOG.warning("book load failed: %s", e)
+    return [], []
+
+
+def blotter_save(positions: List[dict]) -> None:
+    """Kept for the positions-only call sites: preserves any cargoes already saved."""
+    book_save(positions, st.session_state.get("cargos", []))
+
+
+def blotter_load() -> List[dict]:
+    return book_load()[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2003,7 +2427,7 @@ NAV_SECTIONS = {
         "🎯  Options Pricer", "🌊  Vol Surface",
     ],
     "Book & Risk": [
-        "📒  Trade Blotter", "⚠️  Portfolio Risk",
+        "📒  Trade Blotter", "🚢  Physical Cargo", "⚠️  Portfolio Risk",
     ],
     "Reference": [
         "🌍  Macro Rates", "ℹ️  About",
@@ -2201,6 +2625,17 @@ PAGE_HELP: Dict[str, str] = {
         "players. <b>OI</b> = open interest, the total contracts outstanding. "
         "<b>Net</b> = long minus short. A very high percentile = a crowded trade that "
         "can unwind fast. Positions are as of Tuesday, published Friday.",
+    "Physical Cargo":
+        "A physical cargo is automatically <b>long flat price</b> — you own the barrels "
+        "or the bushels. This page books the cargo, derives the futures hedge that "
+        "cancels that exposure, and splits the result into what a merchant is actually "
+        "paid for. <b>Basis</b> (or the differential) = the price of a specific grade at "
+        "a specific place, quoted against the benchmark, e.g. WTI minus $0.90. "
+        "<b>Incoterm</b> (FOB, CFR, CIF) = who pays freight and insurance. <b>Laycan</b> "
+        "= the loading window. <b>Landed cost</b> = purchase price plus every cost you "
+        "carry. <b>Demurrage</b> = the penalty for holding a ship too long. Differentials "
+        "and freight are your own inputs — this desk has no assessment feed, so every "
+        "number derived from them is tagged, and an unsold cargo is marked, not realised.",
     "About":
         "The design contract of this desk: what is live, what is honestly not, what was "
         "excluded and why, the full revision changelog, and the known limits — stated "
@@ -2751,9 +3186,17 @@ def page_vol_surface(marks: MarkBoard) -> None:
 
 def page_blotter(marks: MarkBoard) -> None:
     render_header(marks, "Trade Blotter", "Futures (front or dated), options — marked live, per-book storage")
-    if "positions" not in st.session_state:
-        st.session_state.positions = blotter_load()
+    if "positions" not in st.session_state or "cargos" not in st.session_state:
+        pos0, cg0 = book_load()
+        st.session_state.setdefault("positions", pos0)
+        st.session_state.setdefault("cargos", cg0)
     positions = st.session_state.positions
+    cargos = st.session_state.cargos
+    hedges = cargo_hedge_positions(cargos)
+    if hedges:
+        st.caption(f"➕ {len(hedges)} cargo hedge leg(s) are included below and in risk. "
+                   "They are **derived** from the Physical Cargo page — edit the cargo, "
+                   "not the leg, and the two can never drift apart.")
 
     tab_f, tab_o, tab_io = st.tabs(["BOOK FUTURE", "BOOK OPTION", "BOOK MANAGEMENT"])
 
@@ -2914,8 +3357,9 @@ def page_blotter(marks: MarkBoard) -> None:
     else:
         st.caption("No front-month futures to attribute.")
 
+    book = positions + hedges
     st.markdown("### Net book Greeks")
-    gk = book_greeks(positions, marks)
+    gk = book_greeks(book, marks)
     t = gk["total"]
     g1, g2, g3, g4 = st.columns(4)
     kpi(g1, "Delta ($/1.0 move)", f"{t['delta']:+,.0f}", "cash per unit price move")
@@ -2926,7 +3370,7 @@ def page_blotter(marks: MarkBoard) -> None:
         RED if t["theta"] < 0 else GREEN)
 
     st.markdown("### Roll calendar")
-    rc = roll_calendar(positions, marks)
+    rc = roll_calendar(book, marks)
     if not rc:
         st.caption("Nothing to roll.")
         return
@@ -2958,13 +3402,32 @@ def page_blotter(marks: MarkBoard) -> None:
 
 def page_risk(marks: MarkBoard) -> None:
     render_header(marks, "Portfolio Risk", "Delta-equivalent VaR/ES, historical replay, dated stress")
-    positions = st.session_state.get("positions") or blotter_load()
-    if not positions:
+    if "positions" not in st.session_state or "cargos" not in st.session_state:
+        pos0, cg0 = book_load()
+        st.session_state.setdefault("positions", pos0)
+        st.session_state.setdefault("cargos", cg0)
+    positions = st.session_state.get("positions") or []
+    cargos = st.session_state.get("cargos") or []
+    flat_legs, basis_legs = cargo_risk_legs(cargos, marks)
+    book = positions + cargo_hedge_positions(cargos) + flat_legs
+    if not book:
         st.info("Book is flat — book positions in the Trade Blotter first.")
         return
 
+    view = st.radio("View", ["All", "Paper only", "Physical only"], horizontal=True,
+                    help="One book, three lenses. 'Physical only' isolates the cargoes "
+                         "and their hedges — the merchant's own P&L.")
+    if view == "Paper only":
+        book = [p for p in book if not p.get("cargo_id")]
+        basis_legs = []
+    elif view == "Physical only":
+        book = [p for p in book if p.get("cargo_id")]
+    if not book and not basis_legs:
+        st.info("Nothing in this view.")
+        return
+
     # Work on COPIES: the old page mutated the blotter's vols in session_state.
-    pos = [dict(p) for p in positions]
+    pos = [dict(p) for p in book]
 
     c1, c2, c3, c4 = st.columns(4)
     conf = c1.select_slider("Confidence", [0.90, 0.95, 0.99], 0.95)
@@ -2981,8 +3444,8 @@ def page_risk(marks: MarkBoard) -> None:
             p["risk_vol"] = COMMODITIES[p["commodity"]]["vol"]
 
     corr = correlation_matrix(2, 252)
-    res = portfolio_var(pos, marks, corr, conf, horizon, diversified)
-    if not res["rows"]:
+    res = portfolio_var(pos, marks, corr, conf, horizon, diversified, basis_legs)
+    if not res["rows"] and not res.get("basis_rows"):
         st.error("No position could be marked — VaR unavailable (no proxying).")
         return
 
@@ -2999,15 +3462,37 @@ def page_risk(marks: MarkBoard) -> None:
     elif res["reason"]:
         st.warning(f"Diversified VaR not applied: {res['reason']}.")
 
-    df = pd.DataFrame(res["rows"])
-    st.dataframe(df.style.format({"DeltaCash": "{:+,.0f}", "Vol": "{:.1f}%",
-                                  "StandaloneVaR": "{:,.0f}", "StandaloneES": "{:,.0f}",
-                                  "ComponentVaR": "{:+,.0f}", "PctOfVaR": "{:+.1f}%"}),
-                 use_container_width=True, hide_index=True)
-    st.caption("Options enter at Black-76 delta-cash and carry their UNDERLYING's vol — "
-               "gamma is not charged at this horizon (stated limitation, not an oversight).")
+    if res["rows"]:
+        df = pd.DataFrame(res["rows"])
+        st.dataframe(df.style.format({"DeltaCash": "{:+,.0f}", "Vol": "{:.1f}%",
+                                      "StandaloneVaR": "{:,.0f}", "StandaloneES": "{:,.0f}",
+                                      "ComponentVaR": "{:+,.0f}", "PctOfVaR": "{:+.1f}%"}),
+                     use_container_width=True, hide_index=True)
+        st.caption("Options enter at Black-76 delta-cash and carry their UNDERLYING's vol — "
+                   "gamma is not charged at this horizon (stated limitation, not an oversight).")
+
+    if res.get("basis_rows"):
+        st.markdown("### Basis risk (physical cargoes)")
+        bk1, bk2 = st.columns(2)
+        kpi(bk1, "Basis VaR contribution", f"${res['basis_var']:,.0f}",
+            "differential risk left after the flat-price hedge", AMBER)
+        kpi(bk2, "Share of total VaR",
+            f"{res['basis_var'] / res['var'] * 100:.0f}%" if res["var"] else "—",
+            "a hedged cargo is not a riskless cargo")
+        st.dataframe(pd.DataFrame(res["basis_rows"]).style.format(
+            {"DailySigma": "{:,.0f}", "StandaloneVaR": "{:,.0f}",
+             "ComponentVaR": "{:+,.0f}", "PctOfVaR": "{:+.1f}%"}),
+            use_container_width=True, hide_index=True)
+        st.caption("Differentials are treated as **independent** risk factors: this desk "
+                   "has no assessment history to estimate their correlation with flat "
+                   "price, so it adds their variance rather than inventing a number. "
+                   "Vols come from the cargo booking and are yours to set.")
 
     st.markdown("### Historical-simulation VaR")
+    if basis_legs:
+        st.caption("Basis risk is **not** in the historical figures below — replaying "
+                   "differential history would need an assessment feed this desk does "
+                   "not have. These numbers cover the flat-price book only.")
     hv = historical_var(pos, marks, conf, horizon)
     if hv.get("available"):
         h1, h2, h3 = st.columns(3)
@@ -3258,6 +3743,28 @@ screen says NO MARK and the analytics stand down. Nothing is interpolated into t
 **What is honestly NOT live** (each labelled on its page): regional balances (static
 IEA/USDA-style estimates), the vol surface (a stated parametrisation — no options feed),
 monthly event dates (approximate anchors), and the stress episodes (historical, dated).
+
+### Revision 5 — the merchant layer
+
+**🚢 Physical Cargo** — book a cargo (grade, location, volume in any trade unit, a
+differential OR an outright price, Incoterm, freight, storage, financing) and the desk
+**derives** the futures hedge. One model, no special cases: an outright purchase is
+stored as the differential it implies against the pricing month.
+**Attribution that reconciles** — the result splits into residual flat price, carry /
+timing (hedge month ≠ pricing month), basis, and costs. Components are computed twice —
+by part and directly from the legs — and the difference is displayed as **UNEXPLAINED
+RESIDUAL**. It is zero by algebra, so any non-zero value is a real defect made visible.
+Unrealised basis is tagged **USER MARK**, never presented as a fact.
+**Derived hedges** — cargo hedge legs are generated from the cargo, never stored
+separately, so they cannot drift out of sync with it. They appear tagged in the Blotter
+and flow into Greeks, the roll calendar and risk.
+**Basis risk in VaR** — a fully hedged cargo nets flat price to zero, and that is not
+riskless. Differentials enter as independent variance factors (no assessment history
+exists here to correlate them), with the assumption stated on the page. Portfolio Risk
+gains an All / Paper only / Physical only lens.
+**Not modelled, and said so** — no Platts/Argus/Baltic feed, no freight curve, no
+quality optimisation, and a hedge against an *average* pricing window carries timing
+risk the desk does not capture.
 
 ### Revision 4 — the curve through time
 
@@ -3769,6 +4276,383 @@ def page_cot(marks: MarkBoard) -> None:
                "Reading, not gospel: COT is positioning, not a signal by itself.")
 
 
+def _cargo_state() -> List[dict]:
+    if "cargos" not in st.session_state:
+        st.session_state.cargos = book_load()[1]
+    return st.session_state.cargos
+
+
+def _cargo_persist() -> None:
+    book_save(st.session_state.get("positions", []), st.session_state.get("cargos", []))
+
+
+def page_cargo(marks: MarkBoard) -> None:
+    render_header(marks, "Physical Cargo",
+                  "Cargo economics with the paper hedge — flat price out, basis and freight in")
+    cargos = _cargo_state()
+    t_book, t_list, t_attr, t_life = st.tabs(
+        ["BOOK CARGO", f"CARGO BOOK ({len(cargos)})", "ATTRIBUTION", "LIFECYCLE"])
+
+    with t_book:
+        _cargo_book_form(marks)
+    with t_list:
+        _cargo_book_list(marks, cargos)
+    with t_attr:
+        _cargo_attribution_tab(marks, cargos)
+    with t_life:
+        _cargo_lifecycle_tab(marks, cargos)
+
+
+def _cargo_book_form(marks: MarkBoard) -> None:
+    st.markdown("Every field below the volume is optional — leave freight, storage or "
+                "financing at zero and the model collapses cleanly to a simple hedged "
+                "cargo.")
+    c1, c2, c3 = st.columns(3)
+    name = c1.selectbox("Benchmark contract", list(COMMODITIES), key="cg_bench")
+    side = c2.radio("Side", ["Buy", "Sell forward"], horizontal=True, key="cg_side")
+    side_key = "Buy" if side == "Buy" else "Sell"
+    grade = c3.text_input("Grade / location", value="", placeholder="e.g. Midland, FOB Houston")
+
+    mark = require_mark(marks, name)
+    if mark is None:
+        return
+    c = COMMODITIES[name]
+    strip = fetch_forward_strip(name)
+    if strip.empty:
+        st.error("**NO LIVE STRIP** — a cargo prices against a dated month. "
+                 "No curve is fitted in its place.")
+        return
+
+    # ── Pricing ──────────────────────────────────────────────────────────────
+    st.markdown("##### Pricing")
+    p1, p2, p3 = st.columns(3)
+    pidx = p1.selectbox("Pricing month", range(len(strip)),
+                        format_func=lambda i: f"{strip['label'].iloc[i]} (T={strip['T'].iloc[i]:.2f}y)")
+    B0_live = float(strip["price"].iloc[pidx])
+    price_mode = p2.radio("Price as", ["Differential to benchmark", "Outright (fixed)"],
+                          key="cg_pmode",
+                          help="An outright price is not a separate model: the desk "
+                               "computes the differential it implies against the "
+                               "pricing month and runs the same arithmetic.")
+    bench_buy = p3.number_input("Benchmark at pricing", value=float(round(B0_live, 4)),
+                                step=0.01, format="%.4f",
+                                help="Defaults to the live settle of the pricing month. "
+                                     "Overwrite with the price you actually priced against.")
+    q1, q2 = st.columns(2)
+    if price_mode.startswith("Differential"):
+        diff_buy = q1.number_input(f"Differential ({c['unit']})", value=0.0,
+                                   step=0.01, format="%.4f")
+        q2.metric("Implied outright", f"{bench_buy + diff_buy:,.4f}")
+    else:
+        outright = q1.number_input(f"Outright price ({c['unit']})",
+                                   value=float(round(B0_live, 4)), step=0.01, format="%.4f")
+        diff_buy = outright - bench_buy
+        q2.metric("Implied differential", f"{diff_buy:+,.4f}",
+                  help="This is what the outright price is worth relative to the "
+                       "pricing month — the number the desk actually trades.")
+
+    pb1, pb2 = st.columns(2)
+    pricing_basis = pb1.radio("Pricing basis", ["Single settle", "Average over window", "Fixed"],
+                              horizontal=True)
+    if pricing_basis.startswith("Average"):
+        win = pb2.date_input("Pricing window", value=(date.today(), date.today() + timedelta(days=30)))
+        st.caption("⚠️ A hedge against an **average** unwinds progressively; this desk "
+                   "models a single hedge price, so the timing risk inside the window is "
+                   "**not** captured. Stated, not hidden.")
+    else:
+        win = None
+
+    # ── Volume ───────────────────────────────────────────────────────────────
+    st.markdown("##### Volume")
+    v1, v2, v3 = st.columns(3)
+    units = cargo_trade_units(name)
+    tu = v1.selectbox("Trade unit", list(units))
+    factor = v2.number_input(f"{c['size_unit']} per {tu}", value=float(units[tu]),
+                             step=0.0001, format="%.4f",
+                             help="Density and test weight are grade-dependent — this "
+                                  "default is indicative. Overwrite it and the value used "
+                                  "is stored with the cargo.")
+    volume = v3.number_input(f"Volume ({tu})", value=100_000.0, step=1_000.0, min_value=0.0)
+    V = volume * factor
+    st.caption(f"= **{V:,.0f} {c['size_unit']}** · one lot = {c['contract_size']:,} "
+               f"{c['size_unit']} → {V / c['contract_size']:,.2f} lots")
+
+    # ── Hedge ────────────────────────────────────────────────────────────────
+    st.markdown("##### Hedge")
+    h1, h2, h3 = st.columns(3)
+    ratio = h1.slider("Hedge ratio", 0.0, 1.2, 1.0, 0.05,
+                      help="Deliberate under-hedging is a merchant decision, not an "
+                           "error — the open slice is reported as residual flat price.")
+    proposed = cargo_hedge_lots(name, V, ratio)
+    lots = h2.number_input("Hedge lots", value=int(proposed), step=1, min_value=0)
+    hidx = h3.selectbox("Hedge month", range(len(strip)), index=pidx,
+                        format_func=lambda i: strip["label"].iloc[i])
+    hedge_entry = st.number_input("Hedge entry price",
+                                  value=float(round(strip["price"].iloc[hidx], 4)),
+                                  step=0.01, format="%.4f")
+    Vh = lots * c["contract_size"]
+    resid = V - Vh
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Hedged volume", f"{Vh:,.0f} {c['size_unit']}")
+    r2.metric("Residual (unhedged)", f"{resid:+,.0f} {c['size_unit']}",
+              delta=f"{resid / V * 100:+.2f}%" if V else None, delta_color="off")
+    r3.metric("Hedge month vs pricing",
+              "same" if hidx == pidx else f"{strip['label'].iloc[hidx]} vs {strip['label'].iloc[pidx]}")
+    if hidx != pidx:
+        st.caption("Hedging a different month than you price against creates a **carry / "
+                   "timing** leg — it will appear as its own line in the attribution.")
+
+    # ── Costs ────────────────────────────────────────────────────────────────
+    st.markdown("##### Costs")
+    inc1, inc2, inc3 = st.columns(3)
+    incoterm = inc1.selectbox("Incoterm", INCOTERMS)
+    carries = inc2.toggle("I carry the freight",
+                          value=cargo_carries_freight(side_key, incoterm),
+                          help="Seeded from the Incoterm and your side. Real contracts "
+                               "are messier than the three-letter code — override freely.")
+    freight_budget = inc3.number_input(f"Freight budget ({c['unit']})", value=0.0,
+                                       step=0.01, format="%.4f")
+    s1, s2, s3, s4 = st.columns(4)
+    sofr = live_sofr()
+    fin_rate = s1.number_input("Financing rate (%)",
+                               value=float(round((sofr[0] * 100) if sofr else 4.50, 2)),
+                               step=0.05) / 100.0
+    fin_days = s2.number_input("Days financed", value=0, step=1, min_value=0)
+    stor_def, _ = default_storage_pm(name, mark)
+    stor_rate = s3.number_input(f"Storage ({c['unit']}/month)",
+                                value=float(round(stor_def or 0.0, 4)),
+                                step=0.001, format="%.4f")
+    stor_days = s4.number_input("Days stored", value=0, step=1, min_value=0)
+    o1, o2 = st.columns(2)
+    other = o1.number_input("Demurrage / other ($ cash)", value=0.0, step=100.0)
+    bvol = o2.number_input(f"Basis vol (annual, {c['unit']})",
+                           value=float(round(default_basis_vol(name, mark), 4)),
+                           step=0.01, format="%.4f",
+                           help="Volatility of the DIFFERENTIAL, used by Portfolio Risk. "
+                                "Differential histories are licensed data this desk does "
+                                "not have — this default is indicative.")
+    notes = st.text_input("Notes", value="", placeholder="laycan, counterparty, terms…")
+
+    if st.button("📦 Book cargo + hedge", type="primary", use_container_width=True):
+        cg = dict(
+            id=f"c{uuid.uuid4().hex[:6]}", commodity=name, side=side_key,
+            grade=grade.strip(), volume=float(volume), trade_unit=tu,
+            unit_factor=float(factor),
+            pricing_ticker=str(strip["ticker"].iloc[pidx]),
+            pricing_label=str(strip["label"].iloc[pidx]),
+            pricing_basis=pricing_basis,
+            pricing_window=[d.isoformat() for d in win] if win else None,
+            bench_buy=float(bench_buy), diff_buy=float(diff_buy),
+            diff_mark=float(diff_buy), diff_mark_date=date.today().isoformat(),
+            diff_sell=None, bench_sell=None,
+            hedge_lots=int(lots), hedge_ticker=str(strip["ticker"].iloc[hidx]),
+            hedge_label=str(strip["label"].iloc[hidx]),
+            hedge_entry=float(hedge_entry), hedge_exit=None,
+            incoterm=incoterm, carries_freight=bool(carries),
+            freight_budget=float(freight_budget), freight_actual=None,
+            finance_rate=float(fin_rate), finance_days=int(fin_days),
+            storage_rate=float(stor_rate), storage_days=int(stor_days),
+            other_cost=float(other), basis_vol=float(bvol),
+            stage="Booked", booked_date=date.today().isoformat(), notes=notes.strip())
+        st.session_state.cargos = _cargo_state() + [cg]
+        _cargo_persist()
+        st.success(f"Cargo **{cg['id']}** booked — hedge {lots} lots "
+                   f"{'short' if side_key == 'Buy' else 'long'} "
+                   f"{strip['label'].iloc[hidx]} is now live in the Trade Blotter.")
+        st.rerun()
+
+
+def _cargo_book_list(marks: MarkBoard, cargos: List[dict]) -> None:
+    if not cargos:
+        st.info("No cargo booked yet.")
+        return
+    rows = []
+    for cg in cargos:
+        a = cargo_attribution(cg, marks)
+        rows.append(dict(
+            ID=cg["id"], Stage=cg["stage"], Side=cg["side"],
+            Contract=cg["commodity"], Grade=cg.get("grade") or "—",
+            Volume=f"{cg['volume']:,.0f} {cg['trade_unit']}",
+            Pricing=cg.get("pricing_label", "—"),
+            Diff=cg["diff_buy"], Hedge=f"{cg.get('hedge_lots', 0)} lots",
+            Landed=(a["landed_cost"] if a.get("available") else np.nan),
+            Result=(a["net"] if a.get("available") else np.nan)))
+    df = pd.DataFrame(rows)
+    st.dataframe(df.style.format({"Diff": "{:+,.4f}", "Landed": "{:,.4f}",
+                                  "Result": "{:+,.0f}"}, na_rep="NO MARK"),
+                 use_container_width=True, hide_index=True)
+    st.caption("Landed cost is purchase price plus every cost you carry, per unit. "
+               "A cargo whose pricing contract has no mark shows **NO MARK** and is "
+               "excluded from totals rather than proxied.")
+
+    d1, d2 = st.columns([3, 1])
+    victim = d1.selectbox("Remove cargo", [c["id"] for c in cargos],
+                          format_func=lambda i: f"{i} — "
+                          f"{next(c['commodity'] for c in cargos if c['id'] == i)}")
+    if d2.button("Delete", use_container_width=True):
+        st.session_state.cargos = [c for c in cargos if c["id"] != victim]
+        _cargo_persist()
+        st.rerun()
+    st.caption("Deleting a cargo removes its hedge leg too — the hedge is derived from "
+               "the cargo, never stored separately, so the two can never drift apart.")
+
+
+def _cargo_attribution_tab(marks: MarkBoard, cargos: List[dict]) -> None:
+    if not cargos:
+        st.info("No cargo booked yet.")
+        return
+    cid = st.selectbox("Cargo", [c["id"] for c in cargos],
+                       format_func=lambda i: (
+                           f"{i} — {next(c['commodity'] for c in cargos if c['id'] == i)} "
+                           f"{next(c.get('grade') or '' for c in cargos if c['id'] == i)}"))
+    cg = next(c for c in cargos if c["id"] == cid)
+    a = cargo_attribution(cg, marks)
+    if not a.get("available"):
+        st.error(f"**NO MARK** — {a.get('reason')}. Nothing is shown in its place.")
+        return
+
+    name = cg["commodity"]
+    c = COMMODITIES[name]
+    k1, k2, k3, k4 = st.columns(4)
+    kpi(k1, "Landed cost", f"{a['landed_cost']:,.4f}", f"{c['unit']} all-in")
+    kpi(k2, "Hedge ratio", f"{a['hedge_ratio']:.1f}%",
+        f"residual {a['residual_volume']:+,.0f} {c['size_unit']}",
+        GREEN if abs(a["hedge_ratio"] - 100) < 2 else AMBER)
+    kpi(k3, "Flat price, net", f"${a['flat_net']:+,.0f}",
+        "physical + hedge — should be ~0 when fully hedged",
+        GREEN if abs(a["flat_net"]) < abs(a["net"]) else AMBER)
+    kpi(k4, "Net result", f"${a['net']:+,.0f}",
+        "realised" if a["realised"] else "marked (unrealised)",
+        GREEN if a["net"] >= 0 else RED)
+
+    st.markdown("### Attribution")
+    rows = [dict(Component=x["label"], Amount=x["value"], Share=x["share"],
+                 Source=x["source"]) for x in a["components"]]
+    rows.append(dict(Component="── NET RESULT ──", Amount=a["net"],
+                     Share=100.0, Source="sum of components"))
+    rows.append(dict(Component="UNEXPLAINED RESIDUAL", Amount=a["residual"],
+                     Share=np.nan, Source="must be 0.00"))
+    adf = pd.DataFrame(rows)
+    st.dataframe(adf.style.format({"Amount": "{:+,.0f}", "Share": "{:.0f}%"}, na_rep="—"),
+                 use_container_width=True, hide_index=True)
+
+    if abs(a["residual"]) > 0.01:
+        st.error(f"**RECONCILIATION FAILED** — components miss the direct result by "
+                 f"${a['residual']:,.2f}. A leg is missing from the model; treat the "
+                 f"attribution as unreliable until it is fixed.")
+    else:
+        st.markdown('<span class="badge badge-green">RECONCILED · residual 0.00</span>',
+                    unsafe_allow_html=True)
+
+    # Which bet actually paid?
+    market_share = sum(x["share"] for x in a["components"] if x["kind"] == "market")
+    basis_share = sum(x["share"] for x in a["components"] if x["kind"] == "basis")
+    cost_share = sum(x["share"] for x in a["components"] if x["kind"] == "cost")
+    st.markdown(f"""**What this behaved like** — of the gross variation,
+**{basis_share:.0f}%** came from the differential, **{market_share:.0f}%** from flat
+price and carry, and **{cost_share:.0f}%** from costs. Shares are computed on
+*absolute* contributions, so one large offsetting leg cannot flatter the read.""")
+
+    if not a["realised"]:
+        st.warning(f"**Unrealised.** The basis leg is marked against your own assessment "
+                   f"of **{a['d1']:+,.4f}** (entered {cg.get('diff_mark_date', '—')}), not "
+                   f"against a traded differential. Until the cargo is sold this is a "
+                   f"mark, not a fact — update it in the Lifecycle tab.")
+
+    fig = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=["relative"] * len(a["components"]) + ["total"],
+        x=[x["label"] for x in a["components"]] + ["NET"],
+        y=[x["value"] for x in a["components"]] + [0],
+        connector=dict(line=dict(color=BORDER)),
+        increasing=dict(marker=dict(color=GREEN)),
+        decreasing=dict(marker=dict(color=RED)),
+        totals=dict(marker=dict(color=AMBER))))
+    fig.update_layout(title=f"{cid} — how the result was made ($)")
+    st.plotly_chart(_styled(fig, 400), use_container_width=True)
+
+    with st.expander("Marks used"):
+        st.dataframe(pd.DataFrame([
+            dict(Leg="Pricing benchmark", At_entry=a["B0"], Now=a["B1"],
+                 Move=a["B1"] - a["B0"], Contract=cg.get("pricing_label")),
+            dict(Leg="Differential", At_entry=a["d0"], Now=a["d1"],
+                 Move=a["d1"] - a["d0"], Contract="USER MARK"),
+            dict(Leg="Hedge", At_entry=a["H0"], Now=a["H1"],
+                 Move=a["H1"] - a["H0"], Contract=cg.get("hedge_label")),
+        ]).style.format({"At_entry": "{:,.4f}", "Now": "{:,.4f}", "Move": "{:+,.4f}"}),
+            use_container_width=True, hide_index=True)
+
+
+def _cargo_lifecycle_tab(marks: MarkBoard, cargos: List[dict]) -> None:
+    if not cargos:
+        st.info("No cargo booked yet.")
+        return
+    cid = st.selectbox("Cargo", [c["id"] for c in cargos], key="cg_life")
+    cg = next(c for c in cargos if c["id"] == cid)
+    idx = next(i for i, c in enumerate(cargos) if c["id"] == cid)
+
+    st.markdown(f"**{cid}** · {cg['commodity']} · {cg.get('grade') or '—'} · "
+                f"booked {cg.get('booked_date')}")
+    l1, l2 = st.columns([1, 2])
+    stage = l1.selectbox("Stage", CARGO_STAGES, index=CARGO_STAGES.index(cg["stage"]))
+    l2.caption("A cargo is not one event. Attribution stays **marked** until the sale is "
+               "entered below, then becomes **realised** — the same numbers, but facts "
+               "instead of assessments.")
+
+    st.markdown("##### Update the differential mark")
+    m1, m2 = st.columns(2)
+    new_mark = m1.number_input(f"Current differential ({COMMODITIES[cg['commodity']]['unit']})",
+                              value=float(cg.get("diff_mark", cg["diff_buy"])),
+                              step=0.01, format="%.4f")
+    m2.caption(f"Last updated **{cg.get('diff_mark_date', '—')}**. This is your own "
+               "assessment — the attribution tags every number derived from it.")
+
+    st.markdown("##### Realise the sale")
+    s1, s2, s3 = st.columns(3)
+    sell_diff = s1.number_input("Sale differential", value=float(cg.get("diff_sell") or 0.0),
+                                step=0.01, format="%.4f")
+    live_px = cargo_pricing_price(cg, marks)
+    sell_bench = s2.number_input("Benchmark at sale",
+                                 value=float(cg.get("bench_sell") or (live_px or cg["bench_buy"])),
+                                 step=0.01, format="%.4f")
+    hedge_exit = s3.number_input("Hedge exit price (0 = mark live)",
+                                 value=float(cg.get("hedge_exit") or 0.0),
+                                 step=0.01, format="%.4f")
+    f1, f2 = st.columns(2)
+    freight_actual = f1.number_input("Freight actual (0 = use budget)",
+                                     value=float(cg.get("freight_actual") or 0.0),
+                                     step=0.01, format="%.4f")
+    apply_sale = f2.toggle("Mark this cargo as sold", value=cg["stage"] in ("Sold", "Settled"))
+
+    if st.button("Save changes", type="primary", use_container_width=True):
+        cg = dict(cg)
+        cg["stage"] = stage
+        if new_mark != cg.get("diff_mark"):
+            cg["diff_mark"] = float(new_mark)
+            cg["diff_mark_date"] = date.today().isoformat()
+        cg["freight_actual"] = float(freight_actual) if freight_actual else None
+        cg["hedge_exit"] = float(hedge_exit) if hedge_exit else None
+        if apply_sale:
+            cg["diff_sell"] = float(sell_diff)
+            cg["bench_sell"] = float(sell_bench)
+            if cg["stage"] not in ("Sold", "Settled"):
+                cg["stage"] = "Sold"
+        else:
+            cg["diff_sell"] = cg["bench_sell"] = None
+        st.session_state.cargos = [*cargos[:idx], cg, *cargos[idx + 1:]]
+        _cargo_persist()
+        st.success("Cargo updated.")
+        st.rerun()
+
+    if cg.get("hedge_lots"):
+        rc = roll_calendar(cargo_hedge_positions([cg]), marks)
+        if rc and rc[0].get("Days") is not None:
+            st.info(f"**Hedge roll deadline:** {rc[0]['Days']} days "
+                    f"({rc[0]['Contract']}, expiry {rc[0]['Expiry']}). A hedge whose "
+                    f"contract expires before the cargo prices out must be rolled — "
+                    f"see the Roll calendar in the Blotter.")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3779,7 +4663,7 @@ ROUTES = {
     "🔗  Correlation": page_correlation, "🌡️  Seasonality": page_seasonality,
     "🛢️  EIA Fundamentals": page_eia, "🗺️  Regional Balances": page_regional,
     "🎯  Options Pricer": page_options, "🌊  Vol Surface": page_vol_surface,
-    "📒  Trade Blotter": page_blotter, "⚠️  Portfolio Risk": page_risk,
+    "📒  Trade Blotter": page_blotter, "🚢  Physical Cargo": page_cargo, "⚠️  Portfolio Risk": page_risk,
     "🎲  Monte Carlo": page_mc, "🌍  Macro Rates": page_macro,
     "📡  Signal Scanner": page_signals, "📅  Event Calendar": page_events,
     "ℹ️  About": page_about,
