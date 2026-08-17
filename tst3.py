@@ -99,86 +99,86 @@ CONTRACTS: Dict[str, dict] = {
     "WTI Crude (CL)": dict(
         sector="Energy", unit="$/bbl", yf="CL{M}{YY}.NYM", size=1_000,
         size_unit="bbl", divisor=1.0, months="FGHJKMNQUVXZ", n_liquid=18,
-        expiry="prec_25", vol=0.32, storage=0.096, convenience=0.08),
+        expiry="prec_25", vol=0.32, storage=0.096, convenience=0.08, strike_inc=0.5),
     "Brent Crude (BZ)": dict(
         sector="Energy", unit="$/bbl", yf="BZ{M}{YY}.NYM", size=1_000,
         size_unit="bbl", divisor=1.0, months="FGHJKMNQUVXZ", n_liquid=18,
-        expiry="prec2_eom", vol=0.30, storage=0.096, convenience=0.07),
+        expiry="prec2_eom", vol=0.30, storage=0.096, convenience=0.07, strike_inc=0.5),
     "Henry Hub Gas (NG)": dict(
         sector="Energy", unit="$/MMBtu", yf="NG{M}{YY}.NYM", size=10_000,
         size_unit="MMBtu", divisor=1.0, months="FGHJKMNQUVXZ", n_liquid=18,
-        expiry="prec_eom", vol=0.55, storage=0.120, convenience=0.10),
+        expiry="prec_eom", vol=0.55, storage=0.120, convenience=0.10, strike_inc=0.05),
     "RBOB Gasoline (RB)": dict(
         sector="Energy", unit="$/gal", yf="RB{M}{YY}.NYM", size=42_000,
         size_unit="gal", divisor=1.0, months="FGHJKMNQUVXZ", n_liquid=12,
-        expiry="prec_eom", vol=0.36, storage=0.084, convenience=0.07),
+        expiry="prec_eom", vol=0.36, storage=0.084, convenience=0.07, strike_inc=0.01),
     "ULSD Heating Oil (HO)": dict(
         sector="Energy", unit="$/gal", yf="HO{M}{YY}.NYM", size=42_000,
         size_unit="gal", divisor=1.0, months="FGHJKMNQUVXZ", n_liquid=12,
-        expiry="prec_eom", vol=0.34, storage=0.084, convenience=0.07),
+        expiry="prec_eom", vol=0.34, storage=0.084, convenience=0.07, strike_inc=0.01),
     # ── Metals ────────────────────────────────────────────────────────────────
     "Gold (GC)": dict(
         sector="Metals", unit="$/troy oz", yf="GC{M}{YY}.CMX", size=100,
         size_unit="troy oz", divisor=1.0, months="GJMQVZ", n_liquid=8,
-        expiry="del_eom", vol=0.15, storage=0.024, convenience=0.005),
+        expiry="del_eom", vol=0.15, storage=0.024, convenience=0.005, strike_inc=5.0),
     "Silver (SI)": dict(
         sector="Metals", unit="$/troy oz", yf="SI{M}{YY}.CMX", size=5_000,
         size_unit="troy oz", divisor=1.0, months="HKNUZ", n_liquid=6,
-        expiry="del_eom", vol=0.28, storage=0.036, convenience=0.010),
+        expiry="del_eom", vol=0.28, storage=0.036, convenience=0.010, strike_inc=0.25),
     "Copper (HG)": dict(
         sector="Metals", unit="$/lb", yf="HG{M}{YY}.CMX", size=25_000,
         size_unit="lb", divisor=1.0, months="HKNUZ", n_liquid=8,
-        expiry="del_eom", vol=0.22, storage=0.048, convenience=0.030),
+        expiry="del_eom", vol=0.22, storage=0.048, convenience=0.030, strike_inc=0.05),
     "Platinum (PL)": dict(
         sector="Metals", unit="$/troy oz", yf="PL{M}{YY}.NYM", size=50,
         size_unit="troy oz", divisor=1.0, months="FJNV", n_liquid=6,
-        expiry="del_eom", vol=0.20, storage=0.030, convenience=0.015),
+        expiry="del_eom", vol=0.20, storage=0.030, convenience=0.015, strike_inc=5.0),
     "Palladium (PA)": dict(
         sector="Metals", unit="$/troy oz", yf="PA{M}{YY}.NYM", size=100,
         size_unit="troy oz", divisor=1.0, months="HMUZ", n_liquid=6,
-        expiry="del_eom", vol=0.30, storage=0.030, convenience=0.020),
+        expiry="del_eom", vol=0.30, storage=0.030, convenience=0.020, strike_inc=5.0),
     # ── Grains & oilseeds (quoted in CENTS — divisor 100) ─────────────────────
     "Corn (ZC)": dict(
         sector="Grains", unit="c/bu", yf="ZC{M}{YY}.CBT", size=5_000,
         size_unit="bu", divisor=100.0, months="HKNUZ", n_liquid=8,
-        expiry="del_15", vol=0.25, storage=0.060, convenience=0.04),
+        expiry="del_15", vol=0.25, storage=0.060, convenience=0.04, strike_inc=10.0),
     "Wheat CBOT (ZW)": dict(
         sector="Grains", unit="c/bu", yf="ZW{M}{YY}.CBT", size=5_000,
         size_unit="bu", divisor=100.0, months="HKNUZ", n_liquid=8,
-        expiry="del_15", vol=0.28, storage=0.060, convenience=0.04),
+        expiry="del_15", vol=0.28, storage=0.060, convenience=0.04, strike_inc=10.0),
     "Soybeans (ZS)": dict(
         sector="Grains", unit="c/bu", yf="ZS{M}{YY}.CBT", size=5_000,
         size_unit="bu", divisor=100.0, months="FHKNQUX", n_liquid=8,
-        expiry="del_15", vol=0.23, storage=0.060, convenience=0.05),
+        expiry="del_15", vol=0.23, storage=0.060, convenience=0.05, strike_inc=20.0),
     "Soybean Meal (ZM)": dict(
         sector="Grains", unit="$/short ton", yf="ZM{M}{YY}.CBT", size=100,
         size_unit="short ton", divisor=1.0, months="FHKNQUVZ", n_liquid=8,
-        expiry="del_15", vol=0.24, storage=0.060, convenience=0.05),
+        expiry="del_15", vol=0.24, storage=0.060, convenience=0.05, strike_inc=5.0),
     "Soybean Oil (ZL)": dict(
         sector="Grains", unit="c/lb", yf="ZL{M}{YY}.CBT", size=60_000,
         size_unit="lb", divisor=100.0, months="FHKNQUVZ", n_liquid=8,
-        expiry="del_15", vol=0.26, storage=0.060, convenience=0.05),
+        expiry="del_15", vol=0.26, storage=0.060, convenience=0.05, strike_inc=0.5),
     # ── Softs & livestock ────────────────────────────────────────────────────
     "Sugar #11 (SB)": dict(
         sector="Softs", unit="c/lb", yf="SB{M}{YY}.NYB", size=112_000,
         size_unit="lb", divisor=100.0, months="HKNV", n_liquid=6,
-        expiry="prec_eom", vol=0.30, storage=0.048, convenience=0.04),
+        expiry="prec_eom", vol=0.30, storage=0.048, convenience=0.04, strike_inc=0.25),
     "Arabica Coffee (KC)": dict(
         sector="Softs", unit="c/lb", yf="KC{M}{YY}.NYB", size=37_500,
         size_unit="lb", divisor=100.0, months="HKNUZ", n_liquid=6,
-        expiry="del_20", vol=0.35, storage=0.048, convenience=0.05),
+        expiry="del_20", vol=0.35, storage=0.048, convenience=0.05, strike_inc=2.5),
     "Cocoa (CC)": dict(
         sector="Softs", unit="$/mt", yf="CC{M}{YY}.NYB", size=10,
         size_unit="mt", divisor=1.0, months="HKNUZ", n_liquid=6,
-        expiry="del_15", vol=0.32, storage=0.048, convenience=0.04),
+        expiry="del_15", vol=0.32, storage=0.048, convenience=0.04, strike_inc=50.0),
     "Live Cattle (LE)": dict(
         sector="Livestock", unit="c/lb", yf="LE{M}{YY}.CME", size=40_000,
         size_unit="lb", divisor=100.0, months="GJMQVZ", n_liquid=8,
-        expiry="del_eom", vol=0.18, storage=0.036, convenience=0.03),
+        expiry="del_eom", vol=0.18, storage=0.036, convenience=0.03, strike_inc=1.0),
     "Lean Hogs (HE)": dict(
         sector="Livestock", unit="c/lb", yf="HE{M}{YY}.CME", size=40_000,
         size_unit="lb", divisor=100.0, months="GJKMNQVZ", n_liquid=6,
-        expiry="del_15", vol=0.25, storage=0.036, convenience=0.03),
+        expiry="del_15", vol=0.25, storage=0.036, convenience=0.03, strike_inc=1.0),
 }
 
 # What was deliberately dropped from the previous registry, and why. Stated here
@@ -197,13 +197,22 @@ EXCLUSIONS = {
     "Coal API2, Uranium UxC, Gasoil ICE, Jet Kero CIF NWE":
         "Platts and Argus assessments are licensed; the TradingView symbols used "
         "for them returned nothing and fell through to synthetic prices.",
+    "Fixed-for-floating swaps":
+        "Removed with their tab: a commodity swap is corporate treasury, not a "
+        "paper trader's instrument, and the option chain that replaced it is the "
+        "screen this audience actually works on.",
+    "Parametric vol surface (polynomial)":
+        "Replaced by SABR, which extrapolates sensibly into the wings and whose "
+        "parameters mean something a trader can argue about. The old surface was "
+        "left unreachable behind the new tab — dead code, now deleted.",
     "Dutch TTF Natural Gas":
         "Referenced by the spark-spread definition but absent from the registry, "
         "so it silently priced off a $100 placeholder.",
 }
 
 _REQUIRED_KEYS = {"sector", "unit", "yf", "size", "size_unit", "divisor",
-                  "months", "n_liquid", "expiry", "vol", "storage", "convenience"}
+                  "months", "n_liquid", "expiry", "vol", "storage", "convenience",
+                  "strike_inc"}
 
 
 def _validate_registry(reg: Dict[str, dict]) -> None:
@@ -223,6 +232,7 @@ def _validate_registry(reg: Dict[str, dict]) -> None:
         assert c["size"] > 0 and c["n_liquid"] > 0, f"{name}: bad size/n_liquid"
         assert 0 < c["vol"] < 3, f"{name}: implausible default vol"
         assert 0 <= c["storage"] < 1 and 0 <= c["convenience"] < 1, f"{name}: bad carry"
+        assert c["strike_inc"] > 0, f"{name}: bad strike increment"
 
 
 _validate_registry(CONTRACTS)
@@ -240,6 +250,23 @@ def price_multiplier(name: str) -> float:
     figure a hundredfold."""
     c = CONTRACTS[name]
     return c["size"] / c["divisor"]
+
+
+def snap_strike(name: str, K: float) -> float:
+    """Round a strike onto the contract's listed grid.
+
+    Listed options do not trade at 82.4713. They trade on an increment — half a
+    dollar on WTI, five cents on gas, five dollars on gold, ten cents on corn —
+    and a strike off that grid is a strike you cannot actually deal. Everything
+    the platform derives from a percentage or a delta is snapped before it is
+    priced, so what you see is quotable.
+
+    The increments are INDICATIVE registry defaults: exchanges change them, and
+    they vary by expiry and by how far out of the money the strike sits. Verify
+    against the current contract specs before dealing on one.
+    """
+    inc = CONTRACTS[name]["strike_inc"]
+    return round(round(float(K) / inc) * inc, 10)
 
 
 def notional_per_lot(name: str, price: float) -> float:
@@ -1036,87 +1063,6 @@ def barrier_mc(F, K, H, T, r, sigma, option_type="call", barrier="Down-and-Out",
                 paths=paths[:60], breached=breached[:60])
 
 
-# ── Commodity swap ───────────────────────────────────────────────────────────
-class CommoditySwap:
-    """Fixed-for-floating commodity swap on a strip of forwards.
-
-    The floating leg pays the forward price of each period; the fixed leg pays a
-    constant. NPV = Σ disc_i · (F_i − K) · notional for a fixed payer, and the
-    FAIR rate is the discount-weighted average forward that sets it to zero.
-    """
-
-    def __init__(self, forwards: Sequence[float], fixed: float, r: float,
-                 notional: float = 1.0, tenors: Optional[Sequence[float]] = None,
-                 freq: str = "monthly", position: str = "fixed_payer"):
-        self.F = np.asarray(forwards, dtype=float)
-        self.K = float(fixed)
-        self.r = float(r)
-        self.notional = float(notional)
-        self.pos = position
-        self.N = len(self.F)
-        if tenors is not None and len(tenors) == self.N:
-            self.T = np.asarray(tenors, dtype=float)
-        else:
-            dt = 1 / 12 if freq == "monthly" else 0.25
-            self.T = np.array([(i + 1) * dt for i in range(self.N)])
-        self.disc = np.exp(-self.r * self.T)
-        self.sign = 1.0 if position == "fixed_payer" else -1.0
-
-    @property
-    def fair_rate(self) -> float:
-        return float(np.sum(self.disc * self.F) / np.sum(self.disc))
-
-    def npv(self) -> float:
-        return float(self.sign * np.sum(self.disc * (self.F - self.K) * self.notional))
-
-    def price_01(self) -> float:
-        """Cash change in NPV for a $0.01 parallel shift of the forward curve.
-
-        This is what the previous version labelled DV01. It is a PRICE
-        sensitivity, not a rate one, and the two differ by orders of magnitude —
-        so both are computed here under their own names."""
-        return float(np.sum(self.disc) * self.notional * 0.01)
-
-    def dv01(self) -> float:
-        """True DV01: change in NPV for a 1bp parallel move in the DISCOUNT rate.
-
-        Only the discounting responds, so it is small and negative for a payer
-        with positive NPV — exactly the point of separating it from price_01."""
-        bumped = CommoditySwap(self.F, self.K, self.r + 0.0001, self.notional,
-                               self.T, position=self.pos)
-        return float(bumped.npv() - self.npv())
-
-    def cashflows(self) -> pd.DataFrame:
-        net = self.sign * (self.F - self.K) * self.notional
-        rows = [dict(Period=i + 1, T=round(float(self.T[i]), 4),
-                     Forward=round(float(self.F[i]), 4), Fixed=round(self.K, 4),
-                     Net=round(float(net[i]), 2),
-                     Discount=round(float(self.disc[i]), 6),
-                     PV=round(float(self.disc[i] * net[i]), 2))
-                for i in range(self.N)]
-        return pd.DataFrame(rows)
-
-    def sensitivity(self, shifts: Sequence[float]) -> pd.DataFrame:
-        return pd.DataFrame([
-            dict(shift=float(s),
-                 npv=CommoditySwap(self.F + s, self.K, self.r, self.notional,
-                                   self.T, position=self.pos).npv())
-            for s in shifts])
-
-
-# ── Volatility surface (parametric — a stated shape, not a calibration) ──────
-def surface_vol(K_arr, F, T, atm, skew, curvature, term) -> np.ndarray:
-    """σ(K,T) = σ_ATM·(1 + term·√T) + skew·ln(K/F) + curvature·ln(K/F)²
-
-    A parametrisation, not a fit: there is no listed-options feed here, so this
-    surface teaches shape — where the wings sit, what skew does to a collar — and
-    must not be used to mark a real book. Clamped to a sane range so an extreme
-    slider cannot produce a negative volatility."""
-    lm = np.log(np.asarray(K_arr, dtype=float) / F)
-    return np.clip(atm * (1 + term * math.sqrt(max(T, 0.0))) + skew * lm + curvature * lm ** 2,
-                   0.005, 5.0)
-
-
 # ── American exercise ────────────────────────────────────────────────────────
 #  Most listed commodity options are AMERICAN: LO on WTI, the grain options, the
 #  metals. Pricing them with Black-76 ignores the right to exercise early, which
@@ -1534,6 +1480,40 @@ def gamma_scalp(F, K, T, r, sigma_implied, sigma_realised, n_rebal=63,
 #  looks at the whole thing across a grid of price and volatility.
 # ══════════════════════════════════════════════════════════════════════════════
 
+def as_vol_fn(v):
+    """Normalise a volatility input into a callable σ(K, T).
+
+    The whole platform prices through this. Pass a number and every strike gets
+    the same volatility — a flat surface, which is a MODEL choice, not a
+    simplification to be made silently. Pass a function and each strike gets its
+    own σ(K,T) off the SABR surface, which is the point of having built one: a
+    25-delta put priced at the at-the-money volatility is exactly the error a
+    smile exists to prevent, and before this refactor the platform made it in
+    every tab except the surface itself.
+    """
+    if callable(v):
+        return v
+    x = float(v)
+    return lambda K, T, _x=x: _x
+
+
+def sabr_vol_fn(params: dict, F: float, shift: float = 0.0):
+    """σ(K,T) off a SABR parameter set, with an optional parallel shift in vol
+    points — the shift is what the scenario grid moves."""
+    def f(K, T):
+        v = sabr_vol(F, max(float(K), 1e-9), max(float(T), 1e-9),
+                     params["alpha"], params["beta"], params["rho"], params["nu"])
+        if not np.isfinite(v):
+            v = params.get("atm", 0.3)
+        return max(v + shift, 0.005)
+    return f
+
+
+def shifted_vol_fn(vol_fn, shift: float):
+    base = as_vol_fn(vol_fn)
+    return lambda K, T: max(base(K, T) + shift, 0.005)
+
+
 #  Each template is a list of (quantity, type, strike spec). A strike spec is
 #  either ("pct", x) — percent of the forward — or ("delta", d), resolved through
 #  the delta solver so the structure is built the way it is quoted.
@@ -1599,19 +1579,31 @@ def resolve_strike(spec, F, T, r, sigma, option_type) -> float:
 
 
 def build_strategy(name: str, F, T, r, sigma, lots=1, american=False,
-                   n_steps=200) -> dict:
-    """Price a template and return its legs, net Greeks and payoff function."""
+                   n_steps=200, contract=None) -> dict:
+    """Price a template and return its legs, net Greeks and payoff function.
+
+    `sigma` may be a number or a σ(K,T) callable. Each leg is priced at ITS OWN
+    volatility, which is what makes a risk reversal cost something: with a flat
+    surface the 25-delta call and put carry the same vol and the structure is
+    free, which is never true in a real market. Strikes are snapped onto the
+    contract's listed grid when a contract is given.
+    """
     cfg = STRATEGIES[name]
+    vf = as_vol_fn(sigma)
+    atm = vf(F, T)
     legs = []
     for qty, otype, spec in cfg["legs"]:
-        K = resolve_strike(spec, F, T, r, sigma, otype)
-        b = Black76(F, K, T, r, sigma, otype)
+        K = resolve_strike(spec, F, T, r, atm, otype)
+        if contract:
+            K = snap_strike(contract, K)
+        sig_k = vf(K, T)
+        b = Black76(F, K, T, r, sig_k, otype)
         if american:
-            g = american_greeks(F, K, T, r, sigma, otype, n_steps)
+            g = american_greeks(F, K, T, r, sig_k, otype, n_steps)
         else:
             g = b.greeks()
             g["early_premium"] = 0.0
-        legs.append(dict(qty=qty * lots, type=otype, strike=K,
+        legs.append(dict(qty=qty * lots, type=otype, strike=K, vol=sig_k,
                          spec=f"{spec[0]} {spec[1]}", **g))
     net = {k: float(sum(l["qty"] * l[k] for l in legs))
            for k in ("price", "delta", "gamma", "vega", "theta")}
@@ -1628,20 +1620,22 @@ def strategy_payoff(legs: List[dict], spots: np.ndarray) -> np.ndarray:
     return out
 
 
-def position_value(pos: dict, F: float, sigma: float, T: float, r: float,
+def position_value(pos: dict, F: float, sigma, T: float, r: float,
                    n_steps: int = 150) -> float:
-    """Value one book line at an arbitrary market state."""
+    """Value one book line at an arbitrary market state. `sigma` is a number or a
+    σ(K,T) callable."""
     if pos["kind"] == "future":
         return pos["qty"] * (F - pos["entry"]) * price_multiplier(pos["contract"])
     mult = price_multiplier(pos["contract"])
+    sig = as_vol_fn(sigma)(pos["strike"], T)
     if pos.get("style") == "American":
-        px = crr_price(F, pos["strike"], T, r, sigma, pos["type"], n_steps)
+        px = crr_price(F, pos["strike"], T, r, sig, pos["type"], n_steps)
     else:
-        px = Black76(F, pos["strike"], T, r, sigma, pos["type"]).price()
+        px = Black76(F, pos["strike"], T, r, sig, pos["type"]).price()
     return pos["qty"] * (px - pos["entry"]) * mult
 
 
-def book_greeks(positions: List[dict], F: float, sigma: float, r: float,
+def book_greeks(positions: List[dict], F: float, sigma, r: float,
                 n_steps: int = 150) -> dict:
     """Aggregate the book into cash Greeks, and bucket vega by tenor.
 
@@ -1649,6 +1643,7 @@ def book_greeks(positions: List[dict], F: float, sigma: float, r: float,
     the front and short the back, or the reverse, and a single net number hides
     the calendar risk that actually moves a vol desk's P&L.
     """
+    vf = as_vol_fn(sigma)
     buckets = {"0-3M": 0.0, "3-6M": 0.0, "6-12M": 0.0, "12M+": 0.0}
     tot = dict(delta=0.0, gamma=0.0, vega=0.0, theta=0.0, value=0.0, premium=0.0)
     rows = []
@@ -1657,10 +1652,13 @@ def book_greeks(positions: List[dict], F: float, sigma: float, r: float,
         T = max(float(p["T"]), 1e-6)
         if p["kind"] == "future":
             g = dict(price=F, delta=1.0, gamma=0.0, vega=0.0, theta=0.0)
-        elif p.get("style") == "American":
-            g = american_greeks(F, p["strike"], T, r, sigma, p["type"], n_steps)
+            sig = float("nan")
         else:
-            g = Black76(F, p["strike"], T, r, sigma, p["type"]).greeks()
+            sig = vf(p["strike"], T)
+            if p.get("style") == "American":
+                g = american_greeks(F, p["strike"], T, r, sig, p["type"], n_steps)
+            else:
+                g = Black76(F, p["strike"], T, r, sig, p["type"]).greeks()
         q = p["qty"]
         d_cash = q * g["delta"] * mult * F
         ga_cash = q * g["gamma"] * mult * F ** 2 / 100
@@ -1677,7 +1675,7 @@ def book_greeks(positions: List[dict], F: float, sigma: float, r: float,
              "6-12M" if T <= 1.0 else "12M+")
         buckets[b] += v_cash
         rows.append(dict(Line=_pos_label(p), Qty=q, Strike=p.get("strike"),
-                         T=T, Bucket=b, Price=g["price"], DeltaCash=d_cash,
+                         T=T, Vol=sig, Bucket=b, Price=g["price"], DeltaCash=d_cash,
                          GammaCash=ga_cash, VegaCash=v_cash, ThetaCash=t_cash,
                          MTM=val))
     return dict(total=tot, buckets=buckets, rows=rows)
@@ -1690,7 +1688,7 @@ def _pos_label(p: dict) -> str:
             f"{p['T'] * 12:.1f}M {p.get('style', 'European')[0]} × {p['qty']:+d}")
 
 
-def scenario_matrix(positions: List[dict], F: float, sigma: float, r: float,
+def scenario_matrix(positions: List[dict], F: float, sigma, r: float,
                     price_pct=(-20, -10, -5, 0, 5, 10, 20),
                     vol_pts=(-10, -5, 0, 5, 10), n_steps: int = 120) -> pd.DataFrame:
     """Book P&L across a grid of price and volatility moves.
@@ -1701,11 +1699,12 @@ def scenario_matrix(positions: List[dict], F: float, sigma: float, r: float,
     the exchange uses to set margin — which is why the margin function below
     reads straight off it.
     """
-    base = sum(position_value(p, F, sigma, max(p["T"], 1e-6), r, n_steps)
+    vf = as_vol_fn(sigma)
+    base = sum(position_value(p, F, vf, max(p["T"], 1e-6), r, n_steps)
                for p in positions)
     data = {}
     for dv in vol_pts:
-        s2 = max(sigma + dv / 100.0, 0.005)
+        s2 = shifted_vol_fn(vf, dv / 100.0)     # parallel shift of the WHOLE surface
         row = {}
         for dp in price_pct:
             F2 = F * (1 + dp / 100.0)
@@ -1716,7 +1715,7 @@ def scenario_matrix(positions: List[dict], F: float, sigma: float, r: float,
     return pd.DataFrame(data).T
 
 
-def span_margin(positions: List[dict], F: float, sigma: float, r: float,
+def span_margin(positions: List[dict], F: float, sigma, r: float,
                 scan_pct: float = 5.0, vol_pts: float = 10.0,
                 n_steps: int = 120) -> dict:
     """SPAN-style scan risk: the worst loss across the exchange's standard grid.
@@ -1730,7 +1729,8 @@ def span_margin(positions: List[dict], F: float, sigma: float, r: float,
     It matters because a trader's binding constraint is margin, not notional —
     and return on margin is how a structure is actually judged.
     """
-    base = sum(position_value(p, F, sigma, max(p["T"], 1e-6), r, n_steps)
+    vf = as_vol_fn(sigma)
+    base = sum(position_value(p, F, vf, max(p["T"], 1e-6), r, n_steps)
                for p in positions)
     scen = []
     for frac in (0.0, 1 / 3, -1 / 3, 2 / 3, -2 / 3, 1.0, -1.0):
@@ -1741,7 +1741,7 @@ def span_margin(positions: List[dict], F: float, sigma: float, r: float,
     worst, detail = 0.0, []
     for dp, dv, w in scen:
         F2 = F * (1 + dp / 100.0)
-        s2 = max(sigma + dv / 100.0, 0.005)
+        s2 = shifted_vol_fn(vf, dv / 100.0)
         pnl = sum(position_value(p, F2, s2, max(p["T"], 1e-6), r, n_steps)
                   for p in positions) - base
         loss = -pnl * w
@@ -1928,7 +1928,9 @@ def tab_vanilla(cx: dict) -> None:
             "and tradeable — no spot, no dividend yield, no cost-of-carry assumption. "
             "Greeks are analytic. Conventions: <b>vega</b> per one vol point, "
             "<b>theta</b> per calendar day, <b>rho</b> per one point of rate.")
-    F, K, T, r, vol, unit = cx["F_T"], cx["K"], cx["T"], cx["r"], cx["vol"], cx["unit"]
+    F, K, T, r, unit = cx["F_T"], cx["K"], cx["T_opt"], cx["r"], cx["unit"]
+    vol = cx["vol_K"]
+    vf = cx["vol_fn"]
     call, put = Black76(F, K, T, r, vol, "call"), Black76(F, K, T, r, vol, "put")
     gc, gp = call.greeks(), put.greeks()
     mult = price_multiplier(cx["name"])
@@ -2013,8 +2015,8 @@ def tab_vanilla(cx: dict) -> None:
     Ts = np.array([1 / 12, 3 / 12, 6 / 12, 9 / 12, 1.0, 1.5, 2.0])
     Tl = ["1M", "3M", "6M", "9M", "1Y", "18M", "2Y"]
     typ = cx["side"].lower()
-    P = np.array([[Black76(F, k, t, r, vol, typ).price() for k in Ks] for t in Ts])
-    D = np.array([[Black76(F, k, t, r, vol, typ).delta() for k in Ks] for t in Ts])
+    P = np.array([[Black76(F, k, t, r, vf(k, t), typ).price() for k in Ks] for t in Ts])
+    D = np.array([[Black76(F, k, t, r, vf(k, t), typ).delta() for k in Ks] for t in Ts])
     s1, s2 = st.columns(2)
     for col, Z, cs, lbl, mid in ((s1, P, "YlOrRd", "Price", None),
                                  (s2, D, "RdBu", "Delta", 0.0)):
@@ -2035,7 +2037,8 @@ def tab_asian(cx: dict) -> None:
             "the month, not on the third Wednesday. Averaging suppresses volatility, so an "
             "Asian is always <b>cheaper than the equivalent vanilla</b> — the page proves it "
             "rather than asserting it.")
-    F, K, T, r, vol, unit = cx["F_T"], cx["K"], cx["T"], cx["r"], cx["vol"], cx["unit"]
+    F, K, T, r, unit = cx["F_T"], cx["K"], cx["T_opt"], cx["r"], cx["unit"]
+    vol = cx["vol_K"]
     a1, a2, a3 = st.columns(3)
     avg = a1.radio("Average", ["arithmetic", "geometric"], horizontal=True)
     n_obs = a2.select_slider("Fixings", options=[4, 12, 22, 52, 126, 252], value=12,
@@ -2339,7 +2342,8 @@ def tab_barrier(cx: dict) -> None:
             "up, and that is the point: an airline buys a knock-out call to cap fuel cost while "
             "accepting the cap disappears in a spike. Priced three ways here — closed form, "
             "discrete-monitoring correction, and Monte Carlo — because they must agree.")
-    F, K, T, r, vol, unit = cx["F_T"], cx["K"], cx["T"], cx["r"], cx["vol"], cx["unit"]
+    F, K, T, r, unit = cx["F_T"], cx["K"], cx["T_opt"], cx["r"], cx["unit"]
+    vol = cx["vol_K"]
     b1, b2, b3 = st.columns(3)
     btype = b1.selectbox("Barrier", BARRIER_TYPES)
     otype = cx["side"].lower()
@@ -2435,161 +2439,6 @@ def tab_barrier(cx: dict) -> None:
     st.plotly_chart(styled(fig, 270, "P&L at expiry — the terminal picture ignores the path, "
                                      "which is precisely what a barrier does not"),
                     use_container_width=True)
-
-
-def tab_swap(cx: dict) -> None:
-    section("Fixed-for-floating commodity swap",
-            "One side pays a <b>fixed</b> price each period, the other the floating market. An "
-            "airline pays fixed on jet fuel to make its cost budgetable; a producer receives "
-            "fixed to lock revenue. NPV = Σ discount × (forward − fixed) × notional, and the "
-            "<b>fair rate</b> is the fixed price that makes it zero.")
-    curve, unit = cx["curve"], cx["unit"]
-    if curve.empty:
-        st.error("**NO CURVE** — a swap prices off the forward strip.")
-        return
-
-    s1, s2, s3 = st.columns(3)
-    n = s1.slider("Periods", 2, min(24, len(curve)), min(12, len(curve)))
-    notional = s2.number_input(f"Notional ({CONTRACTS[cx['name']]['size_unit']} per period)",
-                               value=1000.0, step=100.0, format="%.0f")
-    position = s3.radio("Position", ["Fixed payer", "Fixed receiver"], horizontal=True)
-    pos = "fixed_payer" if "payer" in position else "fixed_receiver"
-
-    fwd = curve["price"].to_numpy(dtype=float)[:n]
-    ten = curve["T"].to_numpy(dtype=float)[:n]
-    fair = CommoditySwap(fwd, 0.0, cx["r"], notional, ten, position=pos).fair_rate
-    fixed = st.number_input(f"Fixed rate ({unit})", value=float(round(fair, 4)),
-                            step=0.01, format="%.4f",
-                            help=f"Break-even is {fair:,.4f} — the discount-weighted average "
-                                 f"of the forwards you are swapping against.")
-    sw = CommoditySwap(fwd, fixed, cx["r"], notional, ten, position=pos)
-
-    k1, k2, k3, k4, k5 = st.columns(5)
-    kpi(k1, "NPV", f"${sw.npv():+,.2f}", "at today's curve",
-        GREEN if sw.npv() >= 0 else RED)
-    kpi(k2, "Fair rate", f"{fair:,.4f}", f"{unit} break-even", AMBER)
-    kpi(k3, "Your fixed", f"{fixed:,.4f}",
-        f"{'above' if fixed > fair else 'below'} fair by {abs(fixed - fair):,.4f}")
-    kpi(k4, "Price 01", f"${sw.price_01():,.2f}", f"per $0.01 curve shift", BLUE)
-    kpi(k5, "DV01 (rate)", f"${sw.dv01():+,.2f}", "per 1bp of discount rate", PURPLE)
-    st.markdown(
-        '<div class="note">Those last two are different animals and the previous version '
-        'conflated them. <b>Price 01</b> is exposure to the commodity — it is what moves your '
-        'P&L. <b>DV01</b> is exposure to the discount rate and only touches the present value '
-        'of cashflows you have already locked. On a commodity swap the first is orders of '
-        'magnitude larger, which is exactly why labelling one as the other is misleading.</div>',
-        unsafe_allow_html=True)
-
-    g1, g2 = st.columns(2)
-    cf = sw.cashflows()
-    with g1:
-        fig = go.Figure()
-        fig.add_trace(go.Bar(x=cf["Period"], y=cf["Net"], name="Net cashflow",
-                             marker_color=[GREEN if v >= 0 else RED for v in cf["Net"]],
-                             opacity=0.65))
-        fig.add_trace(go.Bar(x=cf["Period"], y=cf["PV"], name="Discounted",
-                             marker_color=AMBER, opacity=0.9))
-        fig.add_hline(y=0, line=dict(color=GRAY, width=0.8))
-        fig.update_layout(barmode="group")
-        fig.update_xaxes(title="Period")
-        fig.update_yaxes(title="Cash ($)")
-        st.plotly_chart(styled(fig, 320, "Cashflows per period"), use_container_width=True)
-    with g2:
-        scale = max(abs(float(np.mean(fwd))) * 0.15, 0.5)
-        sens = sw.sensitivity(np.linspace(-scale, scale, 41))
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=sens["shift"], y=sens["npv"], name="NPV",
-                                 line=dict(color=AMBER, width=2.4)))
-        fig.add_hline(y=0, line=dict(color=GRAY, width=0.8))
-        vline(fig, 0.0, GREEN, "today")
-        fig.update_xaxes(title=f"Parallel shift of the curve ({unit})")
-        fig.update_yaxes(title="NPV ($)")
-        st.plotly_chart(styled(fig, 320, "NPV against a parallel move — linear, by construction"),
-                        use_container_width=True)
-
-    st.markdown("##### Cashflow schedule")
-    st.dataframe(cf.style.format({"T": "{:.4f}", "Forward": "{:,.4f}", "Fixed": "{:,.4f}",
-                                  "Net": "{:+,.2f}", "Discount": "{:.6f}", "PV": "{:+,.2f}"}),
-                 use_container_width=True, hide_index=True, height=280)
-    st.caption(f"Tenors are the contracts' real calendar tenors, not evenly spaced months — "
-               f"which matters on any commodity that does not list all twelve delivery months.")
-
-
-def tab_surface(cx: dict) -> None:
-    section("Volatility surface — a stated shape, not a calibration",
-            "How implied volatility varies across strikes (<b>skew</b> and <b>smile</b>) and "
-            "maturities (<b>term structure</b>). This surface is a parametrisation seeded from "
-            "your volatility input — there is no listed-options feed on this desk, so it is a "
-            "teaching instrument and the page says so rather than letting you mark a book "
-            "against it.")
-    F, r, unit = cx["F_T"], cx["r"], cx["unit"]
-    v1, v2, v3 = st.columns(3)
-    atm = v1.slider("ATM level (%)", 5, 120, int(cx["vol"] * 100), 1, key="sf_atm") / 100
-    skew = v1.slider("Skew", -30, 30, -5, 1, key="sf_sk",
-                     help="Negative = downside strikes carry more vol, the usual shape when "
-                          "the market fears a collapse. Energy inverts it in a squeeze.") / 100
-    curv = v2.slider("Smile curvature", 0, 40, 8, 1, key="sf_cv") / 100
-    term = v2.slider("Term structure", -30, 40, 8, 1, key="sf_tm",
-                     help="Positive = long-dated vol above short-dated. Around an event the "
-                          "front is bid and this goes negative.") / 100
-    v3.markdown(f'<div class="note">σ(K,T) = σ_ATM·(1 + term·√T) + skew·ln(K/F) + '
-                f'curvature·ln(K/F)²<br><br>Anchored at F = <b>{F:,.3f}</b> {unit}. '
-                f'Clamped to a sane band so no slider can produce a negative volatility.</div>',
-                unsafe_allow_html=True)
-
-    Ks = np.linspace(F * 0.6, F * 1.4, 25)
-    Ts = np.array([1 / 12, 2 / 12, 3 / 12, 6 / 12, 9 / 12, 1.0, 1.5, 2.0])
-    Tl = ["1M", "2M", "3M", "6M", "9M", "1Y", "18M", "2Y"]
-    Z = np.array([surface_vol(Ks, F, t, atm, skew, curv, term) * 100 for t in Ts])
-
-    fig = go.Figure(go.Surface(z=Z, x=Ks, y=Tl, colorscale="RdYlGn_r", opacity=0.93,
-                               contours=dict(z=dict(show=True, usecolormap=True, project_z=True)),
-                               hovertemplate="K %{x:,.2f}<br>T %{y}<br>σ %{z:.2f}%<extra></extra>"))
-    fig.update_layout(template="plotly_dark", height=440, paper_bgcolor=BG,
-                      font=dict(family="Inter", size=11, color=TEXT),
-                      title=dict(text="Implied volatility surface (%)", x=0.5, xanchor="center",
-                                 font=dict(size=13, color=GRAY)),
-                      margin=dict(l=10, r=10, t=60, b=10),
-                      scene=dict(bgcolor=BG,
-                                 xaxis=dict(title=f"Strike ({unit})", gridcolor=BORDER,
-                                            backgroundcolor=BG),
-                                 yaxis=dict(title="Maturity", gridcolor=BORDER, backgroundcolor=BG),
-                                 zaxis=dict(title="σ (%)", gridcolor=BORDER, backgroundcolor=BG),
-                                 camera=dict(eye=dict(x=1.8, y=-1.8, z=0.8))))
-    st.plotly_chart(fig, use_container_width=True)
-
-    g1, g2 = st.columns(2)
-    with g1:
-        fig = go.Figure()
-        palette = [AMBER, BLUE, GREEN, RED, PURPLE, TEAL, "#E3B341", GRAY]
-        for i, (t, lbl) in enumerate(zip(Ts, Tl)):
-            fig.add_trace(go.Scatter(x=Ks / F * 100, y=surface_vol(Ks, F, t, atm, skew, curv, term) * 100,
-                                     mode="lines", name=lbl,
-                                     line=dict(color=palette[i % len(palette)], width=1.8)))
-        vline(fig, 100, GRAY, "ATM")
-        fig.update_xaxes(title="Strike (% of forward)")
-        fig.update_yaxes(title="σ (%)")
-        st.plotly_chart(styled(fig, 320, "Smile by maturity"), use_container_width=True)
-    with g2:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=[t * 12 for t in Ts],
-                                 y=[atm * (1 + term * math.sqrt(t)) * 100 for t in Ts],
-                                 mode="lines+markers", name="ATM",
-                                 line=dict(color=AMBER, width=2.4), marker=dict(size=7)))
-        fig.add_hline(y=atm * 100, line=dict(color=GRAY, dash="dot"))
-        fig.update_xaxes(title="Maturity (months)")
-        fig.update_yaxes(title="σ (%)")
-        st.plotly_chart(styled(fig, 320, "At-the-money term structure"), use_container_width=True)
-
-    P = np.array([[Black76(F, float(k), float(t), r,
-                           float(surface_vol([k], F, t, atm, skew, curv, term)[0]),
-                           "call").price() for k in Ks[::2]] for t in Ts])
-    fig = go.Figure(go.Heatmap(z=P, x=[f"{k:,.1f}" for k in Ks[::2]], y=Tl, colorscale="YlOrRd",
-                               hovertemplate="K %{x}<br>T %{y}<br>Price %{z:.4f}<extra></extra>"))
-    fig.update_xaxes(title=f"Strike ({unit})")
-    fig.update_yaxes(title="Maturity")
-    st.plotly_chart(styled(fig, 250, "Call prices ON this surface — each cell uses its own σ(K,T), "
-                                     "not a single flat volatility"), use_container_width=True)
 
 
 def tab_curve(cx: dict) -> None:
@@ -2717,14 +2566,15 @@ def tab_strategies(cx: dict) -> None:
             "actually quotes — collars, risk reversals, three-ways — with combined Greeks and "
             "a combined payoff. Strikes can be set as a percentage of the forward or, the way "
             "they are really quoted, <b>by delta</b>.")
-    F, T, r, vol, unit = cx["F_T"], cx["T_opt"], cx["r"], cx["vol"], cx["unit"]
+    F, T, r, unit = cx["F_T"], cx["T_opt"], cx["r"], cx["unit"]
+    vf = cx["vol_fn"]
     s1, s2, s3 = st.columns([2, 1, 1])
     name = s1.selectbox("Structure", list(STRATEGIES.keys()), index=10)
     lots = s2.number_input("Lots", -100, 100, 1, 1)
     style = s3.radio("Exercise", ["European", "American"], horizontal=True, key="st_style")
     amer = style == "American"
 
-    strat = build_strategy(name, F, T, r, vol, lots, amer)
+    strat = build_strategy(name, F, T, r, vf, lots, amer, contract=cx["name"])
     mult = price_multiplier(cx["name"])
     st.markdown(f'<div class="note">{strat["note"]}</div>', unsafe_allow_html=True)
 
@@ -2741,11 +2591,18 @@ def tab_strategies(cx: dict) -> None:
         RED if net["theta"] < 0 else GREEN)
 
     ldf = pd.DataFrame(strat["legs"])
-    show = ldf[["qty", "type", "spec", "strike", "price", "delta", "gamma", "vega", "theta"]]
-    show.columns = ["Qty", "Type", "Strike spec", "Strike", "Price", "Δ", "Γ", "Vega", "Θ/day"]
-    st.dataframe(show.style.format({"Strike": "{:,.3f}", "Price": "{:,.4f}", "Δ": "{:+.4f}",
-                                    "Γ": "{:.5f}", "Vega": "{:.4f}", "Θ/day": "{:+.5f}"}),
+    show = ldf[["qty", "type", "spec", "strike", "vol", "price", "delta", "gamma",
+                "vega", "theta"]]
+    show.columns = ["Qty", "Type", "Strike spec", "Strike", "σ(K)", "Price", "Δ", "Γ",
+                    "Vega", "Θ/day"]
+    st.dataframe(show.style.format({"Strike": "{:,.3f}", "σ(K)": "{:.2%}", "Price": "{:,.4f}",
+                                    "Δ": "{:+.4f}", "Γ": "{:.5f}", "Vega": "{:.4f}",
+                                    "Θ/day": "{:+.5f}"}),
                  use_container_width=True, hide_index=True)
+    if cx["sabr_params"]:
+        st.caption("Each leg is priced at its own σ(K) off the smile. On a flat surface the "
+                   "25-delta call and put carry the same volatility and a risk reversal comes "
+                   "out free — which is never true in a market that charges for skew.")
     if amer:
         ep = sum(l["qty"] * l.get("early_premium", 0.0) for l in strat["legs"])
         st.caption(f"American exercise adds {ep:+,.5f} {unit} (${ep * mult:+,.0f}) of early-exercise "
@@ -2806,7 +2663,8 @@ def tab_book(cx: dict) -> None:
             "that same grid. A book is never simply 'long vega' — it is long the front and "
             "short the back, and only the buckets show it.")
     book = st.session_state.setdefault("book", [])
-    F, r, vol, unit = cx["F_T"], cx["r"], cx["vol"], cx["unit"]
+    F, r, unit = cx["F_T"], cx["r"], cx["unit"]
+    vol = cx["vol_fn"]
 
     with st.expander("➕ Add a line manually"):
         a = st.columns(6)
@@ -2820,14 +2678,15 @@ def tab_book(cx: dict) -> None:
         style = a[5].selectbox("Style", ["European", "American"], key="bk_style",
                                disabled=kind == "future")
         Tl = option_tenor(months / 12) if kind == "option" else months / 12
-        entry_default = (Black76(F, strike, Tl, r, vol, otype).price()
-                         if kind == "option" else F)
+        entry_default = (Black76(F, snap_strike(cx["name"], strike), Tl, r,
+                                 cx["vol_fn"](snap_strike(cx["name"], strike), Tl),
+                                 otype).price() if kind == "option" else F)
         entry = st.number_input("Entry price", value=float(round(entry_default, 4)),
                                 step=0.01, format="%.4f", key="bk_e")
         if st.button("Add line", use_container_width=True):
             book.append(dict(kind=kind, contract=cx["name"], type=otype,
-                             strike=float(strike), qty=int(qty), T=float(Tl),
-                             entry=float(entry), style=style, tag="manual"))
+                             strike=snap_strike(cx["name"], strike), qty=int(qty),
+                             T=float(Tl), entry=float(entry), style=style, tag="manual"))
             st.rerun()
 
     if not book:
@@ -2882,7 +2741,8 @@ def tab_book(cx: dict) -> None:
 
     st.markdown("##### Positions")
     rdf = pd.DataFrame(bg["rows"])
-    st.dataframe(rdf.style.format({"Strike": "{:,.2f}", "T": "{:.3f}", "Price": "{:,.4f}",
+    st.dataframe(rdf.style.format({"Strike": "{:,.2f}", "T": "{:.3f}", "Vol": "{:.2%}",
+                                   "Price": "{:,.4f}",
                                    "DeltaCash": "{:+,.0f}", "GammaCash": "{:+,.0f}",
                                    "VegaCash": "{:+,.0f}", "ThetaCash": "{:+,.0f}",
                                    "MTM": "{:+,.0f}"}, na_rep="—"),
@@ -3127,6 +2987,134 @@ def tab_sabr(cx: dict) -> None:
                "instead of printing a square root of a negative.")
 
 
+def option_chain(name: str, F: float, T: float, r: float, vol_fn,
+                 n_strikes: int = 15, american: bool = False) -> pd.DataFrame:
+    """The screen an options trader lives on: every listed strike around the money,
+    calls on one side, puts on the other.
+
+    Strikes come off the contract's own increment grid rather than a percentage
+    sweep, so every row is an option that actually exists. Each is priced at its
+    own σ(K) from the active surface.
+    """
+    vf = as_vol_fn(vol_fn)
+    inc = CONTRACTS[name]["strike_inc"]
+    atm = snap_strike(name, F)
+    half = max(int(n_strikes) // 2, 1)
+    strikes = [atm + i * inc for i in range(-half, half + 1) if atm + i * inc > 0]
+    mult = price_multiplier(name)
+    rows = []
+    for K in strikes:
+        sig = vf(K, T)
+        c = Black76(F, K, T, r, sig, "call")
+        p = Black76(F, K, T, r, sig, "put")
+        cp = crr_price(F, K, T, r, sig, "call", 160) if american else c.price()
+        pp = crr_price(F, K, T, r, sig, "put", 160) if american else p.price()
+        rows.append(dict(
+            call_px=cp, call_cash=cp * mult, call_delta=c.delta(),
+            vega=c.vega(), vol=sig, strike=K,
+            moneyness=K / F * 100,
+            put_delta=p.delta(), put_cash=pp * mult, put_px=pp,
+            atm=abs(K - atm) < inc / 2))
+    return pd.DataFrame(rows)
+
+
+def tab_chain(cx: dict) -> None:
+    section("Option chain",
+            "Every listed strike around the money, calls left, puts right, each priced at its "
+            "own volatility off the active surface. Strikes come off the contract's real "
+            "increment grid — half a dollar on WTI, five on gold — so every line is an option "
+            "you could actually deal, not a percentage sweep.")
+    F, r, unit, name = cx["F_T"], cx["r"], cx["unit"], cx["name"]
+    curve = cx["curve"]
+    c1, c2, c3, c4 = st.columns(4)
+    labels = [f"{r_.label} (T={option_tenor(r_.T):.2f}y)" for r_ in curve.itertuples()]
+    ei = c1.selectbox("Expiry", range(len(curve)),
+                      index=min(cx["T_months"] - 1, len(curve) - 1),
+                      format_func=lambda i: labels[i])
+    T = option_tenor(float(curve["T"].iloc[ei]))
+    Fe = float(curve["price"].iloc[ei])
+    width = c2.slider("Strikes shown", 5, 41, 15, 2)
+    amer = c3.radio("Exercise", ["European", "American"], horizontal=True,
+                    key="ch_style") == "American"
+    c4.markdown(f'<div class="note">Underlying <b>{curve["label"].iloc[ei]}</b> at '
+                f'<b>{Fe:,.4f}</b> {unit}<br>Option expiry {T:.3f}y — '
+                f'{OPTION_EXPIRY_LAG_DAYS} days before the future.</div>',
+                unsafe_allow_html=True)
+
+    vf = (sabr_vol_fn(cx["sabr_params"], Fe) if cx["sabr_params"]
+          else as_vol_fn(cx["vol"]))
+    with st.spinner("Pricing the chain…"):
+        ch = option_chain(name, Fe, T, r, vf, width, amer)
+
+    disp = ch[["call_cash", "call_px", "call_delta", "vol", "strike", "moneyness",
+               "put_delta", "put_px", "put_cash"]].copy()
+    disp.columns = ["Call $/lot", "Call", "Call Δ", "σ(K)", "STRIKE", "% of F",
+                    "Put Δ", "Put", "Put $/lot"]
+
+    def _hl(row):
+        near = abs(row["STRIKE"] - snap_strike(name, Fe)) < CONTRACTS[name]["strike_inc"] / 2
+        return [f"background-color: rgba(240,165,0,0.14)" if near else "" for _ in row]
+
+    st.dataframe(disp.style.format(
+        {"Call $/lot": "${:,.0f}", "Call": "{:,.4f}", "Call Δ": "{:+.3f}", "σ(K)": "{:.2%}",
+         "STRIKE": "{:,.4f}", "% of F": "{:.1f}%", "Put Δ": "{:+.3f}", "Put": "{:,.4f}",
+         "Put $/lot": "${:,.0f}"}).apply(_hl, axis=1),
+        use_container_width=True, hide_index=True, height=min(560, 40 + 35 * len(disp)))
+    st.caption(f"Highlighted row is the strike nearest the forward. σ(K) is "
+               f"{'the SABR smile' if cx['sabr_params'] else 'your flat volatility — every '
+                'strike identical, which is a MODEL choice and visibly wrong in the wings'}. "
+               f"Cash columns are per lot of {CONTRACTS[name]['size']:,} "
+               f"{CONTRACTS[name]['size_unit']}.")
+
+    section("Ticket")
+    t1, t2, t3, t4, t5 = st.columns([2, 1, 1, 1, 1.4])
+    K = t1.selectbox("Strike", ch["strike"].tolist(),
+                     index=int(np.argmin(np.abs(ch["strike"] - Fe))),
+                     format_func=lambda k: f"{k:,.4f}")
+    otype = t2.radio("Type", ["call", "put"], horizontal=True, key="ch_t")
+    sidew = t3.radio("Side", ["Buy", "Sell"], horizontal=True, key="ch_s")
+    lots = t4.number_input("Lots", 1, 500, 1, key="ch_l")
+    row = ch[ch["strike"] == K].iloc[0]
+    px = float(row["call_px"] if otype == "call" else row["put_px"])
+    dlt = float(row["call_delta"] if otype == "call" else row["put_delta"])
+    qty = lots * (1 if sidew == "Buy" else -1)
+    mult = price_multiplier(name)
+    t5.markdown(f'<div class="note">{sidew} {lots} × {curve["label"].iloc[ei]} '
+                f'{K:,.4f} {otype}<br><b>{px:,.4f}</b> {unit} = '
+                f'<b>${px * mult * lots:,.0f}</b><br>Δ {dlt:+.3f} · σ {row["vol"]:.2%}</div>',
+                unsafe_allow_html=True)
+    if st.button("➕  Add to book", type="primary", use_container_width=True):
+        st.session_state.setdefault("book", []).append(
+            dict(kind="option", contract=name, type=otype, strike=float(K),
+                 qty=int(qty), T=float(T), entry=px,
+                 style="American" if amer else "European", tag="chain"))
+        st.success(f"{sidew} {lots} × {K:,.4f} {otype} added to the book.")
+
+    g1, g2 = st.columns(2)
+    with g1:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=ch["strike"], y=ch["vol"] * 100, mode="lines+markers",
+                                 name="σ(K)", line=dict(color=AMBER, width=2.2)))
+        vline(fig, Fe, GREEN, f"F {Fe:,.2f}")
+        fig.update_xaxes(title=f"Strike ({unit})")
+        fig.update_yaxes(title="Implied vol (%)")
+        st.plotly_chart(styled(fig, 300, "The smile across the chain"),
+                        use_container_width=True)
+    with g2:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=ch["strike"], y=ch["call_delta"], mode="lines",
+                                 name="Call Δ", line=dict(color=GREEN, width=2)))
+        fig.add_trace(go.Scatter(x=ch["strike"], y=ch["put_delta"], mode="lines",
+                                 name="Put Δ", line=dict(color=RED, width=2)))
+        for d in (0.25, -0.25):
+            fig.add_hline(y=d, line=dict(color=GRAY, dash="dot", width=1))
+        vline(fig, Fe, BLUE, "F")
+        fig.update_xaxes(title=f"Strike ({unit})")
+        fig.update_yaxes(title="Delta")
+        st.plotly_chart(styled(fig, 300, "Delta profile — dotted lines are the 25s"),
+                        use_container_width=True)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  9. MAIN
 #  One guard around every tab: an exception costs you that tab, not the platform.
@@ -3134,6 +3122,7 @@ def tab_sabr(cx: dict) -> None:
 
 TABS = [
     ("📉  Vanilla", tab_vanilla),
+    ("⛓  Option Chain", tab_chain),
     ("🧩  Strategies", tab_strategies),
     ("📚  Book & Scenarios", tab_book),
     ("📐  Vol Analytics", tab_vol_analytics),
@@ -3142,7 +3131,6 @@ TABS = [
     ("🏭  Cracks & Crush", tab_structure),
     ("📅  Calendar Spread", tab_calendar),
     ("🚧  Barrier", tab_barrier),
-    ("🔄  Swaps", tab_swap),
     ("📈  Forward Curve", tab_curve),
     ("🔬  Model Checks", tab_checks),
 ]
@@ -3207,20 +3195,56 @@ def render_sidebar() -> dict:
                     f'text-transform:uppercase;letter-spacing:.1em">Contract terms</div>',
                     unsafe_allow_html=True)
         T_months = st.slider("Maturity (months)", 1, 36, 6)
-        K_pct = st.number_input("Strike (% of forward)", 20.0, 300.0, 100.0, 1.0, format="%.1f",
-                                help="Percent of the FORWARD at your chosen maturity, so 100% "
-                                     "is genuinely at-the-money-forward. Taking a percentage of "
-                                     "spot instead makes '100%' drift away from the money "
-                                     "whenever the curve is not flat.")
+        strike_mode = st.radio("Strike by", ["Exact", "% of forward", "Delta"],
+                               horizontal=True,
+                               help="Exact is how a listed option is named and how a broker "
+                                    "statement reads. The other two are conveniences that "
+                                    "resolve to a strike and are then snapped onto the "
+                                    "contract's listed grid.")
+        if strike_mode == "Exact":
+            strike_raw = st.number_input(f"Strike ({cfg['unit']})", min_value=1e-6,
+                                         value=float(_last_known_spot(name)),
+                                         step=float(cfg["strike_inc"]), format="%.4f")
+        elif strike_mode == "% of forward":
+            strike_raw = st.number_input("Strike (% of forward)", 20.0, 300.0, 100.0, 1.0,
+                                         format="%.1f")
+        else:
+            strike_raw = st.slider("Delta", 5, 50, 25, 1,
+                                   help="The way a desk names an option: 'the 25-delta put'.") / 100
+        st.caption(f"Listed increment: **{cfg['strike_inc']:g} {cfg['unit'].split('/')[0]}** — "
+                   f"indicative, verify against current specs.")
         side = st.radio("Option side", ["Call", "Put"], horizontal=True)
         st.markdown("---")
 
         st.markdown(f'<div style="font-size:.72rem;font-weight:600;color:{BLUE};'
                     f'text-transform:uppercase;letter-spacing:.1em">Model inputs</div>',
                     unsafe_allow_html=True)
-        vol = st.slider("Volatility (%)", 1, 200, int(cfg["vol"] * 100), 1,
+        vol = st.slider("ATM volatility (%)", 1, 200, int(cfg["vol"] * 100), 1,
                         help="Yours. There is no options feed here, so this is the single "
                              "assumption every price on the platform rests on.") / 100
+        vol_source = st.radio("Volatility source", ["Flat", "SABR smile"],
+                              horizontal=True,
+                              help="Flat gives every strike the same volatility — simple, and "
+                                   "wrong for any strike away from the money. SABR prices each "
+                                   "strike on its own smile, everywhere on the platform.")
+        sabr_p = None
+        if vol_source.startswith("SABR"):
+            cal = st.session_state.get("sabr_cal")
+            use_cal = False
+            if cal and cal.get("ok"):
+                use_cal = st.checkbox("Use the calibrated fit", value=True,
+                                      help="From the SABR tab. Uncheck to drive the smile "
+                                           "with the sliders instead.")
+            if use_cal:
+                sabr_p = dict(alpha=cal["alpha"], beta=cal["beta"], rho=cal["rho"],
+                              nu=cal["nu"], atm=vol)
+                st.caption(f"β {cal['beta']:.2f} · ρ {cal['rho']:+.3f} · ν {cal['nu']:.3f} "
+                           f"— fit RMSE {cal['rmse'] * 100:.3f} vols")
+            else:
+                b_ = st.select_slider("β", options=[0.0, 0.25, 0.5, 0.75, 1.0], value=0.5)
+                rho_ = st.slider("ρ skew", -95, 95, -35, 1, key="sb_rho_side") / 100
+                nu_ = st.slider("ν vol-of-vol", 1, 300, 85, 1, key="sb_nu_side") / 100
+                sabr_p = dict(beta=b_, rho=rho_, nu=nu_, atm=vol)
         r = st.number_input("Discount rate (%)", -5.0, 30.0, 4.25, 0.05, format="%.2f") / 100
         n_paths = st.select_slider("Monte Carlo paths",
                                    options=[10_000, 25_000, 50_000, 100_000, 250_000],
@@ -3235,8 +3259,9 @@ def render_sidebar() -> dict:
 
     return dict(name=name, cfg=cfg, unit=cfg["unit"], sector=sector,
                 is_model=is_model, spot_in=spot_in, storage=storage,
-                convenience=convenience, T_months=T_months, K_pct=K_pct,
-                side=side, vol=vol, r=r, n_paths=n_paths, curves={})
+                convenience=convenience, T_months=T_months, strike_mode=strike_mode,
+                strike_raw=strike_raw, side=side, vol=vol, r=r, n_paths=n_paths,
+                vol_source=vol_source, sabr_p=sabr_p, curves={})
 
 
 def _last_known_spot(name: str) -> float:
@@ -3268,7 +3293,32 @@ def build_context(cx: dict) -> dict:
     cx["T"] = T
     cx["T_opt"] = option_tenor(T)      # options stop trading before their future
     cx["F_T"] = F_T
-    cx["K"] = round(F_T * cx["K_pct"] / 100, 6) if F_T else None
+
+    # Volatility source: one function, σ(K, T), used by every tab.
+    if cx.get("sabr_p") and F_T:
+        p = dict(cx["sabr_p"])
+        p["alpha"] = sabr_alpha_from_atm(F_T, cx["T_opt"], cx["vol"],
+                                         p["beta"], p["rho"], p["nu"])
+        cx["sabr_params"] = p
+        cx["vol_fn"] = sabr_vol_fn(p, F_T)
+    else:
+        cx["sabr_params"] = None
+        cx["vol_fn"] = as_vol_fn(cx["vol"])
+
+    if F_T:
+        mode, raw = cx["strike_mode"], cx["strike_raw"]
+        if mode == "Exact":
+            K = float(raw)
+        elif mode == "% of forward":
+            K = F_T * float(raw) / 100.0
+        else:
+            K = strike_from_delta(F_T, cx["T_opt"], cx["r"],
+                                  cx["vol_fn"](F_T, cx["T_opt"]), float(raw),
+                                  cx["side"].lower())
+        cx["K"] = snap_strike(cx["name"], K)
+        cx["vol_K"] = cx["vol_fn"](cx["K"], cx["T_opt"])
+    else:
+        cx["K"] = cx["vol_K"] = None
     return cx
 
 
@@ -3286,7 +3336,9 @@ def render_header(cx: dict) -> None:
         state = badge(f"{'STALE' if stale else 'LIVE'} · {asof}", AMBER if stale else GREEN)
         sub = f"{len(curve)} dated contracts marked"
     bits = [badge(cx["name"], TEXT), badge(cx["sector"]), badge(cx["unit"]), state,
-            badge(f"σ {cx['vol'] * 100:.0f}% MODEL", PURPLE),
+            badge(f"σ ATM {cx['vol'] * 100:.0f}% MODEL", PURPLE),
+            badge(cx["vol_source"] + " smile" if cx["vol_source"].startswith("SABR")
+                  else "flat vol", PURPLE),
             badge(f"r {cx['r'] * 100:.2f}%"),
             badge(datetime.now().strftime("%d %b %Y %H:%M"))]
     st.markdown('<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px">'
@@ -3299,11 +3351,14 @@ def render_header(cx: dict) -> None:
         kpi(c[0], "Front", f"{stt['f1']:,.4f}", stt["front_label"], AMBER)
         kpi(c[1], f"Forward @ {cx['T_months']}M", f"{cx['F_T']:,.4f}",
             "interpolated on calendar T", TEXT)
-        kpi(c[2], "Strike", f"{cx['K']:,.4f}", f"{cx['K_pct']:.0f}% of forward", GREEN)
+        kpi(c[2], "Strike", f"{cx['K']:,.4f}",
+            f"{cx['K'] / cx['F_T'] * 100:.1f}% of forward · on the {cx['cfg']['strike_inc']:g} grid",
+            GREEN)
         kpi(c[3], "Structure", stt["structure"], f"{stt['slope_ann']:+.1f}% ann.",
             GREEN if stt["structure"] == "BACKWARDATION" else RED)
-        b = Black76(cx["F_T"], cx["K"], cx["T"], cx["r"], cx["vol"], cx["side"].lower())
-        kpi(c[4], f"{cx['side']} premium", f"{b.price():,.4f}", cx["unit"], BLUE)
+        b = Black76(cx["F_T"], cx["K"], cx["T_opt"], cx["r"], cx["vol_K"], cx["side"].lower())
+        kpi(c[4], f"{cx['side']} premium", f"{b.price():,.4f}",
+            f"at σ(K) {cx['vol_K'] * 100:.1f}%", BLUE)
         kpi(c[5], "Per lot", f"${b.price() * price_multiplier(cx['name']):,.0f}",
             f"{cx['cfg']['size']:,} {cx['cfg']['size_unit']}", PURPLE)
 
