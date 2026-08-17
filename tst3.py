@@ -1,44 +1,58 @@
 """
-CODAP — Commodity Options & Derivatives Analytics Platform
-==========================================================
-Pricing and risk for commodity derivatives on live futures curves: European AND
-American vanillas, Asian options, spread options on cracks and calendar spreads
-via Kirk, barrier options, swaps, a SABR volatility surface, realised-volatility
-cones, gamma-scalping simulation, a strategy builder, and a book carrying
-aggregated cash Greeks, vega bucketed by tenor, a price x volatility scenario
-grid and a SPAN-style margin.
+CODAP — Commodity Options Desk
+==============================
+A working desk for paper options traders: an option chain you can deal off, a
+trade ticket, a book with cash Greeks and margin, and the volatility work that
+decides whether any of it is worth doing.
 
-DESIGN CONTRACT — a pricer has two kinds of number and they are never mixed:
+HOW THE VOLATILITY GETS THERE — the one thing worth reading first. An implied
+volatility is not market data anybody can download; it is an option PRICE turned
+inside out. So this app never pretends to fetch one. It ranks the ways of getting
+one and tells you on every screen which is live:
 
-  MARKET DATA is fetched, dated and never invented. When a feed dies the screen
-  says NO MARKET DATA and the curve stands down. There is no random "synthetic"
-  price anywhere in this file: a fabricated settle that looks like a real one is
-  worse than an empty screen.
+    1. YOUR QUOTES    paste the premiums on your broker screen; each is inverted
+                      to an implied vol and SABR is fitted to them. From then on
+                      every price here comes off your market.
+    2. REALISED SEED  the volatility this contract actually delivered over the
+                      last 30 sessions, computed from free price history. Not an
+                      implied vol, and labelled so — but a defensible start.
+    3. REGISTRY       a constant in this file. The weakest source, named as such.
 
-  MODEL INPUTS — volatility, correlation, convenience yield, the shape of the
-  vol surface — are yours. They are labelled MODEL wherever they touch a result,
-  because an option price is only ever as good as the vol you fed it.
+You can override the level by hand at any time, and turn the smile off to price
+every strike flat — both are choices the header reports rather than hides.
 
-SELF-VALIDATION — every model on this desk is checked against an independent
-computation and the residual is displayed, not hidden: put-call parity, the
-knock-in/knock-out identity, Kemna-Vorst against Monte Carlo, and Kirk against a
-two-factor simulation. A pricer that cannot show its own error is a pricer you
-have to take on faith.
+DESIGN CONTRACT — market data is fetched, dated and never invented; a dead feed
+says NO MARKET DATA and the screen stands down. Model inputs are labelled
+wherever they touch a number. Eight independent checks run on demand and show
+their residuals, because a pricer that cannot show its own error is one you have
+to take on faith.
+
+SCREENS, in the order a trader opens them:
+
+    Chain        the strike ladder on the contract's real increment grid, the
+                 ticket, and the paste-your-prices calibration
+    Trade        one option or a structure, strikes by price / % / delta
+    Book         cash Greeks, vega bucketed by tenor, scenario grid, SPAN margin
+    Volatility   SABR surface · realised-vol cones · gamma scalping
+    Structures   cracks and crush · calendar spreads · Asians · barriers
+    Market       the forward curve behind every price
+    Checks       model validation, stated limits, and what was excluded
 
 LAYOUT — reads top-down in dependency order; nothing below is needed above:
 
-    1. REGISTRY & CALENDAR      contracts, expiry rules, calendar tenor
-    2. MARKET DATA              grouped download, dated marks, no fabrication
-    3. PRICING MODELS           European, American, Asian, spreads, barriers, SABR
-    4. VOLATILITY ANALYTICS     realised-vol cones, forward vol, gamma scalping
-    5. STRATEGIES, BOOK, SCENARIOS  structures, cash Greeks, vega buckets, margin
-    6. SELF-VALIDATION          independent checks on every model
-    7. UI HELPERS               chrome shared by every tab
-    8. TABS                     one section per screen
-    9. MAIN                     router, with a per-tab guard
+    1. REGISTRY & CALENDAR    contracts, expiry rules, calendar tenor, strike grid
+    2. MARKET DATA            grouped download, dated marks, no fabrication
+    3. PRICING MODELS         European, American, Asian, spreads, barriers, SABR
+    4. VOLATILITY ANALYTICS   realised-vol cones, forward vol, gamma scalping
+    5. STRATEGIES & BOOK      structures, cash Greeks, vega buckets, scenarios
+    6. SELF-VALIDATION        independent checks on every model
+    6b. VOLATILITY SOURCE     quotes > realised > registry, resolved and named
+    7. UI FOUNDATION          chrome, and the folded-explanation pattern
+    8. SCREENS                one function per screen
+    9. NAVIGATION & MAIN      router, with a per-screen guard
 
 Run:    streamlit run codap.py
-Tests:  pytest test_codap.py -q        (no network, no Streamlit runtime)
+Tests:  pytest test_codap.py -q
 
 by Adam EL GBOURI
 """
@@ -1840,8 +1854,163 @@ def validate_models(F, K, T, r, sigma, n_obs=12, quick=True) -> List[dict]:
     return rows
 
 
+
+def option_chain(name: str, F: float, T: float, r: float, vol_fn,
+                 n_strikes: int = 15, american: bool = False) -> pd.DataFrame:
+    """The screen an options trader lives on: every listed strike around the money,
+    calls on one side, puts on the other.
+
+    Strikes come off the contract's own increment grid rather than a percentage
+    sweep, so every row is an option that actually exists. Each is priced at its
+    own σ(K) from the active surface.
+    """
+    vf = as_vol_fn(vol_fn)
+    inc = CONTRACTS[name]["strike_inc"]
+    atm = snap_strike(name, F)
+    half = max(int(n_strikes) // 2, 1)
+    strikes = [atm + i * inc for i in range(-half, half + 1) if atm + i * inc > 0]
+    mult = price_multiplier(name)
+    rows = []
+    for K in strikes:
+        sig = vf(K, T)
+        c = Black76(F, K, T, r, sig, "call")
+        p = Black76(F, K, T, r, sig, "put")
+        cp = crr_price(F, K, T, r, sig, "call", 160) if american else c.price()
+        pp = crr_price(F, K, T, r, sig, "put", 160) if american else p.price()
+        rows.append(dict(
+            call_px=cp, call_cash=cp * mult, call_delta=c.delta(),
+            vega=c.vega(), vol=sig, strike=K,
+            moneyness=K / F * 100,
+            put_delta=p.delta(), put_cash=pp * mult, put_px=pp,
+            atm=abs(K - atm) < inc / 2))
+    return pd.DataFrame(rows)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  7. UI HELPERS
+#  6b. VOLATILITY SOURCE — where the number actually comes from
+#  An implied volatility is not market data you can download; it is an option
+#  PRICE turned inside out. So the platform never pretends to fetch one. Instead
+#  it ranks the ways of getting one, uses the best available, and says on screen
+#  which one is live:
+#
+#    1. YOUR QUOTES     you paste option prices, they are inverted to implied
+#                       vols and SABR is calibrated to them. Real market data,
+#                       because you supplied the market half.
+#    2. REALISED SEED   the volatility this contract has actually delivered over
+#                       the last 30 trading days, computed from free price
+#                       history. Not an implied vol — a defensible starting point.
+#    3. REGISTRY        a constant written into this file. The weakest source,
+#                       labelled as such, and only used when the other two fail.
+#
+#  The old default was 3 with no explanation, which is exactly the fabricated
+#  input this project refuses everywhere else.
+# ══════════════════════════════════════════════════════════════════════════════
+
+VOL_SOURCES = {
+    "quotes": ("YOUR QUOTES", "implied from the option prices you pasted"),
+    "realised": ("REALISED SEED", "30-day realised volatility, computed from price history"),
+    "registry": ("REGISTRY DEFAULT", "a constant in this file — replace it"),
+}
+
+
+def realised_seed(name: str, window: int = 30) -> Optional[dict]:
+    """Realised volatility over the last `window` sessions, with its percentile.
+
+    Honest about what it is: realised is what the market DID, implied is what it
+    charges for what it MIGHT do. They are different numbers and the gap between
+    them is itself a trade — which is why the app shows both rather than quietly
+    using one as the other.
+    """
+    hist = fetch_history(name, "2y")
+    if hist.empty or len(hist) < window + 20:
+        return None
+    series = realised_vol(hist, window).dropna()
+    if series.empty:
+        return None
+    cur = float(series.iloc[-1])
+    return dict(vol=cur, window=window, n=len(series),
+                pct=float((series < cur).mean() * 100),
+                median=float(series.median()))
+
+
+def implied_from_quotes(F: float, T: float, r: float,
+                        quotes: pd.DataFrame) -> pd.DataFrame:
+    """Invert a table of option PRICES into implied volatilities.
+
+    Expects columns Strike, Type, Price. Each row is solved independently and a
+    row that cannot be solved — a price below intrinsic, above the discounted
+    forward, or simply mistyped — comes back as NaN with a reason rather than a
+    number that would silently poison the calibration.
+    """
+    out = []
+    for row in quotes.itertuples():
+        try:
+            K = float(row.Strike)
+            px = float(row.Price)
+            typ = str(row.Type).strip().lower()
+        except (TypeError, ValueError):
+            continue
+        if K <= 0 or not np.isfinite(px) or typ not in ("call", "put"):
+            continue
+        b = Black76(F, K, T, r, 0.3, typ)
+        iv = b.implied_vol(px)
+        disc = math.exp(-r * T)
+        intr = disc * (max(F - K, 0.0) if typ == "call" else max(K - F, 0.0))
+        reason = ""
+        if math.isnan(iv):
+            reason = ("below intrinsic" if px < intr else
+                      "above the no-arbitrage ceiling" if px > disc * (F if typ == "call" else K)
+                      else "no solution")
+        out.append(dict(Strike=K, Type=typ, Price=px, Implied=iv,
+                        Intrinsic=intr, Note=reason))
+    return pd.DataFrame(out)
+
+
+def resolve_vol_source(name: str, F: Optional[float], T: float, r: float,
+                       manual: Optional[float] = None) -> dict:
+    """Pick the volatility source, best first, and report which one won.
+
+    Returns the ATM level, a σ(K,T) function, the source key and a one-line
+    explanation for the header. Everything downstream reads this and nothing
+    downstream needs to know how the number was obtained.
+    """
+    cal = st.session_state.get("sabr_cal")
+    shape = st.session_state.get("sabr_shape", dict(beta=0.5, rho=-0.30, nu=0.70))
+
+    if manual is not None:
+        atm, key, detail = float(manual), "manual", "your override"
+    elif cal and cal.get("ok") and abs(cal.get("F", F or 0) - (F or 0)) < 1e-6:
+        atm, key, detail = float(cal["atm"]), "quotes", VOL_SOURCES["quotes"][1]
+    else:
+        seed = realised_seed(name)
+        if seed:
+            atm, key = seed["vol"], "realised"
+            detail = (f"{seed['window']}-day realised, {seed['pct']:.0f}th percentile "
+                      f"of its own 2-year range")
+        else:
+            atm, key = CONTRACTS[name]["vol"], "registry"
+            detail = VOL_SOURCES["registry"][1]
+
+    if F and cal and cal.get("ok") and key in ("quotes", "manual"):
+        p = dict(alpha=cal["alpha"], beta=cal["beta"], rho=cal["rho"], nu=cal["nu"], atm=atm)
+        if key == "manual":
+            p["alpha"] = sabr_alpha_from_atm(F, T, atm, p["beta"], p["rho"], p["nu"])
+        return dict(atm=atm, source=key, detail=detail, params=p,
+                    fn=sabr_vol_fn(p, F), smile=True)
+    if F and st.session_state.get("use_smile", True):
+        p = dict(beta=shape["beta"], rho=shape["rho"], nu=shape["nu"], atm=atm)
+        p["alpha"] = sabr_alpha_from_atm(F, T, atm, p["beta"], p["rho"], p["nu"])
+        return dict(atm=atm, source=key, detail=detail, params=p,
+                    fn=sabr_vol_fn(p, F), smile=True)
+    return dict(atm=atm, source=key, detail=detail, params=None,
+                fn=as_vol_fn(atm), smile=False)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  7. UI FOUNDATION
+#  Explanations are everywhere, but folded: one visible line per screen, the
+#  detail one click away, and a tooltip on every input. A wall of prose is
+#  excellent the first time and an obstacle the thirtieth.
 # ══════════════════════════════════════════════════════════════════════════════
 
 CSS = f"""
@@ -1849,25 +2018,25 @@ CSS = f"""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 html,body,[class*="css"]{{font-family:'Inter',sans-serif}}
 code,pre{{font-family:'JetBrains Mono',monospace}}
-.block-container{{padding-top:1rem;max-width:1440px}}
+.block-container{{padding-top:.8rem;max-width:1500px}}
 [data-testid="stSidebar"]{{background:linear-gradient(180deg,#0A0E17 0%,{BG} 100%);
     border-right:1px solid #1C2333}}
 [data-testid="stSidebar"] label{{font-size:.70rem;font-weight:500;color:#6E7681;
-    text-transform:uppercase;letter-spacing:.08em}}
-.stTabs [data-baseweb="tab-list"]{{background:{BG};border-bottom:1px solid #1C2333;gap:2px}}
-.stTabs [data-baseweb="tab"]{{font-size:.80rem;font-weight:500;color:#6E7681;padding:10px 16px}}
-.stTabs [aria-selected="true"]{{color:{TEXT};background:{PANEL};
-    border-bottom:2px solid {AMBER}}}
-hr{{border:none;border-top:1px solid #1C2333;margin:12px 0}}
-.kpi{{background:{PANEL};border:.5px solid {BORDER};border-radius:10px;padding:12px 14px}}
-.kpi-l{{font-size:.66rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;
-    margin-bottom:5px}}
-.kpi-v{{font-family:'JetBrains Mono',monospace;font-size:.98rem;color:{TEXT};white-space:nowrap}}
-.kpi-s{{font-size:.68rem;color:#6E7681;margin-top:3px}}
+    text-transform:uppercase;letter-spacing:.07em}}
+.stTabs [data-baseweb="tab-list"]{{background:{BG};border-bottom:1px solid #1C2333;gap:3px}}
+.stTabs [data-baseweb="tab"]{{font-size:.82rem;font-weight:500;color:#6E7681;padding:9px 16px}}
+.stTabs [aria-selected="true"]{{color:{TEXT};background:{PANEL};border-bottom:2px solid {AMBER}}}
+hr{{border:none;border-top:1px solid #1C2333;margin:10px 0}}
+.kpi{{background:{PANEL};border:.5px solid {BORDER};border-radius:9px;padding:11px 13px}}
+.kpi-l{{font-size:.64rem;font-weight:600;text-transform:uppercase;letter-spacing:.07em;
+    margin-bottom:4px}}
+.kpi-v{{font-family:'JetBrains Mono',monospace;font-size:.95rem;color:{TEXT};white-space:nowrap}}
+.kpi-s{{font-size:.66rem;color:#6E7681;margin-top:3px}}
 .badge{{display:inline-block;padding:2px 8px;border:1px solid {BORDER};border-radius:5px;
-    font-family:'JetBrains Mono',monospace;font-size:.72rem}}
-.note{{font-size:.82rem;color:#9BA6B2;line-height:1.6;padding:9px 13px;background:{PANEL};
-    border-radius:6px;border-left:2px solid {BORDER};margin-bottom:14px}}
+    font-family:'JetBrains Mono',monospace;font-size:.71rem}}
+.lead{{font-size:.85rem;color:#B9C4CF;line-height:1.55;margin:2px 0 10px 0}}
+.note{{font-size:.80rem;color:#9BA6B2;line-height:1.6;padding:8px 12px;background:{PANEL};
+    border-radius:6px;border-left:2px solid {BORDER};margin-bottom:12px}}
 .note b{{color:{TEXT}}}
 </style>
 """
@@ -1884,152 +2053,713 @@ def badge(text, color=GRAY) -> str:
     return f'<span class="badge" style="color:{color}">{text}</span>'
 
 
-def styled(fig, height=340, title=None):
+def styled(fig, height=320, title=None):
     fig.update_layout(
-        template="plotly_dark", height=height,
-        paper_bgcolor=BG, plot_bgcolor=BG,
+        template="plotly_dark", height=height, paper_bgcolor=BG, plot_bgcolor=BG,
         font=dict(family="Inter", size=11, color=TEXT),
         title=(dict(text=title, x=0.5, xanchor="center",
-                    font=dict(size=13, color=GRAY)) if title else None),
-        margin=dict(l=60, r=30, t=60 if title else 30, b=50),
+                    font=dict(size=12, color=GRAY)) if title else None),
+        margin=dict(l=55, r=25, t=55 if title else 25, b=45),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(size=10)),
         xaxis=dict(gridcolor="#1C2333", zerolinecolor=BORDER),
         yaxis=dict(gridcolor="#1C2333", zerolinecolor=BORDER))
     return fig
 
 
-def section(title, note=""):
-    st.markdown(f'<div style="border-left:3px solid {AMBER};padding-left:10px;'
-                f'margin:14px 0 8px 0"><span style="font-size:1.02rem;font-weight:500;'
+def vline(fig, x, color, text, y=0.96):
+    fig.add_vline(x=x, line=dict(color=color, dash="dash", width=1),
+                  annotation_text=text, annotation_position="top left",
+                  annotation=dict(yref="paper", y=y,
+                                  font=dict(color=color, size=10, family="JetBrains Mono"),
+                                  bgcolor=BG, bordercolor=color, borderwidth=1))
+    return fig
+
+
+def lead(text: str, detail: str = "", label: str = "How to read this screen"):
+    """One visible line, the rest folded. Every screen opens the same way, so a
+    returning user's eye can skip it and a first-time user knows where to look."""
+    st.markdown(f'<div class="lead">{text}</div>', unsafe_allow_html=True)
+    if detail:
+        with st.expander(f"ⓘ  {label}"):
+            st.markdown(detail)
+
+
+def section(title: str, note: str = ""):
+    st.markdown(f'<div style="border-left:3px solid {AMBER};padding-left:9px;'
+                f'margin:16px 0 7px 0"><span style="font-size:.98rem;font-weight:500;'
                 f'color:{TEXT}">{title}</span></div>', unsafe_allow_html=True)
     if note:
         st.markdown(f'<div class="note">{note}</div>', unsafe_allow_html=True)
 
 
-def vline(fig, x, color, text, y=0.96):
-    fig.add_vline(x=x, line=dict(color=color, dash="dash", width=1),
-                  annotation_text=text, annotation_position="top left",
-                  annotation=dict(yref="paper", y=y,
-                                  font=dict(color=color, size=10,
-                                            family="JetBrains Mono"),
-                                  bgcolor=BG, bordercolor=color, borderwidth=1))
-    return fig
+def add_to_book(**line) -> None:
+    st.session_state.setdefault("book", []).append(line)
+
+
+def book_state() -> List[dict]:
+    return st.session_state.setdefault("book", [])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  8. TABS
-#  Each tab reads the shared context, renders, and returns. A tab cannot break
-#  another one: main() runs every one of them inside a guard.
+#  8. SCREENS
+#  Ordered by how often a trader opens them: the chain, then a trade, then the
+#  book. Everything else is grouped behind those three.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def tab_vanilla(cx: dict) -> None:
-    section("Black-76 — European options on futures",
-            "Black-76 prices options on the <b>forward</b>, which is directly observable "
-            "and tradeable — no spot, no dividend yield, no cost-of-carry assumption. "
-            "Greeks are analytic. Conventions: <b>vega</b> per one vol point, "
-            "<b>theta</b> per calendar day, <b>rho</b> per one point of rate.")
-    F, K, T, r, unit = cx["F_T"], cx["K"], cx["T_opt"], cx["r"], cx["unit"]
-    vol = cx["vol_K"]
-    vf = cx["vol_fn"]
-    call, put = Black76(F, K, T, r, vol, "call"), Black76(F, K, T, r, vol, "put")
-    gc, gp = call.greeks(), put.greeks()
-    mult = price_multiplier(cx["name"])
+def screen_chain(cx: dict) -> None:
+    lead("Every listed strike around the money, calls left, puts right — and the place "
+         "to turn the prices on your broker screen into a volatility surface.",
+         """
+**The ladder.** Strikes come off the contract's real increment grid (0.50 on WTI, 5 on
+gold, 10 cents on corn), so every line is an option that exists. `Call Δ` and `Put Δ` are
+the futures-equivalent exposure per unit; `σ(K)` is the volatility used for that row.
 
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        rows = [("Price", "premium paid or received", gc["price"], gp["price"]),
-                ("Delta", "futures-equivalent per unit", gc["delta"], gp["delta"]),
-                ("Gamma", "how fast delta moves", gc["gamma"], gp["gamma"]),
-                ("Vega", "per +1 vol point", gc["vega"], gp["vega"]),
-                ("Theta", "per calendar day", gc["theta"], gp["theta"]),
-                ("Rho", "per +1 point of rate", gc["rho"], gp["rho"])]
-        html = '<div style="display:grid;gap:5px">'
-        for lbl, tip, cv, pv in rows:
-            html += (
-                f'<div style="background:{PANEL};border:.5px solid {BORDER};border-radius:8px;'
-                f'padding:8px 12px;display:flex;justify-content:space-between;align-items:center">'
-                f'<div><div style="font-size:.76rem;color:{TEXT}">{lbl}</div>'
-                f'<div style="font-size:.65rem;color:{GRAY}">{tip}</div></div>'
-                f'<div style="display:flex;gap:14px;font-family:JetBrains Mono,monospace">'
-                f'<div style="text-align:right"><div style="font-size:.58rem;color:{GRAY}">CALL</div>'
-                f'<div style="font-size:.78rem;color:{AMBER if lbl=="Price" else (GREEN if cv>=0 else RED)}">{cv:+.6f}</div></div>'
-                f'<div style="text-align:right"><div style="font-size:.58rem;color:{GRAY}">PUT</div>'
-                f'<div style="font-size:.78rem;color:{BLUE if lbl=="Price" else (GREEN if pv>=0 else RED)}">{pv:+.6f}</div></div>'
-                f'</div></div>')
-        st.markdown(html + "</div>", unsafe_allow_html=True)
+**The cash columns** are per lot, so `Call $/lot` is what you would actually pay.
 
-        st.markdown(
-            f'<div class="note" style="margin-top:10px">Per lot ({CONTRACTS[cx["name"]]["size"]:,} '
-            f'{CONTRACTS[cx["name"]]["size_unit"]}): call costs '
-            f'<b>${gc["price"] * mult:,.0f}</b>, put costs <b>${gp["price"] * mult:,.0f}</b>. '
-            f'A one-point move in vol is worth <b>${gc["vega"] * mult:,.0f}</b>; a day of decay '
-            f'costs the call holder <b>${abs(gc["theta"]) * mult:,.0f}</b>.</div>',
-            unsafe_allow_html=True)
+**Pasting quotes is the important part.** An implied volatility is not something anyone
+can download — it is an option price turned inside out. Type the premiums you can see,
+and the app inverts each one, then fits SABR to them. From that moment every screen on
+the platform prices off *your* market rather than an assumption.
 
-        err = put_call_parity_error(F, K, T, r, vol)
-        ok = err < 1e-8
-        st.markdown(
-            f'<div style="font-family:JetBrains Mono,monospace;font-size:.70rem;color:{GRAY};'
-            f'padding:7px 11px;background:{PANEL};border:.5px solid {BORDER};border-radius:7px">'
-            f'Put-call parity residual: {err:.2e} '
-            f'{"<span style=color:%s>✓ exact</span>" % GREEN if ok else "<span style=color:%s>✗</span>" % RED}'
-            f'</div>', unsafe_allow_html=True)
+**Rows that fail to invert** show a reason instead of a number: a premium below intrinsic
+or above the discounted forward has no volatility that reproduces it, and silently
+dropping it would poison the fit.
+""")
+    F_curve, r, unit, name = cx["curve"], cx["r"], cx["unit"], cx["name"]
+    c1, c2, c3 = st.columns([2, 1, 1])
+    labels = [f"{x.label}  ({option_tenor(x.T):.2f}y)" for x in F_curve.itertuples()]
+    ei = c1.selectbox("Expiry", range(len(F_curve)),
+                      index=min(cx["T_months"] - 1, len(F_curve) - 1),
+                      format_func=lambda i: labels[i],
+                      help="Each row of the forward curve is a delivery month. The option "
+                           "expires a few days before the future it settles into.")
+    T = option_tenor(float(F_curve["T"].iloc[ei]))
+    F = float(F_curve["price"].iloc[ei])
+    width = c2.slider("Strikes shown", 5, 41, 15, 2,
+                      help="How far either side of the money to list.")
+    amer = c3.radio("Exercise", ["European", "American"], horizontal=True, key="ch_style",
+                    help="Most listed commodity options are American. Early exercise is "
+                         "priced on a binomial tree, and is worth more the higher the "
+                         "discount rate.") == "American"
 
-    with c2:
-        rng = np.linspace(K * 0.55, K * 1.45, 300)
+    vs = resolve_vol_source(name, F, T, r, cx["manual_vol"])
+    ch = option_chain(name, F, T, r, vs["fn"], width, amer)
+    src_col = {"quotes": GREEN, "realised": AMBER, "manual": BLUE, "registry": RED}[vs["source"]]
+    st.markdown(
+        badge(f"{F_curve['label'].iloc[ei]} @ {F:,.4f} {unit}", TEXT) + " " +
+        badge(f"σ ATM {vs['atm'] * 100:.1f}%", PURPLE) + " " +
+        badge(VOL_SOURCES.get(vs["source"], ("MANUAL", ""))[0], src_col) + " " +
+        badge("SABR smile" if vs["smile"] else "flat", PURPLE) +
+        f'<span style="color:{GRAY};font-size:.76rem;margin-left:8px">{vs["detail"]}</span>',
+        unsafe_allow_html=True)
+
+    disp = ch[["call_cash", "call_px", "call_delta", "vol", "strike", "moneyness",
+               "put_delta", "put_px", "put_cash"]].copy()
+    disp.columns = ["Call $/lot", "Call", "Call Δ", "σ(K)", "STRIKE", "% of F",
+                    "Put Δ", "Put", "Put $/lot"]
+    atm_k = snap_strike(name, F)
+
+    def _hl(row):
+        near = abs(row["STRIKE"] - atm_k) < CONTRACTS[name]["strike_inc"] / 2
+        return ["background-color: rgba(240,165,0,0.14)" if near else "" for _ in row]
+
+    st.dataframe(disp.style.format(
+        {"Call $/lot": "${:,.0f}", "Call": "{:,.4f}", "Call Δ": "{:+.3f}", "σ(K)": "{:.2%}",
+         "STRIKE": "{:,.4f}", "% of F": "{:.1f}%", "Put Δ": "{:+.3f}", "Put": "{:,.4f}",
+         "Put $/lot": "${:,.0f}"}).apply(_hl, axis=1),
+        use_container_width=True, hide_index=True, height=min(540, 42 + 35 * len(disp)))
+
+    # ── ticket ───────────────────────────────────────────────────────────────
+    section("Ticket")
+    t1, t2, t3, t4, t5 = st.columns([1.6, 1, 1, 1, 2])
+    K = t1.selectbox("Strike", ch["strike"].tolist(),
+                     index=int(np.argmin(np.abs(ch["strike"] - F))),
+                     format_func=lambda k: f"{k:,.4f}")
+    otype = t2.radio("Type", ["call", "put"], horizontal=True, key="ck_t")
+    sidew = t3.radio("Side", ["Buy", "Sell"], horizontal=True, key="ck_s")
+    lots = t4.number_input("Lots", 1, 999, 1, key="ck_l")
+    row = ch[ch["strike"] == K].iloc[0]
+    px = float(row["call_px"] if otype == "call" else row["put_px"])
+    dlt = float(row["call_delta"] if otype == "call" else row["put_delta"])
+    mult = price_multiplier(name)
+    t5.markdown(f'<div class="note" style="margin:0">{sidew} {lots} × '
+                f'{F_curve["label"].iloc[ei]} {K:,.4f} {otype}<br>'
+                f'<b>{px:,.4f}</b> {unit} = <b>${px * mult * lots:,.0f}</b> · '
+                f'Δ {dlt * lots * (1 if sidew == "Buy" else -1):+.2f} · '
+                f'σ {row["vol"]:.2%}</div>', unsafe_allow_html=True)
+    if st.button("➕  Add to book", type="primary", use_container_width=True):
+        add_to_book(kind="option", contract=name, type=otype, strike=float(K),
+                    qty=int(lots * (1 if sidew == "Buy" else -1)), T=float(T),
+                    entry=px, style="American" if amer else "European", tag="chain")
+        st.success(f"{sidew} {lots} × {K:,.4f} {otype} booked.")
+
+    # ── quotes → implied vols → SABR ─────────────────────────────────────────
+    section("Paste market prices → implied volatility → surface",
+            "This is the direction a trader actually works in: you have prices on a screen, "
+            "not volatilities. Fill in the premiums you can see and the platform does the "
+            "rest. Leave it empty and it falls back to realised volatility, which it says.")
+    seed = pd.DataFrame({
+        "Strike": [float(x) for x in ch["strike"].iloc[::max(len(ch) // 5, 1)][:6]],
+        "Type": ["put", "put", "call", "call", "call", "call"][:len(ch.iloc[::max(len(ch) // 5, 1)][:6])],
+        "Price": [np.nan] * len(ch.iloc[::max(len(ch) // 5, 1)][:6])})
+    q = st.data_editor(st.session_state.get("quote_table", seed),
+                       use_container_width=True, hide_index=True, num_rows="dynamic",
+                       key="quotes_editor",
+                       column_config={
+                           "Strike": st.column_config.NumberColumn(format="%.4f"),
+                           "Type": st.column_config.SelectboxColumn(options=["call", "put"]),
+                           "Price": st.column_config.NumberColumn(
+                               format="%.4f", help="The premium you can deal at, "
+                                                   "in the contract's quote units.")})
+    a1, a2 = st.columns([1, 3])
+    if a1.button("Invert & calibrate", type="primary", use_container_width=True):
+        st.session_state["quote_table"] = q
+        rows = implied_from_quotes(F, T, r, q.dropna(subset=["Price"]))
+        st.session_state["implied_rows"] = rows
+        good = rows.dropna(subset=["Implied"]) if not rows.empty else rows
+        if len(good) >= 3:
+            beta = st.session_state.get("sabr_shape", {}).get("beta", 0.5)
+            cal = sabr_calibrate(F, T, good["Strike"], good["Implied"], beta)
+            if cal.get("ok"):
+                cal["F"] = F
+                cal["atm"] = float(np.interp(F, np.sort(good["Strike"]),
+                                             good.sort_values("Strike")["Implied"]))
+                st.session_state["sabr_cal"] = cal
+                st.success(f"Calibrated on {len(good)} quotes — RMSE "
+                           f"{cal['rmse'] * 100:.3f} vol points. This surface now drives "
+                           f"every screen.")
+        elif not good.empty:
+            st.warning(f"Only {len(good)} quote(s) inverted — SABR needs at least three. "
+                       f"The implied vols are shown below and are usable on their own.")
+    if a2.button("Clear the calibration", use_container_width=True):
+        st.session_state.pop("sabr_cal", None)
+        st.session_state.pop("implied_rows", None)
+        st.rerun()
+
+    rows = st.session_state.get("implied_rows")
+    if rows is not None and not rows.empty:
+        st.dataframe(rows.style.format({"Strike": "{:,.4f}", "Price": "{:,.4f}",
+                                        "Implied": "{:.2%}", "Intrinsic": "{:,.4f}"},
+                                       na_rep="—"),
+                     use_container_width=True, hide_index=True)
+        good = rows.dropna(subset=["Implied"])
+        if not good.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=good["Strike"], y=good["Implied"] * 100,
+                                     mode="markers", name="Your quotes",
+                                     marker=dict(size=11, color=AMBER)))
+            cal = st.session_state.get("sabr_cal")
+            if cal and cal.get("ok"):
+                ks = np.linspace(min(good["Strike"]) * 0.92, max(good["Strike"]) * 1.08, 100)
+                fig.add_trace(go.Scatter(x=ks, y=[sabr_vol(F, k_, T, cal["alpha"], cal["beta"],
+                                                           cal["rho"], cal["nu"]) * 100
+                                                  for k_ in ks],
+                                         mode="lines", name="SABR fit",
+                                         line=dict(color=BLUE, width=2)))
+            vline(fig, F, GREEN, "F")
+            fig.update_xaxes(title=f"Strike ({unit})")
+            fig.update_yaxes(title="Implied vol (%)")
+            st.plotly_chart(styled(fig, 300, "Your market, inverted"), use_container_width=True)
+
+    g1, g2 = st.columns(2)
+    with g1:
+        fig = go.Figure(go.Scatter(x=ch["strike"], y=ch["vol"] * 100, mode="lines+markers",
+                                   line=dict(color=AMBER, width=2.2)))
+        vline(fig, F, GREEN, f"F {F:,.2f}")
+        fig.update_xaxes(title=f"Strike ({unit})")
+        fig.update_yaxes(title="σ (%)")
+        st.plotly_chart(styled(fig, 280, "Volatility across the chain"),
+                        use_container_width=True)
+    with g2:
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=rng, y=call.pnl(rng), name="Call P&L",
-                                 line=dict(color=AMBER, width=2)))
-        fig.add_trace(go.Scatter(x=rng, y=put.pnl(rng), name="Put P&L",
-                                 line=dict(color=BLUE, width=2)))
-        fig.add_hline(y=0, line=dict(color=GRAY, width=0.8))
-        vline(fig, K, GREEN, f"K {K:,.2f}")
-        vline(fig, F, RED, f"F {F:,.2f}", y=0.82)
-        fig.update_xaxes(title=f"Price at expiry ({unit})")
-        fig.update_yaxes(title=f"P&L ({unit})")
-        st.plotly_chart(styled(fig, 360, "P&L at expiry (premium not discounted)"),
+        fig.add_trace(go.Scatter(x=ch["strike"], y=ch["call_delta"], name="Call Δ",
+                                 line=dict(color=GREEN, width=2)))
+        fig.add_trace(go.Scatter(x=ch["strike"], y=ch["put_delta"], name="Put Δ",
+                                 line=dict(color=RED, width=2)))
+        for d in (0.25, -0.25):
+            fig.add_hline(y=d, line=dict(color=GRAY, dash="dot", width=1))
+        vline(fig, F, BLUE, "F")
+        fig.update_xaxes(title=f"Strike ({unit})")
+        fig.update_yaxes(title="Delta")
+        st.plotly_chart(styled(fig, 280, "Delta ladder — dotted lines are the 25s"),
                         use_container_width=True)
 
-    section("Implied volatility — calibrate to a market premium",
-            "Enter a premium you have been quoted and the pricer solves for the volatility "
-            "that reproduces it. Outside the no-arbitrage band — below intrinsic, above the "
-            "discounted forward — no such volatility exists, and the answer is <b>no solution</b> "
-            "rather than a number produced by a solver that gave up.")
-    iv1, iv2, iv3 = st.columns(3)
-    quoted = iv1.number_input(f"Quoted premium ({unit})", value=float(round(gc["price"], 6)),
-                              step=0.001, format="%.6f")
-    side = iv2.radio("Side", ["Call", "Put"], horizontal=True, key="iv_side")
-    solved = Black76(F, K, T, r, 0.3, side.lower()).implied_vol(quoted)
-    if math.isnan(solved):
-        iv3.markdown(f'<div class="kpi" style="border-left:3px solid {RED}">'
-                     f'<div class="kpi-l" style="color:{RED}">Implied vol</div>'
-                     f'<div class="kpi-v">no solution</div>'
-                     f'<div class="kpi-s">premium outside no-arbitrage bounds</div></div>',
-                     unsafe_allow_html=True)
+
+def screen_trade(cx: dict) -> None:
+    lead("Price one option or a whole structure, on the same screen — a single option is "
+         "just a structure with one leg.",
+         """
+**Strikes** can be given three ways. *Exact* is how a listed option is named and how a
+broker statement reads. *% of forward* is a quick way to say "10% out of the money".
+*Delta* is how a desk quotes: "the 25-delta put". All three are snapped onto the
+contract's listed increment, so the strike you price is one you could deal.
+
+**Every leg carries its own σ(K)** from the active surface. This matters more than it
+looks: on a flat volatility the 25-delta call and put carry the same number and a risk
+reversal comes out nearly free, which is never true in a market that charges for skew.
+
+**The Greeks** are per unit of the commodity; the cash line underneath converts them to
+dollars per lot. Delta is futures-equivalent exposure, gamma is how fast that changes,
+vega is per one volatility point, theta is per calendar day.
+
+**European or American.** Most listed commodity options are American. The tree prices the
+right to exercise early, worth about 0.4% of the premium at a 2% rate and 2.6% at 10%.
+""")
+    F, T, r, unit, name = cx["F_T"], cx["T_opt"], cx["r"], cx["unit"], cx["name"]
+    vs = cx["vs"]
+    vf = vs["fn"]
+    mult = price_multiplier(name)
+
+    mode = st.radio("Build", ["Single option", "Structure"], horizontal=True, key="tr_mode")
+
+    if mode == "Single option":
+        c1, c2, c3, c4, c5 = st.columns([1.3, 1.4, 1, 1, 1])
+        how = c1.selectbox("Strike by", ["Exact", "% of forward", "Delta"],
+                           help="Exact is the way a listed option is named; the others "
+                                "resolve to a strike and are snapped to the grid.")
+        if how == "Exact":
+            raw = c2.number_input(f"Strike ({unit})", min_value=1e-6, value=float(snap_strike(name, F)),
+                                  step=float(CONTRACTS[name]["strike_inc"]), format="%.4f")
+            K = snap_strike(name, raw)
+        elif how == "% of forward":
+            raw = c2.number_input("Strike (% of F)", 20.0, 300.0, 100.0, 1.0, format="%.1f")
+            K = snap_strike(name, F * raw / 100)
+        else:
+            raw = c2.slider("Delta", 5, 50, 25, 1) / 100
+            K = snap_strike(name, strike_from_delta(F, T, r, vf(F, T), raw, "call"))
+        otype = c3.radio("Type", ["call", "put"], horizontal=True, key="tr_ty")
+        lots = c4.number_input("Lots", -999, 999, 1, key="tr_lots")
+        amer = c5.radio("Exercise", ["European", "American"], key="tr_ex") == "American"
+
+        sig = vf(K, T)
+        g = (american_greeks(F, K, T, r, sig, otype, 300) if amer
+             else Black76(F, K, T, r, sig, otype).greeks() | {"early_premium": 0.0})
+        k = st.columns(6)
+        kpi(k[0], "Premium", f"{g['price']:,.5f}",
+            f"${g['price'] * mult * abs(lots):,.0f} for {abs(lots)} lot(s)", AMBER)
+        kpi(k[1], "σ(K)", f"{sig:.2%}", f"ATM {vs['atm']:.2%}", PURPLE)
+        kpi(k[2], "Delta", f"{g['delta'] * lots:+.4f}",
+            f"${g['delta'] * lots * mult * F:+,.0f} cash", GREEN)
+        kpi(k[3], "Gamma", f"{g['gamma'] * lots:+.5f}", "delta change per unit", BLUE)
+        kpi(k[4], "Vega", f"{g['vega'] * lots:+.4f}",
+            f"${g['vega'] * lots * mult:+,.0f} per vol point", PURPLE)
+        kpi(k[5], "Theta", f"{g['theta'] * lots:+.5f}",
+            f"${g['theta'] * lots * mult:+,.0f} per day",
+            RED if g["theta"] * lots < 0 else GREEN)
+        if amer and g["early_premium"] > 0:
+            st.caption(f"Early exercise is worth {g['early_premium']:+.5f} {unit} "
+                       f"(${g['early_premium'] * mult:,.0f} per lot) — priced on the tree, "
+                       f"not assumed away.")
+        legs = [dict(qty=lots, type=otype, strike=K, vol=sig, **g)]
+        label = f"{otype} {K:,.4f}"
     else:
-        kpi(iv3, "Implied vol", f"{solved * 100:.2f}%",
-            f"{'above' if solved > vol else 'below'} your {vol * 100:.1f}% input", PURPLE)
+        c1, c2, c3 = st.columns([2.2, 1, 1])
+        sname = c1.selectbox("Structure", list(STRATEGIES.keys()), index=10)
+        lots = c2.number_input("Lots", -999, 999, 1, key="ts_lots")
+        amer = c3.radio("Exercise", ["European", "American"], key="ts_ex") == "American"
+        strat = build_strategy(sname, F, T, r, vf, lots, amer, contract=name)
+        st.markdown(f'<div class="note">{strat["note"]}</div>', unsafe_allow_html=True)
+        legs, net, label = strat["legs"], strat["net"], sname
+        k = st.columns(5)
+        kpi(k[0], "Net premium", f"{net['price']:+,.5f}",
+            f"${net['price'] * mult:+,.0f} — {'paid' if net['price'] > 0 else 'received'}",
+            RED if net["price"] > 0 else GREEN)
+        kpi(k[1], "Delta", f"{net['delta']:+.4f}", f"${net['delta'] * mult * F:+,.0f}", GREEN)
+        kpi(k[2], "Gamma", f"{net['gamma']:+.5f}", "per unit²", BLUE)
+        kpi(k[3], "Vega", f"{net['vega']:+.4f}", f"${net['vega'] * mult:+,.0f} / vol pt", PURPLE)
+        kpi(k[4], "Theta", f"{net['theta']:+.5f}", f"${net['theta'] * mult:+,.0f} / day",
+            RED if net["theta"] < 0 else GREEN)
+        ldf = pd.DataFrame(legs)[["qty", "type", "spec", "strike", "vol", "price",
+                                  "delta", "gamma", "vega", "theta"]]
+        ldf.columns = ["Qty", "Type", "Spec", "Strike", "σ(K)", "Price", "Δ", "Γ", "Vega", "Θ"]
+        st.dataframe(ldf.style.format({"Strike": "{:,.3f}", "σ(K)": "{:.2%}", "Price": "{:,.4f}",
+                                       "Δ": "{:+.4f}", "Γ": "{:.5f}", "Vega": "{:.4f}",
+                                       "Θ": "{:+.5f}"}),
+                     use_container_width=True, hide_index=True)
 
-    section("Sensitivity across strikes and maturities")
-    Ks = np.linspace(F * 0.7, F * 1.3, 21)
-    Ts = np.array([1 / 12, 3 / 12, 6 / 12, 9 / 12, 1.0, 1.5, 2.0])
-    Tl = ["1M", "3M", "6M", "9M", "1Y", "18M", "2Y"]
-    typ = cx["side"].lower()
-    P = np.array([[Black76(F, k, t, r, vf(k, t), typ).price() for k in Ks] for t in Ts])
-    D = np.array([[Black76(F, k, t, r, vf(k, t), typ).delta() for k in Ks] for t in Ts])
-    s1, s2 = st.columns(2)
-    for col, Z, cs, lbl, mid in ((s1, P, "YlOrRd", "Price", None),
-                                 (s2, D, "RdBu", "Delta", 0.0)):
-        f = go.Figure(go.Heatmap(z=Z, x=[f"{k:,.1f}" for k in Ks], y=Tl, colorscale=cs,
-                                 zmid=mid,
-                                 hovertemplate="K %{x}<br>T %{y}<br>" + lbl + " %{z:.4f}<extra></extra>"))
-        f.update_xaxes(title=f"Strike ({unit})")
-        f.update_yaxes(title="Maturity")
-        col.plotly_chart(styled(f, 300, f"{cx['side']} {lbl.lower()} surface"),
-                         use_container_width=True)
+    prem = sum(l["qty"] * l["price"] for l in legs)
+    rng = np.linspace(F * 0.55, F * 1.45, 400)
+    pnl = strategy_payoff(legs, rng) - prem
+    g1, g2 = st.columns([3, 1.4])
+    with g1:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=rng, y=pnl, name="P&L at expiry",
+                                 line=dict(color=AMBER, width=2.5),
+                                 fill="tozeroy", fillcolor="rgba(240,165,0,0.10)"))
+        fig.add_hline(y=0, line=dict(color=GRAY, width=0.8))
+        for l in legs:
+            fig.add_vline(x=l["strike"], line=dict(color=GREEN if l["qty"] > 0 else RED,
+                                                   dash="dot", width=1))
+        vline(fig, F, BLUE, f"F {F:,.2f}")
+        fig.update_xaxes(title=f"Price at expiry ({unit})")
+        fig.update_yaxes(title=f"P&L ({unit})")
+        st.plotly_chart(styled(fig, 350, "Green lines bought, red sold"),
+                        use_container_width=True)
+    with g2:
+        be = rng[np.where(np.diff(np.sign(pnl)) != 0)[0]]
+        for lbl, val, col in (
+                ("Max profit shown", f"{np.max(pnl):+,.4f}", GREEN),
+                ("Max loss shown", f"{np.min(pnl):+,.4f}", RED),
+                ("Break-evens", ", ".join(f"{b:,.2f}" for b in be[:4]) or "none in range", TEXT),
+                ("Cash per lot", f"${prem * mult:+,.0f}", AMBER)):
+            st.markdown(f'<div style="display:flex;justify-content:space-between;padding:5px 0;'
+                        f'border-bottom:.5px solid {BORDER}"><span style="color:{GRAY};'
+                        f'font-size:.75rem">{lbl}</span><span style="font-family:JetBrains Mono,'
+                        f'monospace;font-size:.75rem;color:{col}">{val}</span></div>',
+                        unsafe_allow_html=True)
+        st.caption("Maxima are read off the plotted range: an unbounded structure shows the "
+                   "edge of the chart, which is the honest answer to 'how much can this lose'.")
+        if st.button("➕  Book it", type="primary", use_container_width=True):
+            for l in legs:
+                add_to_book(kind="option", contract=name, type=l["type"],
+                            strike=float(l["strike"]), qty=int(l["qty"]), T=float(T),
+                            entry=float(l["price"]),
+                            style="American" if amer else "European", tag=label)
+            st.success(f"{len(legs)} leg(s) booked.")
 
 
-def tab_asian(cx: dict) -> None:
+def screen_book(cx: dict) -> None:
+    lead("Everything you hold, in cash terms — with the two views that decide whether a "
+         "position is safe: vega by tenor, and P&L across a grid of price and volatility.",
+         """
+**Cash Greeks.** Delta is your futures-equivalent exposure in dollars; gamma is how much
+that delta moves for a 1% move in the forward; vega is dollars per volatility point;
+theta is dollars lost per calendar day.
+
+**Vega buckets are the point.** A book is never simply "long vega" — it is long the front
+month and short the back, or the reverse. A single net number hides that entirely, and
+calendar risk is what actually moves a volatility book's P&L.
+
+**The scenario grid** is the screen an options desk watches. Rows are volatility shifts in
+points, columns are moves in the forward, cells are book P&L. A position can be perfectly
+delta-flat and still lose in every column.
+
+**SPAN margin** is read off that same grid: sixteen scenarios, the worst weighted loss.
+It is a proxy — the exchange adds credits this does not model — but margin, not notional,
+is what actually caps your size, which is why return on margin is shown next to it.
+""")
+    book = book_state()
+    F, r, unit, name = cx["F_T"], cx["r"], cx["unit"], cx["name"]
+    vf = cx["vs"]["fn"]
+
+    if not book:
+        st.info("The book is empty. Add a line from the **Chain** ticket or the **Trade** "
+                "screen, or use the manual entry below.")
+    with st.expander("➕  Add a line manually", expanded=not book):
+        a = st.columns(6)
+        kind = a[0].selectbox("Kind", ["option", "future"], key="bk_kind")
+        otype = a[1].selectbox("Type", ["call", "put"], key="bk_type",
+                               disabled=kind == "future")
+        raw_k = a[2].number_input("Strike", value=float(snap_strike(name, F or 100)),
+                                  step=float(CONTRACTS[name]["strike_inc"]), key="bk_K",
+                                  disabled=kind == "future")
+        months = a[3].number_input("Tenor (months)", 1, 60, cx["T_months"], key="bk_T")
+        qty = a[4].number_input("Lots", -999, 999, 1, key="bk_q")
+        style = a[5].selectbox("Style", ["European", "American"], key="bk_style",
+                               disabled=kind == "future")
+        K = snap_strike(name, raw_k)
+        Tl = option_tenor(months / 12) if kind == "option" else months / 12
+        default_entry = (Black76(F, K, Tl, r, vf(K, Tl), otype).price()
+                         if kind == "option" and F else (F or 0.0))
+        entry = st.number_input("Entry price", value=float(round(default_entry, 4)),
+                                step=0.01, format="%.4f", key="bk_e",
+                                help="What you actually paid or received. Mark-to-market is "
+                                     "measured against this.")
+        if st.button("Add line", use_container_width=True):
+            add_to_book(kind=kind, contract=name, type=otype, strike=K, qty=int(qty),
+                        T=float(Tl), entry=float(entry), style=style, tag="manual")
+            st.rerun()
+
+    if not book:
+        return
+
+    io1, io2, io3 = st.columns([1, 1, 2])
+    io1.download_button("⬇ Export book", json.dumps(book, indent=2, default=str),
+                        file_name="codap_book.json", use_container_width=True)
+    up = io2.file_uploader("Import", type="json", label_visibility="collapsed")
+    if up is not None and io2.button("Load", use_container_width=True):
+        try:
+            st.session_state["book"] = json.loads(up.read().decode())
+            st.rerun()
+        except Exception as e:                                     # noqa: BLE001
+            st.error(f"Import failed: {e}")
+    if io3.button("🗑  Flatten the book", use_container_width=True):
+        st.session_state["book"] = []
+        st.rerun()
+
+    with st.spinner("Repricing…"):
+        bg = book_greeks(book, F, vf, r)
+        mtx = scenario_matrix(book, F, vf, r)
+        span = span_margin(book, F, vf, r)
+    tot = bg["total"]
+
+    k = st.columns(6)
+    kpi(k[0], "Mark to market", f"${tot['value']:+,.0f}", "against your entries",
+        GREEN if tot["value"] >= 0 else RED)
+    kpi(k[1], "Delta cash", f"${tot['delta']:+,.0f}", "futures-equivalent", GREEN)
+    kpi(k[2], "Gamma cash", f"${tot['gamma']:+,.0f}", "per 1% move", BLUE)
+    kpi(k[3], "Vega cash", f"${tot['vega']:+,.0f}", "per vol point", PURPLE)
+    kpi(k[4], "Theta", f"${tot['theta']:+,.0f}", "per calendar day",
+        RED if tot["theta"] < 0 else GREEN)
+    kpi(k[5], "SPAN margin", f"${span['margin']:,.0f}",
+        f"worst of 16 · ±{span['scan_pct']:.0f}% / ±{span['vol_pts']:.0f} vols", AMBER)
+
+    rom = tot["value"] / span["margin"] * 100 if span["margin"] > 1e-9 else float("nan")
+    st.markdown(f'<div class="note">Margin, not notional, is what caps your size: this book '
+                f'ties up <b>${span["margin"]:,.0f}</b> and is <b>{rom:+.1f}%</b> return on '
+                f'margin. Premium at risk is ${abs(tot["premium"]):,.0f}.</div>',
+                unsafe_allow_html=True)
+
+    section("Vega by tenor")
+    bk = bg["buckets"]
+    bc = st.columns(len(bk))
+    for i, (bn, v) in enumerate(bk.items()):
+        kpi(bc[i], bn, f"${v:+,.0f}", "vega cash", PURPLE if abs(v) > 1 else GRAY)
+    net_v, gross_v = sum(bk.values()), sum(abs(v) for v in bk.values())
+    if gross_v > 1e-9 and abs(net_v) < gross_v * 0.6:
+        st.caption(f"Net vega ${net_v:+,.0f} against gross ${gross_v:,.0f} — this is a "
+                   f"**calendar position**: long volatility in one bucket, short in another. "
+                   f"A single net number would have shown almost nothing.")
+
+    st.markdown("##### Positions")
+    st.dataframe(pd.DataFrame(bg["rows"]).style.format(
+        {"Strike": "{:,.2f}", "T": "{:.3f}", "Vol": "{:.2%}", "Price": "{:,.4f}",
+         "DeltaCash": "{:+,.0f}", "GammaCash": "{:+,.0f}", "VegaCash": "{:+,.0f}",
+         "ThetaCash": "{:+,.0f}", "MTM": "{:+,.0f}"}, na_rep="—"),
+        use_container_width=True, hide_index=True)
+
+    section("Scenario grid — price × volatility")
+    st.dataframe(mtx.style.format("{:+,.0f}").background_gradient(cmap="RdYlGn", axis=None),
+                 use_container_width=True)
+    fig = go.Figure(go.Heatmap(z=mtx.values, x=list(mtx.columns), y=list(mtx.index),
+                               colorscale="RdYlGn", zmid=0,
+                               hovertemplate="%{x} · %{y}<br>$%{z:,.0f}<extra></extra>"))
+    fig.update_xaxes(title="Move in the forward")
+    fig.update_yaxes(title="Shift in volatility")
+    st.plotly_chart(styled(fig, 300, "Book P&L surface"), use_container_width=True)
+    with st.expander("The sixteen SPAN scenarios"):
+        st.dataframe(span["scenarios"].style.format(
+            {"weight": "{:.2f}", "pnl": "{:+,.0f}", "weighted_loss": "{:+,.0f}"}),
+            use_container_width=True, hide_index=True)
+
+
+def screen_vol_analytics(cx: dict) -> None:
+    section("Volatility analytics — is this quote rich?",
+            "The two questions a vol trader asks before trading: what has this market "
+            "actually delivered, and does hedging the option pay? Both are answered from free "
+            "price history — no options feed required.")
+    name, F, T, r, vol = cx["name"], cx["F_T"], cx["T_opt"], cx["r"], cx["vs"]["atm"]
+
+    hist = fetch_history(name, "5y")
+    if hist.empty:
+        st.error("**NO PRICE HISTORY** — the continuous series returned nothing, so no cone "
+                 "can be built. Nothing is drawn in its place.")
+    else:
+        cone = vol_cone(hist)
+        if cone.empty:
+            st.warning("Not enough history for a cone.")
+        else:
+            k = st.columns(4)
+            r20 = cone[cone["window"] == 20]
+            cur = float(r20["current"].iloc[0]) if len(r20) else float(cone["current"].iloc[0])
+            rank = float(r20["rank"].iloc[0]) if len(r20) else float(cone["rank"].iloc[0])
+            kpi(k[0], "Realised 20d", f"{cur * 100:.1f}%", "annualised", AMBER)
+            kpi(k[1], "Percentile", f"{rank:.0f}th", "of its own 5-year range",
+                RED if rank > 80 else GREEN if rank < 20 else GRAY)
+            kpi(k[2], "Your implied", f"{vol * 100:.1f}%", "MODEL input", PURPLE)
+            prem = (vol - cur) * 100
+            kpi(k[3], "Implied − realised", f"{prem:+.1f} vols",
+                "you are paying up" if prem > 0 else "you are being paid",
+                RED if prem > 0 else GREEN)
+
+            fig = go.Figure()
+            for lo, hi, op in (("p5", "p95", 0.12), ("p25", "p75", 0.22)):
+                fig.add_trace(go.Scatter(x=cone["window"], y=cone[hi] * 100, mode="lines",
+                                         line=dict(width=0), showlegend=False))
+                fig.add_trace(go.Scatter(x=cone["window"], y=cone[lo] * 100, mode="lines",
+                                         line=dict(width=0), fill="tonexty",
+                                         fillcolor=f"rgba(88,166,255,{op})",
+                                         name=f"{lo}–{hi}"))
+            fig.add_trace(go.Scatter(x=cone["window"], y=cone["p50"] * 100, mode="lines",
+                                     name="Median", line=dict(color=BLUE, width=1.6, dash="dash")))
+            fig.add_trace(go.Scatter(x=cone["window"], y=cone["current"] * 100,
+                                     mode="lines+markers", name="Today",
+                                     line=dict(color=AMBER, width=2.6), marker=dict(size=7)))
+            fig.add_hline(y=vol * 100, line=dict(color=PURPLE, dash="dot"))
+            fig.update_xaxes(title="Window (trading days)", type="log")
+            fig.update_yaxes(title="Annualised volatility (%)")
+            st.plotly_chart(styled(fig, 360, "Volatility cone — purple dotted is your implied"),
+                            use_container_width=True)
+            st.dataframe(cone[["window", "p5", "p25", "p50", "p75", "p95", "current", "rank"]]
+                         .style.format({c: "{:.1%}" for c in ("p5", "p25", "p50", "p75", "p95", "current")}
+                                       | {"rank": "{:.0f}"}),
+                         use_container_width=True, hide_index=True)
+            st.caption("Built on the continuous front-month series, which is NOT roll-adjusted: "
+                       "each roll injects one artificial jump that inflates realised vol slightly. "
+                       "The right series for a cone, the wrong one for a P&L — stated rather than "
+                       "left for you to discover.")
+
+    section("Gamma scalping — implied against realised",
+            "You buy a straddle at one volatility and delta-hedge it while the market delivers "
+            "another. Theory says the hedged position earns ½∫Γ·F²(σ_real² − σ_impl²)dt. "
+            "Simulation adds what theory hides: <b>the dispersion</b>. Discrete hedging leaves "
+            "path risk, so a correct view still loses on some paths — and that spread is the "
+            "real risk of a gamma book.")
+    g1, g2, g3, g4 = st.columns(4)
+    s_imp = g1.slider("Implied you pay (%)", 5, 150, int(vol * 100), 1, key="gs_i") / 100
+    s_real = g2.slider("Realised delivered (%)", 5, 150, int(vol * 100), 1, key="gs_r") / 100
+    rebal = g3.select_slider("Rebalance", options=[12, 21, 63, 126, 252], value=63,
+                             format_func=lambda x: f"{x}× over the life")
+    pos = g4.radio("Position", ["long", "short"], horizontal=True, key="gs_p")
+
+    with st.spinner("Simulating the hedged path…"):
+        gs = gamma_scalp(F, F, T, r, s_imp, s_real, rebal, min(cx["n_paths"], 8000), position=pos)
+    mult = price_multiplier(cx["name"])
+    k = st.columns(5)
+    kpi(k[0], "Mean P&L", f"{gs['mean']:+,.4f}", f"${gs['mean'] * mult:+,.0f} per lot",
+        GREEN if gs["mean"] > 0 else RED)
+    kpi(k[1], "Theory", f"{gs['theory']:+,.4f}", "½Γ F²(σr²−σi²)T", BLUE)
+    kpi(k[2], "5th–95th", f"[{gs['p5']:+,.2f}, {gs['p95']:+,.2f}]", "path dispersion", AMBER)
+    kpi(k[3], "Win rate", f"{gs['win_rate']:.0f}%", "paths finishing positive",
+        GREEN if gs["win_rate"] > 50 else RED)
+    kpi(k[4], "Premium", f"{gs['premium']:+,.4f}", "straddle paid or received", PURPLE)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = go.Figure(go.Histogram(x=gs["pnl"], nbinsx=60, marker_color=AMBER, opacity=0.8))
+        fig.add_vline(x=0, line=dict(color=GRAY, dash="dash"))
+        vline(fig, gs["mean"], GREEN, f"mean {gs['mean']:+.2f}")
+        fig.update_xaxes(title="Hedged P&L per unit")
+        fig.update_yaxes(title="Paths")
+        st.plotly_chart(styled(fig, 300, "Distribution of the delta-hedged P&L"),
+                        use_container_width=True)
+    with c2:
+        edge = np.linspace(max(s_imp - 0.20, 0.02), s_imp + 0.20, 11)
+        means = [gamma_scalp(F, F, T, r, s_imp, float(sr), rebal, 1200,
+                             position=pos)["mean"] for sr in edge]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=edge * 100, y=means, mode="lines+markers",
+                                 line=dict(color=AMBER, width=2.4)))
+        fig.add_hline(y=0, line=dict(color=GRAY, width=0.8))
+        vline(fig, s_imp * 100, PURPLE, f"implied {s_imp * 100:.0f}%")
+        fig.update_xaxes(title="Realised volatility delivered (%)")
+        fig.update_yaxes(title="Mean hedged P&L")
+        st.plotly_chart(styled(fig, 300, "Break-even sits at the implied you paid"),
+                        use_container_width=True)
+
+
+def screen_sabr(cx: dict) -> None:
+    section("SABR surface and the skew quotes",
+            "SABR is the market standard for commodity option surfaces. Four parameters, each "
+            "with a job a trader can argue about: <b>α</b> the level, <b>β</b> the backbone, "
+            "<b>ρ</b> the skew, <b>ν</b> the smile. Unlike a polynomial it extrapolates "
+            "sensibly into the wings, which is where the quotes that matter live.")
+    F, T, r, unit = cx["F_T"], cx["T_opt"], cx["r"], cx["unit"]
+    c1, c2, c3, c4 = st.columns(4)
+    beta = c1.select_slider("β backbone", options=[0.0, 0.25, 0.5, 0.75, 1.0], value=0.5,
+                            help="0 = normal dynamics, 1 = lognormal. Commodities usually "
+                                 "sit near 0.5; it is a choice, not a fit.")
+    atm = c2.slider("ATM vol (%)", 5, 150, int(cx["vs"]["atm"] * 100), 1, key="sb_atm") / 100
+    rho = c3.slider("ρ skew", -95, 95, -35, 1, key="sb_rho") / 100
+    nu = c4.slider("ν vol-of-vol", 1, 300, 85, 1, key="sb_nu") / 100
+    alpha = sabr_alpha_from_atm(F, T, atm, beta, rho, nu)
+    params = dict(alpha=alpha, beta=beta, rho=rho, nu=nu)
+
+    rrbf = risk_reversal_butterfly(F, T, r, params, 0.25)
+    k = st.columns(5)
+    kpi(k[0], "α (level)", f"{alpha:.4f}", "solved so ATM is exact", AMBER)
+    kpi(k[1], "ATM", f"{rrbf['atm'] * 100:.2f}%", "reproduced by construction", TEXT)
+    kpi(k[2], "25Δ risk reversal", f"{rrbf['rr'] * 100:+.2f} vols",
+        "call vol − put vol", RED if rrbf["rr"] < 0 else GREEN)
+    kpi(k[3], "25Δ butterfly", f"{rrbf['bf'] * 100:+.2f} vols", "wings over the body", BLUE)
+    kpi(k[4], "25Δ strikes", f"{rrbf['K_put']:,.1f} / {rrbf['K_call']:,.1f}",
+        f"put / call ({unit})", PURPLE)
+    st.markdown(
+        f'<div class="note">That third number is how a desk speaks: <b>"the 25-delta risk '
+        f'reversal is at {rrbf["rr"] * 100:+.1f} vols"</b> describes this entire skew in one '
+        f'phrase. Negative means puts are bid over calls — the normal commodity shape outside a '
+        f'supply squeeze, when it inverts.</div>', unsafe_allow_html=True)
+
+    section("Calibrate to quotes")
+    st.markdown('<div class="note">Paste a strip of market volatilities and SABR fits ρ and ν to '
+                'them, with α pinned so ATM is matched exactly. This is the one place the '
+                'platform can consume real option quotes — there is no free feed for them, so '
+                'they are typed in and labelled as your data.</div>', unsafe_allow_html=True)
+    default = pd.DataFrame({
+        "Strike": [round(F * x, 2) for x in (0.80, 0.90, 0.95, 1.00, 1.05, 1.10, 1.20)],
+        "Market vol %": [round(sabr_vol(F, F * x, T, alpha, beta, rho, nu) * 100, 2)
+                         for x in (0.80, 0.90, 0.95, 1.00, 1.05, 1.10, 1.20)]})
+    edited = st.data_editor(default, use_container_width=True, hide_index=True,
+                            num_rows="dynamic", key="sabr_quotes")
+    if st.button("Calibrate SABR", type="primary"):
+        try:
+            cal = sabr_calibrate(F, T, edited["Strike"].astype(float),
+                                 edited["Market vol %"].astype(float) / 100, beta)
+        except Exception as e:                                     # noqa: BLE001
+            st.error(f"Calibration failed: {e}")
+            cal = dict(ok=False)
+        if cal.get("ok"):
+            st.session_state["sabr_cal"] = cal
+    cal = st.session_state.get("sabr_cal")
+    if cal and cal.get("ok"):
+        kk = st.columns(5)
+        kpi(kk[0], "α", f"{cal['alpha']:.4f}", "level", AMBER)
+        kpi(kk[1], "β", f"{cal['beta']:.2f}", "fixed by you")
+        kpi(kk[2], "ρ", f"{cal['rho']:+.4f}", "skew", BLUE)
+        kpi(kk[3], "ν", f"{cal['nu']:.4f}", "vol of vol", PURPLE)
+        kpi(kk[4], "Fit RMSE", f"{cal['rmse'] * 100:.3f} vols",
+            f"worst {cal['max_err'] * 100:.3f}",
+            GREEN if cal["rmse"] < 0.005 else AMBER)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=cal["strikes"], y=cal["market"] * 100, mode="markers",
+                                 name="Quotes", marker=dict(size=10, color=AMBER)))
+        ks = np.linspace(min(cal["strikes"]) * 0.9, max(cal["strikes"]) * 1.1, 120)
+        fig.add_trace(go.Scatter(x=ks, y=[sabr_vol(F, k_, T, cal["alpha"], cal["beta"],
+                                                   cal["rho"], cal["nu"]) * 100 for k_ in ks],
+                                 mode="lines", name="SABR", line=dict(color=BLUE, width=2)))
+        vline(fig, F, GREEN, "ATM")
+        fig.update_xaxes(title=f"Strike ({unit})")
+        fig.update_yaxes(title="Implied vol (%)")
+        st.plotly_chart(styled(fig, 320, "Calibrated smile against the quotes"),
+                        use_container_width=True)
+        params = dict(alpha=cal["alpha"], beta=cal["beta"], rho=cal["rho"], nu=cal["nu"])
+
+    section("Surface and term structure")
+    Ks = np.linspace(F * 0.6, F * 1.45, 30)
+    Ts = np.array([1 / 12, 3 / 12, 6 / 12, 1.0, 1.5, 2.0])
+    Tl = ["1M", "3M", "6M", "1Y", "18M", "2Y"]
+    Z = np.array([[sabr_vol(F, float(k_), float(t), params["alpha"], params["beta"],
+                            params["rho"], params["nu"]) * 100 for k_ in Ks] for t in Ts])
+    fig = go.Figure(go.Surface(z=Z, x=Ks, y=Tl, colorscale="RdYlGn_r", opacity=0.93,
+                               hovertemplate="K %{x:,.1f}<br>T %{y}<br>σ %{z:.2f}%<extra></extra>"))
+    fig.update_layout(template="plotly_dark", height=420, paper_bgcolor=BG,
+                      font=dict(family="Inter", size=11, color=TEXT),
+                      margin=dict(l=10, r=10, t=40, b=10),
+                      scene=dict(bgcolor=BG,
+                                 xaxis=dict(title=f"Strike ({unit})", gridcolor=BORDER,
+                                            backgroundcolor=BG),
+                                 yaxis=dict(title="Maturity", gridcolor=BORDER, backgroundcolor=BG),
+                                 zaxis=dict(title="σ (%)", gridcolor=BORDER, backgroundcolor=BG),
+                                 camera=dict(eye=dict(x=1.8, y=-1.8, z=0.8))))
+    st.plotly_chart(fig, use_container_width=True)
+
+    rows = []
+    for i in range(len(Ts) - 1):
+        a_ = sabr_vol(F, F, float(Ts[i]), **params)
+        b_ = sabr_vol(F, F, float(Ts[i + 1]), **params)
+        rows.append(dict(From=Tl[i], To=Tl[i + 1], ATM_from=a_, ATM_to=b_,
+                         Forward=forward_vol(a_, float(Ts[i]), b_, float(Ts[i + 1]))))
+    st.markdown("##### Forward volatility between expiries")
+    st.dataframe(pd.DataFrame(rows).style.format(
+        {"ATM_from": "{:.2%}", "ATM_to": "{:.2%}", "Forward": "{:.2%}"}, na_rep="negative variance"),
+        use_container_width=True, hide_index=True)
+    st.caption("The volatility implied BETWEEN two expiries — what a calendar option actually "
+               "trades. When the term structure falls steeply enough the forward variance goes "
+               "negative, which is an arbitrage rather than a number, and the table says so "
+               "instead of printing a square root of a negative.")
+
+
+def screen_asian(cx: dict) -> None:
     section("Asian options — payoff on the average price",
             "An Asian option settles against the <b>average</b> of the forward over a set of "
             "fixings, not a single closing price. Airlines, refiners and utilities buy them "
@@ -2117,7 +2847,7 @@ def tab_asian(cx: dict) -> None:
                     use_container_width=True)
 
 
-def tab_structure(cx: dict) -> None:
+def screen_structure(cx: dict) -> None:
     section("Spread options on refining and processing margins — Kirk (1995)",
             "A <b>crack</b> is the refiner's gross margin: crude in, products out. A "
             "<b>crush</b> is the same idea for soybeans. An option on that spread is what a "
@@ -2238,7 +2968,7 @@ def tab_structure(cx: dict) -> None:
                         use_container_width=True)
 
 
-def tab_calendar(cx: dict) -> None:
+def screen_calendar(cx: dict) -> None:
     section("Calendar spread options — an option on the shape of the curve",
             "A calendar spread is the same commodity in two delivery months. A <b>call</b> pays "
             "when backwardation widens (the front pulls away), a <b>put</b> when contango "
@@ -2268,8 +2998,8 @@ def tab_calendar(cx: dict) -> None:
     d1, d2, d3, d4 = st.columns(4)
     K = d1.number_input(f"Strike on the spread ({unit})", value=float(round(spread, 4)),
                         step=0.01, format="%.4f")
-    vn = d2.slider("σ near (%)", 5, 150, int(cx["vol"] * 105), 1, key="cs_vn") / 100
-    vf = d3.slider("σ far (%)", 5, 150, int(cx["vol"] * 90), 1, key="cs_vf") / 100
+    vn = d2.slider("σ near (%)", 5, 150, int(cx["vs"]["atm"] * 105), 1, key="cs_vn") / 100
+    vf = d3.slider("σ far (%)", 5, 150, int(cx["vs"]["atm"] * 90), 1, key="cs_vf") / 100
     rho = d4.slider("Correlation", 50, 99, 95, 1, key="cs_rho",
                     help="Two months of the same commodity move almost together — 0.93–0.98 "
                          "is typical, and the spread's volatility is the small residual.") / 100
@@ -2335,7 +3065,7 @@ def tab_calendar(cx: dict) -> None:
             st.info("Not enough listed months to build a ladder of pairs.")
 
 
-def tab_barrier(cx: dict) -> None:
+def screen_barrier(cx: dict) -> None:
     section("Barrier options — knock-in and knock-out",
             "A barrier option switches on (<b>knock-in</b>) or dies (<b>knock-out</b>) if the "
             "forward touches a level. It is cheaper than the vanilla because you give something "
@@ -2441,7 +3171,7 @@ def tab_barrier(cx: dict) -> None:
                     use_container_width=True)
 
 
-def tab_curve(cx: dict) -> None:
+def screen_curve(cx: dict) -> None:
     curve, unit, name = cx["curve"], cx["unit"], cx["name"]
     section("Forward curve",
             "The strip of listed delivery months, each with its real settle date and its "
@@ -2497,14 +3227,14 @@ def tab_curve(cx: dict) -> None:
                "by roughly 60% and, since an option is worth about √T, underprices it by a third.")
 
 
-def tab_checks(cx: dict) -> None:
+def screen_checks(cx: dict) -> None:
     section("Model self-validation",
             "Every model on this desk is priced a second way and the residual is shown. These "
             "are not decoration: the theta sign error and the inverted Kirk factor that this "
             "version fixes were both invisible to inspection and obvious to a check like these.")
     quick = st.toggle("Quick mode (fewer Monte Carlo paths)", value=True)
     with st.spinner("Running independent checks…"):
-        rows = validate_models(cx["F_T"], cx["K"], cx["T"], cx["r"], cx["vol"], quick=quick)
+        rows = validate_models(cx["F_T"], cx["K"], cx["T_opt"], cx["r"], cx["vs"]["atm"], quick=quick)
 
     n_pass = sum(r["pass"] for r in rows)
     k1, k2 = st.columns([1, 3])
@@ -2560,818 +3290,160 @@ def tab_checks(cx: dict) -> None:
                  use_container_width=True, hide_index=True)
 
 
-def tab_strategies(cx: dict) -> None:
-    section("Strategy builder",
-            "Nobody trades a single option. This builds the structures a commodity desk "
-            "actually quotes — collars, risk reversals, three-ways — with combined Greeks and "
-            "a combined payoff. Strikes can be set as a percentage of the forward or, the way "
-            "they are really quoted, <b>by delta</b>.")
-    F, T, r, unit = cx["F_T"], cx["T_opt"], cx["r"], cx["unit"]
-    vf = cx["vol_fn"]
-    s1, s2, s3 = st.columns([2, 1, 1])
-    name = s1.selectbox("Structure", list(STRATEGIES.keys()), index=10)
-    lots = s2.number_input("Lots", -100, 100, 1, 1)
-    style = s3.radio("Exercise", ["European", "American"], horizontal=True, key="st_style")
-    amer = style == "American"
-
-    strat = build_strategy(name, F, T, r, vf, lots, amer, contract=cx["name"])
-    mult = price_multiplier(cx["name"])
-    st.markdown(f'<div class="note">{strat["note"]}</div>', unsafe_allow_html=True)
-
-    net = strat["net"]
-    k = st.columns(5)
-    kpi(k[0], "Net premium", f"{net['price']:+,.4f}",
-        f"${net['price'] * mult:+,.0f} — {'paid' if net['price'] > 0 else 'received'}",
-        RED if net["price"] > 0 else GREEN)
-    kpi(k[1], "Delta", f"{net['delta']:+.4f}",
-        f"${net['delta'] * mult * F:+,.0f} cash", GREEN)
-    kpi(k[2], "Gamma", f"{net['gamma']:+.5f}", "per unit²", BLUE)
-    kpi(k[3], "Vega", f"{net['vega']:+.4f}", f"${net['vega'] * mult:+,.0f} per vol point", PURPLE)
-    kpi(k[4], "Theta", f"{net['theta']:+.5f}", f"${net['theta'] * mult:+,.0f} per day",
-        RED if net["theta"] < 0 else GREEN)
-
-    ldf = pd.DataFrame(strat["legs"])
-    show = ldf[["qty", "type", "spec", "strike", "vol", "price", "delta", "gamma",
-                "vega", "theta"]]
-    show.columns = ["Qty", "Type", "Strike spec", "Strike", "σ(K)", "Price", "Δ", "Γ",
-                    "Vega", "Θ/day"]
-    st.dataframe(show.style.format({"Strike": "{:,.3f}", "σ(K)": "{:.2%}", "Price": "{:,.4f}",
-                                    "Δ": "{:+.4f}", "Γ": "{:.5f}", "Vega": "{:.4f}",
-                                    "Θ/day": "{:+.5f}"}),
-                 use_container_width=True, hide_index=True)
-    if cx["sabr_params"]:
-        st.caption("Each leg is priced at its own σ(K) off the smile. On a flat surface the "
-                   "25-delta call and put carry the same volatility and a risk reversal comes "
-                   "out free — which is never true in a market that charges for skew.")
-    if amer:
-        ep = sum(l["qty"] * l.get("early_premium", 0.0) for l in strat["legs"])
-        st.caption(f"American exercise adds {ep:+,.5f} {unit} (${ep * mult:+,.0f}) of early-exercise "
-                   f"value across the structure — priced on a {200}-step tree, not assumed away.")
-
-    g1, g2 = st.columns([3, 2])
-    with g1:
-        rng = np.linspace(F * 0.6, F * 1.4, 400)
-        pay = strategy_payoff(strat["legs"], rng)
-        pnl = pay - net["price"]      # both sides already carry the lot count
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=rng, y=pnl, name="P&L at expiry",
-                                 line=dict(color=AMBER, width=2.6),
-                                 fill="tozeroy", fillcolor="rgba(240,165,0,0.10)"))
-        fig.add_trace(go.Scatter(x=rng, y=pay, name="Payoff",
-                                 line=dict(color=AMBER, width=1, dash="dot"), opacity=0.45))
-        fig.add_hline(y=0, line=dict(color=GRAY, width=0.8))
-        for l in strat["legs"]:
-            fig.add_vline(x=l["strike"], line=dict(color=GREEN if l["qty"] > 0 else RED,
-                                                   dash="dot", width=1))
-        vline(fig, F, BLUE, f"F {F:,.2f}")
-        fig.update_xaxes(title=f"Price at expiry ({unit})")
-        fig.update_yaxes(title=f"P&L ({unit})")
-        st.plotly_chart(styled(fig, 380, f"{name} — green lines bought, red sold"),
-                        use_container_width=True)
-    with g2:
-        be = rng[np.where(np.diff(np.sign(pnl)) != 0)[0]] if len(rng) > 1 else []
-        mx, mn = float(np.max(pnl)), float(np.min(pnl))
-        st.markdown("##### Structure at a glance")
-        for lbl, val, col in (("Max profit (in range)", f"{mx:+,.4f} {unit}", GREEN),
-                              ("Max loss (in range)", f"{mn:+,.4f} {unit}", RED),
-                              ("Break-evens", ", ".join(f"{b:,.2f}" for b in be[:4]) or "none in range", TEXT),
-                              ("Premium per lot", f"${net['price'] * mult:+,.0f}", AMBER)):
-            st.markdown(f'<div style="display:flex;justify-content:space-between;padding:5px 0;'
-                        f'border-bottom:.5px solid {BORDER}"><span style="color:{GRAY};'
-                        f'font-size:.76rem">{lbl}</span><span style="font-family:JetBrains Mono,'
-                        f'monospace;font-size:.76rem;color:{col}">{val}</span></div>',
-                        unsafe_allow_html=True)
-        st.caption("Max profit and loss are read off the plotted range, not solved "
-                   "analytically — an unbounded structure will show the edge of the chart, "
-                   "which is the honest answer to 'how much can this lose'.")
-
-    if st.button("➕  Add this structure to the book", type="primary",
-                 use_container_width=True):
-        book = st.session_state.setdefault("book", [])
-        for l in strat["legs"]:
-            book.append(dict(kind="option", contract=cx["name"], type=l["type"],
-                             strike=float(l["strike"]), qty=int(l["qty"]),
-                             T=float(T), entry=float(l["price"]),
-                             style=style, tag=name))
-        st.success(f"{len(strat['legs'])} legs added — see the Book tab.")
-
-
-def tab_book(cx: dict) -> None:
-    section("Book, scenarios and margin",
-            "The whole position in one place: aggregated cash Greeks, <b>vega bucketed by "
-            "tenor</b>, a price × volatility scenario grid, and a SPAN-style margin read off "
-            "that same grid. A book is never simply 'long vega' — it is long the front and "
-            "short the back, and only the buckets show it.")
-    book = st.session_state.setdefault("book", [])
-    F, r, unit = cx["F_T"], cx["r"], cx["unit"]
-    vol = cx["vol_fn"]
-
-    with st.expander("➕ Add a line manually"):
-        a = st.columns(6)
-        kind = a[0].selectbox("Kind", ["option", "future"], key="bk_kind")
-        otype = a[1].selectbox("Type", ["call", "put"], key="bk_type",
-                               disabled=kind == "future")
-        strike = a[2].number_input("Strike", value=float(round(F, 2)), step=0.5,
-                                   key="bk_K", disabled=kind == "future")
-        months = a[3].number_input("Tenor (months)", 1, 60, cx["T_months"], key="bk_T")
-        qty = a[4].number_input("Lots", -500, 500, 1, key="bk_q")
-        style = a[5].selectbox("Style", ["European", "American"], key="bk_style",
-                               disabled=kind == "future")
-        Tl = option_tenor(months / 12) if kind == "option" else months / 12
-        entry_default = (Black76(F, snap_strike(cx["name"], strike), Tl, r,
-                                 cx["vol_fn"](snap_strike(cx["name"], strike), Tl),
-                                 otype).price() if kind == "option" else F)
-        entry = st.number_input("Entry price", value=float(round(entry_default, 4)),
-                                step=0.01, format="%.4f", key="bk_e")
-        if st.button("Add line", use_container_width=True):
-            book.append(dict(kind=kind, contract=cx["name"], type=otype,
-                             strike=snap_strike(cx["name"], strike), qty=int(qty),
-                             T=float(Tl), entry=float(entry), style=style, tag="manual"))
-            st.rerun()
-
-    if not book:
-        st.info("The book is empty. Build a structure in the Strategies tab and add it, "
-                "or enter a line above.")
-        return
-
-    c1, c2 = st.columns([4, 1])
-    c2.button("🗑 Flatten book", use_container_width=True,
-              on_click=lambda: st.session_state.update(book=[]))
-
-    with st.spinner("Repricing the book…"):
-        bg = book_greeks(book, F, vol, r)
-        mtx = scenario_matrix(book, F, vol, r)
-        span = span_margin(book, F, vol, r)
-    tot = bg["total"]
-    mult = price_multiplier(cx["name"])
-
-    k = st.columns(6)
-    kpi(k[0], "Mark to market", f"${tot['value']:+,.0f}", "against entry prices",
-        GREEN if tot["value"] >= 0 else RED)
-    kpi(k[1], "Delta cash", f"${tot['delta']:+,.0f}", "per 1% move ÷ 100", GREEN)
-    kpi(k[2], "Gamma cash", f"${tot['gamma']:+,.0f}", "delta change per 1% move", BLUE)
-    kpi(k[3], "Vega cash", f"${tot['vega']:+,.0f}", "per vol point", PURPLE)
-    kpi(k[4], "Theta", f"${tot['theta']:+,.0f}", "per calendar day",
-        RED if tot["theta"] < 0 else GREEN)
-    kpi(k[5], "SPAN margin", f"${span['margin']:,.0f}",
-        f"worst of 16 scenarios · ±{span['scan_pct']:.0f}% / ±{span['vol_pts']:.0f} vols", AMBER)
-
-    rom = tot["value"] / span["margin"] * 100 if span["margin"] > 1e-9 else float("nan")
-    prem_rom = abs(tot["premium"]) / span["margin"] * 100 if span["margin"] > 1e-9 else float("nan")
-    st.markdown(
-        f'<div class="note">A trader\'s binding constraint is margin, not notional. This book '
-        f'ties up <b>${span["margin"]:,.0f}</b> against <b>${abs(tot["premium"]):,.0f}</b> of '
-        f'premium ({prem_rom:.0f}% of margin) and is currently '
-        f'<b>{rom:+.1f}%</b> return on margin. The margin is a SPAN-style proxy — the '
-        f'exchange adds inter-month and inter-commodity credits this does not model, so read '
-        f'it as an order of magnitude.</div>', unsafe_allow_html=True)
-
-    st.markdown("##### Vega by tenor bucket")
-    bk = bg["buckets"]
-    bcols = st.columns(len(bk))
-    for i, (name_, v) in enumerate(bk.items()):
-        kpi(bcols[i], name_, f"${v:+,.0f}", "vega cash",
-            PURPLE if abs(v) > 1 else GRAY)
-    net_v = sum(bk.values())
-    gross_v = sum(abs(v) for v in bk.values())
-    if gross_v > 1e-9 and abs(net_v) < gross_v * 0.6:
-        st.caption(f"Net vega is ${net_v:+,.0f} but gross is ${gross_v:,.0f} — this book is a "
-                   f"CALENDAR position: long vol in one bucket, short in another. A single net "
-                   f"vega number would have hidden that entirely.")
-
-    st.markdown("##### Positions")
-    rdf = pd.DataFrame(bg["rows"])
-    st.dataframe(rdf.style.format({"Strike": "{:,.2f}", "T": "{:.3f}", "Vol": "{:.2%}",
-                                   "Price": "{:,.4f}",
-                                   "DeltaCash": "{:+,.0f}", "GammaCash": "{:+,.0f}",
-                                   "VegaCash": "{:+,.0f}", "ThetaCash": "{:+,.0f}",
-                                   "MTM": "{:+,.0f}"}, na_rep="—"),
-                 use_container_width=True, hide_index=True)
-
-    section("Scenario matrix — price × volatility")
-    st.markdown('<div class="note">The screen an options desk watches. Rows are volatility '
-                'shifts in points, columns are moves in the forward, cells are book P&L. '
-                'A position can be delta-flat and still bleed in every column.</div>',
-                unsafe_allow_html=True)
-    st.dataframe(mtx.style.format("{:+,.0f}").background_gradient(cmap="RdYlGn", axis=None),
-                 use_container_width=True)
-    fig = go.Figure(go.Heatmap(z=mtx.values, x=list(mtx.columns), y=list(mtx.index),
-                               colorscale="RdYlGn", zmid=0,
-                               hovertemplate="%{x} price, %{y}<br>P&L $%{z:,.0f}<extra></extra>"))
-    fig.update_xaxes(title="Move in the forward")
-    fig.update_yaxes(title="Shift in volatility")
-    st.plotly_chart(styled(fig, 320, "Book P&L surface"), use_container_width=True)
-
-    with st.expander("SPAN scenarios in detail"):
-        st.dataframe(span["scenarios"].style.format(
-            {"weight": "{:.2f}", "pnl": "{:+,.0f}", "weighted_loss": "{:+,.0f}"}),
-            use_container_width=True, hide_index=True)
-        st.caption("Sixteen scenarios: the scan range in thirds, up and down, each with "
-                   "volatility up and down, plus two extreme moves at double the range "
-                   "weighted 35%. Margin is the largest weighted loss.")
-
-
-def tab_vol_analytics(cx: dict) -> None:
-    section("Volatility analytics — is this quote rich?",
-            "The two questions a vol trader asks before trading: what has this market "
-            "actually delivered, and does hedging the option pay? Both are answered from free "
-            "price history — no options feed required.")
-    name, F, T, r, vol = cx["name"], cx["F_T"], cx["T_opt"], cx["r"], cx["vol"]
-
-    hist = fetch_history(name, "5y")
-    if hist.empty:
-        st.error("**NO PRICE HISTORY** — the continuous series returned nothing, so no cone "
-                 "can be built. Nothing is drawn in its place.")
-    else:
-        cone = vol_cone(hist)
-        if cone.empty:
-            st.warning("Not enough history for a cone.")
-        else:
-            k = st.columns(4)
-            r20 = cone[cone["window"] == 20]
-            cur = float(r20["current"].iloc[0]) if len(r20) else float(cone["current"].iloc[0])
-            rank = float(r20["rank"].iloc[0]) if len(r20) else float(cone["rank"].iloc[0])
-            kpi(k[0], "Realised 20d", f"{cur * 100:.1f}%", "annualised", AMBER)
-            kpi(k[1], "Percentile", f"{rank:.0f}th", "of its own 5-year range",
-                RED if rank > 80 else GREEN if rank < 20 else GRAY)
-            kpi(k[2], "Your implied", f"{vol * 100:.1f}%", "MODEL input", PURPLE)
-            prem = (vol - cur) * 100
-            kpi(k[3], "Implied − realised", f"{prem:+.1f} vols",
-                "you are paying up" if prem > 0 else "you are being paid",
-                RED if prem > 0 else GREEN)
-
-            fig = go.Figure()
-            for lo, hi, op in (("p5", "p95", 0.12), ("p25", "p75", 0.22)):
-                fig.add_trace(go.Scatter(x=cone["window"], y=cone[hi] * 100, mode="lines",
-                                         line=dict(width=0), showlegend=False))
-                fig.add_trace(go.Scatter(x=cone["window"], y=cone[lo] * 100, mode="lines",
-                                         line=dict(width=0), fill="tonexty",
-                                         fillcolor=f"rgba(88,166,255,{op})",
-                                         name=f"{lo}–{hi}"))
-            fig.add_trace(go.Scatter(x=cone["window"], y=cone["p50"] * 100, mode="lines",
-                                     name="Median", line=dict(color=BLUE, width=1.6, dash="dash")))
-            fig.add_trace(go.Scatter(x=cone["window"], y=cone["current"] * 100,
-                                     mode="lines+markers", name="Today",
-                                     line=dict(color=AMBER, width=2.6), marker=dict(size=7)))
-            fig.add_hline(y=vol * 100, line=dict(color=PURPLE, dash="dot"))
-            fig.update_xaxes(title="Window (trading days)", type="log")
-            fig.update_yaxes(title="Annualised volatility (%)")
-            st.plotly_chart(styled(fig, 360, "Volatility cone — purple dotted is your implied"),
-                            use_container_width=True)
-            st.dataframe(cone[["window", "p5", "p25", "p50", "p75", "p95", "current", "rank"]]
-                         .style.format({c: "{:.1%}" for c in ("p5", "p25", "p50", "p75", "p95", "current")}
-                                       | {"rank": "{:.0f}"}),
-                         use_container_width=True, hide_index=True)
-            st.caption("Built on the continuous front-month series, which is NOT roll-adjusted: "
-                       "each roll injects one artificial jump that inflates realised vol slightly. "
-                       "The right series for a cone, the wrong one for a P&L — stated rather than "
-                       "left for you to discover.")
-
-    section("Gamma scalping — implied against realised",
-            "You buy a straddle at one volatility and delta-hedge it while the market delivers "
-            "another. Theory says the hedged position earns ½∫Γ·F²(σ_real² − σ_impl²)dt. "
-            "Simulation adds what theory hides: <b>the dispersion</b>. Discrete hedging leaves "
-            "path risk, so a correct view still loses on some paths — and that spread is the "
-            "real risk of a gamma book.")
-    g1, g2, g3, g4 = st.columns(4)
-    s_imp = g1.slider("Implied you pay (%)", 5, 150, int(vol * 100), 1, key="gs_i") / 100
-    s_real = g2.slider("Realised delivered (%)", 5, 150, int(vol * 100), 1, key="gs_r") / 100
-    rebal = g3.select_slider("Rebalance", options=[12, 21, 63, 126, 252], value=63,
-                             format_func=lambda x: f"{x}× over the life")
-    pos = g4.radio("Position", ["long", "short"], horizontal=True, key="gs_p")
-
-    with st.spinner("Simulating the hedged path…"):
-        gs = gamma_scalp(F, F, T, r, s_imp, s_real, rebal, min(cx["n_paths"], 8000), position=pos)
-    mult = price_multiplier(cx["name"])
-    k = st.columns(5)
-    kpi(k[0], "Mean P&L", f"{gs['mean']:+,.4f}", f"${gs['mean'] * mult:+,.0f} per lot",
-        GREEN if gs["mean"] > 0 else RED)
-    kpi(k[1], "Theory", f"{gs['theory']:+,.4f}", "½Γ F²(σr²−σi²)T", BLUE)
-    kpi(k[2], "5th–95th", f"[{gs['p5']:+,.2f}, {gs['p95']:+,.2f}]", "path dispersion", AMBER)
-    kpi(k[3], "Win rate", f"{gs['win_rate']:.0f}%", "paths finishing positive",
-        GREEN if gs["win_rate"] > 50 else RED)
-    kpi(k[4], "Premium", f"{gs['premium']:+,.4f}", "straddle paid or received", PURPLE)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        fig = go.Figure(go.Histogram(x=gs["pnl"], nbinsx=60, marker_color=AMBER, opacity=0.8))
-        fig.add_vline(x=0, line=dict(color=GRAY, dash="dash"))
-        vline(fig, gs["mean"], GREEN, f"mean {gs['mean']:+.2f}")
-        fig.update_xaxes(title="Hedged P&L per unit")
-        fig.update_yaxes(title="Paths")
-        st.plotly_chart(styled(fig, 300, "Distribution of the delta-hedged P&L"),
-                        use_container_width=True)
-    with c2:
-        edge = np.linspace(max(s_imp - 0.20, 0.02), s_imp + 0.20, 11)
-        means = [gamma_scalp(F, F, T, r, s_imp, float(sr), rebal, 1200,
-                             position=pos)["mean"] for sr in edge]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=edge * 100, y=means, mode="lines+markers",
-                                 line=dict(color=AMBER, width=2.4)))
-        fig.add_hline(y=0, line=dict(color=GRAY, width=0.8))
-        vline(fig, s_imp * 100, PURPLE, f"implied {s_imp * 100:.0f}%")
-        fig.update_xaxes(title="Realised volatility delivered (%)")
-        fig.update_yaxes(title="Mean hedged P&L")
-        st.plotly_chart(styled(fig, 300, "Break-even sits at the implied you paid"),
-                        use_container_width=True)
-
-
-def tab_sabr(cx: dict) -> None:
-    section("SABR surface and the skew quotes",
-            "SABR is the market standard for commodity option surfaces. Four parameters, each "
-            "with a job a trader can argue about: <b>α</b> the level, <b>β</b> the backbone, "
-            "<b>ρ</b> the skew, <b>ν</b> the smile. Unlike a polynomial it extrapolates "
-            "sensibly into the wings, which is where the quotes that matter live.")
-    F, T, r, unit = cx["F_T"], cx["T_opt"], cx["r"], cx["unit"]
-    c1, c2, c3, c4 = st.columns(4)
-    beta = c1.select_slider("β backbone", options=[0.0, 0.25, 0.5, 0.75, 1.0], value=0.5,
-                            help="0 = normal dynamics, 1 = lognormal. Commodities usually "
-                                 "sit near 0.5; it is a choice, not a fit.")
-    atm = c2.slider("ATM vol (%)", 5, 150, int(cx["vol"] * 100), 1, key="sb_atm") / 100
-    rho = c3.slider("ρ skew", -95, 95, -35, 1, key="sb_rho") / 100
-    nu = c4.slider("ν vol-of-vol", 1, 300, 85, 1, key="sb_nu") / 100
-    alpha = sabr_alpha_from_atm(F, T, atm, beta, rho, nu)
-    params = dict(alpha=alpha, beta=beta, rho=rho, nu=nu)
-
-    rrbf = risk_reversal_butterfly(F, T, r, params, 0.25)
-    k = st.columns(5)
-    kpi(k[0], "α (level)", f"{alpha:.4f}", "solved so ATM is exact", AMBER)
-    kpi(k[1], "ATM", f"{rrbf['atm'] * 100:.2f}%", "reproduced by construction", TEXT)
-    kpi(k[2], "25Δ risk reversal", f"{rrbf['rr'] * 100:+.2f} vols",
-        "call vol − put vol", RED if rrbf["rr"] < 0 else GREEN)
-    kpi(k[3], "25Δ butterfly", f"{rrbf['bf'] * 100:+.2f} vols", "wings over the body", BLUE)
-    kpi(k[4], "25Δ strikes", f"{rrbf['K_put']:,.1f} / {rrbf['K_call']:,.1f}",
-        f"put / call ({unit})", PURPLE)
-    st.markdown(
-        f'<div class="note">That third number is how a desk speaks: <b>"the 25-delta risk '
-        f'reversal is at {rrbf["rr"] * 100:+.1f} vols"</b> describes this entire skew in one '
-        f'phrase. Negative means puts are bid over calls — the normal commodity shape outside a '
-        f'supply squeeze, when it inverts.</div>', unsafe_allow_html=True)
-
-    section("Calibrate to quotes")
-    st.markdown('<div class="note">Paste a strip of market volatilities and SABR fits ρ and ν to '
-                'them, with α pinned so ATM is matched exactly. This is the one place the '
-                'platform can consume real option quotes — there is no free feed for them, so '
-                'they are typed in and labelled as your data.</div>', unsafe_allow_html=True)
-    default = pd.DataFrame({
-        "Strike": [round(F * x, 2) for x in (0.80, 0.90, 0.95, 1.00, 1.05, 1.10, 1.20)],
-        "Market vol %": [round(sabr_vol(F, F * x, T, alpha, beta, rho, nu) * 100, 2)
-                         for x in (0.80, 0.90, 0.95, 1.00, 1.05, 1.10, 1.20)]})
-    edited = st.data_editor(default, use_container_width=True, hide_index=True,
-                            num_rows="dynamic", key="sabr_quotes")
-    if st.button("Calibrate SABR", type="primary"):
-        try:
-            cal = sabr_calibrate(F, T, edited["Strike"].astype(float),
-                                 edited["Market vol %"].astype(float) / 100, beta)
-        except Exception as e:                                     # noqa: BLE001
-            st.error(f"Calibration failed: {e}")
-            cal = dict(ok=False)
-        if cal.get("ok"):
-            st.session_state["sabr_cal"] = cal
-    cal = st.session_state.get("sabr_cal")
-    if cal and cal.get("ok"):
-        kk = st.columns(5)
-        kpi(kk[0], "α", f"{cal['alpha']:.4f}", "level", AMBER)
-        kpi(kk[1], "β", f"{cal['beta']:.2f}", "fixed by you")
-        kpi(kk[2], "ρ", f"{cal['rho']:+.4f}", "skew", BLUE)
-        kpi(kk[3], "ν", f"{cal['nu']:.4f}", "vol of vol", PURPLE)
-        kpi(kk[4], "Fit RMSE", f"{cal['rmse'] * 100:.3f} vols",
-            f"worst {cal['max_err'] * 100:.3f}",
-            GREEN if cal["rmse"] < 0.005 else AMBER)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=cal["strikes"], y=cal["market"] * 100, mode="markers",
-                                 name="Quotes", marker=dict(size=10, color=AMBER)))
-        ks = np.linspace(min(cal["strikes"]) * 0.9, max(cal["strikes"]) * 1.1, 120)
-        fig.add_trace(go.Scatter(x=ks, y=[sabr_vol(F, k_, T, cal["alpha"], cal["beta"],
-                                                   cal["rho"], cal["nu"]) * 100 for k_ in ks],
-                                 mode="lines", name="SABR", line=dict(color=BLUE, width=2)))
-        vline(fig, F, GREEN, "ATM")
-        fig.update_xaxes(title=f"Strike ({unit})")
-        fig.update_yaxes(title="Implied vol (%)")
-        st.plotly_chart(styled(fig, 320, "Calibrated smile against the quotes"),
-                        use_container_width=True)
-        params = dict(alpha=cal["alpha"], beta=cal["beta"], rho=cal["rho"], nu=cal["nu"])
-
-    section("Surface and term structure")
-    Ks = np.linspace(F * 0.6, F * 1.45, 30)
-    Ts = np.array([1 / 12, 3 / 12, 6 / 12, 1.0, 1.5, 2.0])
-    Tl = ["1M", "3M", "6M", "1Y", "18M", "2Y"]
-    Z = np.array([[sabr_vol(F, float(k_), float(t), params["alpha"], params["beta"],
-                            params["rho"], params["nu"]) * 100 for k_ in Ks] for t in Ts])
-    fig = go.Figure(go.Surface(z=Z, x=Ks, y=Tl, colorscale="RdYlGn_r", opacity=0.93,
-                               hovertemplate="K %{x:,.1f}<br>T %{y}<br>σ %{z:.2f}%<extra></extra>"))
-    fig.update_layout(template="plotly_dark", height=420, paper_bgcolor=BG,
-                      font=dict(family="Inter", size=11, color=TEXT),
-                      margin=dict(l=10, r=10, t=40, b=10),
-                      scene=dict(bgcolor=BG,
-                                 xaxis=dict(title=f"Strike ({unit})", gridcolor=BORDER,
-                                            backgroundcolor=BG),
-                                 yaxis=dict(title="Maturity", gridcolor=BORDER, backgroundcolor=BG),
-                                 zaxis=dict(title="σ (%)", gridcolor=BORDER, backgroundcolor=BG),
-                                 camera=dict(eye=dict(x=1.8, y=-1.8, z=0.8))))
-    st.plotly_chart(fig, use_container_width=True)
-
-    rows = []
-    for i in range(len(Ts) - 1):
-        a_ = sabr_vol(F, F, float(Ts[i]), **params)
-        b_ = sabr_vol(F, F, float(Ts[i + 1]), **params)
-        rows.append(dict(From=Tl[i], To=Tl[i + 1], ATM_from=a_, ATM_to=b_,
-                         Forward=forward_vol(a_, float(Ts[i]), b_, float(Ts[i + 1]))))
-    st.markdown("##### Forward volatility between expiries")
-    st.dataframe(pd.DataFrame(rows).style.format(
-        {"ATM_from": "{:.2%}", "ATM_to": "{:.2%}", "Forward": "{:.2%}"}, na_rep="negative variance"),
-        use_container_width=True, hide_index=True)
-    st.caption("The volatility implied BETWEEN two expiries — what a calendar option actually "
-               "trades. When the term structure falls steeply enough the forward variance goes "
-               "negative, which is an arbitrage rather than a number, and the table says so "
-               "instead of printing a square root of a negative.")
-
-
-def option_chain(name: str, F: float, T: float, r: float, vol_fn,
-                 n_strikes: int = 15, american: bool = False) -> pd.DataFrame:
-    """The screen an options trader lives on: every listed strike around the money,
-    calls on one side, puts on the other.
-
-    Strikes come off the contract's own increment grid rather than a percentage
-    sweep, so every row is an option that actually exists. Each is priced at its
-    own σ(K) from the active surface.
-    """
-    vf = as_vol_fn(vol_fn)
-    inc = CONTRACTS[name]["strike_inc"]
-    atm = snap_strike(name, F)
-    half = max(int(n_strikes) // 2, 1)
-    strikes = [atm + i * inc for i in range(-half, half + 1) if atm + i * inc > 0]
-    mult = price_multiplier(name)
-    rows = []
-    for K in strikes:
-        sig = vf(K, T)
-        c = Black76(F, K, T, r, sig, "call")
-        p = Black76(F, K, T, r, sig, "put")
-        cp = crr_price(F, K, T, r, sig, "call", 160) if american else c.price()
-        pp = crr_price(F, K, T, r, sig, "put", 160) if american else p.price()
-        rows.append(dict(
-            call_px=cp, call_cash=cp * mult, call_delta=c.delta(),
-            vega=c.vega(), vol=sig, strike=K,
-            moneyness=K / F * 100,
-            put_delta=p.delta(), put_cash=pp * mult, put_px=pp,
-            atm=abs(K - atm) < inc / 2))
-    return pd.DataFrame(rows)
-
-
-def tab_chain(cx: dict) -> None:
-    section("Option chain",
-            "Every listed strike around the money, calls left, puts right, each priced at its "
-            "own volatility off the active surface. Strikes come off the contract's real "
-            "increment grid — half a dollar on WTI, five on gold — so every line is an option "
-            "you could actually deal, not a percentage sweep.")
-    F, r, unit, name = cx["F_T"], cx["r"], cx["unit"], cx["name"]
-    curve = cx["curve"]
-    c1, c2, c3, c4 = st.columns(4)
-    labels = [f"{r_.label} (T={option_tenor(r_.T):.2f}y)" for r_ in curve.itertuples()]
-    ei = c1.selectbox("Expiry", range(len(curve)),
-                      index=min(cx["T_months"] - 1, len(curve) - 1),
-                      format_func=lambda i: labels[i])
-    T = option_tenor(float(curve["T"].iloc[ei]))
-    Fe = float(curve["price"].iloc[ei])
-    width = c2.slider("Strikes shown", 5, 41, 15, 2)
-    amer = c3.radio("Exercise", ["European", "American"], horizontal=True,
-                    key="ch_style") == "American"
-    c4.markdown(f'<div class="note">Underlying <b>{curve["label"].iloc[ei]}</b> at '
-                f'<b>{Fe:,.4f}</b> {unit}<br>Option expiry {T:.3f}y — '
-                f'{OPTION_EXPIRY_LAG_DAYS} days before the future.</div>',
-                unsafe_allow_html=True)
-
-    vf = (sabr_vol_fn(cx["sabr_params"], Fe) if cx["sabr_params"]
-          else as_vol_fn(cx["vol"]))
-    with st.spinner("Pricing the chain…"):
-        ch = option_chain(name, Fe, T, r, vf, width, amer)
-
-    disp = ch[["call_cash", "call_px", "call_delta", "vol", "strike", "moneyness",
-               "put_delta", "put_px", "put_cash"]].copy()
-    disp.columns = ["Call $/lot", "Call", "Call Δ", "σ(K)", "STRIKE", "% of F",
-                    "Put Δ", "Put", "Put $/lot"]
-
-    def _hl(row):
-        near = abs(row["STRIKE"] - snap_strike(name, Fe)) < CONTRACTS[name]["strike_inc"] / 2
-        return [f"background-color: rgba(240,165,0,0.14)" if near else "" for _ in row]
-
-    st.dataframe(disp.style.format(
-        {"Call $/lot": "${:,.0f}", "Call": "{:,.4f}", "Call Δ": "{:+.3f}", "σ(K)": "{:.2%}",
-         "STRIKE": "{:,.4f}", "% of F": "{:.1f}%", "Put Δ": "{:+.3f}", "Put": "{:,.4f}",
-         "Put $/lot": "${:,.0f}"}).apply(_hl, axis=1),
-        use_container_width=True, hide_index=True, height=min(560, 40 + 35 * len(disp)))
-    st.caption(f"Highlighted row is the strike nearest the forward. σ(K) is "
-               f"{'the SABR smile' if cx['sabr_params'] else 'your flat volatility — every '
-                'strike identical, which is a MODEL choice and visibly wrong in the wings'}. "
-               f"Cash columns are per lot of {CONTRACTS[name]['size']:,} "
-               f"{CONTRACTS[name]['size_unit']}.")
-
-    section("Ticket")
-    t1, t2, t3, t4, t5 = st.columns([2, 1, 1, 1, 1.4])
-    K = t1.selectbox("Strike", ch["strike"].tolist(),
-                     index=int(np.argmin(np.abs(ch["strike"] - Fe))),
-                     format_func=lambda k: f"{k:,.4f}")
-    otype = t2.radio("Type", ["call", "put"], horizontal=True, key="ch_t")
-    sidew = t3.radio("Side", ["Buy", "Sell"], horizontal=True, key="ch_s")
-    lots = t4.number_input("Lots", 1, 500, 1, key="ch_l")
-    row = ch[ch["strike"] == K].iloc[0]
-    px = float(row["call_px"] if otype == "call" else row["put_px"])
-    dlt = float(row["call_delta"] if otype == "call" else row["put_delta"])
-    qty = lots * (1 if sidew == "Buy" else -1)
-    mult = price_multiplier(name)
-    t5.markdown(f'<div class="note">{sidew} {lots} × {curve["label"].iloc[ei]} '
-                f'{K:,.4f} {otype}<br><b>{px:,.4f}</b> {unit} = '
-                f'<b>${px * mult * lots:,.0f}</b><br>Δ {dlt:+.3f} · σ {row["vol"]:.2%}</div>',
-                unsafe_allow_html=True)
-    if st.button("➕  Add to book", type="primary", use_container_width=True):
-        st.session_state.setdefault("book", []).append(
-            dict(kind="option", contract=name, type=otype, strike=float(K),
-                 qty=int(qty), T=float(T), entry=px,
-                 style="American" if amer else "European", tag="chain"))
-        st.success(f"{sidew} {lots} × {K:,.4f} {otype} added to the book.")
-
-    g1, g2 = st.columns(2)
-    with g1:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=ch["strike"], y=ch["vol"] * 100, mode="lines+markers",
-                                 name="σ(K)", line=dict(color=AMBER, width=2.2)))
-        vline(fig, Fe, GREEN, f"F {Fe:,.2f}")
-        fig.update_xaxes(title=f"Strike ({unit})")
-        fig.update_yaxes(title="Implied vol (%)")
-        st.plotly_chart(styled(fig, 300, "The smile across the chain"),
-                        use_container_width=True)
-    with g2:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=ch["strike"], y=ch["call_delta"], mode="lines",
-                                 name="Call Δ", line=dict(color=GREEN, width=2)))
-        fig.add_trace(go.Scatter(x=ch["strike"], y=ch["put_delta"], mode="lines",
-                                 name="Put Δ", line=dict(color=RED, width=2)))
-        for d in (0.25, -0.25):
-            fig.add_hline(y=d, line=dict(color=GRAY, dash="dot", width=1))
-        vline(fig, Fe, BLUE, "F")
-        fig.update_xaxes(title=f"Strike ({unit})")
-        fig.update_yaxes(title="Delta")
-        st.plotly_chart(styled(fig, 300, "Delta profile — dotted lines are the 25s"),
-                        use_container_width=True)
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  9. MAIN
-#  One guard around every tab: an exception costs you that tab, not the platform.
+#  9. NAVIGATION AND MAIN
+#  Seven screens, ordered by how often they are opened. The three a trader uses
+#  every day are top-level; the rest are grouped behind them, because twelve
+#  equal tabs make the hierarchy of use invisible.
 # ══════════════════════════════════════════════════════════════════════════════
 
-TABS = [
-    ("📉  Vanilla", tab_vanilla),
-    ("⛓  Option Chain", tab_chain),
-    ("🧩  Strategies", tab_strategies),
-    ("📚  Book & Scenarios", tab_book),
-    ("📐  Vol Analytics", tab_vol_analytics),
-    ("🌊  SABR Surface", tab_sabr),
-    ("🎲  Asian", tab_asian),
-    ("🏭  Cracks & Crush", tab_structure),
-    ("📅  Calendar Spread", tab_calendar),
-    ("🚧  Barrier", tab_barrier),
-    ("📈  Forward Curve", tab_curve),
-    ("🔬  Model Checks", tab_checks),
+SCREENS = [
+    ("⛓  Chain", "the ladder, and where you turn prices into a surface", screen_chain),
+    ("🧩  Trade", "price one option or a structure", screen_trade),
+    ("📚  Book", "what you hold: Greeks, scenarios, margin", screen_book),
+    ("🌊  Volatility", "surface, cones, and whether hedging pays", None),
+    ("🧱  Structures", "cracks, calendar spreads, Asians, barriers", None),
+    ("📈  Market", "the forward curve behind every price", screen_curve),
+    ("🔬  Checks", "what the models get right, and their limits", screen_checks),
 ]
 
 
 def _setup_page() -> None:
-    st.set_page_config(page_title="CODAP — Commodity Derivatives Pricer",
-                       page_icon="🎯", layout="wide",
-                       initial_sidebar_state="expanded")
+    st.set_page_config(page_title="CODAP — Commodity Options Desk",
+                       page_icon="🎯", layout="wide", initial_sidebar_state="expanded")
     st.markdown(CSS, unsafe_allow_html=True)
-    st.markdown(
-        f'<div style="display:flex;align-items:baseline;gap:12px;margin:14px 0 2px">'
-        f'<h1 style="font-size:1.85rem;font-weight:700;letter-spacing:-.03em;margin:0;'
-        f'background:linear-gradient(90deg,{AMBER},{RED});-webkit-background-clip:text;'
-        f'-webkit-text-fill-color:transparent">CODAP</h1>'
-        f'<span style="font-size:.92rem;color:#6E7681;font-weight:600">'
-        f'Commodity Options &amp; Derivatives Analytics Platform</span></div>'
-        f'<div style="font-size:.72rem;color:#444C56;margin-bottom:14px">'
-        f'Black-76 · Asian with control variates · Kirk spreads · Barriers · Swaps · '
-        f'Vol surface · Self-validating</div>', unsafe_allow_html=True)
 
 
 def render_sidebar() -> dict:
-    """Build the shared context. Market data and model inputs are separated here
-    and stay separated everywhere downstream."""
+    """Contract, curve, tenor, volatility, rate — in that order, because that is
+    the order in which each one stops mattering if the one above it is wrong."""
     with st.sidebar:
-        st.markdown(f'<div style="text-align:center;padding:10px 0 6px">'
-                    f'<div style="font-size:1.35rem;font-weight:700;letter-spacing:-.03em;'
-                    f'background:linear-gradient(90deg,{AMBER},{RED});'
-                    f'-webkit-background-clip:text;-webkit-text-fill-color:transparent">'
-                    f'CODAP</div><div style="font-size:.72rem;color:#6E7681">'
-                    f'Derivatives pricer</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div style="padding:8px 0 4px"><span style="font-size:1.3rem;'
+                    f'font-weight:700;letter-spacing:-.03em;background:linear-gradient'
+                    f'(90deg,{AMBER},{RED});-webkit-background-clip:text;'
+                    f'-webkit-text-fill-color:transparent">CODAP</span>'
+                    f'<div style="font-size:.7rem;color:#6E7681">Commodity options desk</div>'
+                    f'</div>', unsafe_allow_html=True)
         st.markdown("---")
 
         sector = st.selectbox("Sector", SECTORS)
         name = st.selectbox("Contract", contracts_in(sector))
         cfg = CONTRACTS[name]
-        st.markdown(badge(cfg["unit"], TEXT) + " " + badge(f"{cfg['size']:,} {cfg['size_unit']}/lot"),
-                    unsafe_allow_html=True)
-        st.markdown("---")
+        st.caption(f"{cfg['unit']} · {cfg['size']:,} {cfg['size_unit']}/lot · "
+                   f"strikes every {cfg['strike_inc']:g}")
 
         source = st.radio("Curve", ["Live market", "Model (cost of carry)"],
                           help="Live pulls the listed strip. Model builds a cost-of-carry "
-                               "curve from a spot price YOU enter — useful offline or to price "
-                               "a scenario, and labelled MODEL on every screen it touches.")
+                               "curve from a spot you enter — for pricing offline or a "
+                               "scenario that is not today's market.")
         is_model = source.startswith("Model")
         spot_in, storage, convenience = 0.0, cfg["storage"], cfg["convenience"]
         if is_model:
             spot_in = st.number_input(f"Spot ({cfg['unit']})", min_value=1e-6,
                                       value=float(_last_known_spot(name)), step=0.01,
                                       format="%.4f")
-            storage = st.number_input("Storage (%/yr)", 0.0, 60.0, cfg["storage"] * 100,
-                                      0.1, format="%.1f") / 100
+            storage = st.number_input("Storage (%/yr)", 0.0, 60.0,
+                                      cfg["storage"] * 100, 0.1) / 100
             convenience = st.number_input("Convenience yield (%/yr)", 0.0, 60.0,
-                                          cfg["convenience"] * 100, 0.1, format="%.1f") / 100
+                                          cfg["convenience"] * 100, 0.1) / 100
+        T_months = st.slider("Default maturity (months)", 1, 36, 6,
+                             help="Screens that need one expiry use this; the Chain lets "
+                                  "you pick any listed month.")
+        st.markdown("---")
+
+        st.markdown(f'<div style="font-size:.72rem;font-weight:600;color:{PURPLE};'
+                    f'text-transform:uppercase;letter-spacing:.09em">Volatility</div>',
+                    unsafe_allow_html=True)
+        st.caption("An implied vol cannot be downloaded — it is an option price inverted. "
+                   "Paste prices in the Chain and this becomes your market.")
+        override = st.checkbox("Override the level manually", value=False,
+                               help="Off: the app uses your calibrated quotes if you have "
+                                    "pasted any, otherwise the realised volatility it "
+                                    "computes from price history.")
+        manual_vol = None
+        if override:
+            manual_vol = st.slider("ATM volatility (%)", 1, 200,
+                                   int(cfg["vol"] * 100), 1) / 100
+        st.session_state["use_smile"] = st.checkbox(
+            "Apply a smile (SABR)", value=True,
+            help="On: each strike prices at its own σ(K). Off: one flat number for every "
+                 "strike, which is visibly wrong in the wings.")
+        if st.session_state["use_smile"] and not st.session_state.get("sabr_cal"):
+            with st.expander("Smile shape"):
+                b_ = st.select_slider("β backbone", options=[0.0, 0.25, 0.5, 0.75, 1.0],
+                                      value=0.5)
+                rho_ = st.slider("ρ skew", -95, 95, -30, 1) / 100
+                nu_ = st.slider("ν vol-of-vol", 1, 300, 70, 1) / 100
+                st.session_state["sabr_shape"] = dict(beta=b_, rho=rho_, nu=nu_)
+        st.markdown("---")
+
+        r = st.number_input("Discount rate (%)", -5.0, 30.0, 4.25, 0.05, format="%.2f",
+                            help="Used for discounting and for American early exercise.") / 100
+        n_paths = st.select_slider("Monte Carlo paths",
+                                   options=[10_000, 25_000, 50_000, 100_000], value=25_000,
+                                   help="Only the simulated screens use these.")
         if st.button("↻  Refresh market data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
-        st.markdown("---")
+        with st.expander("🔧 Diagnostics"):
+            st.code("\n".join(list(FEED_LOG)[-20:]) or "nothing logged", language="text")
 
-        st.markdown(f'<div style="font-size:.72rem;font-weight:600;color:{AMBER};'
-                    f'text-transform:uppercase;letter-spacing:.1em">Contract terms</div>',
-                    unsafe_allow_html=True)
-        T_months = st.slider("Maturity (months)", 1, 36, 6)
-        strike_mode = st.radio("Strike by", ["Exact", "% of forward", "Delta"],
-                               horizontal=True,
-                               help="Exact is how a listed option is named and how a broker "
-                                    "statement reads. The other two are conveniences that "
-                                    "resolve to a strike and are then snapped onto the "
-                                    "contract's listed grid.")
-        if strike_mode == "Exact":
-            strike_raw = st.number_input(f"Strike ({cfg['unit']})", min_value=1e-6,
-                                         value=float(_last_known_spot(name)),
-                                         step=float(cfg["strike_inc"]), format="%.4f")
-        elif strike_mode == "% of forward":
-            strike_raw = st.number_input("Strike (% of forward)", 20.0, 300.0, 100.0, 1.0,
-                                         format="%.1f")
-        else:
-            strike_raw = st.slider("Delta", 5, 50, 25, 1,
-                                   help="The way a desk names an option: 'the 25-delta put'.") / 100
-        st.caption(f"Listed increment: **{cfg['strike_inc']:g} {cfg['unit'].split('/')[0]}** — "
-                   f"indicative, verify against current specs.")
-        side = st.radio("Option side", ["Call", "Put"], horizontal=True)
-        st.markdown("---")
-
-        st.markdown(f'<div style="font-size:.72rem;font-weight:600;color:{BLUE};'
-                    f'text-transform:uppercase;letter-spacing:.1em">Model inputs</div>',
-                    unsafe_allow_html=True)
-        vol = st.slider("ATM volatility (%)", 1, 200, int(cfg["vol"] * 100), 1,
-                        help="Yours. There is no options feed here, so this is the single "
-                             "assumption every price on the platform rests on.") / 100
-        vol_source = st.radio("Volatility source", ["Flat", "SABR smile"],
-                              horizontal=True,
-                              help="Flat gives every strike the same volatility — simple, and "
-                                   "wrong for any strike away from the money. SABR prices each "
-                                   "strike on its own smile, everywhere on the platform.")
-        sabr_p = None
-        if vol_source.startswith("SABR"):
-            cal = st.session_state.get("sabr_cal")
-            use_cal = False
-            if cal and cal.get("ok"):
-                use_cal = st.checkbox("Use the calibrated fit", value=True,
-                                      help="From the SABR tab. Uncheck to drive the smile "
-                                           "with the sliders instead.")
-            if use_cal:
-                sabr_p = dict(alpha=cal["alpha"], beta=cal["beta"], rho=cal["rho"],
-                              nu=cal["nu"], atm=vol)
-                st.caption(f"β {cal['beta']:.2f} · ρ {cal['rho']:+.3f} · ν {cal['nu']:.3f} "
-                           f"— fit RMSE {cal['rmse'] * 100:.3f} vols")
-            else:
-                b_ = st.select_slider("β", options=[0.0, 0.25, 0.5, 0.75, 1.0], value=0.5)
-                rho_ = st.slider("ρ skew", -95, 95, -35, 1, key="sb_rho_side") / 100
-                nu_ = st.slider("ν vol-of-vol", 1, 300, 85, 1, key="sb_nu_side") / 100
-                sabr_p = dict(beta=b_, rho=rho_, nu=nu_, atm=vol)
-        r = st.number_input("Discount rate (%)", -5.0, 30.0, 4.25, 0.05, format="%.2f") / 100
-        n_paths = st.select_slider("Monte Carlo paths",
-                                   options=[10_000, 25_000, 50_000, 100_000, 250_000],
-                                   value=50_000)
-        st.markdown("---")
-
-        with st.expander("🔧 Feed diagnostics"):
-            if FEED_LOG:
-                st.code("\n".join(list(FEED_LOG)[-24:]), language="text")
-            else:
-                st.caption("Nothing logged yet.")
-
-    return dict(name=name, cfg=cfg, unit=cfg["unit"], sector=sector,
-                is_model=is_model, spot_in=spot_in, storage=storage,
-                convenience=convenience, T_months=T_months, strike_mode=strike_mode,
-                strike_raw=strike_raw, side=side, vol=vol, r=r, n_paths=n_paths,
-                vol_source=vol_source, sabr_p=sabr_p, curves={})
-
-
-def _last_known_spot(name: str) -> float:
-    """Seed for the manual spot box: the live front month when one is cached, so
-    the model curve starts somewhere sensible. Never used as a price by itself —
-    it only populates an input the user can see and change."""
-    try:
-        df = fetch_curve(name)
-        if not df.empty:
-            return float(df["price"].iloc[0])
-    except Exception:                                              # noqa: BLE001
-        pass
-    return 100.0
+    return dict(name=name, cfg=cfg, unit=cfg["unit"], sector=sector, is_model=is_model,
+                spot_in=spot_in, storage=storage, convenience=convenience,
+                T_months=T_months, manual_vol=manual_vol, r=r, n_paths=n_paths,
+                side="Call", curves={})
 
 
 def build_context(cx: dict) -> dict:
-    """Attach the curve and the derived pricing inputs."""
     name = cx["name"]
     T = cx["T_months"] / 12
-    if cx["is_model"]:
-        curve = model_curve(name, cx["spot_in"], cx["r"], cx["storage"],
-                            cx["convenience"], n=max(cx["T_months"], 12))
-    else:
-        curve = fetch_curve(name)
+    curve = (model_curve(name, cx["spot_in"], cx["r"], cx["storage"], cx["convenience"],
+                         n=max(cx["T_months"], 12)) if cx["is_model"]
+             else fetch_curve(name))
     cx["curve"] = curve
     cx["curves"][name] = curve
-
-    F_T = forward_at(curve, T) if not curve.empty else None
     cx["T"] = T
-    cx["T_opt"] = option_tenor(T)      # options stop trading before their future
-    cx["F_T"] = F_T
-
-    # Volatility source: one function, σ(K, T), used by every tab.
-    if cx.get("sabr_p") and F_T:
-        p = dict(cx["sabr_p"])
-        p["alpha"] = sabr_alpha_from_atm(F_T, cx["T_opt"], cx["vol"],
-                                         p["beta"], p["rho"], p["nu"])
-        cx["sabr_params"] = p
-        cx["vol_fn"] = sabr_vol_fn(p, F_T)
-    else:
-        cx["sabr_params"] = None
-        cx["vol_fn"] = as_vol_fn(cx["vol"])
-
-    if F_T:
-        mode, raw = cx["strike_mode"], cx["strike_raw"]
-        if mode == "Exact":
-            K = float(raw)
-        elif mode == "% of forward":
-            K = F_T * float(raw) / 100.0
-        else:
-            K = strike_from_delta(F_T, cx["T_opt"], cx["r"],
-                                  cx["vol_fn"](F_T, cx["T_opt"]), float(raw),
-                                  cx["side"].lower())
-        cx["K"] = snap_strike(cx["name"], K)
-        cx["vol_K"] = cx["vol_fn"](cx["K"], cx["T_opt"])
-    else:
-        cx["K"] = cx["vol_K"] = None
+    cx["T_opt"] = option_tenor(T)
+    cx["F_T"] = forward_at(curve, T) if not curve.empty else None
+    cx["vs"] = resolve_vol_source(name, cx["F_T"], cx["T_opt"], cx["r"], cx["manual_vol"])
+    cx["vol"] = cx["vs"]["atm"]
+    cx["vol_fn"] = cx["vs"]["fn"]
+    cx["sabr_params"] = cx["vs"]["params"]
+    cx["K"] = snap_strike(name, cx["F_T"]) if cx["F_T"] else None
+    cx["vol_K"] = cx["vs"]["fn"](cx["K"], cx["T_opt"]) if cx["K"] else None
     return cx
 
 
 def render_header(cx: dict) -> None:
-    curve = cx["curve"]
+    curve, vs = cx["curve"], cx["vs"]
     if cx["is_model"]:
-        state = badge("MODEL CURVE", AMBER)
-        sub = "cost of carry from the spot you entered — not a market price"
+        state, sub = badge("MODEL CURVE", AMBER), "cost of carry from your spot"
     elif curve.empty:
-        state = badge("NO MARKET DATA", RED)
-        sub = "no listed contract returned a settle"
+        state, sub = badge("NO MARKET DATA", RED), "no listed contract returned a settle"
     else:
         asof = max(d for d in curve["asof"] if d is not None)
         stale = curve_is_stale(curve)
         state = badge(f"{'STALE' if stale else 'LIVE'} · {asof}", AMBER if stale else GREEN)
         sub = f"{len(curve)} dated contracts marked"
-    bits = [badge(cx["name"], TEXT), badge(cx["sector"]), badge(cx["unit"]), state,
-            badge(f"σ ATM {cx['vol'] * 100:.0f}% MODEL", PURPLE),
-            badge(cx["vol_source"] + " smile" if cx["vol_source"].startswith("SABR")
-                  else "flat vol", PURPLE),
-            badge(f"r {cx['r'] * 100:.2f}%"),
-            badge(datetime.now().strftime("%d %b %Y %H:%M"))]
-    st.markdown('<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px">'
+    src_col = {"quotes": GREEN, "realised": AMBER, "manual": BLUE, "registry": RED}
+    bits = [badge(cx["name"], TEXT), badge(cx["unit"]), state,
+            badge(f"σ {vs['atm'] * 100:.1f}%", PURPLE),
+            badge(VOL_SOURCES.get(vs["source"], ("MANUAL", ""))[0],
+                  src_col.get(vs["source"], BLUE)),
+            badge("smile" if vs["smile"] else "flat vol", PURPLE),
+            badge(f"r {cx['r'] * 100:.2f}%")]
+    st.markdown('<div style="display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 2px">'
                 + "".join(bits) + "</div>", unsafe_allow_html=True)
-    st.caption(sub)
-
-    if not curve.empty and cx["F_T"]:
-        stt = curve_stats(curve)
-        c = st.columns(6)
-        kpi(c[0], "Front", f"{stt['f1']:,.4f}", stt["front_label"], AMBER)
-        kpi(c[1], f"Forward @ {cx['T_months']}M", f"{cx['F_T']:,.4f}",
-            "interpolated on calendar T", TEXT)
-        kpi(c[2], "Strike", f"{cx['K']:,.4f}",
-            f"{cx['K'] / cx['F_T'] * 100:.1f}% of forward · on the {cx['cfg']['strike_inc']:g} grid",
-            GREEN)
-        kpi(c[3], "Structure", stt["structure"], f"{stt['slope_ann']:+.1f}% ann.",
-            GREEN if stt["structure"] == "BACKWARDATION" else RED)
-        b = Black76(cx["F_T"], cx["K"], cx["T_opt"], cx["r"], cx["vol_K"], cx["side"].lower())
-        kpi(c[4], f"{cx['side']} premium", f"{b.price():,.4f}",
-            f"at σ(K) {cx['vol_K'] * 100:.1f}%", BLUE)
-        kpi(c[5], "Per lot", f"${b.price() * price_multiplier(cx['name']):,.0f}",
-            f"{cx['cfg']['size']:,} {cx['cfg']['size_unit']}", PURPLE)
+    st.caption(f"{sub} · volatility: {vs['detail']}")
 
 
-def render_tab(label: str, fn, cx: dict) -> None:
-    """One guard per tab. Without it any exception anywhere takes the whole page
-    down and the other eight tabs become unreachable behind a traceback."""
+def guard(label: str, fn, cx: dict) -> None:
     try:
         fn(cx)
     except Exception as e:                                         # noqa: BLE001
-        LOG.exception("TAB ERROR %s: %s: %s", label.strip(), type(e).__name__, e)
-        st.error(f"**This tab hit an error and stopped.** The rest of the platform still "
-                 f"works.\n\n`{type(e).__name__}: {e}`")
+        LOG.exception("SCREEN ERROR %s: %s: %s", label.strip(), type(e).__name__, e)
+        st.error(f"**This screen stopped.** The rest of the app still works.\n\n"
+                 f"`{type(e).__name__}: {e}`")
         with st.expander("Details"):
             st.code(traceback.format_exc(), language="text")
 
@@ -3379,26 +3451,44 @@ def render_tab(label: str, fn, cx: dict) -> None:
 def main() -> None:
     _setup_page()
     if not YF_AVAILABLE:
-        st.warning("yfinance is not installed — live curves are unavailable. "
-                   "`pip install yfinance`, or use the model curve in the sidebar.")
+        st.warning("yfinance is not installed — live curves unavailable. "
+                   "`pip install yfinance`, or use the model curve.")
     cx = build_context(render_sidebar())
     render_header(cx)
 
     if cx["curve"].empty or not cx["F_T"]:
-        st.error("**NO CURVE — nothing can be priced.** Every model on this platform prices "
-                 "off a forward, and no forward is available for this contract right now. "
-                 "Nothing is fabricated in its place: switch to a model curve in the sidebar "
-                 "to price a scenario, or check the feed diagnostics.")
+        st.error("**No curve, so nothing can be priced.** Every model here prices off a "
+                 "forward. Switch to a model curve in the sidebar to price a scenario, or "
+                 "check the diagnostics.")
         return
 
-    st.markdown("---")
-    for tab, (label, fn) in zip(st.tabs([t[0] for t in TABS]), TABS):
-        with tab:
-            render_tab(label, fn, cx)
+    tabs = st.tabs([s[0] for s in SCREENS])
+    with tabs[0]:
+        guard("Chain", screen_chain, cx)
+    with tabs[1]:
+        guard("Trade", screen_trade, cx)
+    with tabs[2]:
+        guard("Book", screen_book, cx)
+    with tabs[3]:
+        sub = st.tabs(["Surface (SABR)", "Cones & gamma scalping"])
+        with sub[0]:
+            guard("SABR", screen_sabr, cx)
+        with sub[1]:
+            guard("Vol analytics", screen_vol_analytics, cx)
+    with tabs[4]:
+        sub = st.tabs(["Cracks & Crush", "Calendar spreads", "Asian", "Barrier"])
+        for s_, fn in zip(sub, (screen_structure, screen_calendar,
+                                screen_asian, screen_barrier)):
+            with s_:
+                guard("Structures", fn, cx)
+    with tabs[5]:
+        guard("Market", screen_curve, cx)
+    with tabs[6]:
+        guard("Checks", screen_checks, cx)
 
     st.markdown("---")
-    st.caption(f"CODAP · every price rests on a forward that was fetched and a volatility that "
-               f"is yours · {datetime.now():%d %b %Y %H:%M} · by Adam EL GBOURI")
+    st.caption("CODAP · every price rests on a forward that was fetched and a volatility "
+               "whose source is named on screen · by Adam EL GBOURI")
 
 
 if __name__ == "__main__":
