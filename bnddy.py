@@ -1181,9 +1181,11 @@ def classify_asset(ticker: str, quote_type: str = "") -> str:
     for cls, hints in CLASS_HINTS.items():
         if any(t == h or t.startswith(h + ".") for h in hints):
             return cls
-    if q == "CURRENCY":
+    if q in ("CURRENCY", "FOREX", "CASH", "MONEYMARKET"):
         return "Cash"
-    if q in ("EQUITY", "ETF", "MUTUALFUND", "INDEX", ""):
+    # Accepts both the yfinance vocabulary (EQUITY, MUTUALFUND) and the
+    # catalogue's (Stock, Fund).
+    if q in ("EQUITY", "STOCK", "ETF", "MUTUALFUND", "FUND", "INDEX", "DR", ""):
         return "Stocks"
     return "Other"
 
@@ -1193,6 +1195,8 @@ def instrument_type(ticker: str, quote_type: str = "") -> str:
     q = (quote_type or "").upper()
     if q in INSTRUMENT:
         return INSTRUMENT[q]
+    if q.title() in ("Stock", "Etf", "Fund", "Index", "Crypto", "Forex", "Future", "Cash"):
+        return "ETF" if q.upper() == "ETF" else q.title()
     t = ticker.upper()
     if t.endswith(("-USD", "-EUR")):
         return "Crypto"
@@ -1205,10 +1209,16 @@ def instrument_type(ticker: str, quote_type: str = "") -> str:
     return "Action"
 
 
-def pea_eligible(exchange: str, quote_type: str) -> bool:
-    eu = {"PAR", "AMS", "BRU", "LIS", "MIL", "MCE", "GER", "FRA", "XETRA", "EBS",
-          "STO", "CPH", "HEL", "OSL", "DUB", "VIE", "WSE"}
-    return (exchange or "").upper() in eu and (quote_type or "EQUITY").upper() in ("EQUITY", "ETF")
+def pea_eligible(country: str = "", exchange: str = "", asset_type: str = "Stock") -> bool:
+    """French PEA eligibility depends on where the issuer is based, not only on
+    where it lists. Country comes from the catalogue when available."""
+    if asset_type not in ("Stock", "ETF", "Fund"):
+        return False
+    if country:
+        return country in EU_COUNTRIES
+    eu_ex = {"PAR", "AMS", "BRU", "LIS", "MIL", "MCE", "GER", "FRA", "XETRA", "EBS",
+             "STO", "CPH", "HEL", "OSL", "DUB", "VIE", "WSE"}
+    return (exchange or "").upper() in eu_ex
 
 
 @cache_data(ttl=1800, show_spinner=False)
@@ -1361,6 +1371,105 @@ def build_audit(params: dict, prices: pd.DataFrame, weights: dict, stats: dict) 
                        for k, v in stats.items()},
         "disclaimer": "Educational simulation, not investment advice.",
     }
+
+
+# ══ Instrument catalogue (financedatabase) ══════════════════════════════════
+# Offline catalogue of ~300k instruments. It carries sector, country and ISIN,
+# which neither Yahoo nor TradingView expose cleanly, and its symbols are in
+# Yahoo format - so prices still come from yfinance with dividends reinvested.
+
+try:
+    import financedatabase as fd
+    HAS_FD = True
+except Exception:
+    fd, HAS_FD = None, False
+
+CAT_COLS = ["symbol", "name", "type", "exchange", "currency", "sector",
+            "country", "market_cap", "isin"]
+MAJOR_EXCHANGES = {"NMS", "NAS", "NASDAQ", "NYQ", "NYSE", "NGM", "PCX", "ASE", "BTS",
+                   "PAR", "AMS", "BRU", "LIS", "MIL", "MCE", "GER", "FRA", "STU",
+                   "LSE", "IOB", "EBS", "STO", "CPH", "HEL", "OSL", "VIE", "DUB",
+                   "TOR", "VAN", "ASX", "JPX", "TYO", "HKG", "SHH", "SHZ", "CCC",
+                   "CCY", "SNP", "WCB"}
+EU_COUNTRIES = {"France", "Germany", "Netherlands", "Belgium", "Spain", "Italy",
+                "Portugal", "Ireland", "Austria", "Finland", "Sweden", "Denmark",
+                "Luxembourg", "Poland", "Greece", "Czech Republic", "Hungary",
+                "Norway", "Iceland", "Estonia", "Latvia", "Lithuania", "Slovakia",
+                "Slovenia", "Croatia", "Bulgaria", "Romania", "Malta", "Cyprus"}
+
+
+@cache_data(show_spinner=False, ttl=86400)
+def load_catalogue(major_only: bool = True) -> pd.DataFrame:
+    """Flatten financedatabase into one searchable frame."""
+    if not HAS_FD:
+        raise DataError("Catalogue needs financedatabase: pip install financedatabase")
+    loaders = {"Stock": "Equities", "ETF": "ETFs", "Fund": "Funds",
+               "Index": "Indices", "Crypto": "Cryptos", "Forex": "Currencies",
+               "Cash": "Moneymarkets"}
+    frames = []
+    for typ, cls_name in loaders.items():
+        cls = getattr(fd, cls_name, None)
+        if cls is None:
+            continue
+        try:
+            df = cls().select()
+        except Exception:
+            continue
+        if df is None or len(df) == 0:
+            continue
+        df = df.reset_index()
+        df = df.rename(columns={df.columns[0]: "symbol"})
+        out = pd.DataFrame({"symbol": df["symbol"].astype(str).str.upper()})
+        out["name"] = df.get("name", pd.Series("", index=df.index)).fillna("").astype(str)
+        out["type"] = typ
+        for col, src in (("exchange", "exchange"), ("currency", "currency"),
+                         ("country", "country"), ("market_cap", "market_cap"),
+                         ("isin", "isin")):
+            out[col] = df.get(src, pd.Series("", index=df.index)).fillna("").astype(str)
+        # Equities carry a sector; funds and ETFs carry a category instead.
+        sector = df.get("sector")
+        if sector is None:
+            sector = df.get("category_group", df.get("category"))
+        out["sector"] = (sector.fillna("").astype(str) if sector is not None
+                         else pd.Series("", index=df.index))
+        frames.append(out)
+    if not frames:
+        raise DataError("financedatabase returned nothing.")
+    cat = pd.concat(frames, ignore_index=True)
+    cat = cat[cat["symbol"].str.len().between(1, 24)]
+    if major_only:
+        cat = cat[cat["exchange"].str.upper().isin(MAJOR_EXCHANGES)
+                  | cat["type"].isin(["Crypto", "Forex", "Index"])]
+    cat["currency"] = cat["currency"].str.upper().replace("", "USD")
+    cat["haystack"] = (cat["symbol"] + " " + cat["name"]).str.lower()
+    cat["label"] = (cat["symbol"] + " · " + cat["name"].str.slice(0, 40)
+                    + " · " + cat["exchange"] + " · " + cat["type"])
+    return cat.drop_duplicates("symbol").reset_index(drop=True)
+
+
+def search_catalogue(cat: pd.DataFrame, query: str, types=None, limit=40) -> list[dict]:
+    """Substring search, exact symbol matches first."""
+    if cat is None or cat.empty or not query or len(query) < 2:
+        return []
+    df = cat if not types else cat[cat["type"].isin(types)]
+    q = query.strip().lower()
+    hit = df[df["haystack"].str.contains(re.escape(q), regex=True, na=False)]
+    if hit.empty:
+        return []
+    exact = hit["symbol"].str.lower() == q
+    hit = pd.concat([hit[exact], hit[~exact]]).head(limit)
+    return hit[CAT_COLS + ["label"]].to_dict("records")
+
+
+def catalogue_holding(row: dict) -> dict:
+    """Catalogue row -> holding. Symbols are Yahoo-format, so prices via yfinance."""
+    return {"symbol": row["symbol"], "exchange": row.get("exchange", ""),
+            "description": row.get("name", row["symbol"]), "type": row.get("type", "Stock"),
+            "currency": row.get("currency", "USD") or "USD", "source": "yahoo",
+            "sector": row.get("sector", "") or "Unclassified",
+            "country": row.get("country", "") or "Unknown",
+            "isin": row.get("isin", ""),
+            "asset_class": classify_asset(row["symbol"], row.get("type", "").upper())}
 
 
 # ══ TradingView symbol search ═══════════════════════════════════════════════
@@ -1667,7 +1776,9 @@ def build_constraints(assets, types: dict, classes: dict, p: dict) -> Constraint
             groups["Risky assets"] = (risky, 0.0, float(risky_cap))
 
     for label, mapping, limits in (("Type", types, p.get("type_limits", {})),
-                                   ("Class", classes, p.get("class_limits", {}))):
+                                   ("Class", classes, p.get("class_limits", {})),
+                                   ("Sector", p.get("sectors", {}), p.get("sector_limits", {})),
+                                   ("Country", p.get("countries", {}), p.get("country_limits", {}))):
         for g, (gmin, gmax) in limits.items():
             idx = [i for i, a in enumerate(assets) if mapping.get(a) == g]
             if idx and (gmin > 0 or gmax < 1):
@@ -1720,6 +1831,9 @@ def run_analysis(p: dict, log: Callable[[str], None]) -> dict:
     prices, dropped = align_common_history(prices)
     assets = list(prices.columns)
     types = {a: holdings[a].get("type", "Stock") for a in assets}
+    sectors = {a: holdings[a].get("sector", "Unclassified") for a in assets}
+    countries = {a: holdings[a].get("country", "Unknown") for a in assets}
+    p = {**p, "sectors": sectors, "countries": countries}
     classes = {a: holdings[a].get("asset_class")
                or classify_asset(holdings[a]["symbol"], holdings[a].get("quote_type", ""))
                for a in assets}
@@ -1822,6 +1936,7 @@ def run_analysis(p: dict, log: Callable[[str], None]) -> dict:
 
     picks = [k for k in weights if k not in ("Equal weight (1/N)", "Benchmark 60/40")]
     return dict(prices=prices, returns=rets, assets=assets, types=types, classes=classes,
+                sectors=sectors, countries=countries,
                 mu=mu, cov=cov, diag=diag, spec=spec_m, cons=cons, weights=weights,
                 stats=stats, errors=errors, W_boot=W_boot, frontier=(fv, fr),
                 frontier_failed=n_failed, cloud=cloud, oos=oos, quality=quality,
@@ -1935,17 +2050,58 @@ def holdings_picker():
     if "holdings" not in st.session_state:
         st.session_state.holdings = dict(DEFAULT_HOLDINGS)
 
-    sources = ["Search (TradingView)", "Ticker (Yahoo Finance)"]
-    src = st.sidebar.radio("How do you want to add holdings?", sources,
-                           index=0 if HAS_TV else 1, horizontal=True, key="src",
-                           help="Search lets you find a name like 'Apple' or 'world "
-                                "ETF' and pick the exact listing. Ticker mode is for "
-                                "when you already know the symbol.")
-    if src.startswith("Search") and not HAS_TV:
-        st.sidebar.warning("Install tvdatafeed to enable search. Using ticker mode.")
-        src = sources[1]
+    sources = ["Browse catalogue", "Search TradingView", "Type a ticker"]
+    default = 0 if HAS_FD else (1 if HAS_TV else 2)
+    src = st.sidebar.radio("How do you want to add holdings?", sources, index=default,
+                           key="src",
+                           help="The catalogue is a 300,000-instrument offline "
+                                "database that also knows each company's sector and "
+                                "country, which unlocks sector and country limits. "
+                                "TradingView search is live. Ticker mode is for when "
+                                "you already know the symbol.")
+    if src == sources[0] and not HAS_FD:
+        st.sidebar.warning("Install financedatabase to browse the catalogue.")
+        src = sources[1] if HAS_TV else sources[2]
+    if src == sources[1] and not HAS_TV:
+        st.sidebar.warning("Install tvdatafeed to search TradingView.")
+        src = sources[2]
 
-    if src.startswith("Search"):
+    if src == sources[0]:
+        try:
+            with st.spinner("Loading catalogue…"):
+                cat = load_catalogue(st.sidebar.checkbox(
+                    "Major exchanges only", True, key="major",
+                    help="Uncheck to include smaller venues. Slower, and prices are "
+                         "often patchy there."))
+        except DataError as e:
+            st.sidebar.error(str(e)); cat = None
+        if cat is not None:
+            st.sidebar.caption(f"{len(cat):,} instruments available".replace(",", " "))
+            kinds = st.sidebar.multiselect("Limit to", sorted(cat["type"].unique()),
+                                           default=["Stock", "ETF"], key="kinds")
+            q = st.sidebar.text_input("Search by name or symbol", key="cq",
+                                      placeholder="apple, world, gold…")
+            hits = search_catalogue(cat, q, kinds or None)
+            if hits:
+                pick = st.sidebar.selectbox("Matches", [h["label"] for h in hits],
+                                            key="cpick", label_visibility="collapsed")
+                row = next(h for h in hits if h["label"] == pick)
+                st.sidebar.caption(
+                    f"{row['type']} · {row['currency']} · "
+                    f"{row.get('country') or 'country unknown'}"
+                    + (f" · {row['sector']}" if row.get("sector") else "")
+                    + (f" · ISIN {row['isin']}" if row.get("isin") else ""))
+                if st.sidebar.button("＋ Add to portfolio", use_container_width=True,
+                                     key="add_cat"):
+                    if row["symbol"] in st.session_state.holdings:
+                        st.sidebar.warning("Already in your portfolio.")
+                    else:
+                        st.session_state.holdings[row["symbol"]] = catalogue_holding(row)
+                        st.rerun()
+            elif q:
+                st.sidebar.caption("No match.")
+
+    elif src == sources[1]:
         q = st.sidebar.text_input("Search a company, ETF or crypto", key="q",
                                   placeholder="apple, world etf, bitcoin…",
                                   help="Type at least two letters, then pick a listing "
@@ -1965,8 +2121,9 @@ def holdings_picker():
                         st.sidebar.warning("Already in your portfolio.")
                     else:
                         st.session_state.holdings[r["key"]] = {
-                            **r, "asset_class": classify_asset(r["symbol"],
-                                                               r["type"].upper())}
+                            **r, "sector": "Unclassified", "country": "Unknown",
+                            "asset_class": classify_asset(r["symbol"],
+                                                          r["type"].upper())}
                         st.rerun()
             else:
                 st.sidebar.caption("No match yet.")
@@ -1978,19 +2135,34 @@ def holdings_picker():
             for raw in t.replace(";", ",").split(","):
                 k = raw.strip().upper()
                 if k and k not in st.session_state.holdings:
-                    typ, cls = asset_profile(k) if HAS_YF else ("Stock", "Stocks")
-                    st.session_state.holdings[k] = {
-                        "symbol": k, "exchange": "", "description": k, "type": typ,
-                        "currency": "USD", "source": "yahoo", "asset_class": cls}
+                    row = None
+                    if HAS_FD:
+                        try:
+                            hits = search_catalogue(load_catalogue(), k)
+                            row = next((h for h in hits
+                                        if h["symbol"] == k), None)
+                        except DataError:
+                            row = None
+                    if row:
+                        st.session_state.holdings[k] = catalogue_holding(row)
+                    else:
+                        typ, cls = asset_profile(k) if HAS_YF else ("Stock", "Stocks")
+                        st.session_state.holdings[k] = {
+                            "symbol": k, "exchange": "", "description": k, "type": typ,
+                            "currency": "USD", "source": "yahoo", "asset_class": cls,
+                            "sector": "Unclassified", "country": "Unknown"}
             st.rerun()
 
     st.sidebar.caption(f"{len(st.session_state.holdings)} holding(s)")
     for k, h in list(st.session_state.holdings.items()):
         c1, c2 = st.sidebar.columns([6, 1])
+        extra = " · ".join(x for x in (h.get("country"), h.get("sector"))
+                           if x and x not in ("Unknown", "Unclassified"))
         c1.markdown(f'<div style="font-size:.78rem;"><code>{h["symbol"]}</code> '
                     f'<span style="color:#64748B;">{h["type"]} · {h["currency"]}</span>'
                     f'<br><span style="color:#475569;font-size:.68rem;">'
-                    f'{h.get("description","")[:38]}</span></div>', unsafe_allow_html=True)
+                    f'{h.get("description","")[:38]}{" · " + extra if extra else ""}'
+                    f'</span></div>', unsafe_allow_html=True)
         if c2.button("✕", key=f"rm_{k}"):
             if len(st.session_state.holdings) > 2:
                 del st.session_state.holdings[k]
@@ -2002,9 +2174,10 @@ def holdings_picker():
 
 def group_limits_ui(title, mapping: dict, prefix: str) -> dict:
     """Min/max sliders, shown only for the groups actually present."""
-    present = sorted({v for v in mapping.values()})
+    present = sorted({v for v in mapping.values() if v})
     out = {}
-    if not present:
+    # A single group covering everything can only be capped at 100%, so hide it.
+    if len(present) < 2:
         return out
     st.markdown(f"**{title}**")
     for g in present:
@@ -2139,6 +2312,12 @@ def sidebar() -> dict:
         adv["class_limits"] = group_limits_ui(
             "Limits by asset class",
             {k: h.get("asset_class", "Stocks") for k, h in holdings.items()}, "cl")
+        adv["sector_limits"] = group_limits_ui(
+            "Limits by sector",
+            {k: h.get("sector", "Unclassified") for k, h in holdings.items()}, "sl")
+        adv["country_limits"] = group_limits_ui(
+            "Limits by country",
+            {k: h.get("country", "Unknown") for k, h in holdings.items()}, "col")
         adv["max_assets"] = st.number_input("Max number of holdings (0 = no limit)",
                                             0, 50, 0, 1, key="maxn",
                                             help="Fewer lines is easier to manage.") or None
@@ -2223,16 +2402,22 @@ def tab_portfolio(res):
 
     heading("What is inside", "Grouped the way your broker would show it")
     df = pd.DataFrame({"Holding": [names[a] for a in res["assets"]],
-                       "What it is": [res["holdings"][a].get("description", "")[:44]
+                       "What it is": [res["holdings"][a].get("description", "")[:40]
                                       for a in res["assets"]],
                        "Type": [res["types"][a] for a in res["assets"]],
                        "Asset class": [res["classes"][a] for a in res["assets"]],
+                       "Sector": [res["sectors"][a] for a in res["assets"]],
+                       "Country": [res["countries"][a] for a in res["assets"]],
                        "Weight": [f"{x*100:.1f}%" for x in w],
                        f"Amount ({p['sym']})": [money(p["initial"] * x, "") for x in w]})
     st.dataframe(df, use_container_width=True, hide_index=True)
-    g = pd.DataFrame({"Asset class": [res["classes"][a] for a in res["assets"]],
-                      "Weight": w}).groupby("Asset class")["Weight"].sum()
-    st.caption("By asset class: " + " · ".join(f"{k} {v*100:.0f}%" for k, v in g.items()))
+    for label, mapping in (("asset class", res["classes"]), ("sector", res["sectors"]),
+                           ("country", res["countries"])):
+        g = pd.DataFrame({"g": [mapping[a] for a in res["assets"]], "w": w})
+        g = g[~g["g"].isin(["Unclassified", "Unknown", ""])].groupby("g")["w"].sum()
+        if len(g) > 1:
+            st.caption(f"By {label}: " + " · ".join(
+                f"{k} {v*100:.0f}%" for k, v in g.sort_values(ascending=False).items()))
 
     with st.expander("See the other mixes we tested, and why they differ"):
         note("<b>Min Variance</b> takes the calmest possible route. "
@@ -2569,6 +2754,21 @@ def tab_orders(res):
     st.download_button("⬇ Download this order list (CSV)",
                        plan.to_csv(index=False).encode(), "order_list.csv", "text/csv")
 
+    if any(res["countries"][a] != "Unknown" for a in res["assets"]):
+        heading("French PEA eligibility", "Indicative - confirm with your broker")
+        st.dataframe(pd.DataFrame({
+            "Holding": [res["holdings"][a]["symbol"] for a in res["assets"]],
+            "Issuer country": [res["countries"][a] for a in res["assets"]],
+            "Type": [res["types"][a] for a in res["assets"]],
+            "ISIN": [res["holdings"][a].get("isin", "") or "-" for a in res["assets"]],
+            "PEA": ["✅ likely" if pea_eligible(res["countries"][a],
+                                                res["holdings"][a].get("exchange", ""),
+                                                res["types"][a]) else "❌ unlikely"
+                    for a in res["assets"]]}),
+            use_container_width=True, hide_index=True)
+        st.caption("Based on the issuer's country from the catalogue, which is the "
+                   "criterion that actually matters - not the listing venue.")
+
     note(f"With <b>{money(p['monthly'], sym)} a month</b> going in, you do not need to "
          f"rebalance often. Your current setting is "
          f"<b>{[k for k,v in REBALANCE_CHOICES.items() if v==p['rebalance']][0].lower()}"
@@ -2605,6 +2805,8 @@ def tab_data(res):
         "Holding": [res["holdings"][a]["symbol"] for a in res["assets"]],
         "Type": [res["types"][a] for a in res["assets"]],
         "Asset class": [res["classes"][a] for a in res["assets"]],
+        "Sector": [res["sectors"][a] for a in res["assets"]],
+        "Country": [res["countries"][a] for a in res["assets"]],
         "Min": [f"{x*100:.0f}%" for x in c.min_w],
         "Max": [f"{x*100:.0f}%" for x in c.max_w]}),
         use_container_width=True, hide_index=True)
@@ -3048,6 +3250,8 @@ def run_self_tests(verbose=True) -> int:
     @test("instrument type and asset class are detected")
     def _():
         assert instrument_type("SPY", "ETF") == "ETF"
+        assert instrument_type("MC.PA", "Stock") == "Stock"
+        assert classify_asset("MC.PA", "STOCK") == "Stocks"
         assert instrument_type("BTC-USD") == "Crypto" and instrument_type("^GSPC") == "Index"
         assert classify_asset("AGG") == "Bonds" and classify_asset("GLD") == "Commodities"
         assert classify_asset("AAPL", "EQUITY") == "Stocks"
@@ -3063,6 +3267,58 @@ def run_self_tests(verbose=True) -> int:
                                   "class_limits": {"Bonds": (.1, .4)}})
         assert cons.groups["Type: ETF"] == ([1, 2], .2, .6)
         assert cons.groups["Class: Bonds"] == ([1], .1, .4)
+
+    @test("catalogue rows normalise into holdings")
+    def _():
+        row = {"symbol": "MC.PA", "name": "LVMH", "type": "Stock", "exchange": "PAR",
+               "currency": "EUR", "sector": "Consumer Discretionary",
+               "country": "France", "isin": "FR0000121014", "market_cap": "Mega Cap"}
+        h = catalogue_holding(row)
+        assert h["source"] == "yahoo" and h["currency"] == "EUR"
+        assert h["country"] == "France" and h["asset_class"] == "Stocks"
+
+    @test("catalogue search ranks exact symbol matches first")
+    def _():
+        cat = pd.DataFrame({"symbol": ["AAPLX", "AAPL"], "name": ["Fund", "Apple Inc"],
+                            "type": ["Fund", "Stock"], "exchange": ["NMS", "NMS"],
+                            "currency": ["USD", "USD"], "sector": ["", "Technology"],
+                            "country": ["", "United States"],
+                            "market_cap": ["", "Mega Cap"], "isin": ["", "US0378331005"]})
+        cat["haystack"] = (cat["symbol"] + " " + cat["name"]).str.lower()
+        cat["label"] = cat["symbol"]
+        assert search_catalogue(cat, "aapl")[0]["symbol"] == "AAPL"
+        assert search_catalogue(cat, "a") == []
+        assert [h["symbol"] for h in search_catalogue(cat, "aapl", ["Fund"])] == ["AAPLX"]
+
+    @test("PEA eligibility follows the issuer country, not the listing venue")
+    def _():
+        assert pea_eligible("France", "PAR", "Stock")
+        assert not pea_eligible("United States", "PAR", "Stock")   # US firm listed in Paris
+        assert not pea_eligible("France", "PAR", "Crypto")
+        assert pea_eligible("", "PAR", "Stock")                    # fallback on venue
+
+    @test("sector and country limits become group constraints")
+    def _():
+        assets = ["a", "b", "c"]
+        cons = build_constraints(
+            assets, {x: "Stock" for x in assets},
+            {x: "Stocks" for x in assets},
+            {"profile": "Aggressive", "apply_profile": False,
+             "sectors": {"a": "Tech", "b": "Tech", "c": "Energy"},
+             "countries": {"a": "France", "b": "United States", "c": "France"},
+             "sector_limits": {"Tech": (0.0, .5)},
+             "country_limits": {"France": (.3, .8)}})
+        assert cons.groups["Sector: Tech"] == ([0, 1], 0.0, .5)
+        assert cons.groups["Country: France"] == ([0, 2], .3, .8)
+
+    @test("a single-group dimension produces no constraint")
+    def _():
+        cons = build_constraints(
+            ["a", "b"], {"a": "Stock", "b": "Stock"}, {"a": "Stocks", "b": "Stocks"},
+            {"profile": "Aggressive", "apply_profile": False,
+             "sectors": {"a": "Unclassified", "b": "Unclassified"},
+             "sector_limits": {}})
+        assert not cons.groups
 
     @test("risk profile guardrails cap single holdings and risky assets")
     def _():
