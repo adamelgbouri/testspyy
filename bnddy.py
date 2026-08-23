@@ -1736,6 +1736,34 @@ def chart_frontier(mu, cov, rf, assets, weights, cloud, frontier) -> "go.Figure"
     return fig
 
 
+def chart_factors(fac: pd.DataFrame) -> "go.Figure":
+    body = fac[fac["Factor"] != "Alpha (annual)"]
+    fig = go.Figure(go.Bar(
+        x=body["Coefficient"], y=body["Factor"], orientation="h",
+        marker=dict(color=[GOLD if sig else MUTED for sig in body["Significant"]],
+                    opacity=.88, line=dict(color=BG, width=1)),
+        text=[f"{b:.2f} (t={t:.1f})" for b, t in zip(body["Coefficient"], body["t-stat"])],
+        textposition="outside", textfont=dict(color=TEXT, size=11)))
+    fig.add_vline(x=0, line=dict(color=MUTED, width=1))
+    fig.update_layout(**layout(
+        f"Factor exposure  ·  R² = {fac.attrs.get('r2', float('nan')):.2f}",
+        "Beta", "", height=340))
+    return fig
+
+
+def chart_rolling(returns: dict, rf: float, window: int) -> "go.Figure":
+    fig = go.Figure()
+    for name, r in returns.items():
+        rs = ((r.rolling(window).mean() * PERIODS - rf)
+              / (r.rolling(window).std(ddof=1) * np.sqrt(PERIODS)))
+        fig.add_trace(go.Scatter(x=rs.index, y=rs.values, mode="lines", name=name,
+                                 line=dict(color=PORT_COLORS.get(name, GOLD), width=1.7)))
+    fig.add_hline(y=0, line=dict(color=MUTED, width=1, dash="dash"))
+    fig.update_layout(**layout(f"Rolling {window}-day Sharpe ratio", "Date", "Sharpe",
+                               height=380))
+    return fig
+
+
 def chart_box(assets, W) -> "go.Figure":
     fig = go.Figure()
     for i, a in enumerate(assets):
@@ -2381,7 +2409,7 @@ def tab_portfolio(res):
     c1, c2 = st.columns([2, 3])
     with c1:
         st.plotly_chart(chart_pie(w, [names[a] for a in res["assets"]], rec),
-                        use_container_width=True)
+                        use_container_width=True, key="pie_main")
     with c2:
         cards = [("Growth per year", pct(s["cagr"], 1, True),
                   "what this mix returned annually"),
@@ -2437,7 +2465,7 @@ def tab_portfolio(res):
         for i, (k, ww) in enumerate(res["weights"].items()):
             cols[i % len(cols)].plotly_chart(
                 chart_pie(ww, [names[a] for a in res["assets"]], k),
-                use_container_width=True)
+                use_container_width=True, key=f"pie_{i}_{k}")
     if res["errors"]:
         with st.expander(f"⚠️ {len(res['errors'])} calculation(s) could not complete"):
             for k, v in res["errors"].items():
@@ -2488,7 +2516,7 @@ def tab_plan(res):
 
     st.plotly_chart(chart_fan(sim["trajectories"],
                               p["initial"] + p["monthly"] * np.arange(sim["horizon_months"] + 1),
-                              sym), use_container_width=True)
+                              sym), use_container_width=True, key="fan")
     st.caption("The gold line is the middle outcome. The shaded bands hold half and "
                "then nine tenths of all simulated futures. The dashed line is simply "
                "the cash you paid in.")
@@ -2504,7 +2532,8 @@ def tab_plan(res):
 
     c1, c2 = st.columns([3, 2])
     c1.plotly_chart(chart_hist(sim["terminal"], sim["invested"],
-                               p["goal"] or None, sym), use_container_width=True)
+                               p["goal"] or None, sym), use_container_width=True,
+                    key="terminal_hist")
     with c2:
         heading("In today's money", "After tax and inflation")
         st.dataframe(pd.DataFrame({
@@ -2545,7 +2574,7 @@ def tab_reality(res):
     else:
         st.plotly_chart(chart_lines({k: v["nav"] for k, v in res["oos"].items()},
                                     "Growth of 1 unit, using no future information",
-                                    "Value"), use_container_width=True)
+                                    "Value"), use_container_width=True, key="oos_nav")
         naive = res["oos"].get("Equal weight (1/N)")
         rows = []
         for k, bt in res["oos"].items():
@@ -2595,7 +2624,7 @@ def tab_reality(res):
 
     st.plotly_chart(chart_uncertainty(
         [res["holdings"][a]["symbol"] for a in res["assets"]],
-        d["mu_hist"], d["se_mu"]), use_container_width=True)
+        d["mu_hist"], d["se_mu"]), use_container_width=True, key="mu_ci")
     note("Each dot is an asset's average past return; the bar is the range we cannot "
          "rule out. <b>When a bar crosses zero, history cannot even confirm the asset "
          "makes money.</b> This is normal, and it is why we lean on risk-based mixes "
@@ -2603,7 +2632,8 @@ def tab_reality(res):
 
     if res["W_boot"] is not None:
         st.plotly_chart(chart_box([res["holdings"][a]["symbol"] for a in res["assets"]],
-                                  res["W_boot"]), use_container_width=True)
+                                  res["W_boot"]), use_container_width=True,
+                        key="weight_box")
         sp = (res["W_boot"].max(0) - res["W_boot"].min(0)).max() * 100
         st.caption(f"Re-running the optimiser on reshuffled history moves some weights "
                    f"by up to {sp:.0f} percentage points. Tall boxes mean the 'optimal' "
@@ -2613,19 +2643,8 @@ def tab_reality(res):
         note("You are using market equilibrium with no views of your own, so the "
              "Max Sharpe mix simply mirrors the market. That is the model working as "
              "designed — add views in Advanced settings to move away from it.")
-    with st.expander("Advanced: the full risk/reward map"):
-        if p["mu_method"] == "none":
-            st.info("This chart needs expected returns. Pick a return model in "
-                    "Advanced settings.")
-        else:
-            core = {k: v for k, v in res["weights"].items() if k != "Benchmark 60/40"}
-            st.plotly_chart(chart_frontier(
-                res["mu"], res["cov"], p["rf"],
-                [res["holdings"][a]["symbol"] for a in res["assets"]], core,
-                res["cloud"], res["frontier"]), use_container_width=True)
-            st.caption("Each grey dot is a random mix. The gold curve is the best "
-                       "return available at each level of risk. Anything below the "
-                       "curve is a mix you could improve on for free.")
+    st.caption("The efficient frontier, factor exposures and the full metric set "
+               "are in the Analytics tab.")
 
 
 def tab_risk(res):
@@ -2637,13 +2656,13 @@ def tab_risk(res):
 
     heading("Falls from the previous peak")
     st.plotly_chart(chart_drawdown({k: v["nav"] for k, v in res["stats"].items()}),
-                    use_container_width=True)
+                    use_container_width=True, key="dd")
 
     c1, c2 = st.columns(2)
     with c1:
         st.plotly_chart(chart_corr(res["returns"].rename(
             columns={a: n for a, n in zip(res["assets"], names)})),
-            use_container_width=True)
+            use_container_width=True, key="corr")
         st.caption("1.00 means they move in lockstep, so they diversify nothing. "
                    "Values near 0 or below are what real diversification looks like.")
     with c2:
@@ -2652,7 +2671,7 @@ def tab_risk(res):
                                    "Where the risk actually comes from",
                                    "Share of total risk (%)", fmt="{:.0f}%",
                                    colors=[PALETTE[i % len(PALETTE)] for i in range(len(names))]),
-                        use_container_width=True)
+                        use_container_width=True, key="rc_main")
         st.caption("A holding can be 10% of your money and 40% of your risk. That gap "
                    "is the single most common surprise in a portfolio.")
 
@@ -2708,7 +2727,244 @@ def tab_risk(res):
                                      for k, v in sc["portfolios"].items()},
                                     f"{name} — value through the crisis", "Base 100",
                                     height=340, base100=True),
-                        use_container_width=True)
+                        use_container_width=True, key=f"sc_{name}")
+
+
+def tab_analytics(res):
+    """Full quantitative detail: frontier, decomposition, factors, every metric."""
+    p = res["params"]
+    names = [res["holdings"][a]["symbol"] for a in res["assets"]]
+    note("Everything the guided tabs summarise, in full. Definitions and formulas "
+         "for every figure are in the Method tab.", "info")
+
+    heading("Efficient frontier",
+            "Mean-variance opportunity set under your constraints")
+    if p["mu_method"] == "none":
+        st.info("The frontier is a return-versus-risk map, so it needs expected "
+                "returns. Pick a return model in Advanced settings.")
+    else:
+        core = {k: v for k, v in res["weights"].items() if k != "Benchmark 60/40"}
+        st.plotly_chart(chart_frontier(res["mu"], res["cov"], p["rf"], names, core,
+                                       res["cloud"], res["frontier"]),
+                        use_container_width=True, key="frontier")
+        lo, hi = res["frontier"][1][:1], res["frontier"][1][-1:]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.markdown(kpi("Attainable return band",
+                        f"{pct(float(lo[0]) if len(lo) else float('nan'), 1)} → "
+                        f"{pct(float(hi[0]) if len(hi) else float('nan'), 1)}",
+                        "under your limits, by LP"), unsafe_allow_html=True)
+        c2.markdown(kpi("Frontier points", f"{len(res['frontier'][0])}",
+                        f"{res['frontier_failed']} infeasible and dropped"),
+                    unsafe_allow_html=True)
+        c3.markdown(kpi("Random mixes plotted", f"{len(res['cloud'][0]):,}".replace(",", " "),
+                        "Dirichlet draws inside the constraint set"),
+                    unsafe_allow_html=True)
+        rec_w = res["weights"][res["recommended"]]
+        c4.markdown(kpi("Tangency Sharpe", num(sharpe(rec_w, res["mu"], res["cov"],
+                                                      p["rf"]), 3),
+                        f"{res['recommended']}, in sample"), unsafe_allow_html=True)
+        st.caption("Grey dots are random admissible mixes. The gold curve is the "
+                   "minimum variance attainable at each target return, solved by "
+                   "SLSQP; the dashed line is the capital market line through the "
+                   "risk-free rate. Frontier bounds come from a linear program, so "
+                   "they respect every group limit rather than assuming the full "
+                   "range of asset returns is reachable.")
+
+    heading("Portfolio decomposition", "Weights, risk shares and concentration")
+    rows = []
+    for k, w in res["weights"].items():
+        rc = risk_contributions(w, res["cov"])
+        rows.append({"Portfolio": k, "Return (arith.)": pct(port_return(w, res["mu"]), 2),
+                     "Volatility": pct(port_vol(w, res["cov"]), 2),
+                     "Sharpe": num(sharpe(w, res["mu"], res["cov"], p["rf"]), 3),
+                     "Diversification ratio": num(diversification_ratio(w, res["cov"]), 2),
+                     "Effective N": num(effective_n(w), 2),
+                     "Max weight": pct(float(np.max(w)), 1),
+                     "Max risk share": f"{np.max(rc):.0f}%",
+                     "Herfindahl": num(float((w ** 2).sum()), 3)})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    sel = st.multiselect("Risk contributions for", list(res["weights"]),
+                         default=[res["recommended"], "Equal weight (1/N)"], key="rcsel")
+    if sel:
+        fig = go.Figure()
+        for k in sel:
+            fig.add_trace(go.Bar(name=k, x=names,
+                                 y=risk_contributions(res["weights"][k], res["cov"]),
+                                 marker=dict(color=PORT_COLORS.get(k, GOLD), opacity=.85,
+                                             line=dict(color=BG, width=1))))
+        fig.update_layout(**layout("Marginal risk contribution by holding (%)",
+                                   "", "Share of portfolio variance (%)",
+                                   barmode="group", height=400))
+        st.plotly_chart(fig, use_container_width=True, key="rc_multi")
+
+    heading("Full metric set", "Net of fees, on the analysis window")
+    st.dataframe(pd.DataFrame([
+        {"Portfolio": k, "CAGR": pct(v["cagr"], 2, True),
+         "Arith. return": pct(v["net_returns"].mean() * PERIODS, 2, True),
+         "Volatility": pct(v["vol"], 2), "Sharpe": num(v["sharpe"], 3),
+         "Sortino": num(v["sortino"], 3), "Calmar": num(v["calmar"], 3),
+         "Max DD": pct(v["max_drawdown"], 2),
+         "Underwater (days)": v["underwater_days"], "Ulcer": num(v["ulcer"], 4),
+         "VaR 95%": pct(v["var95"], 2), "CVaR 95%": pct(v["cvar95"], 2),
+         "VaR 99%": pct(v["var99"], 2), "CVaR 99%": pct(v["cvar99"], 2),
+         "Skew": num(v["skew"], 2), "Excess kurtosis": num(v["kurtosis"], 2),
+         "Beta": num(v.get("beta"), 2), "Alpha": pct(v.get("alpha"), 2, True),
+         "Tracking error": pct(v.get("tracking_error"), 2),
+         "Info ratio": num(v.get("information_ratio"), 2),
+         "R²": num(v.get("r2"), 2), "Turnover/yr": f"{v['annual_turnover']*100:.0f}%",
+         "Fees paid": pct(v["total_fees"], 2)}
+        for k, v in res["stats"].items()]), use_container_width=True, hide_index=True)
+    st.caption(f"Beta, alpha, tracking error and information ratio are measured "
+               f"against {res['bench_key']}. Risk-free rate {p['rf']*100:.2f}%.")
+
+    heading("Stability of the estimates")
+    d = res["diag"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown(kpi("Estimation frequency",
+                    {"D": "Daily", "W": "Weekly", "M": "Monthly"}[d["est_freq"]],
+                    f"{d['periods_per_year']} periods/yr, {d['t_obs']} obs"),
+                unsafe_allow_html=True)
+    c2.markdown(kpi("Ledoit-Wolf δ", f"{d['shrinkage_delta']*100:.1f}%",
+                    "weight on the constant-correlation target"), unsafe_allow_html=True)
+    c3.markdown(kpi("Condition number", num(float(np.linalg.cond(res["cov"])), 1),
+                    "of the covariance matrix"), unsafe_allow_html=True)
+    c4.markdown(kpi("Median noise ratio", f"{float(np.median(d['noise_ratio'])):.2f}×",
+                    "SE(μ) ÷ |μ|"), unsafe_allow_html=True)
+    st.dataframe(pd.DataFrame({
+        "Holding": names,
+        "μ used": [pct(x, 2, True) for x in res["mu"]],
+        "μ historical": [pct(x, 2, True) for x in d["mu_hist"]],
+        "SE(μ)": [pct(x, 2) for x in d["se_mu"]],
+        "95% CI": [f"{(m-1.96*e)*100:+.1f}% … {(m+1.96*e)*100:+.1f}%"
+                   for m, e in zip(d["mu_hist"], d["se_mu"])],
+        "σ": [pct(x, 2) for x in np.sqrt(np.diag(res["cov"]))],
+        "Asset Sharpe": [num((res["mu"][i] - p["rf"]) / np.sqrt(res["cov"][i, i]), 2)
+                         for i in range(len(names))]}),
+        use_container_width=True, hide_index=True)
+
+    heading("Rolling risk-adjusted return")
+    win = st.slider("Window (trading days)", 60, 756, 252, 21, key="rollwin")
+    st.plotly_chart(chart_rolling({k: v["net_returns"] for k, v in res["stats"].items()},
+                                  p["rf"], win), use_container_width=True, key="rolling")
+    st.caption("A Sharpe that swings widely across windows is a sign the in-sample "
+               "figure is period-specific rather than a stable property.")
+
+    heading("Factor exposure", "Is this a real allocation or a disguised index bet?")
+    if not HAS_YF:
+        st.info("yfinance is required to download the factor proxies.")
+    elif st.button("Run factor regression", key="runfac"):
+        try:
+            with st.spinner("Downloading factor proxies…"):
+                fp = fetch_prices(tuple(FACTOR_PROXIES.values()), str(p["start"]),
+                                  str(p["end"]))
+                fp = fp.rename(columns={v: k for k, v in FACTOR_PROXIES.items()})
+                fr = simple_returns(fp)
+            fac = factor_regression(res["stats"][res["recommended"]]["net_returns"],
+                                    fr, p["rf"])
+            st.plotly_chart(chart_factors(fac), use_container_width=True, key="factors")
+            st.dataframe(fac, use_container_width=True, hide_index=True)
+            st.caption("OLS of portfolio excess returns on ETF proxies "
+                       f"({', '.join(FACTOR_PROXIES.values())}). A market beta near 1 "
+                       "with a high R² means an index fund would deliver the same "
+                       "exposure at lower cost. Proxies are USD-denominated, so for a "
+                       "non-USD base currency part of the residual is currency, not alpha.")
+        except (PortfolioLabError, KeyError) as e:
+            st.error(str(e))
+
+
+def tab_method(res):
+    """Methodology and glossary - what every number means and how it is computed."""
+    p = res["params"]
+    note("Every figure in this app is defined here, with the formula and the "
+         "assumption behind it. Nothing is computed by a black box.", "info")
+
+    heading("Pipeline", "In order, from raw prices to an order list")
+    st.markdown("""
+1. **Prices** are split- and dividend-adjusted closes, so they are total return.
+2. **Currency conversion** happens *before* returns are computed. Converting after
+   would mix units inside the covariance matrix and corrupt every correlation.
+3. **Common history** is truncated to the dates every holding shares, so all
+   covariance pairs are estimated over the same window.
+4. **Returns** are simple (arithmetic), never logarithmic: log returns are not
+   additive across assets, so `w·μ_log` understates portfolio return by about σ²/2.
+5. **Estimation frequency** defaults to weekly when holdings span several venues,
+   because non-synchronous closes depress measured daily correlations.
+6. **Σ** is shrunk toward a constant-correlation target (Ledoit-Wolf 2003); **μ**
+   comes from market equilibrium (Black-Litterman), history, or is not estimated.
+7. **Feasibility** of the constraint set is proved by a linear program before any
+   solver runs. Infeasible sets raise an error instead of silently returning 1/N.
+8. **Optimisation** uses SLSQP with multi-start for mean-variance and risk parity,
+   and a linear program for minimum CVaR.
+9. **Evaluation** is net of broker fees, half-spread and ongoing charges, on a
+   single explicitly chosen rebalancing policy.
+10. **Validation** re-optimises through history on a rolling window using only past
+    data, and compares the result to 1/N with a Memmel test.
+""")
+
+    heading("Return and risk")
+    st.markdown("""
+| Term | Definition | Note |
+|---|---|---|
+| Arithmetic return | Mean period return × periods per year | What mean-variance optimises |
+| CAGR | (V_end / V_start)^(1/years) − 1 | Compounded; ≈ arithmetic − σ²/2 |
+| Volatility (σ) | Standard deviation × √periods | Symmetric: penalises gains too |
+| Sharpe | (μ − r_f) / σ | Excess return per unit of total risk |
+| Sortino | (μ − r_f) / downside deviation | Only deviations below the threshold |
+| Calmar | CAGR / abs(max drawdown) | Return per unit of worst loss |
+| Max drawdown | min(V_t / max(V_≤t) − 1) | Worst peak-to-trough fall |
+| Underwater days | Longest run below the prior peak | Patience actually required |
+| Ulcer index | √mean(drawdown²) | Penalises deep *and* long drawdowns |
+| VaR 95% | 5th percentile of returns, sign-flipped | Historical, no normality assumed |
+| CVaR 95% | Mean of returns below the VaR | Coherent; captures tail depth |
+| Skew / excess kurtosis | 3rd / 4th standardised moments | Negative skew and fat tails are the danger case |
+""")
+
+    heading("Portfolio construction")
+    st.markdown("""
+| Method | Objective | Depends on μ? |
+|---|---|---|
+| Min Variance | min wᵀΣw | No |
+| Risk Parity | equalise wᵢ(Σw)ᵢ/σ_p | No |
+| Max Sharpe | max (wᵀμ − r_f)/√(wᵀΣw) | Yes, heavily |
+| Min CVaR | Rockafellar-Uryasev linear program | No |
+| Resampled | mean of Max Sharpe over bootstrap draws | Yes, but averaged |
+| Equal weight | wᵢ = 1/N | No |
+
+All are solved subject to Σw = 1, per-asset bounds, and group bounds
+(gmin ≤ Σ_group w ≤ gmax) for instrument type, asset class, sector and country.
+""")
+
+    heading("Diagnostics")
+    st.markdown("""
+- **Diversification ratio** — (Σ wᵢσᵢ) / σ_p. Equals 1 for a single asset; rises as
+  correlations fall. Below about 1.2 the portfolio is one bet in disguise.
+- **Effective N** — 1 / Σwᵢ². The number of equally weighted holdings that would be
+  as concentrated as yours.
+- **Risk contribution** — wᵢ(Σw)ᵢ / σ_p, summing to 100%. A 10% position can supply
+  40% of the risk; that gap is the most common surprise in a portfolio.
+- **SE(μ)** — σ / √years. The standard error of an annualised mean return. With 10
+  years of a 20% volatility asset it is about 6.3 points, which is why confidence
+  intervals on expected returns usually straddle zero.
+- **Ledoit-Wolf δ** — weight given to the structured target. Higher means the raw
+  sample correlations were judged too noisy to trust.
+- **Memmel test** — corrects the Jobson-Korkie statistic for the correlation between
+  two Sharpe ratios. p below 0.05 means the gap versus 1/N is unlikely to be luck.
+""")
+
+    heading("Assumptions you are accepting")
+    st.markdown(f"""
+- Risk-free rate **{p['rf']*100:.2f}%**, constant over the whole window.
+- Rebalancing **{[k for k, v in REBALANCE_CHOICES.items() if v == p['rebalance']][0]}**,
+  costing {p['costs'].one_way*1e4:.0f} bps of traded notional each way, plus
+  {p['costs'].ter_bps:.0f} bps a year of ongoing charges.
+- Projections resample the observed distribution in blocks: no future crisis can be
+  worse than the worst one already in your history.
+- Public price feeds exclude delisted companies, so every backtest is mildly
+  flattering (survivorship bias).
+- Dividends are assumed reinvested with no foreign withholding tax.
+- The maximum-holdings limit is solved by a greedy heuristic, not to a proven optimum.
+""")
 
 
 def tab_orders(res):
@@ -2903,9 +3159,10 @@ Build · test honestly · project</div></div></div>""", unsafe_allow_html=True)
     res = st.session_state.res
     tabs = st.tabs(["  🥧  Your portfolio  ", "  🔮  Your plan  ",
                     "  🎯  Reality check  ", "  ⚠️  Risk  ",
-                    "  🧾  What to buy  ", "  🗂️  Data  "])
+                    "  📐  Analytics  ", "  🧾  What to buy  ",
+                    "  📖  Method  ", "  🗂️  Data  "])
     for tab, fn in zip(tabs, [tab_portfolio, tab_plan, tab_reality, tab_risk,
-                              tab_orders, tab_data]):
+                              tab_analytics, tab_orders, tab_method, tab_data]):
         with tab:
             try:
                 fn(res)
@@ -3363,6 +3620,25 @@ def run_self_tests(verbose=True) -> int:
         v = oos_verdict({"nav": (1 + g).cumprod(), "returns": g},
                         {"nav": (1 + b).cumprod(), "returns": b}, 0.)
         assert v["beats_naive"] and v["sharpe_gap"] > 0
+
+    @test("every chart call carries a unique key (Streamlit duplicate-ID guard)")
+    def _():
+        import inspect
+        src = inspect.getsource(sys.modules[__name__])
+        keys, calls = [], 0
+        for m in re.finditer(r"plotly_chart\(", src):
+            i, depth = src.index("(", m.start()), 0
+            for j in range(i, len(src)):
+                depth += (src[j] == "(") - (src[j] == ")")
+                if depth == 0:
+                    break
+            body = src[i:j]
+            calls += 1
+            k = re.search(r"key=(f?\"[^\"]*\"|[A-Za-z_][\w.]*)", body)
+            assert k, f"plotly_chart without key: {body[:70]}"
+            keys.append(k.group(1))
+        assert calls >= 10
+        assert len(set(keys)) == len(keys), "duplicate chart keys"
 
     @test("data fingerprint is stable and sensitive")
     def _():
