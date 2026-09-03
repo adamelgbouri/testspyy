@@ -4177,7 +4177,7 @@ def page_cargo(marks: MarkBoard) -> None:
         ["BOOK CARGO", f"CARGO BOOK ({len(cargos)})", "ATTRIBUTION", "LIFECYCLE"])
 
     with t_book:
-        _cargo_book_form(marks)
+        _cargo_book_form(marks, cargos)
     with t_list:
         _cargo_book_list(marks, cargos)
     with t_attr:
@@ -4186,7 +4186,7 @@ def page_cargo(marks: MarkBoard) -> None:
         _cargo_lifecycle_tab(marks, cargos)
 
 
-def _cargo_book_form(marks: MarkBoard) -> None:
+def _cargo_book_form(marks: MarkBoard, cargos: List[dict]) -> None:
     st.markdown("Every field below the volume is optional — leave freight, storage or "
                 "financing at zero and the model collapses cleanly to a simple hedged "
                 "cargo.")
@@ -4337,6 +4337,7 @@ def _cargo_book_form(marks: MarkBoard) -> None:
             storage_rate=float(stor_rate), storage_days=int(stor_days),
             other_cost=float(other), basis_vol=float(bvol),
             stage="Booked", booked_date=date.today().isoformat(), notes=notes.strip())
+        current_cargos = st.session_state.get("cargos", cargos)
         st.session_state.cargos = list(cargos) + [cg]
         save_book()
         st.success(f"Cargo **{cg['id']}** booked — hedge {lots} lots "
