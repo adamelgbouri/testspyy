@@ -34,3 +34,4 @@ par_rates  = [0.04, 0.042, 0.044, 0.047]
 print("\n3. Yield Curve Bootstrap")
 for T, z in bootstrap_yield_curve(maturities, par_rates).items():
     print(f"   {T}Y zero rate: {z}%")
+
