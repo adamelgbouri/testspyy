@@ -24,6 +24,7 @@ def bond_analytics(face, coupon_rate, ytm, n_periods, freq=2):
             "MacaulayDur": round(duration, 4),
             "ModDur": round(mod_dur, 4),
             "Convexity": round(convex, 4)}
+    
  
 print("\n7. Bond Duration & Convexity")
 for k, v in bond_analytics(1000, 0.05, 0.06, 10).items():
