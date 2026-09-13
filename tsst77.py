@@ -17,3 +17,4 @@ for ticker in portfolio:
     change = ((curr_close - prev_close) / prev_close) * 100
     
     print(f"{ticker}: {change:+.2f}%")
+
