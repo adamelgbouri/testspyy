@@ -1111,7 +1111,7 @@ def fetch_gie_history(dataset: str, api_key: str, scope: str,
     # Country filters use the provider's two-letter country slug.
     is_europe_scope = scope in {"Europe aggregate", "Europe / EU datasets"}
     if is_europe_scope:
-        params_base["type"] = "EU"
+        params_base["type"] = "eu"
     else:
         params_base["country"] = country_code.lower()
     request_json = _json_get_fn or _json_get
@@ -1570,6 +1570,312 @@ def _display_live_frame(frame: pd.DataFrame, title: str, chart_x: Optional[str] 
     st.dataframe(frame, use_container_width=True, hide_index=True)
 
 
+def _normalised_col_name(value: object) -> str:
+    """Case/punctuation-insensitive column identifier for provider schemas."""
+    return "".join(ch.lower() for ch in str(value) if ch.isalnum())
+
+
+def _find_column(frame: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+    if frame is None or frame.empty:
+        return None
+    columns = list(frame.columns)
+    normalised = {_normalised_col_name(c): c for c in columns}
+    for candidate in candidates:
+        key = _normalised_col_name(candidate)
+        if key in normalised:
+            return normalised[key]
+    # Some provider payloads flatten nested objects (e.g. inventory_gwh).
+    for candidate in candidates:
+        key = _normalised_col_name(candidate)
+        matches = [c for c in columns if _normalised_col_name(c).endswith(key)]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def _numeric_column(frame: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+    col = _find_column(frame, candidates)
+    if col is None:
+        return None
+    parsed = _number_series(frame[col])
+    return col if parsed.notna().any() else None
+
+
+def _frame_with_time(frame: pd.DataFrame, date_candidates: Optional[Sequence[str]] = None) -> tuple[pd.DataFrame, Optional[str]]:
+    """Return a copy with a UTC sort key, supporting date-only and timestamp columns."""
+    if frame is None or frame.empty:
+        return pd.DataFrame(), None
+    candidates = date_candidates or (
+        "observation_date", "gasDayStart", "gas_day", "date", "timestamp", "periodFrom", "periodfrom"
+    )
+    col = _find_column(frame, candidates)
+    if col is None:
+        return frame.copy(), None
+    out = frame.copy()
+    parsed = pd.to_datetime(out[col], errors="coerce", utc=True)
+    out["_meridian_sort_time"] = parsed
+    out = out.loc[parsed.notna()].sort_values("_meridian_sort_time").reset_index(drop=True)
+    return out, col
+
+
+def _latest_row(frame: pd.DataFrame, date_candidates: Optional[Sequence[str]] = None,
+                prefer_aggregate: bool = False) -> Optional[pd.Series]:
+    """Get the latest observation without accidentally summing facilities or series."""
+    out, time_col = _frame_with_time(frame, date_candidates)
+    if out.empty:
+        return None
+    if prefer_aggregate:
+        name_col = _find_column(out, ("name", "country", "label", "dataset"))
+        code_col = _find_column(out, ("code", "countryCode", "country_code"))
+        mask = pd.Series(False, index=out.index)
+        if name_col:
+            mask |= out[name_col].astype(str).str.strip().str.casefold().isin({"eu", "europe", "european union", "europe aggregate"})
+        if code_col:
+            mask |= out[code_col].astype(str).str.strip().str.casefold().isin({"eu", "europe"})
+        if mask.any():
+            out = out.loc[mask].copy()
+    return out.iloc[-1]
+
+
+def _latest_metric(frame: pd.DataFrame, value_candidates: Sequence[str],
+                   date_candidates: Optional[Sequence[str]] = None,
+                   prefer_aggregate: bool = False) -> tuple[Optional[float], Optional[pd.Series], Optional[str]]:
+    """Return latest numeric value, source row and matched column."""
+    row = _latest_row(frame, date_candidates, prefer_aggregate=prefer_aggregate)
+    if row is None:
+        return None, None, None
+    col = _numeric_column(frame, value_candidates)
+    if col is None:
+        return None, row, None
+    value = _number_series(pd.Series([row.get(col)])).iloc[0]
+    if pd.isna(value) or not math.isfinite(float(value)):
+        return None, row, col
+    return float(value), row, col
+
+
+def _latest_observation_date(frame: pd.DataFrame,
+                             date_candidates: Optional[Sequence[str]] = None) -> Optional[str]:
+    out, col = _frame_with_time(frame, date_candidates)
+    if out.empty:
+        return None
+    if col is None:
+        return None
+    try:
+        value = out.iloc[-1][col]
+        stamp = pd.Timestamp(value)
+        if stamp.tzinfo is not None:
+            stamp = stamp.tz_convert("UTC")
+        return stamp.strftime("%Y-%m-%d %H:%M UTC" if (stamp.hour or stamp.minute or stamp.second) else "%Y-%m-%d")
+    except Exception:
+        return str(out.iloc[-1][col])
+
+
+def _live_item_fetched_at(key: str) -> str:
+    item = st.session_state.get("live_data", {}).get(key, {})
+    return str(item.get("fetched_at", "")) if isinstance(item, dict) else ""
+
+
+def _live_item_meta(key: str) -> dict:
+    item = st.session_state.get("live_data", {}).get(key, {})
+    return item.get("metadata", {}) if isinstance(item, dict) and isinstance(item.get("metadata", {}), dict) else {}
+
+
+def _series_value_at_latest_timestamp(frame: pd.DataFrame, series_names: Sequence[str]) -> Optional[float]:
+    """Aggregate selected ENTSO-E series at the latest timestamp common to those rows."""
+    if frame is None or frame.empty or "value" not in frame.columns:
+        return None
+    time_col = _find_column(frame, ("timestamp",))
+    series_col = _find_column(frame, ("series", "name"))
+    if not time_col or not series_col:
+        return None
+    out = frame.copy()
+    out["_time"] = pd.to_datetime(out[time_col], errors="coerce", utc=True).dt.floor("h")
+    out["_value"] = _number_series(out["value"])
+    wanted = out[series_col].astype(str).str.casefold().apply(
+        lambda text: any(name.casefold() in text for name in series_names)
+    )
+    out = out.loc[wanted & out["_time"].notna() & out["_value"].notna()]
+    if out.empty:
+        return None
+    latest_time = out["_time"].max()
+    latest = out.loc[out["_time"].eq(latest_time)]
+    return float(latest.groupby(series_col)["_value"].last().sum())
+
+
+def _build_residual_load_proxy() -> pd.DataFrame:
+    """Join ENTSO-E load, wind/solar output and day-ahead price into hourly context.
+
+    This proxy is only computed for overlapping timestamps: residual load = actual load
+    minus actual wind and solar output. It is not a full system balance or a price model.
+    """
+    prices = _live_dataset_frame("entsoe_price")
+    load = _live_dataset_frame("entsoe_load")
+    generation = _live_dataset_frame("entsoe_generation")
+    if any(frame.empty for frame in (prices, load, generation)):
+        return pd.DataFrame()
+
+    def to_hourly(frame: pd.DataFrame, column_name: str) -> pd.DataFrame:
+        if "timestamp" not in frame.columns or "value" not in frame.columns:
+            return pd.DataFrame(columns=["hour", column_name])
+        out = frame[["timestamp", "value"]].copy()
+        out["hour"] = pd.to_datetime(out["timestamp"], errors="coerce", utc=True).dt.floor("h")
+        out[column_name] = _number_series(out["value"])
+        out = out.dropna(subset=["hour", column_name])
+        return out.groupby("hour", as_index=False)[column_name].mean()
+
+    price_hourly = to_hourly(prices, "day_ahead_eur_mwh")
+    load_hourly = to_hourly(load, "actual_load_mw")
+    if price_hourly.empty or load_hourly.empty or "series" not in generation.columns:
+        return pd.DataFrame()
+    gen = generation.copy()
+    labels = gen["series"].astype(str).str.casefold()
+    renewable_mask = labels.str.contains("wind onshore|wind offshore|solar", regex=True)
+    gen = gen.loc[renewable_mask].copy()
+    if gen.empty:
+        return pd.DataFrame()
+    gen["hour"] = pd.to_datetime(gen["timestamp"], errors="coerce", utc=True).dt.floor("h")
+    gen["generation_mw"] = _number_series(gen["value"])
+    gen = gen.dropna(subset=["hour", "generation_mw"])
+    # Sum onshore wind + offshore wind + solar at each source timestamp, then average
+    # these sub-hourly/ hourly totals into a common UTC-hour bucket.
+    renewable_hourly = (gen.groupby(["hour", "timestamp"], as_index=False)["generation_mw"].sum()
+                        .groupby("hour", as_index=False)["generation_mw"].mean()
+                        .rename(columns={"generation_mw": "wind_solar_mw"}))
+    if renewable_hourly.empty:
+        return pd.DataFrame()
+    joined = price_hourly.merge(load_hourly, on="hour", how="inner").merge(renewable_hourly, on="hour", how="inner")
+    if joined.empty:
+        return joined
+    joined["residual_load_proxy_mw"] = joined["actual_load_mw"] - joined["wind_solar_mw"]
+    return joined.sort_values("hour").reset_index(drop=True)
+
+
+def build_live_snapshot() -> dict[str, dict]:
+    """Summarise current session feeds for dashboards, without fabricating missing values."""
+    snapshot: dict[str, dict] = {}
+    # GIE AGSI+ gas storage. EU type requests contain an aggregate; country requests stay country-level.
+    agsi = _live_dataset_frame("gie_agsi")
+    if not agsi.empty:
+        full, row, _ = _latest_metric(agsi, ("full", "fillLevel", "fill_level"), prefer_aggregate=True)
+        storage, storage_row, _ = _latest_metric(agsi, ("gasInStorage", "gas_in_storage"), prefer_aggregate=True)
+        capacity, _, _ = _latest_metric(agsi, ("workingGasVolume", "working_gas_volume"), prefer_aggregate=True)
+        if full is None and storage is not None and capacity and capacity > 0:
+            full = storage / capacity * 100.0
+        date_label = _latest_observation_date(agsi, ("observation_date", "gasDayStart", "gas_day"))
+        scope = str(_live_item_meta("gie_agsi").get("scope", "selected API scope"))
+        change = None
+        date_col = _find_column(agsi, ("observation_date", "gasDayStart", "gas_day"))
+        storage_col = _find_column(agsi, ("gasInStorage", "gas_in_storage"))
+        if date_col and storage_col:
+            hist = agsi.copy()
+            hist["_day"] = pd.to_datetime(hist[date_col], errors="coerce")
+            hist["_storage"] = _number_series(hist[storage_col])
+            name_col = _find_column(hist, ("name", "country"))
+            code_col = _find_column(hist, ("code", "countryCode", "country_code"))
+            if scope == "Europe / EU datasets":
+                aggregate_mask = pd.Series(False, index=hist.index)
+                if name_col: aggregate_mask |= hist[name_col].astype(str).str.casefold().isin({"eu", "europe", "european union"})
+                if code_col: aggregate_mask |= hist[code_col].astype(str).str.casefold().isin({"eu", "europe"})
+                if aggregate_mask.any(): hist = hist.loc[aggregate_mask]
+            hist = hist.dropna(subset=["_day", "_storage"]).sort_values("_day")
+            if len(hist) >= 8:
+                change = float(hist.iloc[-1]["_storage"] - hist.iloc[-8]["_storage"])
+        snapshot["storage"] = {"fill_pct": full, "inventory_twh": storage, "capacity_twh": capacity,
+                               "date": date_label, "scope": scope, "change_7_reports_twh": change,
+                               "fetched_at": _live_item_fetched_at("gie_agsi")}
+
+    # GIE ALSI+ LNG fields have different units: inventory is commonly 10^3 m3 LNG, send-out GWh/d.
+    alsi = _live_dataset_frame("gie_alsi")
+    if not alsi.empty:
+        inventory, row, inventory_col = _latest_metric(alsi, ("inventory", "inventory_lng", "inventory_gwh", "inventory_twh"), prefer_aggregate=True)
+        sendout, _, sendout_col = _latest_metric(alsi, ("sendOut", "sendout", "send_out", "sendout_gwh"), prefer_aggregate=True)
+        dtmi, _, _ = _latest_metric(alsi, ("dtmi",), prefer_aggregate=True)
+        inventory_unit = "10³ m³ LNG" if inventory_col and _normalised_col_name(inventory_col) == "inventory" else ("GWh" if inventory_col and "gwh" in inventory_col.casefold() else ("TWh" if inventory_col and "twh" in inventory_col.casefold() else "provider-defined unit"))
+        snapshot["lng"] = {"inventory": inventory, "inventory_unit": inventory_unit, "sendout": sendout,
+                           "sendout_unit": "GWh/d" if sendout is not None else None, "capacity": dtmi,
+                           "date": _latest_observation_date(alsi, ("observation_date", "gasDayStart", "gas_day")),
+                           "scope": str(_live_item_meta("gie_alsi").get("scope", "selected API scope")),
+                           "fetched_at": _live_item_fetched_at("gie_alsi")}
+
+    price_frame = _live_dataset_frame("entsoe_price")
+    if not price_frame.empty and "value" in price_frame.columns:
+        p = price_frame.copy()
+        p["timestamp"] = pd.to_datetime(p.get("timestamp"), errors="coerce", utc=True)
+        p["value"] = _number_series(p["value"])
+        p = p.dropna(subset=["timestamp", "value"]).sort_values("timestamp")
+        if not p.empty:
+            recent_cutoff = p["timestamp"].max() - pd.Timedelta(days=7)
+            recent = p.loc[p["timestamp"].ge(recent_cutoff)]
+            meta = _live_item_meta("entsoe_price")
+            snapshot["power_price"] = {"value": float(p.iloc[-1]["value"]), "unit": str(p.iloc[-1].get("unit", "EUR/MWh")),
+                "timestamp": p.iloc[-1]["timestamp"].strftime("%Y-%m-%d %H:%M UTC"),
+                "zone": str(meta.get("zone", "selected bidding zone")),
+                "sample_mean": float(recent["value"].mean()) if not recent.empty else None,
+                "sample_min": float(recent["value"].min()) if not recent.empty else None,
+                "sample_max": float(recent["value"].max()) if not recent.empty else None,
+                "negative_observations": int((recent["value"] < 0).sum()),
+                "fetched_at": _live_item_fetched_at("entsoe_price")}
+
+    load_frame = _live_dataset_frame("entsoe_load")
+    if not load_frame.empty and "value" in load_frame.columns:
+        load = load_frame.copy()
+        load["timestamp"] = pd.to_datetime(load.get("timestamp"), errors="coerce", utc=True)
+        load["value"] = _number_series(load["value"])
+        load = load.dropna(subset=["timestamp", "value"]).sort_values("timestamp")
+        if not load.empty:
+            snapshot["power_load"] = {"value": float(load.iloc[-1]["value"]), "unit": str(load.iloc[-1].get("unit", "MW")),
+                "timestamp": load.iloc[-1]["timestamp"].strftime("%Y-%m-%d %H:%M UTC"),
+                "zone": str(_live_item_meta("entsoe_load").get("zone", "selected bidding zone")),
+                "fetched_at": _live_item_fetched_at("entsoe_load")}
+
+    gen = _live_dataset_frame("entsoe_generation")
+    if not gen.empty and {"timestamp", "value", "series"}.issubset(gen.columns):
+        gen = gen.copy()
+        gen["timestamp"] = pd.to_datetime(gen["timestamp"], errors="coerce", utc=True)
+        gen["value"] = _number_series(gen["value"])
+        gen = gen.dropna(subset=["timestamp", "value"]).sort_values("timestamp")
+        if not gen.empty:
+            latest_t = gen["timestamp"].max()
+            latest_gen = gen.loc[gen["timestamp"].eq(latest_t)]
+            labels = latest_gen["series"].astype(str).str.casefold()
+            renewable = latest_gen.loc[labels.str.contains("wind onshore|wind offshore|solar", regex=True), "value"].sum()
+            snapshot["generation"] = {"timestamp": latest_t.strftime("%Y-%m-%d %H:%M UTC"),
+                "wind_solar_mw": float(renewable) if not latest_gen.empty else None,
+                "series_count": int(latest_gen["series"].nunique()),
+                "zone": str(_live_item_meta("entsoe_generation").get("zone", "selected bidding zone")),
+                "fetched_at": _live_item_fetched_at("entsoe_generation")}
+
+    flow = _live_dataset_frame("entsog_flow")
+    if not flow.empty:
+        value_col = _numeric_column(flow, ("value_numeric", "value", "quantity", "flow"))
+        row = _latest_row(flow, ("timestamp", "periodFrom", "period_from", "date"))
+        if row is not None and value_col:
+            val = _number_series(pd.Series([row.get(value_col)])).iloc[0]
+            snapshot["gas_flow"] = {"value": float(val) if pd.notna(val) else None,
+                "unit": str(row.get("unit", row.get("unitName", "check provider unit"))),
+                "timestamp": str(row.get("timestamp", row.get("periodFrom", row.get("date", "")))),
+                "label": str(_live_item_meta("entsog_flow").get("indicator", "Selected ENTSOG indicator")),
+                "point_direction": str(_live_item_meta("entsog_flow").get("point_direction", "selected point")),
+                "fetched_at": _live_item_fetched_at("entsog_flow")}
+
+    weather = _live_dataset_frame("weather_daily")
+    if not weather.empty:
+        row = _latest_row(weather, ("date", "timestamp"))
+        if row is not None:
+            def row_num(aliases):
+                col = _find_column(weather, aliases)
+                if not col: return None
+                x = _number_series(pd.Series([row.get(col)])).iloc[0]
+                return float(x) if pd.notna(x) and math.isfinite(float(x)) else None
+            snapshot["weather"] = {"date": str(row.get("date", "")),
+                "temperature_c": row_num(("temperature_mean_c", "temperature_2m")),
+                "wind_kmh": row_num(("wind_speed_mean_kmh", "wind_speed_10m")),
+                "solar_wm2": row_num(("solar_radiation_mean_wm2", "shortwave_radiation")),
+                "location": str(_live_item_meta("weather_daily").get("location", "selected location")),
+                "fetched_at": _live_item_fetched_at("weather_daily")}
+    return snapshot
+
+
 NAV_SECTIONS = {
     "Markets": ["📊  Market Overview", "📈  Forward Curves", "🧭  Market Fundamentals", "🔌  Live Data Integrations"],
     "Trading & Risk": ["💬  OTC Quote Builder", "📒  Trading Book & MtM", "⚠️  P&L & Exposure"],
@@ -1628,6 +1934,7 @@ def render_sidebar() -> str:
         if st.button("↻ Reset demo book & curves", use_container_width=True):
             st.session_state.trades = build_sample_trades()
             st.session_state.custom_curves = {}
+            st.session_state.curve_metadata = {}
             st.session_state.physical_ops = build_sample_physical_ops(st.session_state.trades)
             st.session_state.pop("last_quote", None)
             st.rerun()
@@ -1659,6 +1966,8 @@ if "trades" not in st.session_state:
     st.session_state.trades = build_sample_trades()
 if "custom_curves" not in st.session_state:
     st.session_state.custom_curves = {}
+if "curve_metadata" not in st.session_state:
+    st.session_state.curve_metadata = {}
 if "physical_ops" not in st.session_state:
     st.session_state.physical_ops = build_sample_physical_ops(st.session_state.trades)
 else:
@@ -1699,7 +2008,11 @@ def get_marked_trades() -> pd.DataFrame:
 
 
 def curve_source_label(product: str) -> str:
-    return "USER / PROVIDER-IMPORTED MARKS" if product in st.session_state.get("custom_curves", {}) else "ILLUSTRATIVE DEMO MARKS"
+    if product not in st.session_state.get("custom_curves", {}):
+        return "ILLUSTRATIVE DEMO MARKS"
+    metadata = st.session_state.get("curve_metadata", {}).get(product, {})
+    origin = str(metadata.get("source_label", "USER / PROVIDER-IMPORTED MARKS")).strip()
+    return origin or "USER / PROVIDER-IMPORTED MARKS"
 
 
 def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -2102,14 +2415,14 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
                 "full": "74.0", "workingGasVolume": "61.0", "status": "C"
             }]}
         got = fetch_gie_history("AGSI", "test-key", "Europe / EU datasets", date(2026, 10, 20), date(2026, 10, 20), "DE", _json_get_fn=fake_get)
-        if not calls or calls[0][1].get("type") != "EU" or "continent" in calls[0][1]:
+        if not calls or str(calls[0][1].get("type", "")).casefold() != "eu" or "continent" in calls[0][1]:
             raise AssertionError("GIE Europe selection must use the documented type=EU parameter.")
         if calls[0][2].get("x-key") != "test-key":
             raise AssertionError("GIE API key was not sent in the x-key header.")
         assert_close(float(got.iloc[0]["gasInStorage"]), 45.2)
         if str(got.iloc[0]["observation_date"]) != "2026-10-20":
             raise AssertionError("GIE gasDayStart was not mapped to an observation date.")
-        return "Mocked GIE request uses the documented EU selector, sends its API key in a header, and normalises dates/numeric fields."
+        return "Mocked GIE request uses the documented type=eu selector, sends its API key in a header, and normalises dates/numeric fields."
 
     def check_entsog_envelope_normalisation() -> str:
         directions = _payload_rows({"operatorpointdirections": [{"pointDirection": "sample-id", "pointLabel": "Interconnector"}]})
@@ -2160,6 +2473,60 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         assert_close(float(curve.iloc[0]["price"]), 90.5)
         return "Mocked licensed-provider REST CSV is parsed, authenticated, and normalised to the canonical monthly-curve schema."
 
+    def check_live_snapshot_indicators() -> str:
+        previous = st.session_state.get("live_data", {})
+        try:
+            st.session_state.live_data = {
+                "gie_agsi": {"label": "AGSI EU", "metadata": {"scope": "Europe / EU datasets"}, "fetched_at": "2026-10-23T19:00:00+00:00", "data": pd.DataFrame([
+                    {"gasDayStart": "2026-10-13", "observation_date": date(2026, 10, 13), "name": "EU", "code": "eu", "gasInStorage": 100.0, "workingGasVolume": 120.0, "full": 83.33},
+                    {"gasDayStart": "2026-10-20", "observation_date": date(2026, 10, 20), "name": "EU", "code": "eu", "gasInStorage": 95.0, "workingGasVolume": 120.0, "full": 79.17},
+                    {"gasDayStart": "2026-10-21", "observation_date": date(2026, 10, 21), "name": "EU", "code": "eu", "gasInStorage": 94.5, "workingGasVolume": 120.0, "full": 78.75},
+                    {"gasDayStart": "2026-10-22", "observation_date": date(2026, 10, 22), "name": "EU", "code": "eu", "gasInStorage": 94.0, "workingGasVolume": 120.0, "full": 78.33},
+                    {"gasDayStart": "2026-10-23", "observation_date": date(2026, 10, 23), "name": "EU", "code": "eu", "gasInStorage": 93.5, "workingGasVolume": 120.0, "full": 77.92},
+                    {"gasDayStart": "2026-10-24", "observation_date": date(2026, 10, 24), "name": "EU", "code": "eu", "gasInStorage": 93.0, "workingGasVolume": 120.0, "full": 77.50},
+                    {"gasDayStart": "2026-10-25", "observation_date": date(2026, 10, 25), "name": "EU", "code": "eu", "gasInStorage": 92.5, "workingGasVolume": 120.0, "full": 77.08},
+                    {"gasDayStart": "2026-10-26", "observation_date": date(2026, 10, 26), "name": "EU", "code": "eu", "gasInStorage": 92.0, "workingGasVolume": 120.0, "full": 76.67},
+                ])},
+                "gie_alsi": {"label": "ALSI EU", "metadata": {"scope": "Europe / EU datasets"}, "fetched_at": "2026-10-23T19:00:00+00:00", "data": pd.DataFrame([{"gasDayStart": "2026-10-23", "observation_date": date(2026, 10, 23), "name": "EU", "code": "eu", "inventory": 520.0, "sendOut": 1100.0, "dtmi": 700.0}])},
+                "entsoe_price": {"label": "ENTSO-E price", "metadata": {"zone": "France"}, "fetched_at": "2026-10-23T19:00:00+00:00", "data": pd.DataFrame([{"timestamp": "2026-10-23T11:00:00Z", "value": -5.0, "unit": "EUR/MWh", "series": "Day-ahead price"}, {"timestamp": "2026-10-23T12:00:00Z", "value": 80.0, "unit": "EUR/MWh", "series": "Day-ahead price"}])},
+                "weather_daily": {"label": "Weather", "metadata": {"location": "Paris"}, "fetched_at": "2026-10-23T19:00:00+00:00", "data": pd.DataFrame([{"date": pd.Timestamp("2026-10-23"), "temperature_mean_c": 13.0, "wind_speed_mean_kmh": 15.0, "solar_radiation_mean_wm2": 90.0}])},
+            }
+            snap = build_live_snapshot()
+            assert_close(snap["storage"]["fill_pct"], 76.67)
+            assert_close(snap["storage"]["inventory_twh"], 92.0)
+            assert_close(snap["storage"]["change_7_reports_twh"], -8.0)
+            assert_close(snap["lng"]["sendout"], 1100.0)
+            assert_close(snap["power_price"]["value"], 80.0)
+            if snap["weather"]["location"] != "Paris":
+                raise AssertionError("Weather location metadata was lost.")
+            return "Market snapshot reads AGSI inventory/fill/change, ALSI send-out, latest ENTSO-E price and weather from mocked feed data without hardcoded market values."
+        finally:
+            st.session_state.live_data = previous
+
+    def check_residual_load_proxy_alignment() -> str:
+        previous = st.session_state.get("live_data", {})
+        try:
+            times = pd.date_range("2026-10-20T10:00:00Z", periods=4, freq="h")
+            st.session_state.live_data = {
+                "entsoe_price": {"data": pd.DataFrame({"timestamp": times, "value": [50, 55, 60, 65]})},
+                "entsoe_load": {"data": pd.DataFrame({"timestamp": times, "value": [1000, 1100, 1200, 1300]})},
+                "entsoe_generation": {"data": pd.DataFrame([
+                    {"timestamp": t, "value": wind, "series": "Wind onshore"} for t, wind in zip(times, [100, 100, 100, 100])
+                ] + [
+                    {"timestamp": t, "value": solar, "series": "Solar"} for t, solar in zip(times, [25, 50, 75, 100])
+                ] + [
+                    {"timestamp": t, "value": 20, "series": "Nuclear"} for t in times
+                ])},
+            }
+            result = _build_residual_load_proxy()
+            if len(result) != 4:
+                raise AssertionError(f"Expected four aligned hourly rows, got {len(result)}.")
+            assert_close(float(result.iloc[0]["wind_solar_mw"]), 125.0)
+            assert_close(float(result.iloc[0]["residual_load_proxy_mw"]), 875.0)
+            return "Power context joins overlapping hourly timestamps and computes residual-load proxy as load minus wind/solar; unrelated generation types are excluded."
+        finally:
+            st.session_state.live_data = previous
+
     cases = [
         ("Product registry and market timezones", "Configuration", check_product_registry),
         ("MWh ↔ MMBtu conversions", "Units & conversions", check_energy_conversion),
@@ -2204,6 +2571,8 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("ENTSOG JSON envelope normalisation", "Live API integration", check_entsog_envelope_normalisation),
         ("Open-Meteo timezone and daily aggregation", "Live API integration", check_open_meteo_aggregation_and_timezone),
         ("Licensed REST-provider CSV connector", "Live API integration", check_generic_provider_rest_csv),
+        ("Live dashboard indicator integration", "Dashboard integration", check_live_snapshot_indicators),
+        ("Cross-market hourly load/generation/price join", "Fundamentals analytics", check_residual_load_proxy_alignment),
     ]
     for name, area, fn in cases:
         run_case(name, area, fn)
@@ -2236,6 +2605,69 @@ if page == "Market Overview":
     if imported_products: source_parts.append("Imported marks: " + ", ".join(imported_products))
     if fallback_products: source_parts.append("Illustrative fallback marks: " + ", ".join(fallback_products))
     st.caption("MtM is reported separately by quote currency. " + "; ".join(source_parts) + ". Not an executable or accounting valuation.")
+
+    # Live feeds are consumed here as market context; fundamentals are not used as substitute forward marks.
+    snapshot = build_live_snapshot()
+    st.subheader("Live market snapshot")
+    if not snapshot:
+        st.info("No provider data is loaded yet. Fetch GIE storage/LNG, ENTSO-E prices/load, ENTSOG flows or weather in Live Data Integrations. The dashboard will populate automatically when those datasets are loaded.")
+        if st.button("Open Live Data Integrations", key="overview_open_integrations"):
+            st.session_state.nav_page = next(label for label in ALL_NAV_ITEMS if label.endswith("Live Data Integrations"))
+            st.rerun()
+    else:
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        storage = snapshot.get("storage", {})
+        lng = snapshot.get("lng", {})
+        power = snapshot.get("power_price", {})
+        load = snapshot.get("power_load", {})
+        weather = snapshot.get("weather", {})
+        gas_flow = snapshot.get("gas_flow", {})
+        s1.metric("Gas storage fill", f"{storage['fill_pct']:.1f}%" if storage.get("fill_pct") is not None else "—",
+                  help=f"GIE AGSI+ · {storage.get('scope', 'selected scope')} · observation {storage.get('date', 'n/a')}")
+        change = storage.get("change_7_reports_twh")
+        s2.metric("Gas in storage", f"{storage['inventory_twh']:.1f} TWh" if storage.get("inventory_twh") is not None else "—",
+                  delta=f"{change:+.1f} TWh vs 7 reports ago" if change is not None else None,
+                  help=f"GIE AGSI+ · {storage.get('date', 'n/a')}")
+        s3.metric("LNG send-out", f"{lng['sendout']:.1f} GWh/d" if lng.get("sendout") is not None else "—",
+                  help=f"GIE ALSI+ · {lng.get('scope', 'selected scope')} · {lng.get('date', 'n/a')}")
+        s4.metric("Day-ahead power", f"{power['value']:.2f} {power.get('unit', 'EUR/MWh')}" if power.get("value") is not None else "—",
+                  help=f"ENTSO-E · {power.get('zone', 'zone')} · {power.get('timestamp', 'n/a')}")
+        s5.metric("Actual electricity load", f"{load['value']/1000:.2f} GW" if load.get("value") is not None else "—",
+                  help=f"ENTSO-E · {load.get('zone', 'zone')} · {load.get('timestamp', 'n/a')} · source unit {load.get('unit', 'MW')}")
+        s6.metric("Weather temperature", f"{weather['temperature_c']:.1f} °C" if weather.get("temperature_c") is not None else "—",
+                  help=f"Open-Meteo daily mean · {weather.get('location', 'selected location')} · {weather.get('date', 'n/a')}")
+        st.caption("Data sources: GIE AGSI+ (gas storage), GIE ALSI+ (LNG), ENTSO-E Transparency Platform (power prices/load), ENTSOG (selected gas point-direction) and Open-Meteo (weather). Observation timestamps and selected scopes appear in tooltips and the Data freshness expander.")
+        if gas_flow.get("value") is not None:
+            st.caption(f"Latest ENTSOG {gas_flow.get('label', 'indicator')}: {gas_flow['value']:,.2f} {gas_flow.get('unit', 'unit unverified')} · point direction {gas_flow.get('point_direction', 'selected point')} · observation {gas_flow.get('timestamp', 'n/a')}. Confirm the exact unit and direction before using operationally.")
+        if weather.get("wind_kmh") is not None or weather.get("solar_wm2") is not None:
+            bits = []
+            if weather.get("wind_kmh") is not None: bits.append(f"daily mean wind {weather['wind_kmh']:.1f} km/h")
+            if weather.get("solar_wm2") is not None: bits.append(f"daily mean solar radiation {weather['solar_wm2']:.1f} W/m²")
+            st.caption(f"Weather context — {weather.get('location', 'selected location')}: " + "; ".join(bits) + ". These are weather proxies, not power-price forecasts.")
+        st.subheader("Fundamental observations")
+        observations = []
+        if storage.get("change_7_reports_twh") is not None:
+            direction = "inventory draw" if storage["change_7_reports_twh"] < 0 else "inventory build" if storage["change_7_reports_twh"] > 0 else "flat inventory"
+            observations.append({"Observation": "Gas storage", "Latest signal": f"{direction}: {storage['change_7_reports_twh']:+.2f} TWh across the latest seven reporting observations", "Interpretation boundary": "Inventory change is context; it does not alone determine the TTF price direction."})
+        if power:
+            observations.append({"Observation": "Day-ahead power", "Latest signal": f"Latest {power.get('zone', 'zone')} observation {power['value']:.2f} {power.get('unit', 'EUR/MWh')}; fetched sample includes {power.get('negative_observations', 0)} negative observations", "Interpretation boundary": "Count is observations, not necessarily hours; market resolution may vary."})
+        if weather:
+            weather_text = ", ".join([x for x in [f"temperature {weather['temperature_c']:.1f} °C" if weather.get('temperature_c') is not None else "", f"wind {weather['wind_kmh']:.1f} km/h" if weather.get('wind_kmh') is not None else ""] if x])
+            if weather_text:
+                observations.append({"Observation": "Weather", "Latest signal": f"{weather.get('location', 'Selected location')}: {weather_text}", "Interpretation boundary": "Local weather is a proxy; it is not a system-wide demand or renewable forecast."})
+        if observations:
+            st.dataframe(pd.DataFrame(observations), use_container_width=True, hide_index=True)
+        with st.expander("Data freshness and provenance", expanded=False):
+            freshness_rows = []
+            for key, item in st.session_state.get("live_data", {}).items():
+                frame = item.get("data") if isinstance(item, dict) else None
+                freshness_rows.append({"Dataset": item.get("label", key), "Observations": len(frame) if isinstance(frame, pd.DataFrame) else 0,
+                    "Latest observation": _latest_observation_date(frame) if isinstance(frame, pd.DataFrame) else None,
+                    "Fetched at (UTC)": item.get("fetched_at", ""),
+                    "Source": (frame["_source"].iloc[0] if isinstance(frame, pd.DataFrame) and not frame.empty and "_source" in frame.columns else item.get("label", key))})
+            st.dataframe(pd.DataFrame(freshness_rows), use_container_width=True, hide_index=True)
+            st.caption("GIE AGSI+/ALSI attribution is mandatory. Market data may be delayed or revised. The last fetch timestamp is not the same as the observation timestamp.")
+
     left, right = st.columns([1.3, 1])
     with left:
         st.subheader("Forward curves")
@@ -2270,6 +2702,23 @@ elif page == "Forward Curves":
     kpi(c2, "Curve average", f"{curve['price'].mean():,.2f}", PRODUCTS[selected]["unit"], BLUE)
     kpi(c3, "Curve low", f"{curve['price'].min():,.2f}", PRODUCTS[selected]["unit"], GREEN)
     kpi(c4, "Curve high", f"{curve['price'].max():,.2f}", PRODUCTS[selected]["unit"], RED)
+    curve_meta = st.session_state.get("curve_metadata", {}).get(selected, {})
+    if selected in st.session_state.get("custom_curves", {}):
+        st.caption(f"Curve provenance: {curve_source_label(selected)} · imported at {curve_meta.get('imported_at_utc', 'timestamp not recorded')}. This is an imported mark set; verify valuation date, contract definition and vendor entitlement.")
+    else:
+        st.warning("This curve is illustrative demo data. Do not treat it as a market quote or use it as evidence of current TTF/NBP/power prices.")
+    # Display day-ahead prices as contextual spot evidence only; they must not replace monthly forward marks.
+    if PRODUCTS[selected]["commodity"] == "Power":
+        context = build_live_snapshot().get("power_price", {})
+        expected_zone = "France" if PRODUCTS[selected]["zone"] == "France" else "Germany-Luxembourg" if PRODUCTS[selected]["zone"] == "Germany" else None
+        if context and (expected_zone is None or context.get("zone") == expected_zone):
+            st.info(f"Day-ahead context only — latest ENTSO-E {context.get('zone', 'selected zone')} observation: {context.get('value', float('nan')):.2f} {context.get('unit', 'EUR/MWh')} at {context.get('timestamp', 'n/a')}. This observation is not used as the monthly forward mark.")
+        elif context:
+            st.caption(f"An ENTSO-E day-ahead price is loaded for {context.get('zone', 'another zone')}, which does not match the selected product's bidding zone; no cross-zone substitution was made.")
+        else:
+            st.caption("Connect ENTSO-E day-ahead prices in Live Data Integrations to display a spot-market context. This will not replace the forward curve.")
+    elif PRODUCTS[selected]["commodity"] == "Gas":
+        st.caption("GIE AGSI+/ALSI provide gas-storage and LNG fundamentals, not TTF/NBP traded forwards. A licensed or explicitly authorised futures curve is still required for market-referenced OTC MtM.")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=curve["delivery_month"], y=curve["price"], mode="lines+markers", name="Monthly forward", line=dict(color=AMBER, width=2)))
     fig.add_hline(y=float(curve["price"].mean()), line=dict(color=BLUE, dash="dot"), annotation_text="Curve average")
@@ -2592,8 +3041,17 @@ elif page == "Live Data Integrations":
         gie_api_key = c1.text_input("GIE API key (AGSI+ / ALSI)", value=gie_default, type="password", key="live_gie_api_key", help="Register with GIE and confirm your key is entitled for the selected AGSI+ or ALSI dataset.")
         entsoe_api_token = c2.text_input("ENTSO-E Web API token", value=entsoe_default, type="password", key="live_entsoe_token", help="Register on transparency.entsoe.eu and request RESTful API access by email.")
         openmeteo_api_key = c3.text_input("Open-Meteo commercial API key (optional)", value=openmeteo_default, type="password", key="live_openmeteo_key", help="Leave blank to use the public evaluation endpoint. Follow provider licensing and attribution terms.")
-        st.markdown("**Access notes:** [GIE AGSI+](https://agsi.gie.eu/account) · [ENTSO-E Transparency Platform](https://transparency.entsoe.eu/) · [ENTSOG API manual](https://transparency.entsog.eu/api/archiveDirectories/8/api-manual/ENTSOG_TP_API_UserManual_v3.0.pdf) · [Open-Meteo API](https://open-meteo.com/en/docs) · [ICE Endex data](https://developer.ice.com/fixed-income-data-services/catalog/ice-endex)")
-        st.caption("GIE needs a registered API key with AGSI+/ALSI rights. ENTSO-E REST API access must be enabled for your account. ENTSOG is public. Open-Meteo's public API is restricted to non-commercial use; use a paid commercial plan for commercial deployment.")
+        st.markdown("**API access:** [AGSI+ API](https://agsi.gie.eu/#/api) · [ALSI API](https://alsi.gie.eu/#/api) · [ENTSO-E Transparency Platform](https://transparency.entsoe.eu/) · [ENTSOG API manual](https://transparency.entsog.eu/api/archiveDirectories/8/api-manual/ENTSOG_TP_API_UserManual_v3.0.pdf) · [Open-Meteo API](https://open-meteo.com/en/docs) · [ICE Endex data](https://developer.ice.com/fixed-income-data-services/catalog/ice-endex)")
+        st.caption("GIE requires a registered personal key and selected access to AGSI+, ALSI, or both. ENTSO-E requires a registered account and activation of RESTful API access. ENTSOG is public. Open-Meteo's public endpoint is subject to non-commercial-use terms; check its commercial plan before commercial deployment.")
+        with st.expander("How to obtain your ENTSO-E API token", expanded=False):
+            st.markdown("""1. Create an account on the [ENTSO-E Transparency Platform](https://transparency.entsoe.eu/).
+2. From the email address used for registration, send a request to **transparency@entsoe.eu** with the subject **Restful API access**. Include that same registered email address in the message body.
+3. Wait for ENTSO-E to enable REST API access. Their process/documentation describes this as an access request, not an instant self-service key.
+4. Sign in again and open **Account Settings**. If the **Web API Security Token** field is available, choose the option to generate a token and copy it somewhere secure. The token is not displayed again after the dialog is closed.
+5. Paste the token into the masked **ENTSO-E Web API token** field above or set `ENTSOE_API_TOKEN` in your local environment. Never commit the token to Git or send it in chat.
+
+Official [token-management instructions](https://transparency.entsoe.eu/content/static_content/download?path=%2FStatic+content%2FAPI-Token-Management.pdf).""")
+            st.info("A token can be unavailable until ENTSO-E activates REST access for the registered email. If the token field does not appear, contact transparency@entsoe.eu rather than repeatedly generating a new account.")
 
     tab_gie, tab_power, tab_gasflows, tab_weather, tab_forward = st.tabs([
         "Gas Storage & LNG", "Power Market · ENTSO-E", "Gas Flows · ENTSOG", "Weather", "Licensed Forward Curves"
@@ -2601,7 +3059,7 @@ elif page == "Live Data Integrations":
 
     with tab_gie:
         st.subheader("GIE storage inventories and LNG terminal data")
-        st.write("AGSI+ provides European gas storage data; ALSI provides LNG terminal data. The Europe/EU selector returns the API's EU dataset group (not a guaranteed single pre-summed total). Figures are daily observations and can contain estimated or corrected operator submissions.")
+        st.write("AGSI+ provides daily storage inventory/fill/injection/withdrawal data; ALSI provides LNG-terminal inventory and send-out data. The Europe/EU selector requests GIE's documented EU aggregate series (`type=eu`); the country selector requests a country-level dataset. Do not sum facility rows blindly. Observations can be estimated or retroactively corrected.")
         with st.form("gie_live_fetch_form"):
             g1, g2, g3 = st.columns(3)
             gie_dataset = g1.selectbox("Dataset", ["AGSI — Gas storage", "ALSI — LNG terminals"], key="gie_dataset_choice")
@@ -2813,6 +3271,7 @@ elif page == "Live Data Integrations":
                 try:
                     candidate_curve = normalise_provider_curve(raw_table, mapped_product, mapped_date_col, mapped_price_col)
                     st.session_state.custom_curves[mapped_product] = candidate_curve
+                    st.session_state.curve_metadata[mapped_product] = {"source_label": "LICENSED PROVIDER IMPORT", "imported_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source_type": "REST endpoint"}
                     st.success(f"Applied {len(candidate_curve):,} validated monthly marks to {mapped_product} for this session. Revaluation uses these marks; save an authorised export separately if you need persistence.")
                     st.dataframe(candidate_curve, use_container_width=True, hide_index=True)
                     st.rerun()
@@ -2823,60 +3282,242 @@ elif page == "Live Data Integrations":
         st.caption("Provider APIs have vendor-specific URLs, response schemas, authentication and redistribution terms. If your licence uses a different authentication method or schema, adapt the connector to that official specification; do not paste vendor secrets into source code.")
 
 elif page == "Market Fundamentals":
-    title_block("European Energy Fundamentals", "Real storage, gas-flow, power and weather datasets fetched from provider APIs in this session.")
+    title_block("European Energy Fundamentals", "Translate fetched storage, LNG, power, gas-flow and weather observations into transparent market context.")
     data_items = st.session_state.get("live_data", {})
+    snapshot = build_live_snapshot()
+
+    top_a, top_b, top_c = st.columns([1.2, 1.2, 2])
+    top_a.metric("Loaded datasets", sum(1 for x in data_items.values() if isinstance(x, dict) and isinstance(x.get("data"), pd.DataFrame) and not x["data"].empty))
+    latest_fetch_raw = max((str(x.get("fetched_at", "")) for x in data_items.values() if isinstance(x, dict)), default="")
+    try:
+        latest_fetch_display = pd.Timestamp(latest_fetch_raw).strftime("%d %b %H:%M UTC") if latest_fetch_raw else "—"
+    except Exception:
+        latest_fetch_display = "—"
+    top_b.metric("Latest fetch (UTC)", latest_fetch_display)
+    if top_c.button("Manage / refresh data sources", type="primary", use_container_width=True):
+        st.session_state.nav_page = next(label for label in ALL_NAV_ITEMS if label.endswith("Live Data Integrations"))
+        st.rerun()
+
     if not data_items:
-        st.info("No external dataset has been fetched yet. Open Live Data Integrations to connect GIE, ENTSO-E, ENTSOG and Open-Meteo.")
+        st.info("No external dataset has been fetched yet. Open Live Data Integrations to connect GIE AGSI+/ALSI, ENTSO-E, ENTSOG and Open-Meteo.")
     else:
         status_rows = []
         for key, item in data_items.items():
             frame = item.get("data") if isinstance(item, dict) else None
             status_rows.append({
                 "Dataset": item.get("label", key),
-                "Rows": len(frame) if isinstance(frame, pd.DataFrame) else 0,
+                "Observations": len(frame) if isinstance(frame, pd.DataFrame) else 0,
+                "Latest observation": _latest_observation_date(frame) if isinstance(frame, pd.DataFrame) else None,
                 "Last fetched (UTC)": item.get("fetched_at", ""),
                 "Source": (frame["_source"].iloc[0] if isinstance(frame, pd.DataFrame) and not frame.empty and "_source" in frame.columns else item.get("label", key)),
             })
-        st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
-        live_tabs = st.tabs(["Gas storage", "LNG", "Power", "Gas flows", "Weather"])
-        with live_tabs[0]:
-            data = _live_dataset_frame("gie_agsi")
-            if not data.empty:
-                y = next((c for c in ("full", "gasInStorage", "workingGasVolume") if c in data.columns), None)
-                date_x = "observation_date" if "observation_date" in data.columns else None
-                _display_live_frame(data, "GIE AGSI+ storage history", date_x, y, "name" if "name" in data.columns and data["name"].nunique() > 1 else None)
-            else: st.info("Fetch AGSI+ in Live Data Integrations.")
-        with live_tabs[1]:
-            data = _live_dataset_frame("gie_alsi")
-            if not data.empty:
-                y = next((c for c in ("inventory_gwh", "inventory_gwh_gwh", "sendOut", "sendout") if c in data.columns), None)
-                _display_live_frame(data, "GIE ALSI+ LNG terminals", "observation_date" if "observation_date" in data.columns else None, y,
-                                    "name" if "name" in data.columns and data["name"].nunique() > 1 else None)
-            else: st.info("Fetch ALSI+ in Live Data Integrations.")
-        with live_tabs[2]:
-            data = _live_dataset_frame("entsoe_price")
-            if data.empty: data = _live_dataset_frame("entsoe_load")
-            if data.empty: data = _live_dataset_frame("entsoe_generation")
-            if data.empty: data = _live_dataset_frame("entsoe_flow")
-            if not data.empty:
-                _display_live_frame(data, "ENTSO-E time series", "timestamp" if "timestamp" in data.columns else None,
-                                    "value" if "value" in data.columns else None, "series" if "series" in data.columns and data["series"].nunique() > 1 else None)
-            else: st.info("Fetch an ENTSO-E series in Live Data Integrations.")
-        with live_tabs[3]:
-            data = _live_dataset_frame("entsog_flow")
-            if not data.empty:
-                _display_live_frame(data, "ENTSOG flow history", "timestamp" if "timestamp" in data.columns else None,
-                                    "value_numeric" if "value_numeric" in data.columns else None)
-            else: st.info("Fetch ENTSOG point data in Live Data Integrations.")
-        with live_tabs[4]:
-            data = _live_dataset_frame("weather_daily")
-            if not data.empty:
-                y = next((c for c in ("temperature_mean_c", "wind_speed_mean_kmh", "solar_radiation_mean_wm2") if c in data.columns), None)
-                _display_live_frame(data, "Open-Meteo daily weather proxies", "date" if "date" in data.columns else None, y)
-            else: st.info("Fetch Open-Meteo weather in Live Data Integrations.")
-    st.markdown("### How to interpret the feeds")
-    st.markdown("- **GIE AGSI+/ALSI:** storage and LNG inventory context, not directly tradable prices.\n- **ENTSO-E:** day-ahead electricity price, load, generation and interconnector-flow observations. These do not replace forward curves.\n- **ENTSOG:** point-level gas transport indicators. Always confirm point direction and physical units.\n- **Open-Meteo:** weather covariates for demand and renewable analysis; not a deterministic price forecast.\n- **ICE Endex/EEX:** licensed futures settlements/curves are required to make the OTC book's forward MtM market-referenced.")
-    st.caption("API values are shown with the provider timestamps and units where supplied. Provider publication delays, corrections, data access rights and licensing still apply.")
+        with st.expander("Data coverage, timestamps and provenance", expanded=False):
+            st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
+            st.caption("The observation timestamp describes the market/fundamental period; Last fetched describes when this app retrieved it. These are not interchangeable. GIE AGSI+/ALSI attribution is mandatory.")
+
+    st.subheader("Derived market indicators")
+    d1, d2, d3, d4, d5 = st.columns(5)
+    storage = snapshot.get("storage", {})
+    lng = snapshot.get("lng", {})
+    power = snapshot.get("power_price", {})
+    load = snapshot.get("power_load", {})
+    weather = snapshot.get("weather", {})
+    d1.metric("Storage fill", f"{storage['fill_pct']:.1f}%" if storage.get("fill_pct") is not None else "Not loaded",
+              help=f"GIE AGSI+ · {storage.get('scope', 'selected scope')} · {storage.get('date', 'n/a')}")
+    change = storage.get("change_7_reports_twh")
+    d2.metric("Storage change", f"{change:+.2f} TWh" if change is not None else "Not enough history",
+              help="Change across latest and eighth-latest available reporting observations; assumes the same aggregate series and unit.")
+    d3.metric("LNG send-out", f"{lng['sendout']:.1f} GWh/d" if lng.get("sendout") is not None else "Not loaded",
+              help=f"GIE ALSI+ · {lng.get('date', 'n/a')}")
+    d4.metric("Latest day-ahead", f"{power['value']:.2f} {power.get('unit', 'EUR/MWh')}" if power.get("value") is not None else "Not loaded",
+              help=f"ENTSO-E · {power.get('zone', 'selected zone')} · {power.get('timestamp', 'n/a')}")
+    d5.metric("Actual load", f"{load['value']/1000:.2f} GW" if load.get("value") is not None else "Not loaded",
+              help=f"ENTSO-E · {load.get('zone', 'selected zone')} · {load.get('timestamp', 'n/a')}")
+
+    insights = []
+    if change is not None:
+        if change < 0:
+            interpretation = "Observed storage draw over the latest seven reporting steps. Check weather, consumption, net imports and LNG send-out before forming a price view."
+        elif change > 0:
+            interpretation = "Observed storage build over the latest seven reporting steps. Check whether the change reflects injections, lower demand or supply flows."
+        else:
+            interpretation = "Little net inventory change over the selected reporting window."
+        insights.append({"Topic": "Gas storage", "Observation": f"{change:+.2f} TWh versus seven reporting steps ago", "Commercial reading": interpretation})
+    if power:
+        sample_mean = power.get("sample_mean")
+        relative = ""
+        if sample_mean is not None:
+            relative = f"; latest observation is {power['value'] - sample_mean:+.2f} {power.get('unit', 'EUR/MWh')} versus fetched-window mean"
+        insights.append({"Topic": "Day-ahead power", "Observation": f"{power.get('zone', 'Selected zone')}: {power['value']:.2f} {power.get('unit', 'EUR/MWh')}{relative}", "Commercial reading": f"{power.get('negative_observations', 0)} negative price observations in the most recent 7-day part of the fetched sample. This is a count of observations, not necessarily hours; the data resolution can vary."})
+    if weather:
+        w = []
+        if weather.get("temperature_c") is not None: w.append(f"mean temperature {weather['temperature_c']:.1f} °C")
+        if weather.get("wind_kmh") is not None: w.append(f"mean wind {weather['wind_kmh']:.1f} km/h")
+        if weather.get("solar_wm2") is not None: w.append(f"mean solar radiation {weather['solar_wm2']:.1f} W/m²")
+        if w:
+            insights.append({"Topic": "Weather", "Observation": f"{weather.get('location', 'Selected location')}: " + "; ".join(w), "Commercial reading": "Use as a local demand/renewables covariate. One city is not a weighted national forecast and does not directly predict hub prices."})
+    if insights:
+        st.dataframe(pd.DataFrame(insights), use_container_width=True, hide_index=True)
+    else:
+        st.info("Fetch one or more feeds to generate derived observations. Missing data are left blank rather than filled with fabricated values.")
+
+    fund_tabs = st.tabs(["Gas storage", "LNG", "Power", "Gas flows", "Weather", "Cross-market analysis"])
+    with fund_tabs[0]:
+        data = _live_dataset_frame("gie_agsi")
+        st.subheader("European gas storage — GIE AGSI+")
+        if not data.empty:
+            frame, date_col = _frame_with_time(data, ("observation_date", "gasDayStart", "gas_day"))
+            value_col = _find_column(frame, ("gasInStorage", "gas_in_storage"))
+            fill_col = _find_column(frame, ("full", "fillLevel", "fill_level"))
+            cap_col = _find_column(frame, ("workingGasVolume", "working_gas_volume"))
+            scope = _live_item_meta("gie_agsi").get("scope", "selected API scope")
+            st.caption(f"Source: GIE AGSI+ · scope: {scope} · updated daily by GIE; latest fetched time {_live_item_fetched_at('gie_agsi')}")
+            if date_col and value_col:
+                frame[value_col] = _number_series(frame[value_col])
+                if fill_col: frame[fill_col] = _number_series(frame[fill_col])
+                if cap_col: frame[cap_col] = _number_series(frame[cap_col])
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=frame[date_col], y=frame[value_col], mode="lines+markers", name="Gas in storage (TWh)", line=dict(color=AMBER, width=2)))
+                fig.update_layout(title="Gas inventory trend", xaxis_title="Gas day", yaxis_title="GIE reported inventory unit (normally TWh)")
+                st.plotly_chart(_styled(fig, 360), use_container_width=True)
+                if fill_col:
+                    fig_fill = px.line(frame, x=date_col, y=fill_col, markers=True, title="Reported storage fill level", labels={fill_col: "Fill (%)", date_col: "Gas day"})
+                    fig_fill.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=300)
+                    st.plotly_chart(_styled(fig_fill), use_container_width=True)
+                elif cap_col:
+                    frame["derived_fill_pct"] = frame[value_col] / frame[cap_col] * 100.0
+                    st.caption("Fill percentage is derived as inventory / working gas volume because the feed did not provide a usable full field.")
+                    fig_fill = px.line(frame, x=date_col, y="derived_fill_pct", markers=True, title="Derived storage fill level", labels={"derived_fill_pct": "Fill (%)", date_col: "Gas day"})
+                    fig_fill.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=300)
+                    st.plotly_chart(_styled(fig_fill), use_container_width=True)
+            st.dataframe(data, use_container_width=True, hide_index=True)
+        else:
+            st.info("Fetch AGSI+ in Live Data Integrations. Choose the EU aggregate if you want an aggregate-level series; a country/facility dataset must not be summed blindly.")
+
+    with fund_tabs[1]:
+        data = _live_dataset_frame("gie_alsi")
+        st.subheader("LNG terminals — GIE ALSI+")
+        if not data.empty:
+            frame, date_col = _frame_with_time(data, ("observation_date", "gasDayStart", "gas_day"))
+            inv_col = _find_column(frame, ("inventory", "inventory_lng", "inventory_gwh", "inventory_twh"))
+            send_col = _find_column(frame, ("sendOut", "sendout", "send_out", "sendout_gwh"))
+            st.caption(f"Source: GIE ALSI+ · scope: {_live_item_meta('gie_alsi').get('scope', 'selected scope')} · inventory units follow the field returned by GIE (often 10³ m³ LNG); send-out is commonly GWh/d.")
+            if date_col and inv_col:
+                frame[inv_col] = _number_series(frame[inv_col])
+                fig = px.line(frame, x=date_col, y=inv_col, color="name" if "name" in frame.columns and frame["name"].nunique() > 1 else None, markers=True, title=f"LNG inventory · {inv_col}")
+                fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=330, xaxis_title="Gas day", yaxis_title="Provider field unit")
+                st.plotly_chart(_styled(fig), use_container_width=True)
+            if date_col and send_col:
+                frame[send_col] = _number_series(frame[send_col])
+                fig = px.line(frame, x=date_col, y=send_col, color="name" if "name" in frame.columns and frame["name"].nunique() > 1 else None, markers=True, title="LNG send-out")
+                fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=330, xaxis_title="Gas day", yaxis_title="GWh/d (confirm selected field/unit)")
+                st.plotly_chart(_styled(fig), use_container_width=True)
+            st.dataframe(data, use_container_width=True, hide_index=True)
+        else:
+            st.info("Fetch ALSI+ in Live Data Integrations. Inventory and send-out use different physical units and must not be combined as if they were comparable.")
+
+    with fund_tabs[2]:
+        st.subheader("Power prices, load and generation — ENTSO-E")
+        power_keys = [("entsoe_price", "Day-ahead price"), ("entsoe_load", "Actual load"), ("entsoe_generation", "Actual generation by type"), ("entsoe_flow", "Physical interconnector flow")]
+        available = [(key, label) for key, label in power_keys if not _live_dataset_frame(key).empty]
+        if available:
+            selected_power_key = st.selectbox("Loaded ENTSO-E dataset", [x[0] for x in available], format_func=lambda x: dict(available)[x], key="fundamentals_entsoe_display_key")
+            data = _live_dataset_frame(selected_power_key).copy()
+            meta = _live_item_meta(selected_power_key)
+            st.caption(f"Source: ENTSO-E Transparency Platform · {dict(available)[selected_power_key]} · zone: {meta.get('zone', 'not stored')} · last fetched {_live_item_fetched_at(selected_power_key)}")
+            if {"timestamp", "value"}.issubset(data.columns):
+                data["timestamp"] = pd.to_datetime(data["timestamp"], errors="coerce", utc=True)
+                data["value"] = _number_series(data["value"])
+                data = data.dropna(subset=["timestamp", "value"]).sort_values("timestamp")
+                chart = px.line(data, x="timestamp", y="value", color="series" if "series" in data.columns and data["series"].nunique() > 1 else None,
+                                title=dict(available)[selected_power_key], labels={"timestamp": "Delivery timestamp (UTC)", "value": str(data["unit"].iloc[0]) if "unit" in data.columns and not data.empty else "Value"})
+                chart.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=360)
+                st.plotly_chart(_styled(chart), use_container_width=True)
+                if selected_power_key == "entsoe_price":
+                    neg_count = int((data["value"] < 0).sum())
+                    p1, p2, p3, p4 = st.columns(4)
+                    p1.metric("Last price", f"{data['value'].iloc[-1]:.2f} EUR/MWh")
+                    p2.metric("Sample mean", f"{data['value'].mean():.2f} EUR/MWh")
+                    p3.metric("Sample low", f"{data['value'].min():.2f} EUR/MWh")
+                    p4.metric("Negative observations", str(neg_count))
+                    st.caption("The count is observations, not necessarily hours. Use the data's resolution and bidding-zone conventions when interpreting negative-price periods.")
+                if selected_power_key == "entsoe_generation" and "series" in data:
+                    mix = data.groupby("series", as_index=False)["value"].mean().sort_values("value", ascending=False)
+                    mix_fig = px.bar(mix, x="series", y="value", title="Average output by reported production type", labels={"series": "Production type", "value": str(data["unit"].iloc[0]) if "unit" in data.columns else "Value"})
+                    mix_fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=350, xaxis_title="")
+                    st.plotly_chart(_styled(mix_fig), use_container_width=True)
+                st.dataframe(data, use_container_width=True, hide_index=True)
+        else:
+            st.info("Fetch a price, load, generation or flow series from ENTSO-E. The API requires approved REST access and a security token.")
+
+    with fund_tabs[3]:
+        data = _live_dataset_frame("entsog_flow")
+        st.subheader("Gas infrastructure flows — ENTSOG")
+        if not data.empty:
+            value_col = _numeric_column(data, ("value_numeric", "value", "quantity", "flow"))
+            date_col = _find_column(data, ("timestamp", "periodFrom", "period_from", "date"))
+            meta = _live_item_meta("entsog_flow")
+            st.caption(f"Source: ENTSOG Transparency Platform · indicator {meta.get('indicator', 'selected indicator')} · point direction {meta.get('point_direction', 'selected point')} · last fetched {_live_item_fetched_at('entsog_flow')}")
+            if date_col and value_col:
+                chart_frame = data.copy()
+                chart_frame[date_col] = pd.to_datetime(chart_frame[date_col], errors="coerce")
+                chart_frame[value_col] = _number_series(chart_frame[value_col])
+                chart_frame = chart_frame.dropna(subset=[date_col, value_col])
+                if not chart_frame.empty:
+                    fig = px.line(chart_frame, x=date_col, y=value_col, markers=True, title="Selected point-direction flow / indicator")
+                    fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=350, xaxis_title="Provider observation period", yaxis_title="Provider value — verify unit")
+                    st.plotly_chart(_styled(fig), use_container_width=True)
+            st.dataframe(data, use_container_width=True, hide_index=True)
+            st.caption("A network flow at a specific point is not automatically a delivery to a contractual counterparty; direction and physical units must be reconciled.")
+        else:
+            st.info("Fetch the ENTSOG point-direction catalogue, select an exact identifier, and fetch the chosen indicator in Live Data Integrations.")
+
+    with fund_tabs[4]:
+        data = _live_dataset_frame("weather_daily")
+        st.subheader("Weather proxies — Open-Meteo")
+        if not data.empty:
+            meta = _live_item_meta("weather_daily")
+            st.caption(f"Source: Open-Meteo · location: {meta.get('location', 'selected location')} · last fetched {_live_item_fetched_at('weather_daily')}")
+            y_cols = [c for c in ("temperature_mean_c", "wind_speed_mean_kmh", "solar_radiation_mean_wm2") if c in data.columns]
+            if "date" in data.columns and y_cols:
+                chart = data.copy()
+                chart["date"] = pd.to_datetime(chart["date"], errors="coerce")
+                fig = go.Figure()
+                for col in y_cols:
+                    fig.add_trace(go.Scatter(x=chart["date"], y=chart[col], mode="lines+markers", name=col.replace("_", " ")))
+                fig.update_layout(title="Daily weather context", xaxis_title="Local date", yaxis_title="Each series retains its own native unit")
+                st.plotly_chart(_styled(fig, 360), use_container_width=True)
+            st.dataframe(data, use_container_width=True, hide_index=True)
+            st.caption("Weather data support scenario context but are not a direct power-price forecast. One city should not be treated as a country-wide weighted weather index.")
+        else:
+            st.info("Fetch a location-specific forecast/history from Open-Meteo in Live Data Integrations.")
+
+    with fund_tabs[5]:
+        st.subheader("Cross-market context: residual load proxy vs day-ahead price")
+        residual = _build_residual_load_proxy()
+        if not residual.empty:
+            st.caption("Proxy definition: actual system load minus reported actual wind-onshore, wind-offshore and solar output. Data are aligned to UTC hourly buckets using averages. This omits other generation, imports/exports, storage, curtailment and losses; it is not a full residual-load model.")
+            fig = px.line(residual, x="hour", y="residual_load_proxy_mw", title="Hourly residual-load proxy", labels={"hour": "UTC hour", "residual_load_proxy_mw": "MW"})
+            fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=330)
+            st.plotly_chart(_styled(fig), use_container_width=True)
+            scatter = px.scatter(residual, x="residual_load_proxy_mw", y="day_ahead_eur_mwh",
+                                 title="Day-ahead price vs residual-load proxy", labels={"residual_load_proxy_mw": "Residual-load proxy (MW)", "day_ahead_eur_mwh": "Day-ahead price (EUR/MWh)"})
+            scatter.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=350)
+            st.plotly_chart(_styled(scatter), use_container_width=True)
+            corr = residual[["residual_load_proxy_mw", "day_ahead_eur_mwh"]].corr().iloc[0, 1] if len(residual) >= 3 else float("nan")
+            st.metric("Sample Pearson correlation", f"{corr:.3f}" if pd.notna(corr) else "Insufficient overlap", help="Descriptive correlation only. It is not causation and is not a trading signal.")
+            st.download_button("Download aligned power context (CSV)", residual.to_csv(index=False).encode("utf-8"), file_name="meridian_power_context.csv", mime="text/csv", key="download_residual_load_context")
+        else:
+            st.info("To create this comparison, fetch overlapping ENTSO-E day-ahead prices, actual load and actual generation by type for the same bidding zone and dates. The chart will remain unavailable rather than fabricating a proxy.")
+
+    st.markdown("### Interpretation and limitations")
+    st.markdown("- **GIE AGSI+/ALSI:** storage and LNG inventories, injections/withdrawals and send-out inform gas supply context. GIE attribution is mandatory.")
+    st.markdown("- **ENTSO-E:** day-ahead prices, actual load and generation are spot/fundamental observations. They do not replace monthly OTC forward marks.")
+    st.markdown("- **ENTSOG:** a point-direction transport observation must retain its direction, period and provider unit; do not equate flows with contract deliveries.")
+    st.markdown("- **Open-Meteo:** weather covariates can contextualise demand and renewable production but do not constitute a price forecast.")
+    st.markdown("- **ICE Endex/EEX:** a licensed futures curve or authorised vendor export is still required to make TTF/NBP/power OTC MtM market-referenced.")
+    st.caption("All derived indicators are descriptive. APIs may publish delayed observations or retroactive corrections; user-provided data are not independently certified by this application.")
+
 elif page == "Data & Assumptions":
     title_block("Data, Conventions & Validation", "Explicit assumptions and import validation are part of the risk controls, not an afterthought.")
     st.subheader("Product registry")
