@@ -1,6 +1,6 @@
 """MERIDIAN Energy Desk — European energy trading and risk management prototype.
 
-Run with: streamlit run meridian_energy_desk_weather_gie_ready.py
+Run with: streamlit run meridian_energy_desk_reorganized.py
 
 IMPORTANT: Built-in curves and trades are synthetic demo data, not live market quotes.
 This is an educational prototype, not a production ETRM or valuation system.
@@ -884,6 +884,12 @@ section[data-testid="stSidebar"] div[data-testid="stRadio"] label[data-baseweb="
     border-radius:8px; padding:10px 14px; margin:6px 0 4px 0;
     font-size:0.78rem; line-height:1.6; color:#B9C4CF; }}
 .page-help b {{ color:{TEXT}; }}
+.workflow-strip {{ display:flex; align-items:center; justify-content:space-between; gap:12px;
+    padding:8px 12px; margin:7px 0 12px 0; border:1px solid {BORDER};
+    border-radius:7px; background:rgba(22,27,34,0.55); color:{GRAY};
+    font-family:'JetBrains Mono',monospace; font-size:0.68rem; letter-spacing:0.04em; }}
+.workflow-step {{ color:{AMBER}; font-weight:700; }}
+.workflow-next {{ color:{TEXT}; }}
 </style>
 """
 
@@ -915,18 +921,33 @@ def kpi(col, label: str, value: str, sub: str = "", accent: str = AMBER) -> None
 
 def render_header(title: str, subtitle: str) -> None:
     user_curves = st.session_state.get("custom_curves", {})
-    if user_curves:
-        badge = '<span class="badge badge-amber">USER CURVE INPUTS · DEMO BOOK</span>'
+    all_products_imported = bool(user_curves) and len(user_curves) == len(PRODUCTS)
+    if all_products_imported:
+        badge = '<span class="badge badge-green">USER CURVES ACTIVE</span>'
+    elif user_curves:
+        badge = '<span class="badge badge-amber">MIXED CURVE SOURCES</span>'
     else:
-        badge = '<span class="badge badge-amber">ILLUSTRATIVE CURVES · DEMO BOOK</span>'
+        badge = '<span class="badge badge-amber">ILLUSTRATIVE CURVES</span>'
     st.markdown(
         f"""<div style="display:flex;justify-content:space-between;align-items:baseline">
         <div><h2 style="margin-bottom:0">{title}</h2>
         <span style="color:{GRAY};font-size:0.8rem">{subtitle}</span></div>
         <div>{badge}</div></div>""", unsafe_allow_html=True)
-    help_text = PAGE_HELP.get(title)
+    current_page = NAV_TO_PAGE.get(st.session_state.get("nav_page", ""), title)
+    help_text = PAGE_HELP.get(current_page)
     if help_text:
         st.markdown(f'<div class="page-help">{help_text}</div>', unsafe_allow_html=True)
+    guidance = workflow_guidance(current_page)
+    if guidance:
+        step_label, role, next_page = guidance
+        st.markdown(
+            f'<div class="workflow-strip"><span><span class="workflow-step">{step_label}</span> &nbsp; {role}</span>'
+            f'<span>RECOMMENDED NEXT: <span class="workflow-next">{next_page}</span></span></div>',
+            unsafe_allow_html=True,
+        )
+        if st.button(f"Continue to {next_page} →", key=f"workflow_next_{current_page}", type="secondary"):
+            st.session_state["pending_nav_page"] = next_page
+            st.rerun()
     st.markdown("")
 
 
@@ -2043,28 +2064,61 @@ def build_live_snapshot() -> dict[str, dict]:
 
 
 NAV_SECTIONS = {
-    "Markets": ["📊  Market Overview", "📈  Forward Curves", "🧭  Market Fundamentals", "🔌  Live Data Integrations"],
-    "Trading & Risk": ["💬  OTC Quote Builder", "📒  Trading Book & MtM", "⚠️  P&L & Exposure"],
-    "Physical Operations": ["🚢  Physical Operations"],
-    "Analytics": ["🧪  Model Validation"],
-    "Reference": ["🔧  Data & Assumptions"],
+    "01 · MARKET INTELLIGENCE": ["📊  Market Overview", "🧭  Market Fundamentals"],
+    "02 · PRICING & ORIGINATION": ["📈  Forward Curves", "💬  OTC Quote Builder"],
+    "03 · PORTFOLIO & RISK": ["📒  Trading Book & MtM", "⚠️  P&L & Exposure", "🚢  Physical Operations"],
+    "04 · DATA & CONTROLS": ["🔌  Live Data Integrations", "🔧  Data & Assumptions", "🧪  Model Validation"],
 }
 ALL_NAV_ITEMS = [label for labels in NAV_SECTIONS.values() for label in labels]
 DEFAULT_NAV_ITEM = ALL_NAV_ITEMS[0]
 NAV_TO_PAGE = {label: label.split("  ", 1)[1] for label in ALL_NAV_ITEMS}
 
 PAGE_HELP = {
-    "MERIDIAN Energy Trading Desk": "European gas and power OTC quote support, trade capture, mark-to-market and delivery monitoring. Built-in prices and trades are illustrative.",
-    "OTC Quote Builder": "Indicative price = reference forward plus/minus commercial margin. The quote is not executable and must be checked against approved market data, credit limits and current conventions.",
-    "Trading Book & Mark-to-Market": "FORWARD uses one monthly mark; SWAP uses a delivery-hour-weighted strip. MtM is simplified and undiscounted. Positions are split by delivery month and profile, with net and gross MWh shown separately.",
-    "Forward Curves": "Monthly forward marks are illustrative unless replaced by validated user data. Missing delivery tenors are rejected rather than silently interpolated.",
-    "P&L Sensitivity & Exposure": "A parallel curve shock estimates a simplified change in MtM. It is not VaR, realised daily P&L or a full risk measure.",
-    "Physical Operations & Delivery Tracking": "Nominations, delivered volumes and invoice status persist in the session and are reconciled to linked confirmed/executed physical trades. External operational feeds are not connected.",
-    "European Energy Fundamentals": "Use real storage, LNG, power, gas-flow and weather datasets. Weather indicators are point forecasts and degree-day/resource proxies, not direct demand or price forecasts.",
-    "Model Validation & System Checks": "Runs deterministic unit and integration checks on conversions, delivery calendars, curve validation, trade capture, MtM, portfolio aggregation and scenario calculations.",
-    "Data, Conventions & Validation": "Sources, units, delivery calendars and validation rules should be explicit before marks or trades are used for commercial decisions.",
-    "Live Data Integrations": "Connect GIE storage/LNG, ENTSO-E electricity data, ENTSOG gas flows, multi-region Open-Meteo weather and a licensed forward-curve feed. API calls run only on explicit user action.",
+    "Market Overview": "Start here: check data freshness, current market fundamentals, curve provenance and the active trade book. Built-in marks and trades are illustrative until replaced and validated.",
+    "Market Fundamentals": "Interpret observed storage, LNG, flows, power prices, load, generation and weather together. These indicators provide context; they are not standalone price forecasts or trading signals.",
+    "Forward Curves": "Review the monthly marks that feed OTC quotes and MtM. Every curve must have consistent product, currency, unit, delivery month and provenance. Day-ahead spot prices never substitute automatically for forward marks.",
+    "OTC Quote Builder": "Create an indicative quote from a validated reference curve, delivery period, profile and commercial margin. The quote is non-executable and should be reviewed against approved market data, credit and contract conventions.",
+    "Trading Book & MtM": "Capture and manage trades, review trade lifecycle status, and mark the active book against available monthly curves. The current MtM is simplified and undiscounted; missing marks remain explicitly unmarked.",
+    "P&L & Exposure": "Review currency-separated MtM and parallel price-shock sensitivity. Scenario P&L is not VaR, a realised daily P&L ledger or a complete market-risk measure.",
+    "Physical Operations": "Reconcile nominations, delivered volumes and invoice status to linked physical-settlement trades. This is an operational workflow simulator, not a live nomination or logistics connection.",
+    "Live Data Integrations": "Configure and refresh GIE AGSI+/ALSI, ENTSO-E, ENTSOG, Open-Meteo and authorised forward-curve sources. Requests run only on explicit user action; credentials and provider entitlements remain your responsibility.",
+    "Data & Assumptions": "Review product definitions, data coverage, unit conversions, calendars and model limitations. Upload and apply market curves from Forward Curves so curve input and curve analysis stay together.",
+    "Model Validation": "Run deterministic formula and workflow checks against fixtures and current session data. Passing these checks does not certify real market feeds or production-grade valuation.",
 }
+
+
+def workflow_guidance(current_page: str):
+    """Return the current workflow stage, purpose, and a useful next page."""
+    if current_page == "Market Overview":
+        data = st.session_state.get("live_data", {})
+        has_live = any(
+            isinstance(item, dict) and isinstance(item.get("data"), pd.DataFrame) and not item["data"].empty
+            for item in data.values()
+        )
+        next_page = "Market Fundamentals" if has_live else "Live Data Integrations"
+        return ("STEP 01", "Market snapshot & readiness", next_page)
+    flow = {
+        "Market Fundamentals": ("STEP 02", "Explain the physical and market drivers", "Forward Curves"),
+        "Forward Curves": ("STEP 03", "Validate reference marks before pricing", "OTC Quote Builder"),
+        "OTC Quote Builder": ("STEP 04", "Construct an indicative commercial quote", "Trading Book & MtM"),
+        "Trading Book & MtM": ("STEP 05", "Capture trades and review valuation", "P&L & Exposure"),
+        "P&L & Exposure": ("STEP 06", "Stress the active portfolio", "Physical Operations"),
+        "Physical Operations": ("STEP 07", "Reconcile delivery against contracts", "Model Validation"),
+        "Model Validation": ("CONTROL", "Check calculations and workflows", "Market Overview"),
+        "Live Data Integrations": ("DATA SETUP", "Configure and refresh approved sources", "Market Overview"),
+        "Data & Assumptions": ("REFERENCE", "Review units, conventions and data quality", "Forward Curves"),
+    }
+    return flow.get(current_page)
+
+
+def set_nav_page(page_name: str) -> None:
+    """Navigate to a route and synchronise the grouped sidebar radios."""
+    target_label = next((label for label, name in NAV_TO_PAGE.items() if name == page_name), None)
+    if target_label is None:
+        raise ValueError(f"Unknown application page: {page_name}")
+    st.session_state.nav_page = target_label
+    for section, items in NAV_SECTIONS.items():
+        st.session_state[f"navsec_{section}"] = target_label if target_label in items else None
 
 
 def _on_nav(section: str) -> None:
@@ -2088,7 +2142,10 @@ def render_sidebar() -> str:
           <span style="font-size:0.68rem;color:{GRAY}">EUROPEAN ENERGY &nbsp;·&nbsp; OTC &nbsp;·&nbsp; MTM</span>
         </div>""", unsafe_allow_html=True)
         live_items = st.session_state.get("live_data", {})
-        loaded_count = sum(1 for value in live_items.values() if isinstance(value, dict) and value.get("data") is not None)
+        loaded_count = sum(
+            1 for value in live_items.values()
+            if isinstance(value, dict) and isinstance(value.get("data"), pd.DataFrame) and not value["data"].empty
+        )
         status_label = f"{loaded_count} LIVE DATASET(S) LOADED" if loaded_count else "DEMO CURVES · NO LIVE DATA LOADED"
         status_class = "badge" if loaded_count else "badge badge-amber"
         st.markdown(f'<span class="badge {"" if loaded_count else "badge-amber"}">{status_label}</span>', unsafe_allow_html=True)
@@ -2097,12 +2154,14 @@ def render_sidebar() -> str:
             if key not in st.session_state:
                 st.session_state[key] = current if current in items else None
             st.radio(section, items, key=key, on_change=_on_nav, args=(section,))
-        if st.button("↻ Reset demo book & curves", use_container_width=True):
+        if st.button("↻ Reset demo book & user curves", use_container_width=True):
             st.session_state.trades = build_sample_trades()
             st.session_state.custom_curves = {}
             st.session_state.curve_metadata = {}
             st.session_state.physical_ops = build_sample_physical_ops(st.session_state.trades)
             st.session_state.pop("last_quote", None)
+            st.session_state.pop("provider_curve_raw_table", None)
+            st.session_state["flash_message"] = "Demo trades, user-imported curves and physical-operation records have been reset; fetched external market datasets were retained."
             st.rerun()
         st.markdown("---")
         custom_count = len(st.session_state.get("custom_curves", {}))
@@ -2831,10 +2890,19 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
     return pd.DataFrame(rows, columns=["Status", "Area", "Check", "Details"])
 
 
+# Apply any queued navigation before sidebar widgets are instantiated. This avoids
+# mutating Streamlit radio-widget state after the widgets have already been created.
+pending_nav_page = st.session_state.pop("pending_nav_page", None)
+if pending_nav_page:
+    set_nav_page(str(pending_nav_page))
+
 page = render_sidebar()
+flash_message = st.session_state.pop("flash_message", None)
+if flash_message:
+    st.success(str(flash_message))
 
 if page == "Market Overview":
-    title_block("MERIDIAN Energy Trading Desk", "A compact ETRM prototype focused on European gas, power, OTC pricing and risk.")
+    title_block("MERIDIAN Energy Trading Desk", "Start with market conditions, validate the price references, quote OTC contracts, then monitor portfolio risk and delivery.")
     marked = get_marked_trades()
     executed = marked.loc[marked["status"].eq("EXECUTED") & marked["mark_status"].eq("MARKED")] if not marked.empty else pd.DataFrame()
     unmarked_count = int(marked.loc[~marked["status"].isin(["CANCELLED", "EXPIRED"]) & ~marked["mark_status"].eq("MARKED")].shape[0]) if not marked.empty else 0
@@ -2887,7 +2955,7 @@ if page == "Market Overview":
     if not snapshot:
         st.info("No provider data is loaded yet. Fetch GIE storage/LNG, ENTSO-E prices/load, ENTSOG flows or weather in Live Data Integrations. The dashboard will populate automatically when those datasets are loaded.")
         if st.button("Open Live Data Integrations", key="overview_open_integrations"):
-            st.session_state.nav_page = next(label for label in ALL_NAV_ITEMS if label.endswith("Live Data Integrations"))
+            st.session_state["pending_nav_page"] = "Live Data Integrations"
             st.rerun()
     else:
         s1, s2, s3, s4, s5, s6 = st.columns(6)
@@ -2987,7 +3055,31 @@ if page == "Market Overview":
     st.dataframe(watch, use_container_width=True, hide_index=True)
 
 elif page == "Forward Curves":
-    title_block("Forward Curves", "Inspect monthly delivery marks by product. Curves are illustrative unless you import and validate your own market data.")
+    title_block("Forward Curves", "Validate monthly market marks here before using them to price OTC contracts or mark the trade book.")
+    with st.expander("Import and validate a monthly forward curve", expanded=not bool(st.session_state.get("custom_curves"))):
+        st.caption("Use the canonical CSV schema: delivery_month, product, price, currency, unit (one row per product and delivery month). If your vendor returns a provider-specific JSON/CSV schema or a licensed REST response, use Live Data Integrations → Licensed Forward Curves to map its fields first. The application does not manufacture live futures data.")
+        curve_file = st.file_uploader("Upload forward curve CSV", type=["csv"], key="forward_curve_upload")
+        if curve_file is not None:
+            try:
+                candidate_curve = validate_curve(pd.read_csv(curve_file))
+                candidate_products = sorted(candidate_curve["product"].unique().tolist())
+                import_product = st.selectbox("Product to update", candidate_products, key="forward_curve_import_product")
+                import_subset = candidate_curve.loc[candidate_curve["product"].eq(import_product)].copy()
+                st.caption(f"Preview: {len(import_subset)} monthly marks · {import_subset['currency'].iloc[0]} · {import_subset['unit'].iloc[0]}")
+                st.dataframe(import_subset, use_container_width=True, hide_index=True)
+                if st.button("Validate and apply curve for this session", key="apply_forward_curve_csv", type="primary"):
+                    st.session_state.custom_curves[import_product] = import_subset
+                    st.session_state.curve_metadata[import_product] = {
+                        "source_label": "USER CSV IMPORT",
+                        "source_type": "CSV upload",
+                        "file_name": getattr(curve_file, "name", "user_curve.csv"),
+                        "imported_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    }
+                    st.session_state.pop("last_quote", None)
+                    st.session_state["flash_message"] = f"Applied {len(import_subset)} validated monthly marks for {import_product}. Downstream quotes and MtM will use the new curve where tenor coverage is available."
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Curve rejected. The existing curve remains unchanged: {exc}")
     selected = st.selectbox("Product", list(PRODUCTS.keys()), key="forward_curve_product")
     curve = curves[selected].copy().sort_values("delivery_month")
     curve["delivery_month"] = pd.to_datetime(curve["delivery_month"])
@@ -3050,6 +3142,7 @@ elif page == "OTC Quote Builder":
         counterparty = c.text_input("Counterparty", value="Prospective client (Demo)")
         submitted = st.form_submit_button("Calculate indicative quote", type="primary")
     if submitted:
+        st.session_state.pop("last_quote", None)
         try:
             if instrument == "FORWARD" and (start.day != 1 or months != 1):
                 raise ValueError("A FORWARD quote must cover exactly one full calendar month. Choose SWAP for delivery strips.")
@@ -3085,7 +3178,8 @@ elif page == "OTC Quote Builder":
             try:
                 st.session_state.trades = add_trade_to_book(st.session_state.trades, new)
                 st.session_state.physical_ops = sync_physical_ops_with_trades(st.session_state.physical_ops, st.session_state.trades)
-                st.success(f"Quote {new_id} added to the trade book as PROPOSED. It is excluded from executed-book position totals.")
+                st.session_state["flash_message"] = f"Quote {new_id} was added to the trade book as PROPOSED. It is excluded from executed-book position totals until its lifecycle status changes."
+                st.session_state["pending_nav_page"] = "Trading Book & MtM"
                 st.rerun()
             except Exception as exc:
                 st.error(f"Could not add quote: {exc}")
@@ -3620,7 +3714,7 @@ elif page == "Market Fundamentals":
         latest_fetch_display = "—"
     top_b.metric("Latest fetch (UTC)", latest_fetch_display)
     if top_c.button("Manage / refresh data sources", type="primary", use_container_width=True):
-        st.session_state.nav_page = next(label for label in ALL_NAV_ITEMS if label.endswith("Live Data Integrations"))
+        st.session_state["pending_nav_page"] = "Live Data Integrations"
         st.rerun()
 
     if not data_items:
@@ -3882,36 +3976,50 @@ elif page == "Market Fundamentals":
     st.caption("All derived indicators are descriptive. APIs may publish delayed observations or retroactive corrections; user-provided data are not independently certified by this application.")
 
 elif page == "Data & Assumptions":
-    title_block("Data, Conventions & Validation", "Explicit assumptions and import validation are part of the risk controls, not an afterthought.")
+    title_block("Data, Conventions & Validation", "Reference page for product definitions, data provenance, conversion rules and model limitations.")
+    st.info("Recommended workflow: configure providers in Live Data Integrations → review fundamentals in Market Overview / Market Fundamentals → validate monthly marks in Forward Curves → build quotes and monitor the book.")
     st.subheader("Product registry")
     registry = pd.DataFrame([{"Product": p, **spec} for p, spec in PRODUCTS.items()])
     st.dataframe(registry, use_container_width=True, hide_index=True)
-    st.subheader("Upload a forward curve")
-    st.write("Required CSV columns: `delivery_month`, `product`, `price`, `currency`, `unit`. One row per product and delivery month. Prices must use a consistent unit for the selected product. Negative prices are allowed because electricity prices can be negative.")
-    curve_file = st.file_uploader("Upload monthly curve CSV", type=["csv"], key="curve_upload")
-    if curve_file is not None:
-        try:
-            candidate = validate_curve(pd.read_csv(curve_file))
-            chosen = st.selectbox("Product to replace", list(PRODUCTS.keys()), key="replace_curve_product")
-            subset = candidate.loc[candidate["product"].eq(chosen)].copy()
-            if subset.empty:
-                st.error(f"No rows for {chosen} in uploaded file.")
-            else:
-                expected = PRODUCTS[chosen]
-                if not subset["currency"].eq(expected["currency"]).all() or not subset["unit"].eq(expected["unit"]).all():
-                    st.error(f"Unit/currency mismatch. Expected {expected['currency']} and {expected['unit']} for {chosen}.")
-                else:
-                    st.dataframe(subset, use_container_width=True, hide_index=True)
-                    if st.button("Use uploaded curve for this session"):
-                        st.session_state.custom_curves[chosen] = subset
-                        st.success("Curve applied for this session. The app does not persist it to disk.")
-                        st.rerun()
-        except Exception as exc:
-            st.error(f"Curve rejected: {exc}")
+    st.subheader("Current curve inventory")
+    curve_inventory = []
+    for product_name, product_spec in PRODUCTS.items():
+        product_curve = curves[product_name]
+        imported = product_name in st.session_state.get("custom_curves", {})
+        dates = pd.to_datetime(product_curve.get("delivery_month", pd.Series(dtype="datetime64[ns]")), errors="coerce")
+        curve_inventory.append({
+            "Product": product_name,
+            "Source status": curve_source_label(product_name),
+            "Monthly marks": int(len(product_curve)),
+            "First delivery": dates.min().date() if len(dates.dropna()) else None,
+            "Last delivery": dates.max().date() if len(dates.dropna()) else None,
+            "Currency": product_spec["currency"],
+            "Price unit": product_spec["unit"],
+            "Imported at (UTC)": st.session_state.get("curve_metadata", {}).get(product_name, {}).get("imported_at_utc", "—") if imported else "—",
+        })
+    st.dataframe(pd.DataFrame(curve_inventory), use_container_width=True, hide_index=True)
+    st.caption("Use Forward Curves for canonical-schema CSV files. Use Live Data Integrations → Licensed Forward Curves for provider-specific REST/JSON/CSV formats and field mapping. In both cases, review source provenance and tenor coverage before pricing.")
+
+    st.subheader("Live-data coverage and freshness")
+    live_rows = []
+    for dataset_key, item in st.session_state.get("live_data", {}).items():
+        frame = item.get("data") if isinstance(item, dict) else None
+        is_loaded = isinstance(frame, pd.DataFrame) and not frame.empty
+        live_rows.append({
+            "Dataset": item.get("label", dataset_key) if isinstance(item, dict) else dataset_key,
+            "Status": "LOADED" if is_loaded else "EMPTY / NOT LOADED",
+            "Rows": len(frame) if isinstance(frame, pd.DataFrame) else 0,
+            "Latest observation": _latest_observation_date(frame) if is_loaded else None,
+            "Last fetched (UTC)": item.get("fetched_at", "") if isinstance(item, dict) else "",
+        })
+    if live_rows:
+        st.dataframe(pd.DataFrame(live_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No external market datasets have been loaded. Open Live Data Integrations, fetch the datasets your analysis needs, then return to Market Overview and Market Fundamentals.")
     st.subheader("Unit conversion utilities")
     a, b = st.columns(2)
     mwh = a.number_input("Energy (MWh)", min_value=0.0, value=1000.0, step=100.0)
-    eur_mwh = b.number_input("Gas price (EUR/MWh)", min_value=0.0, value=35.0, step=1.0)
+    eur_mwh = b.number_input("Reference commodity price (EUR/MWh)", min_value=-500.0, max_value=10000.0, value=35.0, step=1.0)
     fx = st.number_input("FX: EUR per GBP", min_value=0.01, value=1.17, step=0.01, help="Illustrative FX input. 1 GBP = this many EUR.")
     st.write(f"**Energy conversion:** {mwh:,.2f} MWh = {mwh_to_mmbtu(mwh):,.2f} MMBtu")
     st.write(f"**Price conversion:** {eur_mwh:.4f} EUR/MWh = {price_eur_mwh_to_gbp_therm(eur_mwh, fx):.6f} GBP/therm at the entered FX rate")
@@ -3927,12 +4035,15 @@ elif page == "Data & Assumptions":
     - **P&L:** the current implementation calculates indicative unrealised MtM; it does not yet produce a production-grade realised/unrealised daily P&L ledger.
     - **Valuation:** no credit valuation adjustment, collateral, bid/ask liquidity, discount curve, shaping premium, imbalance, fees, or exchange settlement rules are modelled.
     """)
-    st.subheader("Reset demo data")
-    if st.button("Reset trade book and uploaded curves"):
+    st.subheader("Reset demo book and user-imported marks")
+    if st.button("Reset demo book and user-imported curves"):
         st.session_state.trades = build_sample_trades()
         st.session_state.custom_curves = {}
+        st.session_state.curve_metadata = {}
         st.session_state.physical_ops = build_sample_physical_ops(st.session_state.trades)
-        st.success("Demo book, custom curves and physical operations reset.")
+        st.session_state.pop("last_quote", None)
+        st.session_state.pop("provider_curve_raw_table", None)
+        st.session_state["flash_message"] = "Demo trades, user-imported forward curves and linked physical-operation records have been reset. Previously fetched external datasets were retained."
         st.rerun()
 
 
