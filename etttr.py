@@ -1,6 +1,6 @@
 """MERIDIAN Energy Desk — European energy trading and risk management prototype.
 
-Run with: streamlit run meridian_energy_desk.py
+Run with: streamlit run meridian_energy_desk_live.py
 
 IMPORTANT: Built-in curves and trades are synthetic demo data, not live market quotes.
 This is an educational prototype, not a production ETRM or valuation system.
@@ -11,6 +11,14 @@ from datetime import date, datetime, timedelta, time, timezone
 from zoneinfo import ZoneInfo
 import math
 import io
+import os
+import json
+import zipfile
+import gzip
+import xml.etree.ElementTree as ET
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from typing import Iterable, Sequence, Optional, Tuple
 
 import pandas as pd
@@ -925,8 +933,645 @@ def title_block(title: str, subtitle: str) -> None:
     render_header(title, subtitle)
 
 
+# -----------------------------------------------------------------------------
+# Live market-data integrations (public APIs + licensed market-data adapter)
+# -----------------------------------------------------------------------------
+# Credentials are intentionally not hard-coded. Supply them in Streamlit secrets,
+# environment variables, or password inputs in the Live Data Integrations page.
+# API calls are made only when the user clicks a Fetch/Refresh button.
+
+HTTP_TIMEOUT_SECONDS = 25
+MAX_API_RESPONSE_BYTES = 20 * 1024 * 1024
+GIE_AGSI_BASE = "https://agsi.gie.eu/api"
+GIE_ALSI_BASE = "https://alsi.gie.eu/api"
+ENTSOE_BASE = "https://web-api.tp.entsoe.eu/api"
+ENTSOG_BASE = "https://transparency.entsog.eu/api/v1"
+OPEN_METEO_FORECAST_BASE = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_CUSTOMER_BASE = "https://customer-api.open-meteo.com/v1/forecast"
+
+ENTSOE_ZONES = {
+    "France": {"eic": "10YFR-RTE------C", "timezone": "Europe/Paris"},
+    "Germany-Luxembourg": {"eic": "10Y1001A1001A82H", "timezone": "Europe/Berlin"},
+    "Netherlands": {"eic": "10YNL----------L", "timezone": "Europe/Amsterdam"},
+    "Belgium": {"eic": "10YBE----------2", "timezone": "Europe/Brussels"},
+    "Spain": {"eic": "10YES-REE------0", "timezone": "Europe/Madrid"},
+    "Italy North": {"eic": "10Y1001A1001A73I", "timezone": "Europe/Rome"},
+    "Austria": {"eic": "10YAT-APG------L", "timezone": "Europe/Vienna"},
+    "Denmark West": {"eic": "10YDK-1--------W", "timezone": "Europe/Copenhagen"},
+    "Denmark East": {"eic": "10YDK-2--------M", "timezone": "Europe/Copenhagen"},
+    "Poland": {"eic": "10YPL-AREA-----S", "timezone": "Europe/Warsaw"},
+    "Great Britain": {"eic": "10YGB----------A", "timezone": "Europe/London"},
+    "Switzerland": {"eic": "10YCH-SWISSGRIDZ", "timezone": "Europe/Zurich"},
+}
+
+WEATHER_LOCATIONS = {
+    "Amsterdam / TTF proxy": {"latitude": 52.3676, "longitude": 4.9041, "timezone": "Europe/Amsterdam"},
+    "London / NBP proxy": {"latitude": 51.5072, "longitude": -0.1276, "timezone": "Europe/London"},
+    "Paris / French power proxy": {"latitude": 48.8566, "longitude": 2.3522, "timezone": "Europe/Paris"},
+    "Berlin / German power proxy": {"latitude": 52.5200, "longitude": 13.4050, "timezone": "Europe/Berlin"},
+    "Brussels / Belgian power proxy": {"latitude": 50.8503, "longitude": 4.3517, "timezone": "Europe/Brussels"},
+    "Madrid / Iberian power proxy": {"latitude": 40.4168, "longitude": -3.7038, "timezone": "Europe/Madrid"},
+}
+
+
+def _secret_or_env(secret_name: str, env_name: str) -> str:
+    """Read optional credentials without printing or logging them."""
+    try:
+        value = st.secrets.get(secret_name, "")
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    return str(os.getenv(env_name, "")).strip()
+
+
+def _build_url(url: str, params: Optional[dict] = None) -> str:
+    clean = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
+    if not clean:
+        return url
+    separator = "&" if "?" in url else "?"
+    return url + separator + urlencode(clean, doseq=True)
+
+
+def _http_get_bytes(url: str, params: Optional[dict] = None,
+                    headers: Optional[dict] = None,
+                    timeout: int = HTTP_TIMEOUT_SECONDS) -> tuple[bytes, str]:
+    """Small dependency-free HTTP GET. Error messages never echo query tokens or headers."""
+    final_url = _build_url(url, params)
+    req_headers = {"User-Agent": "MERIDIAN-Energy-Desk/1.0", "Accept": "application/json,*/*"}
+    if headers:
+        req_headers.update({str(k): str(v) for k, v in headers.items() if v is not None})
+    request = Request(final_url, headers=req_headers, method="GET")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            content_type = response.headers.get("Content-Type", "")
+            body = response.read(MAX_API_RESPONSE_BYTES + 1)
+            if len(body) > MAX_API_RESPONSE_BYTES:
+                raise RuntimeError("API response exceeded the 20 MB safety limit. Narrow the requested dates or filters.")
+            return body, content_type
+    except HTTPError as exc:
+        # Do not include exc.url because some vendors require tokens in URL query strings.
+        raise RuntimeError(f"API returned HTTP {exc.code}. Check access rights, credentials, dates and query parameters.") from None
+    except URLError as exc:
+        reason = getattr(exc, "reason", "network error")
+        raise RuntimeError(f"Could not reach the data provider ({reason}). Check your internet connection and provider availability.") from None
+    except TimeoutError:
+        raise RuntimeError("The data provider timed out. Try a shorter date range.") from None
+
+
+def _json_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> dict | list:
+    body, _ = _http_get_bytes(url, params=params, headers=headers)
+    try:
+        return json.loads(body.decode("utf-8-sig"))
+    except Exception as exc:
+        raise RuntimeError("The API response was not valid JSON. Confirm that the URL returns JSON data.") from exc
+
+
+def _payload_rows(payload) -> list[dict]:
+    """Extract record lists from common API response envelopes."""
+    if isinstance(payload, list):
+        return [dict(x) for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        return []
+    # Several providers change the envelope's capitalisation over time.
+    # Match envelope names case-insensitively, but preserve record field names.
+    lower_keys = {str(k).casefold(): v for k, v in payload.items()}
+    record_keys = {
+        "gasdaystart", "periodfrom", "periodto", "value", "pointdirection",
+        "pointdirectionkey", "operatorlabel", "pointlabel", "full", "price",
+        "gasinstorage", "name", "timestamp",
+    }
+    envelope_keys = (
+        "data", "results", "items", "records", "result", "operatorpointdirections",
+        "operatorpointdirection", "aggregateddata", "operationaldata", "operationaldatas",
+    )
+    for key in envelope_keys:
+        value = lower_keys.get(key.casefold())
+        if isinstance(value, list):
+            return [dict(x) for x in value if isinstance(x, dict)]
+        if isinstance(value, dict):
+            nested = _payload_rows(value)
+            if nested:
+                return nested
+            # Data may be a single observation rather than a list.
+            if any(str(k).casefold() in record_keys for k in value):
+                return [value]
+    if any(str(k).casefold() in record_keys for k in payload):
+        return [payload]
+    return []
+
+
+def _number_series(series: pd.Series) -> pd.Series:
+    """Parse provider numbers, including decimal commas and missing-value markers."""
+    def one(value):
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return float("nan")
+        s = str(value).strip()
+        if s in {"", "-", "--", "N/A", "n/a", "null", "None"}:
+            return float("nan")
+        if "," in s and "." in s:
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                s = s.replace(",", "")
+        elif "," in s:
+            s = s.replace(",", ".")
+        try:
+            return float(s)
+        except ValueError:
+            return float("nan")
+    return series.map(one)
+
+
+def _flatten_records(rows: list[dict]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    try:
+        return pd.json_normalize(rows, sep="_")
+    except Exception:
+        return pd.DataFrame(rows)
+
+
+def fetch_gie_history(dataset: str, api_key: str, scope: str,
+                      start_date: date, end_date: date, country_code: str = "DE",
+                      _json_get_fn=None) -> pd.DataFrame:
+    """Fetch GIE AGSI+ storage or ALSI LNG observations for a country/European aggregate."""
+    if not api_key.strip():
+        raise ValueError("Enter your GIE API key. Register at https://agsi.gie.eu/account.")
+    if end_date < start_date:
+        raise ValueError("End date must be on or after start date.")
+    if (end_date - start_date).days > 730:
+        raise ValueError("Select a period of no more than 730 days to limit API calls.")
+    dataset_key = dataset.strip().upper()
+    if dataset_key not in {"AGSI", "ALSI"}:
+        raise ValueError("GIE dataset must be AGSI or ALSI.")
+    endpoint = GIE_AGSI_BASE if dataset_key == "AGSI" else GIE_ALSI_BASE
+    params_base = {"from": start_date.isoformat(), "to": end_date.isoformat(), "size": 300}
+    # GIE's documented selector is `type=EU` (not `continent=EU`).
+    # Country filters use the provider's two-letter country slug.
+    is_europe_scope = scope in {"Europe aggregate", "Europe / EU datasets"}
+    if is_europe_scope:
+        params_base["type"] = "EU"
+    else:
+        params_base["country"] = country_code.lower()
+    request_json = _json_get_fn or _json_get
+    all_rows: list[dict] = []
+    # A 2-year European dataset can span many pages. Never silently return a partial curve.
+    max_pages = 100
+    pagination_complete = False
+    for page in range(1, max_pages + 1):
+        params = dict(params_base, page=page)
+        payload = request_json(endpoint, params=params, headers={"x-key": api_key, "Accept": "application/json"})
+        if isinstance(payload, dict):
+            error = str(payload.get("error", "") or payload.get("message", ""))
+            if error and ("denied" in error.lower() or "api key" in error.lower() or "invalid" in error.lower()):
+                raise RuntimeError("GIE rejected the API key or dataset access. Check the key and its AGSI+/ALSI permissions.")
+        rows = _payload_rows(payload)
+        all_rows.extend(rows)
+        last_page = None
+        if isinstance(payload, dict):
+            lower_meta = {str(k).casefold(): v for k, v in payload.items()}
+            for key in ("last_page", "lastpage"):
+                if lower_meta.get(key) is not None:
+                    try: last_page = int(lower_meta[key])
+                    except Exception: pass
+                    break
+        if not rows:
+            pagination_complete = True
+            break
+        if last_page is not None and page >= last_page:
+            pagination_complete = True
+            break
+        if last_page is None and len(rows) < int(params_base["size"]):
+            pagination_complete = True
+            break
+    if not pagination_complete:
+        raise RuntimeError(f"GIE query exceeded the {max_pages}-page safety limit and may be incomplete. Narrow the date range and retry.")
+    if not all_rows:
+        raise RuntimeError("GIE returned no records for this scope and period. Try another country/date range or check dataset access.")
+    frame = _flatten_records(all_rows)
+    date_col = next((c for c in ("gasDayStart", "gas_day", "date", "gasDay") if c in frame.columns), None)
+    if date_col:
+        frame["observation_date"] = pd.to_datetime(frame[date_col], errors="coerce").dt.date
+    numeric_cols = [c for c in frame.columns if c.lower() in {
+        "full", "gasinstorage", "workinggasvolume", "injection", "withdrawal",
+        "injectioncapacity", "withdrawalcapacity", "inventory", "sendout", "dtmi", "dtrs",
+        "gasinstoragegwh", "inventory_gwh", "sendout_gwh", "workinggasvolume_twh"
+    } or c.lower().endswith(("_gwh", "_twh"))]
+    for col in numeric_cols:
+        frame[col] = _number_series(frame[col])
+    frame["_source"] = f"GIE {dataset_key}+"
+    frame["_fetched_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    frame["_scope"] = "Europe / EU datasets" if is_europe_scope else f"{country_code.upper()} aggregate / facilities"
+    return frame
+
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _xml_text(parent, names: Sequence[str]) -> Optional[str]:
+    wanted = set(names)
+    for node in parent.iter():
+        if _xml_local_name(node.tag) in wanted and node.text and node.text.strip():
+            return node.text.strip()
+    return None
+
+
+def _xml_direct_children(parent, name: str):
+    return [child for child in list(parent) if _xml_local_name(child.tag) == name]
+
+
+def _parse_duration(value: str) -> pd.Timedelta:
+    # ENTSO-E uses ISO 8601 durations such as PT60M, PT15M and PT1H.
+    td = pd.to_timedelta(value)
+    if pd.isna(td) or td <= pd.Timedelta(0):
+        raise ValueError(f"Unsupported ENTSO-E resolution: {value}")
+    return td
+
+
+def parse_entsoe_xml(content: bytes, series_kind: str = "price") -> pd.DataFrame:
+    """Parse standard ENTSO-E Publication/GL MarketDocument time series into rows."""
+    if content[:2] == b"PK":
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            xml_names = [n for n in zf.namelist() if n.lower().endswith((".xml", ".xml.gz"))]
+            if not xml_names:
+                raise ValueError("ENTSO-E returned a ZIP without an XML document.")
+            content = zf.read(xml_names[0])
+            if xml_names[0].lower().endswith(".xml.gz") or content[:2] == b"\x1f\x8b":
+                content = gzip.decompress(content)
+    elif content[:2] == b"\x1f\x8b":
+        content = gzip.decompress(content)
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as exc:
+        raise ValueError("ENTSO-E response could not be parsed as XML.") from exc
+    if any(_xml_local_name(n.tag) == "Acknowledgement_MarketDocument" for n in root.iter()):
+        reason = _xml_text(root, ["text", "code"]) or "No matching market document was returned."
+        raise RuntimeError(f"ENTSO-E acknowledgement: {reason}")
+    rows = []
+    kind = series_kind.lower()
+    for ts in [n for n in root.iter() if _xml_local_name(n.tag) == "TimeSeries"]:
+        psr_code = _xml_text(ts, ["psrType"]) or ""
+        series_name = {
+            "B01": "Biomass", "B02": "Lignite", "B03": "Hard coal", "B04": "Natural gas",
+            "B05": "Hard coal", "B06": "Oil", "B07": "Oil shale", "B08": "Peat",
+            "B09": "Geothermal", "B10": "Hydro pumped storage", "B11": "Hydro run-of-river",
+            "B12": "Hydro reservoir", "B13": "Marine", "B14": "Nuclear", "B15": "Other renewable",
+            "B16": "Solar", "B17": "Waste", "B18": "Wind offshore", "B19": "Wind onshore",
+            "B20": "Other", "B21": "AC link", "B22": "DC link", "B23": "Substation", "B24": "Energy storage",
+        }.get(psr_code, psr_code or ("Day-ahead price" if kind == "price" else kind.title()))
+        # Period elements are direct children of TimeSeries in standard ENTSO-E XML.
+        periods = [n for n in ts.iter() if _xml_local_name(n.tag) == "Period"]
+        for period in periods:
+            interval_node = next((n for n in period.iter() if _xml_local_name(n.tag) == "timeInterval"), None)
+            start_txt = _xml_text(interval_node, ["start"]) if interval_node is not None else _xml_text(period, ["start"])
+            resolution = _xml_text(period, ["resolution"])
+            if not start_txt or not resolution:
+                continue
+            try:
+                period_start = pd.Timestamp(start_txt)
+                if period_start.tzinfo is None:
+                    period_start = period_start.tz_localize("UTC")
+                else:
+                    period_start = period_start.tz_convert("UTC")
+                delta = _parse_duration(resolution)
+            except Exception:
+                continue
+            for point in [n for n in period.iter() if _xml_local_name(n.tag) == "Point"]:
+                pos_txt = _xml_text(point, ["position"])
+                if not pos_txt:
+                    continue
+                value_txt = _xml_text(point, ["price.amount", "quantity", "outBiddingZone_Domain.mRID"] if kind == "price" else ["quantity", "price.amount"])
+                if value_txt is None:
+                    continue
+                try:
+                    value = float(value_txt.replace(",", "."))
+                    pos = int(pos_txt)
+                except Exception:
+                    continue
+                rows.append({
+                    "timestamp": period_start + (pos - 1) * delta,
+                    "value": value,
+                    "series": series_name,
+                    "psr_code": psr_code,
+                    "resolution": resolution,
+                    "unit": "EUR/MWh" if kind == "price" else "MW",
+                })
+    if not rows:
+        msg = _xml_text(root, ["text"]) or "No observations found in ENTSO-E XML response."
+        raise RuntimeError(f"ENTSO-E returned no usable observations. {msg}")
+    result = pd.DataFrame(rows).drop_duplicates(subset=["timestamp", "series", "value"]).sort_values(["timestamp", "series"])
+    return result.reset_index(drop=True)
+
+
+def fetch_entsoe_series(token: str, series_kind: str, zone_name: str,
+                        start_date: date, end_date_exclusive: date,
+                        source_zone: Optional[str] = None,
+                        target_zone: Optional[str] = None) -> pd.DataFrame:
+    """Fetch ENTSO-E day-ahead prices, actual load, generation or cross-border flow."""
+    if not token.strip():
+        raise ValueError("Enter your ENTSO-E Web API token. REST access must be enabled on your account.")
+    if end_date_exclusive <= start_date:
+        raise ValueError("End date must be later than start date (end date is exclusive).")
+    if (end_date_exclusive - start_date).days > 31:
+        raise ValueError("Select at most 31 delivery days per request to stay within API limits.")
+    if series_kind == "Physical flow":
+        if source_zone not in ENTSOE_ZONES or target_zone not in ENTSOE_ZONES:
+            raise ValueError("Select both a source and destination bidding zone.")
+        if source_zone == target_zone:
+            raise ValueError("Physical flow requires two different bidding zones.")
+        document_type = "A11"
+        base_params = {"in_Domain": ENTSOE_ZONES[source_zone]["eic"], "out_Domain": ENTSOE_ZONES[target_zone]["eic"]}
+        query_label = f"{source_zone} → {target_zone} physical flow"
+        parser_kind = "flow"
+    else:
+        if zone_name not in ENTSOE_ZONES:
+            raise ValueError("Select a supported ENTSO-E bidding zone.")
+        eic = ENTSOE_ZONES[zone_name]["eic"]
+        if series_kind == "Day-ahead price":
+            document_type, parser_kind = "A44", "price"
+            base_params = {"in_Domain": eic, "out_Domain": eic}
+        elif series_kind == "Actual load":
+            document_type, parser_kind = "A65", "load"
+            base_params = {"processType": "A16", "outBiddingZone_Domain": eic}
+        elif series_kind == "Actual generation by type":
+            document_type, parser_kind = "A75", "generation"
+            base_params = {"processType": "A16", "in_Domain": eic}
+        else:
+            raise ValueError("Unsupported ENTSO-E series type.")
+        query_label = f"{zone_name} {series_kind.lower()}"
+    # ENTSO-E expects UTC period boundaries in yyyyMMddHHmm format.
+    tz_name = ENTSOE_ZONES.get(zone_name, {}).get("timezone", "Europe/Paris")
+    zone = ZoneInfo(tz_name)
+    start_local = datetime.combine(start_date, time.min, tzinfo=zone)
+    end_local = datetime.combine(end_date_exclusive, time.min, tzinfo=zone)
+    start_utc = start_local.astimezone(timezone.utc)
+    end_utc = end_local.astimezone(timezone.utc)
+    params = dict(base_params)
+    params.update({
+        "documentType": document_type,
+        "periodStart": start_utc.strftime("%Y%m%d%H%M"),
+        "periodEnd": end_utc.strftime("%Y%m%d%H%M"),
+        "securityToken": token.strip(),
+    })
+    body, _ = _http_get_bytes(ENTSOE_BASE, params=params, headers={"Accept": "application/xml, application/zip, */*"})
+    frame = parse_entsoe_xml(body, parser_kind)
+    frame["_source"] = "ENTSO-E Transparency Platform"
+    frame["_query"] = query_label
+    frame["_fetched_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    frame["_area"] = query_label
+    return frame
+
+
+def normalise_entsog_point_catalogue(frame: pd.DataFrame) -> pd.DataFrame:
+    """Ensure the catalogue has the exact pointDirection identifier ENTSOG expects.
+
+    Depending on response representation, the catalogue may expose a combined
+    pointDirection/key field or the separate operatorKey + pointKey + directionKey
+    components. ENTSOG's API identifier is the exact concatenation of those components.
+    """
+    if frame is None or frame.empty:
+        return pd.DataFrame() if frame is None else frame.copy()
+    out = frame.copy()
+    def norm(name: object) -> str:
+        return "".join(ch for ch in str(name).casefold() if ch.isalnum())
+    lookup = {norm(column): column for column in out.columns}
+
+    combined_candidates = ("pointdirection", "pointdirectionkey", "pointdirectionid")
+    combined_col = next((lookup[k] for k in combined_candidates if k in lookup), None)
+    if combined_col is not None:
+        out["pointDirection"] = out[combined_col].astype("string").str.strip()
+        return out
+
+    operator_col = next((lookup[k] for k in ("operatorkey", "operatorid") if k in lookup), None)
+    point_col = next((lookup[k] for k in ("pointkey", "connectionpointkey", "pointid") if k in lookup), None)
+    direction_col = next((lookup[k] for k in ("directionkey", "directionid", "flowdirectionkey") if k in lookup), None)
+    if operator_col is not None and point_col is not None and direction_col is not None:
+        components = (out[operator_col], out[point_col], out[direction_col])
+        valid = pd.Series(True, index=out.index)
+        for column in components:
+            valid &= column.notna() & column.astype(str).str.strip().ne("")
+        ids = components[0].astype("string").str.strip().fillna("") + components[1].astype("string").str.strip().fillna("") + components[2].astype("string").str.strip().fillna("")
+        out["pointDirection"] = ids.where(valid, pd.NA)
+        return out
+
+    # Some API representations expose a generic key/id only; use it as a last resort.
+    generic_col = next((lookup[k] for k in ("key", "id") if k in lookup), None)
+    if generic_col is not None:
+        out["pointDirection"] = out[generic_col].astype("string").str.strip()
+    return out
+
+
+def fetch_entsog_point_catalogue(limit: int = 1000) -> pd.DataFrame:
+    """Fetch a bounded list of gas transmission point directions with published data."""
+    payload = _json_get(f"{ENTSOG_BASE}/operatorpointdirections", params={"hasData": 1, "limit": min(max(int(limit), 1), 1000)})
+    rows = _payload_rows(payload)
+    if not rows:
+        raise RuntimeError("ENTSOG returned no point-direction catalogue rows. Try the official platform catalogue.")
+    frame = _flatten_records(rows)
+    frame = normalise_entsog_point_catalogue(frame)
+    if "pointDirection" not in frame.columns or frame["pointDirection"].dropna().empty:
+        raise RuntimeError("ENTSOG returned catalogue rows without a recognised pointDirection identifier. Paste an identifier from the official catalogue or update the mapping for the provider's current response fields.")
+    return frame
+
+
+def fetch_entsog_flow(point_direction: str, start_date: date,
+                      end_date: date, indicator: str = "Physical Flow") -> pd.DataFrame:
+    """Fetch physical gas flows for one exact ENTSOG pointDirection identifier.
+
+    ENTSOG's date filters are passed as the selected inclusive calendar dates.
+    """
+    if not point_direction.strip():
+        raise ValueError("Enter/select a pointDirection identifier from the ENTSOG catalogue.")
+    if end_date < start_date:
+        raise ValueError("End date must be on or after start date.")
+    if (end_date - start_date).days > 180:
+        raise ValueError("Select a period of no more than 180 days to avoid slow provider queries.")
+    params = {
+        "pointDirection": point_direction.strip(),
+        "from": start_date.isoformat(),
+        "to": end_date.isoformat(),
+        "indicator": indicator,
+        "periodType": "day",
+        "timeZone": "CET",
+        "limit": 1000,
+        "sorting": "periodFrom",
+    }
+    payload = _json_get(f"{ENTSOG_BASE}/aggregatedData", params=params)
+    rows = _payload_rows(payload)
+    if not rows:
+        raise RuntimeError("ENTSOG returned no records. pointDirection and indicator values are case-sensitive; verify the catalogue selection and date range.")
+    frame = _flatten_records(rows)
+    date_col = next((c for c in ("periodFrom", "periodTo", "from", "date") if c in frame.columns), None)
+    value_col = next((c for c in ("value", "quantity", "physicalFlow") if c in frame.columns), None)
+    if date_col:
+        frame["timestamp"] = pd.to_datetime(frame[date_col], errors="coerce", utc=True)
+    if value_col:
+        frame["value_numeric"] = _number_series(frame[value_col])
+    frame["_source"] = "ENTSOG Transparency Platform"
+    frame["_fetched_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    frame["_point_direction"] = point_direction.strip()
+    return frame
+
+
+def fetch_open_meteo(latitude: float, longitude: float, timezone_name: str,
+                     past_days: int = 3, forecast_days: int = 7,
+                     api_key: str = "", commercial_endpoint: bool = False,
+                     _json_get_fn=None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Fetch weather forecast/hourly observations and aggregate daily energy proxies."""
+    if not (-90 <= float(latitude) <= 90 and -180 <= float(longitude) <= 180):
+        raise ValueError("Weather coordinates must be valid latitude/longitude values.")
+    if not (0 <= int(past_days) <= 7 and 1 <= int(forecast_days) <= 16):
+        raise ValueError("Use past_days 0–7 and forecast_days 1–16 for this dashboard request.")
+    endpoint = OPEN_METEO_CUSTOMER_BASE if commercial_endpoint else OPEN_METEO_FORECAST_BASE
+    params = {
+        "latitude": latitude, "longitude": longitude,
+        "hourly": "temperature_2m,wind_speed_10m,shortwave_radiation",
+        "past_days": int(past_days), "forecast_days": int(forecast_days),
+        "timezone": timezone_name, "timeformat": "unixtime",
+    }
+    if commercial_endpoint:
+        if not api_key.strip():
+            raise ValueError("Enter your Open-Meteo commercial API key or select the public endpoint.")
+        params["apikey"] = api_key.strip()
+    request_json = _json_get_fn or _json_get
+    payload = request_json(endpoint, params=params)
+    hourly_payload = payload.get("hourly", {}) if isinstance(payload, dict) else {}
+    if not hourly_payload or "time" not in hourly_payload:
+        raise RuntimeError("Open-Meteo response has no hourly observations. Check coordinates and request parameters.")
+    hourly = pd.DataFrame(hourly_payload)
+    time_values = hourly.pop("time")
+    numeric_times = pd.to_numeric(time_values, errors="coerce")
+    if numeric_times.notna().all():
+        # Unix timestamps avoid ambiguous local wall times on DST fall-back days.
+        hourly["timestamp"] = pd.to_datetime(numeric_times, unit="s", utc=True).dt.tz_convert(timezone_name)
+    else:
+        # Fallback supports saved fixtures/provider-compatible ISO timestamps.
+        hourly["timestamp"] = pd.to_datetime(time_values, errors="coerce")
+        if getattr(hourly["timestamp"].dt, "tz", None) is None:
+            try:
+                hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(timezone_name, ambiguous="infer", nonexistent="shift_forward")
+            except Exception:
+                hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(timezone_name, ambiguous="NaT", nonexistent="shift_forward")
+    hourly["date"] = hourly["timestamp"].dt.date
+    hourly["timezone"] = timezone_name
+    for col in ("temperature_2m", "wind_speed_10m", "shortwave_radiation"):
+        if col in hourly:
+            hourly[col] = pd.to_numeric(hourly[col], errors="coerce")
+    agg = {c: "mean" for c in ("temperature_2m", "wind_speed_10m", "shortwave_radiation") if c in hourly.columns}
+    daily = hourly.groupby("date", as_index=False).agg(agg) if agg else pd.DataFrame()
+    if not daily.empty:
+        if "temperature_2m" in daily: daily = daily.rename(columns={"temperature_2m": "temperature_mean_c"})
+        if "wind_speed_10m" in daily: daily = daily.rename(columns={"wind_speed_10m": "wind_speed_mean_kmh"})
+        if "shortwave_radiation" in daily: daily = daily.rename(columns={"shortwave_radiation": "solar_radiation_mean_wm2"})
+        daily["date"] = pd.to_datetime(daily["date"])
+        daily["timezone"] = timezone_name
+    hourly["_source"] = "Open-Meteo"
+    hourly["_fetched_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if not daily.empty:
+        daily["_source"] = "Open-Meteo"
+    return hourly, daily
+
+
+def fetch_provider_table(url: str, api_key: str = "", auth_mode: str = "Bearer token",
+                         header_name: str = "Authorization", response_format: str = "Auto",
+                         query_params: Optional[dict] = None, _http_get_bytes_fn=None) -> pd.DataFrame:
+    """Generic adapter for a licensed market-data REST endpoint; vendor-specific terms apply."""
+    if not url.strip().lower().startswith("https://"):
+        raise ValueError("Use an HTTPS endpoint URL supplied by your licensed data vendor.")
+    headers = {"Accept": "application/json,text/csv,*/*"}
+    if auth_mode == "Bearer token":
+        if api_key.strip(): headers[header_name.strip() or "Authorization"] = f"Bearer {api_key.strip()}"
+    elif auth_mode == "API-key header":
+        if api_key.strip(): headers[header_name.strip() or "X-API-Key"] = api_key.strip()
+    elif auth_mode == "No authentication":
+        pass
+    else:
+        raise ValueError("Unsupported provider authentication mode.")
+    if query_params is not None and not isinstance(query_params, dict):
+        raise ValueError("Provider query parameters must be a JSON object of key/value pairs.")
+    request_http = _http_get_bytes_fn or _http_get_bytes
+    body, content_type = request_http(url.strip(), params=query_params, headers=headers)
+    fmt = response_format
+    if fmt == "Auto":
+        fmt = "CSV" if ("csv" in content_type.lower() or body[:100].lower().find(b"delivery_month") >= 0) else "JSON"
+    try:
+        if fmt == "CSV":
+            frame = pd.read_csv(io.BytesIO(body))
+        else:
+            payload = json.loads(body.decode("utf-8-sig"))
+            rows = _payload_rows(payload)
+            if not rows and isinstance(payload, dict):
+                # If the vendor returns a keyed object of arrays, try normalisation.
+                for v in payload.values():
+                    if isinstance(v, list) and v and isinstance(v[0], dict):
+                        rows = v
+                        break
+            frame = _flatten_records(rows)
+            if frame.empty and isinstance(payload, dict):
+                frame = pd.json_normalize(payload)
+    except Exception as exc:
+        raise RuntimeError("Could not parse the provider response as the selected JSON/CSV format.") from exc
+    if frame.empty:
+        raise RuntimeError("Provider returned an empty table. Check endpoint, permissions, response format and query parameters.")
+    frame["_provider_fetched_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return frame
+
+
+def normalise_provider_curve(raw: pd.DataFrame, product: str, delivery_col: str,
+                             price_col: str) -> pd.DataFrame:
+    """Map a vendor response to the desk's strict monthly forward-curve schema."""
+    if product not in PRODUCTS:
+        raise ValueError(f"Unsupported canonical product: {product}")
+    if delivery_col not in raw.columns or price_col not in raw.columns:
+        raise ValueError("Choose valid delivery date and price columns from the provider response.")
+    out = pd.DataFrame({
+        "delivery_month": pd.to_datetime(raw[delivery_col], errors="coerce"),
+        "product": product,
+        "price": _number_series(raw[price_col]),
+        "currency": PRODUCTS[product]["currency"],
+        "unit": PRODUCTS[product]["unit"],
+    })
+    if out["delivery_month"].isna().any():
+        raise ValueError("Some delivery dates could not be parsed. Map a column containing ISO dates such as YYYY-MM-01, and convert contract labels before import.")
+    if out["price"].isna().any():
+        raise ValueError("Some provider prices are missing or non-numeric. No implicit conversion was applied.")
+    return validate_curve(out)
+
+
+def _stored_live_item(source_key: str, label: str, data, metadata: Optional[dict] = None) -> None:
+    st.session_state.setdefault("live_data", {})[source_key] = {
+        "label": label,
+        "data": data,
+        "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "metadata": metadata or {},
+    }
+
+
+def _live_dataset_frame(key: str) -> pd.DataFrame:
+    item = st.session_state.get("live_data", {}).get(key, {})
+    data = item.get("data") if isinstance(item, dict) else None
+    return data.copy() if isinstance(data, pd.DataFrame) else pd.DataFrame()
+
+
+def _display_live_frame(frame: pd.DataFrame, title: str, chart_x: Optional[str] = None,
+                        chart_y: Optional[str] = None, color: Optional[str] = None) -> None:
+    if frame.empty:
+        st.info(f"No {title.lower()} data loaded yet. Open Live Data Integrations and fetch this dataset.")
+        return
+    if chart_x and chart_y and chart_x in frame.columns and chart_y in frame.columns:
+        plot_frame = frame.copy()
+        fig = px.line(plot_frame, x=chart_x, y=chart_y, color=color if color in frame.columns else None,
+                      markers=True, title=title)
+        fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=350)
+        st.plotly_chart(_styled(fig), use_container_width=True)
+    st.dataframe(frame, use_container_width=True, hide_index=True)
+
+
 NAV_SECTIONS = {
-    "Markets": ["📊  Market Overview", "📈  Forward Curves", "🧭  Market Fundamentals"],
+    "Markets": ["📊  Market Overview", "📈  Forward Curves", "🧭  Market Fundamentals", "🔌  Live Data Integrations"],
     "Trading & Risk": ["💬  OTC Quote Builder", "📒  Trading Book & MtM", "⚠️  P&L & Exposure"],
     "Physical Operations": ["🚢  Physical Operations"],
     "Analytics": ["🧪  Model Validation"],
@@ -946,6 +1591,7 @@ PAGE_HELP = {
     "European Energy Fundamentals": "Charts are illustrative until connected to timestamped, licensed market data for European gas and power fundamentals.",
     "Model Validation & System Checks": "Runs deterministic unit and integration checks on conversions, delivery calendars, curve validation, trade capture, MtM, portfolio aggregation and scenario calculations.",
     "Data, Conventions & Validation": "Sources, units, delivery calendars and validation rules should be explicit before marks or trades are used for commercial decisions.",
+    "Live Data Integrations": "Connect GIE storage/LNG, ENTSO-E electricity data, ENTSOG gas flows, Open-Meteo weather and a licensed forward-curve feed. Credentials are entered locally and are never embedded in the source file.",
 }
 
 
@@ -969,7 +1615,11 @@ def render_sidebar() -> str:
           <span style="font-family:'JetBrains Mono',monospace;font-size:1.05rem;font-weight:700;color:{AMBER}">MERIDIAN ENERGY DESK</span><br>
           <span style="font-size:0.68rem;color:{GRAY}">EUROPEAN ENERGY &nbsp;·&nbsp; OTC &nbsp;·&nbsp; MTM</span>
         </div>""", unsafe_allow_html=True)
-        st.markdown('<span class="badge badge-amber">DEMO MODE · NO LIVE MARKET FEED</span>', unsafe_allow_html=True)
+        live_items = st.session_state.get("live_data", {})
+        loaded_count = sum(1 for value in live_items.values() if isinstance(value, dict) and value.get("data") is not None)
+        status_label = f"{loaded_count} LIVE DATASET(S) LOADED" if loaded_count else "DEMO CURVES · NO LIVE DATA LOADED"
+        status_class = "badge" if loaded_count else "badge badge-amber"
+        st.markdown(f'<span class="badge {"" if loaded_count else "badge-amber"}">{status_label}</span>', unsafe_allow_html=True)
         for section, items in NAV_SECTIONS.items():
             key = f"navsec_{section}"
             if key not in st.session_state:
@@ -988,9 +1638,13 @@ def render_sidebar() -> str:
             f'<span class="badge {"badge-amber" if custom_count else ""}">USER CURVES {custom_count}</span>',
             unsafe_allow_html=True)
         with st.expander("Feed / methodology status"):
-            st.caption("No live exchange, ENTSO-E, ENTSOG or GIE API is connected in this version.")
-            st.caption("Built-in forward curves and sample trades are illustrative. Uploaded curves are session-only.")
-            st.caption("Model Validation runs deterministic functional checks against the calculation engine and current demo/user data.")
+            if loaded_count:
+                st.caption(f"{loaded_count} dataset(s) were loaded from external APIs during this session.")
+            else:
+                st.caption("No external data has been fetched in this session. Use Live Data Integrations to connect provider APIs.")
+            st.caption("Built-in forward curves remain illustrative unless replaced with a validated licensed curve or CSV.")
+            st.caption("Day-ahead prices are not automatically substituted for monthly forward marks.")
+            st.caption("Model Validation checks deterministic formulas and parser fixtures; external API access still depends on your credentials and provider availability.")
         st.markdown("---")
         st.markdown(f'<div style="font-size:0.62rem;color:{GRAY};line-height:1.5">Single-file educational ETRM prototype<br>European gas & power · not for trade execution</div>', unsafe_allow_html=True)
     return NAV_TO_PAGE[st.session_state.nav_page]
@@ -1011,6 +1665,8 @@ else:
     st.session_state.physical_ops = sync_physical_ops_with_trades(
         st.session_state.physical_ops, st.session_state.trades
     )
+if "live_data" not in st.session_state:
+    st.session_state.live_data = {}
 
 valuation_date = date.today()
 curves = {
@@ -1040,6 +1696,10 @@ def get_marked_trades() -> pd.DataFrame:
     # Preserve cancelled/expired rows in the blotter for auditability while excluding
     # them from MtM and risk metrics. An unavailable tenor only marks that trade unmarked.
     return mark_trades_resilient(st.session_state.trades.copy(), curves)
+
+
+def curve_source_label(product: str) -> str:
+    return "USER / PROVIDER-IMPORTED MARKS" if product in st.session_state.get("custom_curves", {}) else "ILLUSTRATIVE DEMO MARKS"
 
 
 def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -1252,7 +1912,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
     def check_navigation_registry() -> str:
         pages = set(NAV_TO_PAGE.values())
         required = {"Market Overview", "Forward Curves", "OTC Quote Builder", "Trading Book & MtM",
-                    "P&L & Exposure", "Physical Operations", "Market Fundamentals", "Model Validation", "Data & Assumptions"}
+                    "P&L & Exposure", "Physical Operations", "Market Fundamentals", "Live Data Integrations", "Model Validation", "Data & Assumptions"}
         missing = required - pages
         if missing:
             raise AssertionError(f"Navigation is missing page(s): {sorted(missing)}")
@@ -1395,6 +2055,111 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             assert_close(float(bucket_mtm), float(marked.loc[trade_id, "mtm"]), 1e-6)
         return "FORWARD uses its single monthly mark; SWAP uses a delivery-hour-weighted strip and monthly MtM reconciles."
 
+    def check_entsoe_price_parser() -> str:
+        fixture = b'''<?xml version="1.0" encoding="UTF-8"?>
+        <Publication_MarketDocument xmlns="urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3">
+          <TimeSeries><Period><timeInterval><start>2026-01-01T00:00Z</start><end>2026-01-01T02:00Z</end></timeInterval>
+            <resolution>PT60M</resolution><Point><position>1</position><price.amount>80.5</price.amount></Point>
+            <Point><position>2</position><price.amount>-12.0</price.amount></Point></Period></TimeSeries>
+        </Publication_MarketDocument>'''
+        parsed = parse_entsoe_xml(fixture, "price")
+        if len(parsed) != 2 or list(parsed["value"]) != [80.5, -12.0]:
+            raise AssertionError(f"Unexpected parsed values: {parsed.to_dict('records')}")
+        if str(parsed.iloc[0]["timestamp"].tz) != "UTC":
+            raise AssertionError("ENTSO-E timestamps must be UTC-aware.")
+        # Exercise the compressed transport format used by some ENTSO-E responses.
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zipped:
+            zipped.writestr("market-data.xml.gz", gzip.compress(fixture))
+        compressed = parse_entsoe_xml(archive.getvalue(), "price")
+        if len(compressed) != 2 or list(compressed["value"]) != [80.5, -12.0]:
+            raise AssertionError("ZIP/GZIP-wrapped ENTSO-E XML was not parsed correctly.")
+        return "Namespaced XML and ZIP/GZIP-wrapped XML parse two hourly prices, including a negative price, with UTC timestamps."
+
+    def check_provider_curve_normalisation() -> str:
+        raw = pd.DataFrame({"delivery_date": ["2026-11-01", "2026-12-01"], "settlement": [72.5, -5.0]})
+        mapped = normalise_provider_curve(raw, "French Power Base", "delivery_date", "settlement")
+        if len(mapped) != 2 or mapped.iloc[1]["price"] != -5.0:
+            raise AssertionError("Provider curve mapping failed or lost a negative power price.")
+        return "Mapped vendor fields to canonical product/unit schema; negative electricity prices are preserved."
+
+    def check_provider_numeric_parser() -> str:
+        got = _number_series(pd.Series(["1.234,56", "-5,25", "-", "12.5"]))
+        expected = [1234.56, -5.25, float("nan"), 12.5]
+        for actual, want in zip(got, expected):
+            if math.isnan(want):
+                if not math.isnan(actual): raise AssertionError("Missing marker was not parsed as NaN.")
+            else:
+                assert_close(actual, want)
+        return "Numeric parsing handles decimal commas, thousands separators, missing markers and negative values."
+
+    def check_gie_request_and_data_mapping() -> str:
+        calls = []
+        def fake_get(url, params=None, headers=None):
+            calls.append((url, params or {}, headers or {}))
+            return {"last_page": 1, "data": [{
+                "gasDayStart": "2026-10-20", "name": "Germany", "gasInStorage": "45.2",
+                "full": "74.0", "workingGasVolume": "61.0", "status": "C"
+            }]}
+        got = fetch_gie_history("AGSI", "test-key", "Europe / EU datasets", date(2026, 10, 20), date(2026, 10, 20), "DE", _json_get_fn=fake_get)
+        if not calls or calls[0][1].get("type") != "EU" or "continent" in calls[0][1]:
+            raise AssertionError("GIE Europe selection must use the documented type=EU parameter.")
+        if calls[0][2].get("x-key") != "test-key":
+            raise AssertionError("GIE API key was not sent in the x-key header.")
+        assert_close(float(got.iloc[0]["gasInStorage"]), 45.2)
+        if str(got.iloc[0]["observation_date"]) != "2026-10-20":
+            raise AssertionError("GIE gasDayStart was not mapped to an observation date.")
+        return "Mocked GIE request uses the documented EU selector, sends its API key in a header, and normalises dates/numeric fields."
+
+    def check_entsog_envelope_normalisation() -> str:
+        directions = _payload_rows({"operatorpointdirections": [{"pointDirection": "sample-id", "pointLabel": "Interconnector"}]})
+        aggregated = _payload_rows({"AggregatedData": [{"periodFrom": "2026-10-01", "value": "1,25"}]})
+        if not directions or directions[0].get("pointDirection") != "sample-id":
+            raise AssertionError("Case-insensitive operator-point-direction envelope was not recognised.")
+        if not aggregated or aggregated[0].get("value") != "1,25":
+            raise AssertionError("Case-insensitive aggregated-data envelope was not recognised.")
+        components = normalise_entsog_point_catalogue(pd.DataFrame([{
+            "operatorKey": "FR-TSO-0001", "pointKey": "FR-POINT-0002", "directionKey": "exit"
+        }]))
+        expected_identifier = "FR-TSO-0001FR-POINT-0002exit"
+        if components.iloc[0]["pointDirection"] != expected_identifier:
+            raise AssertionError(f"ENTSOG component identifiers were not concatenated correctly: {components.iloc[0]['pointDirection']!r}")
+        mixed_case = normalise_entsog_point_catalogue(pd.DataFrame([{
+            "operator_key": "DE-TSO-0001", "point_key": "DE-POINT-0002", "direction_key": "entry"
+        }]))
+        if mixed_case.iloc[0]["pointDirection"] != "DE-TSO-0001DE-POINT-0002entry":
+            raise AssertionError("ENTSOG underscored component field variants were not recognised.")
+        return "ENTSOG JSON envelopes and both combined/component-derived pointDirection identifiers are handled."
+
+    def check_open_meteo_aggregation_and_timezone() -> str:
+        payload = {"hourly": {
+            "time": ["2026-10-20T00:00", "2026-10-20T01:00", "2026-10-21T00:00"],
+            "temperature_2m": [10, 12, 8], "wind_speed_10m": [4, 6, 5],
+            "shortwave_radiation": [0, 20, 0],
+        }}
+        hourly, daily = fetch_open_meteo(52.3, 4.9, "Europe/Amsterdam", past_days=1, forecast_days=1, _json_get_fn=lambda *args, **kwargs: payload)
+        if len(hourly) != 3 or len(daily) != 2:
+            raise AssertionError("Open-Meteo observations were not correctly grouped by local delivery date.")
+        assert_close(float(daily.iloc[0]["temperature_mean_c"]), 11.0)
+        if not hourly["timezone"].eq("Europe/Amsterdam").all():
+            raise AssertionError("Weather rows must retain the selected timezone metadata.")
+        return "Mocked Open-Meteo hourly observations aggregate into local-date summaries with timezone metadata."
+
+    def check_generic_provider_rest_csv() -> str:
+        calls = []
+        def fake_http(url, params=None, headers=None, **kwargs):
+            calls.append((url, params or {}, headers or {}))
+            return b"delivery_month,settlement_price\n2026-11-01,90.5\n", "text/csv"
+        raw = fetch_provider_table("https://provider.example/curves", "test-token", "Bearer token",
+                                   query_params={"product": "TTF", "limit": 10}, _http_get_bytes_fn=fake_http)
+        if not calls or calls[0][2].get("Authorization") != "Bearer test-token":
+            raise AssertionError("Licensed provider REST adapter did not build the expected bearer header.")
+        if calls[0][1] != {"product": "TTF", "limit": 10}:
+            raise AssertionError("Provider query parameters were not passed through.")
+        curve = normalise_provider_curve(raw, "TTF Natural Gas", "delivery_month", "settlement_price")
+        assert_close(float(curve.iloc[0]["price"]), 90.5)
+        return "Mocked licensed-provider REST CSV is parsed, authenticated, and normalised to the canonical monthly-curve schema."
+
     cases = [
         ("Product registry and market timezones", "Configuration", check_product_registry),
         ("MWh ↔ MMBtu conversions", "Units & conversions", check_energy_conversion),
@@ -1432,6 +2197,13 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Filtered trade-book KPI reconciliation", "Interface integration", check_filtered_book_metrics),
         ("Physical/financial settlement validation", "Input validation", check_physical_settlement_validation),
         ("Distinct FORWARD and SWAP valuation methods", "Valuation", check_forward_and_swap_valuation_methods),
+        ("ENTSO-E XML and ZIP/GZIP parser including negative price", "Live data parser", check_entsoe_price_parser),
+        ("Licensed vendor curve field mapping", "Live data parser", check_provider_curve_normalisation),
+        ("Provider numeric format normalisation", "Live data parser", check_provider_numeric_parser),
+        ("GIE EU selector, credential header and data mapping", "Live API integration", check_gie_request_and_data_mapping),
+        ("ENTSOG JSON envelope normalisation", "Live API integration", check_entsog_envelope_normalisation),
+        ("Open-Meteo timezone and daily aggregation", "Live API integration", check_open_meteo_aggregation_and_timezone),
+        ("Licensed REST-provider CSV connector", "Live API integration", check_generic_provider_rest_csv),
     ]
     for name, area, fn in cases:
         run_case(name, area, fn)
@@ -1453,19 +2225,24 @@ if page == "Market Overview":
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Executed trades", f"{total_trades}")
     c2.metric("Products traded", f"{total_products}")
-    c3.metric("Illustrative MtM · EUR", money(eur_mtm, "EUR"))
-    c4.metric("Illustrative MtM · GBP", money(gbp_mtm, "GBP"))
+    c3.metric("Session MtM · EUR", money(eur_mtm, "EUR"))
+    c4.metric("Session MtM · GBP", money(gbp_mtm, "GBP"))
     c5.metric("Unmarked active trades", f"{unmarked_count}")
     if unmarked_count:
         st.warning(f"{unmarked_count} active trade(s) could not be marked. Review the trade-level diagnostic in Trading Book & MtM.")
-    st.caption("MtM is reported separately by quote currency. Values are based on illustrative curves and are not live valuations.")
+    imported_products = sorted(st.session_state.get("custom_curves", {}).keys())
+    fallback_products = sorted(set(PRODUCTS) - set(imported_products))
+    source_parts = []
+    if imported_products: source_parts.append("Imported marks: " + ", ".join(imported_products))
+    if fallback_products: source_parts.append("Illustrative fallback marks: " + ", ".join(fallback_products))
+    st.caption("MtM is reported separately by quote currency. " + "; ".join(source_parts) + ". Not an executable or accounting valuation.")
     left, right = st.columns([1.3, 1])
     with left:
         st.subheader("Forward curves")
         selected = st.selectbox("Product", list(PRODUCTS.keys()), key="overview_product")
         curve = curves[selected].copy()
         fig = px.line(curve, x="delivery_month", y="price", markers=True,
-                      title=f"{selected} — illustrative monthly curve",
+                      title=f"{selected} — {curve_source_label(selected).title()}",
                       labels={"delivery_month": "Delivery month", "price": PRODUCTS[selected]["unit"]})
         fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=370)
         st.plotly_chart(_styled(fig), use_container_width=True)
@@ -1479,7 +2256,7 @@ if page == "Market Overview":
         else:
             st.caption("No executed trades in the current book.")
     st.subheader("Desk watchlist")
-    watch = pd.DataFrame([{"Product": p, "Currency": s["currency"], "Quote unit": s["unit"], "Curve status": "Illustrative demo curve"} for p, s in PRODUCTS.items()])
+    watch = pd.DataFrame([{"Product": p, "Currency": spec["currency"], "Quote unit": spec["unit"], "Curve status": curve_source_label(p)} for p, spec in PRODUCTS.items()])
     st.dataframe(watch, use_container_width=True, hide_index=True)
 
 elif page == "Forward Curves":
@@ -1496,14 +2273,14 @@ elif page == "Forward Curves":
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=curve["delivery_month"], y=curve["price"], mode="lines+markers", name="Monthly forward", line=dict(color=AMBER, width=2)))
     fig.add_hline(y=float(curve["price"].mean()), line=dict(color=BLUE, dash="dot"), annotation_text="Curve average")
-    fig.update_layout(title=f"{selected} — monthly forward curve", xaxis_title="Delivery month", yaxis_title=PRODUCTS[selected]["unit"])
+    fig.update_layout(title=f"{selected} — {curve_source_label(selected).title()}", xaxis_title="Delivery month", yaxis_title=PRODUCTS[selected]["unit"])
     st.plotly_chart(_styled(fig, 440), use_container_width=True)
     st.subheader("Monthly delivery marks")
     display_curve = curve.copy()
     display_curve["delivery_month"] = display_curve["delivery_month"].dt.date
     st.dataframe(display_curve, use_container_width=True, hide_index=True)
     st.download_button("Download displayed curve (CSV)", data=display_curve.to_csv(index=False).encode("utf-8"), file_name=f"{selected.lower().replace(' ', '_')}_forward_curve.csv", mime="text/csv")
-    st.caption("Curve shape and average are descriptive only. These marks are not a bid, offer, exchange settlement, or executable quote.")
+    st.caption(f"Source status: {curve_source_label(selected)}. Confirm the provider, valuation timestamp, delivery definitions and unit before using imported marks. Curves are not executable quotes.")
 
 elif page == "OTC Quote Builder":
     title_block("OTC Quote Builder", "Build an indicative forward or swap quote from the selected delivery curve. No quote is executable.")
@@ -1540,7 +2317,7 @@ elif page == "OTC Quote Builder":
             st.session_state.last_quote = {"product": product, "instrument": instrument, "settlement_type": settlement_type, "profile": profile,
                 "start": start, "end": end, "mw": mw, "mwh": total_mwh, "side": side,
                 "reference": ref, "margin": margin, "quote": quoted, "counterparty": counterparty,
-                "currency": PRODUCTS[product]["currency"], "unit": PRODUCTS[product]["unit"]}
+                "currency": PRODUCTS[product]["currency"], "unit": PRODUCTS[product]["unit"], "curve_source": curve_source_label(product)}
         except Exception as exc:
             st.error(f"Quote could not be calculated: {exc}")
     q = st.session_state.get("last_quote")
@@ -1551,7 +2328,7 @@ elif page == "OTC Quote Builder":
         c2.metric("Indicative client price", f"{q['quote']:.4f} {q['unit']}")
         c3.metric("Delivery hours", f"{delivery_hours(q['start'], q['end'], q['profile'], PRODUCTS[q['product']]['timezone']):,}")
         c4.metric("Contract energy", f"{q['mwh']:,.0f} MWh")
-        st.write(f"**Counterparty:** {q['counterparty']}  ·  **Delivery:** {q['start']} to {q['end']} (end date exclusive)  ·  **Status:** Indicative only")
+        st.write(f"**Counterparty:** {q['counterparty']}  ·  **Delivery:** {q['start']} to {q['end']} (end date exclusive)  ·  **Curve source:** {q.get('curve_source', 'unverified')}  ·  **Status:** Indicative only")
         st.caption("Quote convention: sell-to-client = reference + margin; buy-from-client = reference − margin. This is a configurable illustrative convention, not a universal market convention.")
         if st.button("Add quote to blotter as PROPOSED"):
             new_id = f"Q-{pd.Timestamp.now().strftime('%y%m%d%H%M%S')}"
@@ -1803,25 +2580,303 @@ elif page == "Model Validation":
         st.error(f"The validation suite could not complete: {type(exc).__name__}: {exc}")
 
 
-elif page == "Market Fundamentals":
-    title_block("European Energy Fundamentals", "A place for market context: demand, generation, storage, flows and price spreads.")
-    st.warning("No live ENTSO-E, ENTSOG, GIE or exchange feed is connected. The charts below are explicitly synthetic demonstrations; do not use them as market analysis.")
-    product = st.selectbox("Illustrative price series", list(PRODUCTS.keys()))
-    curve = curves[product].copy()
-    curve["price_change_pct"] = curve["price"].pct_change() * 100
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=curve["delivery_month"], y=curve["price"], mode="lines+markers", name="Illustrative forward"))
-    fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, title=f"{product}: monthly forward curve", xaxis_title="Delivery month", yaxis_title=PRODUCTS[product]["unit"], height=400)
-    st.plotly_chart(_styled(fig), use_container_width=True)
-    st.subheader("Recommended real-data integrations")
-    st.markdown("""
-    - **ENTSO-E Transparency Platform:** power load, generation by type, cross-border flows and outages.
-    - **ENTSOG Transparency Platform:** gas flows, capacity and infrastructure information.
-    - **Gas Infrastructure Europe (AGSI/ALSI):** gas storage and LNG inventory information.
-    - **Exchange or licensed market-data provider:** tradable spot and forward prices, with appropriate licensing.
-    """)
-    st.caption("For a defensible fundamental view, join market data on timestamps, bidding zones and delivery periods; record publication time and source, and never mix currencies or units implicitly.")
+elif page == "Live Data Integrations":
+    title_block("Live Data Integrations", "Connect public transparency APIs and your licensed market-data source. API calls run only when you explicitly fetch data.")
+    st.caption("Credentials stay in this Streamlit session or your local Streamlit secrets/environment. Do not paste API keys into public repositories or chat messages.")
 
+    gie_default = _secret_or_env("GIE_API_KEY", "GIE_API_KEY")
+    entsoe_default = _secret_or_env("ENTSOE_API_TOKEN", "ENTSOE_API_TOKEN")
+    openmeteo_default = _secret_or_env("OPEN_METEO_API_KEY", "OPEN_METEO_API_KEY")
+    with st.expander("Credentials & access setup", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        gie_api_key = c1.text_input("GIE API key (AGSI+ / ALSI)", value=gie_default, type="password", key="live_gie_api_key", help="Register with GIE and confirm your key is entitled for the selected AGSI+ or ALSI dataset.")
+        entsoe_api_token = c2.text_input("ENTSO-E Web API token", value=entsoe_default, type="password", key="live_entsoe_token", help="Register on transparency.entsoe.eu and request RESTful API access by email.")
+        openmeteo_api_key = c3.text_input("Open-Meteo commercial API key (optional)", value=openmeteo_default, type="password", key="live_openmeteo_key", help="Leave blank to use the public evaluation endpoint. Follow provider licensing and attribution terms.")
+        st.markdown("**Access notes:** [GIE AGSI+](https://agsi.gie.eu/account) · [ENTSO-E Transparency Platform](https://transparency.entsoe.eu/) · [ENTSOG API manual](https://transparency.entsog.eu/api/archiveDirectories/8/api-manual/ENTSOG_TP_API_UserManual_v3.0.pdf) · [Open-Meteo API](https://open-meteo.com/en/docs) · [ICE Endex data](https://developer.ice.com/fixed-income-data-services/catalog/ice-endex)")
+        st.caption("GIE needs a registered API key with AGSI+/ALSI rights. ENTSO-E REST API access must be enabled for your account. ENTSOG is public. Open-Meteo's public API is restricted to non-commercial use; use a paid commercial plan for commercial deployment.")
+
+    tab_gie, tab_power, tab_gasflows, tab_weather, tab_forward = st.tabs([
+        "Gas Storage & LNG", "Power Market · ENTSO-E", "Gas Flows · ENTSOG", "Weather", "Licensed Forward Curves"
+    ])
+
+    with tab_gie:
+        st.subheader("GIE storage inventories and LNG terminal data")
+        st.write("AGSI+ provides European gas storage data; ALSI provides LNG terminal data. The Europe/EU selector returns the API's EU dataset group (not a guaranteed single pre-summed total). Figures are daily observations and can contain estimated or corrected operator submissions.")
+        with st.form("gie_live_fetch_form"):
+            g1, g2, g3 = st.columns(3)
+            gie_dataset = g1.selectbox("Dataset", ["AGSI — Gas storage", "ALSI — LNG terminals"], key="gie_dataset_choice")
+            gie_scope = g2.selectbox("Scope", ["Europe / EU datasets", "Selected country"], key="gie_scope_choice")
+            gie_country = g3.selectbox("Country", ["DE", "FR", "NL", "IT", "ES", "BE", "AT", "PL", "CZ", "DK", "GB"], key="gie_country_choice")
+            g1, g2 = st.columns(2)
+            gie_from = g1.date_input("From gas day", value=date.today() - timedelta(days=30), key="gie_from_date")
+            gie_to = g2.date_input("To gas day", value=date.today(), key="gie_to_date")
+            gie_submit = st.form_submit_button("Fetch GIE history", type="primary")
+        if gie_submit:
+            try:
+                dataset_code = "AGSI" if gie_dataset.startswith("AGSI") else "ALSI"
+                with st.spinner("Requesting GIE observations…"):
+                    frame = fetch_gie_history(dataset_code, gie_api_key, gie_scope, gie_from, gie_to, gie_country)
+                _stored_live_item(f"gie_{dataset_code.lower()}", gie_dataset, frame, {"scope": gie_scope, "country": gie_country})
+                st.success(f"Loaded {len(frame):,} GIE observation(s).")
+            except Exception as exc:
+                st.error(f"GIE request failed: {exc}")
+        gie_show_dataset = "gie_agsi" if gie_dataset.startswith("AGSI") else "gie_alsi"
+        gie_frame = _live_dataset_frame(gie_show_dataset)
+        if not gie_frame.empty:
+            st.caption(f"Last fetch: {st.session_state.live_data[gie_show_dataset]['fetched_at']} · Source: {st.session_state.live_data[gie_show_dataset]['label']}")
+            date_axis = "observation_date" if "observation_date" in gie_frame.columns else None
+            value_axis = next((c for c in (("gasInStorage", "gasinstorage", "workingGasVolume", "full") if gie_show_dataset == "gie_agsi" else ("inventory_gwh", "gasInStorage", "inventory", "sendOut", "sendout")) if c in gie_frame.columns), None)
+            color_axis = "name" if "name" in gie_frame.columns and gie_frame["name"].nunique() > 1 else None
+            if date_axis and value_axis:
+                chart = gie_frame.copy()
+                chart[date_axis] = pd.to_datetime(chart[date_axis], errors="coerce")
+                fig = px.line(chart, x=date_axis, y=value_axis, color=color_axis, markers=True, title=f"{gie_dataset} · {value_axis}")
+                fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=350)
+                st.plotly_chart(_styled(fig), use_container_width=True)
+            st.dataframe(gie_frame, use_container_width=True, hide_index=True)
+            st.download_button("Download GIE data (CSV)", gie_frame.to_csv(index=False).encode("utf-8"), file_name=f"{gie_show_dataset}.csv", mime="text/csv", key=f"download_{gie_show_dataset}")
+        else:
+            st.info("No GIE dataset has been fetched in this session yet.")
+
+    with tab_power:
+        st.subheader("ENTSO-E electricity transparency data")
+        st.write("Fetch day-ahead prices, actual total load, actual generation by production type, or cross-border physical flows. Day-ahead prices are kept separate from forward curves and are not used to mark monthly OTC positions.")
+        with st.form("entsoe_live_fetch_form"):
+            e1, e2, e3 = st.columns(3)
+            entsoe_kind = e1.selectbox("Dataset", ["Day-ahead price", "Actual load", "Actual generation by type", "Physical flow"], key="entsoe_kind_choice")
+            entsoe_zone = e2.selectbox("Bidding zone", list(ENTSOE_ZONES.keys()), index=list(ENTSOE_ZONES.keys()).index("France"), key="entsoe_zone_choice")
+            entsoe_source = e3.selectbox("Flow source zone", list(ENTSOE_ZONES.keys()), index=list(ENTSOE_ZONES.keys()).index("France"), key="entsoe_flow_source")
+            e1, e2, e3 = st.columns(3)
+            entsoe_target = e1.selectbox("Flow destination zone", list(ENTSOE_ZONES.keys()), index=list(ENTSOE_ZONES.keys()).index("Germany-Luxembourg"), key="entsoe_flow_target")
+            entsoe_from = e2.date_input("Delivery start date", value=date.today() - timedelta(days=7), key="entsoe_start_date")
+            entsoe_to = e3.date_input("Delivery end date (exclusive)", value=date.today(), key="entsoe_end_date")
+            entsoe_submit = st.form_submit_button("Fetch ENTSO-E series", type="primary")
+        if entsoe_submit:
+            try:
+                selected_zone = entsoe_source if entsoe_kind == "Physical flow" else entsoe_zone
+                with st.spinner("Requesting ENTSO-E time series…"):
+                    frame = fetch_entsoe_series(entsoe_api_token, entsoe_kind, selected_zone, entsoe_from, entsoe_to,
+                                                source_zone=entsoe_source, target_zone=entsoe_target)
+                key = {"Day-ahead price": "entsoe_price", "Actual load": "entsoe_load", "Actual generation by type": "entsoe_generation", "Physical flow": "entsoe_flow"}[entsoe_kind]
+                _stored_live_item(key, entsoe_kind, frame, {"zone": selected_zone, "source_zone": entsoe_source, "target_zone": entsoe_target})
+                st.success(f"Loaded {len(frame):,} ENTSO-E observations.")
+            except Exception as exc:
+                st.error(f"ENTSO-E request failed: {exc}")
+        entsoe_data_key = {"Day-ahead price": "entsoe_price", "Actual load": "entsoe_load", "Actual generation by type": "entsoe_generation", "Physical flow": "entsoe_flow"}[entsoe_kind]
+        entsoe_frame = _live_dataset_frame(entsoe_data_key)
+        if not entsoe_frame.empty:
+            st.caption(f"Last fetch: {st.session_state.live_data[entsoe_data_key]['fetched_at']} · Data unit: {entsoe_frame['unit'].iloc[0] if 'unit' in entsoe_frame.columns else 'provider-defined'}")
+            entsoe_display = entsoe_frame.copy()
+            entsoe_display["timestamp"] = pd.to_datetime(entsoe_display["timestamp"], errors="coerce", utc=True)
+            fig = px.line(entsoe_display, x="timestamp", y="value", color="series" if entsoe_display["series"].nunique() > 1 else None,
+                          markers=False, title=str(st.session_state.live_data[entsoe_data_key]["label"]))
+            fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=350, xaxis_title="Delivery timestamp (UTC)", yaxis_title=str(entsoe_display["unit"].iloc[0]))
+            st.plotly_chart(_styled(fig), use_container_width=True)
+            st.dataframe(entsoe_display, use_container_width=True, hide_index=True)
+            st.download_button("Download ENTSO-E data (CSV)", entsoe_display.to_csv(index=False).encode("utf-8"), file_name=f"{entsoe_data_key}.csv", mime="text/csv", key=f"download_{entsoe_data_key}")
+        else:
+            st.info("No ENTSO-E series of this type has been fetched in this session yet.")
+
+    with tab_gasflows:
+        st.subheader("ENTSOG pipeline / interconnection flow data")
+        st.write("ENTSOG uses exact, case-sensitive point-direction identifiers and indicator names. Search the published point-direction catalogue, then request one point for a bounded period.")
+        c1, c2 = st.columns([1, 2])
+        if c1.button("Load point-direction catalogue", key="entsog_load_catalogue"):
+            try:
+                with st.spinner("Loading published point directions…"):
+                    catalogue = fetch_entsog_point_catalogue(limit=1000)
+                st.session_state.entsog_point_catalogue = catalogue
+                st.success(f"Loaded {len(catalogue):,} catalogue records.")
+            except Exception as exc:
+                st.error(f"ENTSOG catalogue request failed: {exc}")
+        catalogue = st.session_state.get("entsog_point_catalogue", pd.DataFrame())
+        keyword = c2.text_input("Filter catalogue rows", placeholder="e.g. France, Germany, Fluxys, Zeebrugge", key="entsog_catalogue_search")
+        if isinstance(catalogue, pd.DataFrame) and not catalogue.empty:
+            shown = catalogue
+            if keyword.strip():
+                mask = shown.astype(str).apply(lambda col: col.str.contains(keyword.strip(), case=False, na=False)).any(axis=1)
+                shown = shown.loc[mask]
+            st.dataframe(shown.head(100), use_container_width=True, hide_index=True)
+        direction_col = next((c for c in catalogue.columns if "".join(ch for ch in c.casefold() if ch.isalnum()) == "pointdirection"), None) if isinstance(catalogue, pd.DataFrame) else None
+        direction_options = catalogue[direction_col].dropna().astype(str).unique().tolist() if direction_col and not catalogue.empty else []
+        selected_direction = st.selectbox("Point direction from catalogue", [""] + direction_options, key="entsog_direction_selected") if direction_options else ""
+        with st.form("entsog_flow_fetch_form"):
+            manual_direction = st.text_input("Or paste pointDirection identifier", value=selected_direction, key="entsog_manual_direction", help="Use the exact pointDirection value from the ENTSOG operatorPointDirections catalogue; where needed, it is operatorKey + pointKey + directionKey.")
+            f1, f2, f3 = st.columns(3)
+            entsog_indicator = f1.selectbox("Indicator", ["Physical Flow", "Nomination", "Allocation"], key="entsog_indicator_choice")
+            entsog_from = f2.date_input("From", value=date.today() - timedelta(days=30), key="entsog_from_date")
+            entsog_to = f3.date_input("To (inclusive)", value=date.today() - timedelta(days=1), key="entsog_to_date")
+            entsog_submit = st.form_submit_button("Fetch ENTSOG data", type="primary")
+        if entsog_submit:
+            try:
+                with st.spinner("Requesting ENTSOG observations…"):
+                    frame = fetch_entsog_flow(manual_direction, entsog_from, entsog_to, entsog_indicator)
+                _stored_live_item("entsog_flow", f"ENTSOG {entsog_indicator}", frame, {"point_direction": manual_direction, "indicator": entsog_indicator})
+                st.success(f"Loaded {len(frame):,} ENTSOG observations.")
+            except Exception as exc:
+                st.error(f"ENTSOG request failed: {exc}")
+        entsog_frame = _live_dataset_frame("entsog_flow")
+        if not entsog_frame.empty:
+            st.caption(f"Last fetch: {st.session_state.live_data['entsog_flow']['fetched_at']} · Units are supplied by ENTSOG; confirm the unit before interpreting volumes.")
+            if "timestamp" in entsog_frame and "value_numeric" in entsog_frame:
+                chart = entsog_frame.dropna(subset=["timestamp", "value_numeric"]).copy()
+                if not chart.empty:
+                    fig = px.line(chart, x="timestamp", y="value_numeric", markers=True, title="ENTSOG daily flow / indicator")
+                    fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=350)
+                    st.plotly_chart(_styled(fig), use_container_width=True)
+            st.dataframe(entsog_frame, use_container_width=True, hide_index=True)
+            st.download_button("Download ENTSOG data (CSV)", entsog_frame.to_csv(index=False).encode("utf-8"), file_name="entsog_flows.csv", mime="text/csv", key="download_entsog_flow")
+        st.markdown("[Open the ENTSOG Transparency Platform](https://transparency.entsog.eu/) for the official catalogue and point details.")
+
+    with tab_weather:
+        st.subheader("Weather-driven demand and renewable proxies")
+        st.write("Open-Meteo provides hourly temperature, wind speed and solar radiation. These are contextual proxies—not forecasts of power prices or exact system demand.")
+        with st.form("open_meteo_live_fetch_form"):
+            w1, w2, w3 = st.columns(3)
+            weather_location = w1.selectbox("Reference location", list(WEATHER_LOCATIONS.keys()), key="weather_location_choice")
+            weather_past = w2.selectbox("Past days", [0, 1, 3, 5, 7], index=2, key="weather_past_days")
+            weather_forecast = w3.selectbox("Forecast days", [3, 5, 7, 10, 14, 16], index=2, key="weather_forecast_days")
+            weather_commercial = st.checkbox("Use Open-Meteo commercial endpoint", value=False, key="weather_commercial_endpoint")
+            weather_submit = st.form_submit_button("Fetch weather data", type="primary")
+        if weather_submit:
+            try:
+                loc = WEATHER_LOCATIONS[weather_location]
+                with st.spinner("Requesting weather data…"):
+                    hourly, daily = fetch_open_meteo(loc["latitude"], loc["longitude"], loc["timezone"], weather_past,
+                                                    weather_forecast, openmeteo_api_key, weather_commercial)
+                _stored_live_item("weather_hourly", f"Open-Meteo hourly · {weather_location}", hourly, {"location": weather_location})
+                _stored_live_item("weather_daily", f"Open-Meteo daily · {weather_location}", daily, {"location": weather_location})
+                st.success(f"Loaded {len(hourly):,} hourly and {len(daily):,} daily weather observations.")
+            except Exception as exc:
+                st.error(f"Open-Meteo request failed: {exc}")
+        weather_daily = _live_dataset_frame("weather_daily")
+        if not weather_daily.empty:
+            st.caption(f"Last fetch: {st.session_state.live_data['weather_daily']['fetched_at']} · Attribution: Open-Meteo / CC BY 4.0; check applicable usage terms.")
+            if "temperature_mean_c" in weather_daily.columns:
+                fig = px.line(weather_daily, x="date", y="temperature_mean_c", markers=True, title="Daily mean temperature")
+                fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=330, yaxis_title="°C")
+                st.plotly_chart(_styled(fig), use_container_width=True)
+            st.dataframe(weather_daily, use_container_width=True, hide_index=True)
+            hourly_weather = _live_dataset_frame("weather_hourly")
+            st.download_button("Download hourly weather (CSV)", hourly_weather.to_csv(index=False).encode("utf-8"), file_name="open_meteo_hourly.csv", mime="text/csv", key="download_weather_hourly")
+        else:
+            st.info("No weather series has been fetched in this session yet. The public endpoint does not require an API key for evaluation.")
+
+    with tab_forward:
+        st.subheader("Licensed ICE Endex / EEX or other vendor forward curves")
+        st.warning("ICE/EEX futures data is licensed. This adapter does not bypass exchange entitlements; use the endpoint and credentials supplied by your data agreement, or upload a permitted export.")
+        st.markdown("Supported input schema after mapping: one row per contract month with a parseable delivery date and price. The selected product sets the canonical currency/unit; no hidden FX or unit conversion is performed.")
+        st.subheader("Option A — Fetch from your licensed REST endpoint")
+        p1, p2 = st.columns([2, 1])
+        provider_url = p1.text_input("Licensed provider HTTPS endpoint", placeholder="https://your-provider.example/api/forward-curves", key="provider_curve_url")
+        provider_auth = p2.selectbox("Authentication", ["Bearer token", "API-key header", "No authentication"], key="provider_auth_mode")
+        p1, p2, p3 = st.columns(3)
+        provider_token = p1.text_input("Provider token / key", type="password", key="provider_curve_token")
+        provider_header = p2.text_input("Auth header name", value="Authorization" if provider_auth == "Bearer token" else "X-API-Key", key="provider_auth_header")
+        provider_format = p3.selectbox("Response format", ["Auto", "JSON", "CSV"], key="provider_response_format")
+        provider_query_json = st.text_area("Provider query parameters (JSON object, optional)", value="{}", height=70, key="provider_query_parameters", help="Use only the parameter names and values specified by your market-data vendor. Keep credentials in the authentication field/header where possible.")
+        if st.button("Fetch licensed provider table", type="primary", key="fetch_provider_curve_button"):
+            try:
+                query_parameters = json.loads(provider_query_json or "{}")
+                if not isinstance(query_parameters, dict):
+                    raise ValueError("Provider query parameters must be a JSON object.")
+                with st.spinner("Requesting licensed provider data…"):
+                    raw_table = fetch_provider_table(provider_url, provider_token, provider_auth, provider_header, provider_format, query_parameters)
+                st.session_state.provider_curve_raw_table = raw_table
+                st.success(f"Received {len(raw_table):,} row(s) and {len(raw_table.columns):,} column(s) from the configured provider endpoint.")
+            except Exception as exc:
+                st.error(f"Provider request failed: {exc}")
+        st.subheader("Option B — Upload an authorised vendor export")
+        provider_upload = st.file_uploader("Upload provider CSV or JSON", type=["csv", "json"], key="provider_curve_upload")
+        if provider_upload is not None:
+            try:
+                if provider_upload.name.lower().endswith(".csv"):
+                    st.session_state.provider_curve_raw_table = pd.read_csv(provider_upload)
+                else:
+                    payload = json.loads(provider_upload.getvalue().decode("utf-8-sig"))
+                    rows = _payload_rows(payload)
+                    st.session_state.provider_curve_raw_table = _flatten_records(rows) if rows else pd.json_normalize(payload)
+            except Exception as exc:
+                st.error(f"Provider file could not be read: {exc}")
+        raw_table = st.session_state.get("provider_curve_raw_table", pd.DataFrame())
+        if isinstance(raw_table, pd.DataFrame) and not raw_table.empty:
+            st.caption("Raw provider response. Confirm contract mapping and delivery units before applying this curve.")
+            st.dataframe(raw_table.head(100), use_container_width=True, hide_index=True)
+            columns = [c for c in raw_table.columns if not str(c).startswith("_")]
+            date_guess = next((c for c in columns if any(t in str(c).lower() for t in ("delivery_month", "deliverydate", "delivery_date", "maturity", "tenor_date", "contract_date", "month"))), columns[0])
+            price_guess = next((c for c in columns if any(t in str(c).lower() for t in ("settlement", "settle", "price", "close", "last"))), columns[-1])
+            m1, m2, m3 = st.columns(3)
+            mapped_product = m1.selectbox("Canonical product to update", list(PRODUCTS.keys()), key="provider_curve_product")
+            mapped_date_col = m2.selectbox("Delivery date column", columns, index=columns.index(date_guess) if date_guess in columns else 0, key="provider_curve_date_col")
+            mapped_price_col = m3.selectbox("Price column", columns, index=columns.index(price_guess) if price_guess in columns else len(columns)-1, key="provider_curve_price_col")
+            if st.button("Validate and apply monthly forward curve", key="apply_provider_curve_button"):
+                try:
+                    candidate_curve = normalise_provider_curve(raw_table, mapped_product, mapped_date_col, mapped_price_col)
+                    st.session_state.custom_curves[mapped_product] = candidate_curve
+                    st.success(f"Applied {len(candidate_curve):,} validated monthly marks to {mapped_product} for this session. Revaluation uses these marks; save an authorised export separately if you need persistence.")
+                    st.dataframe(candidate_curve, use_container_width=True, hide_index=True)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Curve rejected: {exc}")
+        else:
+            st.info("No licensed provider table loaded yet. Use the endpoint connector or upload a permitted CSV/JSON export.")
+        st.caption("Provider APIs have vendor-specific URLs, response schemas, authentication and redistribution terms. If your licence uses a different authentication method or schema, adapt the connector to that official specification; do not paste vendor secrets into source code.")
+
+elif page == "Market Fundamentals":
+    title_block("European Energy Fundamentals", "Real storage, gas-flow, power and weather datasets fetched from provider APIs in this session.")
+    data_items = st.session_state.get("live_data", {})
+    if not data_items:
+        st.info("No external dataset has been fetched yet. Open Live Data Integrations to connect GIE, ENTSO-E, ENTSOG and Open-Meteo.")
+    else:
+        status_rows = []
+        for key, item in data_items.items():
+            frame = item.get("data") if isinstance(item, dict) else None
+            status_rows.append({
+                "Dataset": item.get("label", key),
+                "Rows": len(frame) if isinstance(frame, pd.DataFrame) else 0,
+                "Last fetched (UTC)": item.get("fetched_at", ""),
+                "Source": (frame["_source"].iloc[0] if isinstance(frame, pd.DataFrame) and not frame.empty and "_source" in frame.columns else item.get("label", key)),
+            })
+        st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
+        live_tabs = st.tabs(["Gas storage", "LNG", "Power", "Gas flows", "Weather"])
+        with live_tabs[0]:
+            data = _live_dataset_frame("gie_agsi")
+            if not data.empty:
+                y = next((c for c in ("full", "gasInStorage", "workingGasVolume") if c in data.columns), None)
+                date_x = "observation_date" if "observation_date" in data.columns else None
+                _display_live_frame(data, "GIE AGSI+ storage history", date_x, y, "name" if "name" in data.columns and data["name"].nunique() > 1 else None)
+            else: st.info("Fetch AGSI+ in Live Data Integrations.")
+        with live_tabs[1]:
+            data = _live_dataset_frame("gie_alsi")
+            if not data.empty:
+                y = next((c for c in ("inventory_gwh", "inventory_gwh_gwh", "sendOut", "sendout") if c in data.columns), None)
+                _display_live_frame(data, "GIE ALSI+ LNG terminals", "observation_date" if "observation_date" in data.columns else None, y,
+                                    "name" if "name" in data.columns and data["name"].nunique() > 1 else None)
+            else: st.info("Fetch ALSI+ in Live Data Integrations.")
+        with live_tabs[2]:
+            data = _live_dataset_frame("entsoe_price")
+            if data.empty: data = _live_dataset_frame("entsoe_load")
+            if data.empty: data = _live_dataset_frame("entsoe_generation")
+            if data.empty: data = _live_dataset_frame("entsoe_flow")
+            if not data.empty:
+                _display_live_frame(data, "ENTSO-E time series", "timestamp" if "timestamp" in data.columns else None,
+                                    "value" if "value" in data.columns else None, "series" if "series" in data.columns and data["series"].nunique() > 1 else None)
+            else: st.info("Fetch an ENTSO-E series in Live Data Integrations.")
+        with live_tabs[3]:
+            data = _live_dataset_frame("entsog_flow")
+            if not data.empty:
+                _display_live_frame(data, "ENTSOG flow history", "timestamp" if "timestamp" in data.columns else None,
+                                    "value_numeric" if "value_numeric" in data.columns else None)
+            else: st.info("Fetch ENTSOG point data in Live Data Integrations.")
+        with live_tabs[4]:
+            data = _live_dataset_frame("weather_daily")
+            if not data.empty:
+                y = next((c for c in ("temperature_mean_c", "wind_speed_mean_kmh", "solar_radiation_mean_wm2") if c in data.columns), None)
+                _display_live_frame(data, "Open-Meteo daily weather proxies", "date" if "date" in data.columns else None, y)
+            else: st.info("Fetch Open-Meteo weather in Live Data Integrations.")
+    st.markdown("### How to interpret the feeds")
+    st.markdown("- **GIE AGSI+/ALSI:** storage and LNG inventory context, not directly tradable prices.\n- **ENTSO-E:** day-ahead electricity price, load, generation and interconnector-flow observations. These do not replace forward curves.\n- **ENTSOG:** point-level gas transport indicators. Always confirm point direction and physical units.\n- **Open-Meteo:** weather covariates for demand and renewable analysis; not a deterministic price forecast.\n- **ICE Endex/EEX:** licensed futures settlements/curves are required to make the OTC book's forward MtM market-referenced.")
+    st.caption("API values are shown with the provider timestamps and units where supplied. Provider publication delays, corrections, data access rights and licensing still apply.")
 elif page == "Data & Assumptions":
     title_block("Data, Conventions & Validation", "Explicit assumptions and import validation are part of the risk controls, not an afterthought.")
     st.subheader("Product registry")
