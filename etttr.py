@@ -936,12 +936,14 @@ def title_block(title: str, subtitle: str) -> None:
 # -----------------------------------------------------------------------------
 # Live market-data integrations (public APIs + licensed market-data adapter)
 # -----------------------------------------------------------------------------
-# Credentials are intentionally not hard-coded. Supply them in Streamlit secrets,
-# environment variables, or password inputs in the Live Data Integrations page.
+# AGSI+ credential was explicitly supplied by the user for this local copy.
+# Keep this file private: the key is embedded as a convenience for local use.
+# Prefer environment variables / Streamlit secrets for shared or deployed copies.
 # API calls are made only when the user clicks a Fetch/Refresh button.
 
 HTTP_TIMEOUT_SECONDS = 25
 MAX_API_RESPONSE_BYTES = 20 * 1024 * 1024
+GIE_AGSI_API_KEY_DEFAULT = "76556429239ab949472fb6f5714c9017"
 GIE_AGSI_BASE = "https://agsi.gie.eu/api"
 GIE_ALSI_BASE = "https://alsi.gie.eu/api"
 ENTSOE_BASE = "https://web-api.tp.entsoe.eu/api"
@@ -3031,14 +3033,16 @@ elif page == "Model Validation":
 
 elif page == "Live Data Integrations":
     title_block("Live Data Integrations", "Connect public transparency APIs and your licensed market-data source. API calls run only when you explicitly fetch data.")
-    st.caption("Credentials stay in this Streamlit session or your local Streamlit secrets/environment. Do not paste API keys into public repositories or chat messages.")
+    st.caption("Your AGSI+ key is preconfigured in this local source file. Keep the file private; for shared/deployed copies use Streamlit secrets or environment variables. The same GIE field is used for ALSI only if your key is entitled for that dataset. Do not commit credentials to a public repository.")
 
-    gie_default = _secret_or_env("GIE_API_KEY", "GIE_API_KEY")
+    # Streamlit secrets/environment override the locally embedded AGSI+ default.
+    # This means the supplied AGSI+ key is available without manual re-entry in this file.
+    gie_default = _secret_or_env("GIE_API_KEY", "GIE_API_KEY") or GIE_AGSI_API_KEY_DEFAULT
     entsoe_default = _secret_or_env("ENTSOE_API_TOKEN", "ENTSOE_API_TOKEN")
     openmeteo_default = _secret_or_env("OPEN_METEO_API_KEY", "OPEN_METEO_API_KEY")
     with st.expander("Credentials & access setup", expanded=True):
         c1, c2, c3 = st.columns(3)
-        gie_api_key = c1.text_input("GIE API key (AGSI+ / ALSI)", value=gie_default, type="password", key="live_gie_api_key", help="Register with GIE and confirm your key is entitled for the selected AGSI+ or ALSI dataset.")
+        gie_api_key = c1.text_input("GIE API key (AGSI+ / ALSI)", value=gie_default, type="password", key="live_gie_api_key", help="The AGSI+ key you supplied is prefilled automatically. ALSI requests require your key to be entitled for that dataset.")
         entsoe_api_token = c2.text_input("ENTSO-E Web API token", value=entsoe_default, type="password", key="live_entsoe_token", help="Register on transparency.entsoe.eu and request RESTful API access by email.")
         openmeteo_api_key = c3.text_input("Open-Meteo commercial API key (optional)", value=openmeteo_default, type="password", key="live_openmeteo_key", help="Leave blank to use the public evaluation endpoint. Follow provider licensing and attribution terms.")
         st.markdown("**API access:** [AGSI+ API](https://agsi.gie.eu/#/api) · [ALSI API](https://alsi.gie.eu/#/api) · [ENTSO-E Transparency Platform](https://transparency.entsoe.eu/) · [ENTSOG API manual](https://transparency.entsog.eu/api/archiveDirectories/8/api-manual/ENTSOG_TP_API_UserManual_v3.0.pdf) · [Open-Meteo API](https://open-meteo.com/en/docs) · [ICE Endex data](https://developer.ice.com/fixed-income-data-services/catalog/ice-endex)")
