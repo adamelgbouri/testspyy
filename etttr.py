@@ -1,6 +1,6 @@
 """MERIDIAN Energy Desk — European energy trading and risk management prototype.
 
-Run with: streamlit run meridian_energy_desk_live.py
+Run with: streamlit run meridian_energy_desk_weather_gie_ready.py
 
 IMPORTANT: Built-in curves and trades are synthetic demo data, not live market quotes.
 This is an educational prototype, not a production ETRM or valuation system.
@@ -8,6 +8,7 @@ This is an educational prototype, not a production ETRM or valuation system.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, time, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
 import math
 import io
@@ -1430,7 +1431,9 @@ def fetch_open_meteo(latitude: float, longitude: float, timezone_name: str,
     endpoint = OPEN_METEO_CUSTOMER_BASE if commercial_endpoint else OPEN_METEO_FORECAST_BASE
     params = {
         "latitude": latitude, "longitude": longitude,
-        "hourly": "temperature_2m,wind_speed_10m,shortwave_radiation",
+        # 100 m wind is a more relevant wind-generation proxy than 10 m wind,
+        # but neither variable is a generation forecast without turbine/power-curve data.
+        "hourly": "temperature_2m,wind_speed_10m,wind_speed_100m,shortwave_radiation,precipitation,cloud_cover",
         "past_days": int(past_days), "forecast_days": int(forecast_days),
         "timezone": timezone_name, "timeformat": "unixtime",
     }
@@ -1459,22 +1462,169 @@ def fetch_open_meteo(latitude: float, longitude: float, timezone_name: str,
                 hourly["timestamp"] = hourly["timestamp"].dt.tz_localize(timezone_name, ambiguous="NaT", nonexistent="shift_forward")
     hourly["date"] = hourly["timestamp"].dt.date
     hourly["timezone"] = timezone_name
-    for col in ("temperature_2m", "wind_speed_10m", "shortwave_radiation"):
+    numeric_weather_columns = (
+        "temperature_2m", "wind_speed_10m", "wind_speed_100m",
+        "shortwave_radiation", "precipitation", "cloud_cover",
+    )
+    for col in numeric_weather_columns:
         if col in hourly:
             hourly[col] = pd.to_numeric(hourly[col], errors="coerce")
-    agg = {c: "mean" for c in ("temperature_2m", "wind_speed_10m", "shortwave_radiation") if c in hourly.columns}
+
+    # Average weather variables by local calendar day; precipitation is accumulated.
+    mean_cols = [c for c in numeric_weather_columns if c in hourly.columns and c != "precipitation"]
+    agg = {c: "mean" for c in mean_cols}
+    if "precipitation" in hourly.columns:
+        agg["precipitation"] = "sum"
     daily = hourly.groupby("date", as_index=False).agg(agg) if agg else pd.DataFrame()
     if not daily.empty:
-        if "temperature_2m" in daily: daily = daily.rename(columns={"temperature_2m": "temperature_mean_c"})
-        if "wind_speed_10m" in daily: daily = daily.rename(columns={"wind_speed_10m": "wind_speed_mean_kmh"})
-        if "shortwave_radiation" in daily: daily = daily.rename(columns={"shortwave_radiation": "solar_radiation_mean_wm2"})
+        daily = daily.rename(columns={
+            "temperature_2m": "temperature_mean_c",
+            "wind_speed_10m": "wind_speed_mean_kmh",
+            "wind_speed_100m": "wind_speed_100m_mean_kmh",
+            "shortwave_radiation": "solar_radiation_mean_wm2",
+            "precipitation": "precipitation_sum_mm",
+            "cloud_cover": "cloud_cover_mean_pct",
+        })
         daily["date"] = pd.to_datetime(daily["date"])
         daily["timezone"] = timezone_name
+        if "shortwave_radiation" in hourly.columns:
+            solar_sum = hourly.groupby("date", as_index=False)["shortwave_radiation"].sum(min_count=1)
+            solar_sum = solar_sum.rename(columns={"shortwave_radiation": "solar_irradiation_sum_whm2"})
+            solar_sum["date"] = pd.to_datetime(solar_sum["date"], errors="coerce")
+            daily = daily.merge(solar_sum, on="date", how="left")
+        hours_per_day = hourly.groupby("date").size()
+        daily["hours_covered"] = daily["date"].dt.date.map(hours_per_day).fillna(0).astype(int)
+        local_today = datetime.now(ZoneInfo(timezone_name)).date()
+        daily["local_today"] = pd.Timestamp(local_today)
+        daily["forecast_period"] = daily["date"].dt.date.map(
+            lambda d: "Historical / recent" if d < local_today else ("Today (may be partial)" if d == local_today else "Forecast")
+        )
+        # Simple degree-day proxies (not official national demand indices): use daily mean temperature.
+        if "temperature_mean_c" in daily.columns:
+            daily["heating_degree_day_proxy_18c"] = (18.0 - daily["temperature_mean_c"]).clip(lower=0)
+            daily["cooling_degree_day_proxy_22c"] = (daily["temperature_mean_c"] - 22.0).clip(lower=0)
     hourly["_source"] = "Open-Meteo"
     hourly["_fetched_at_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     if not daily.empty:
         daily["_source"] = "Open-Meteo"
     return hourly, daily
+
+
+def fetch_open_meteo_market_pack(
+    location_names: Sequence[str], past_days: int = 3, forecast_days: int = 10,
+    api_key: str = "", commercial_endpoint: bool = False, _fetch_fn=None,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Fetch a selected set of representative European energy-market weather locations.
+
+    Requests are made only when invoked by a user action. Individual location failures are
+    returned as warnings so one unavailable endpoint does not discard successful locations.
+    The location set is a commercial-context proxy, not a population- or load-weighted forecast.
+    """
+    selected = list(dict.fromkeys(str(name) for name in location_names))
+    unknown = [name for name in selected if name not in WEATHER_LOCATIONS]
+    if unknown:
+        raise ValueError(f"Unknown weather location(s): {unknown}")
+    if not selected:
+        raise ValueError("Select at least one energy-market weather location.")
+
+    def fetch_one(name: str):
+        loc = WEATHER_LOCATIONS[name]
+        if _fetch_fn is not None:
+            hourly_frame, daily_frame = _fetch_fn(name, loc, past_days, forecast_days, api_key, commercial_endpoint)
+        else:
+            hourly_frame, daily_frame = fetch_open_meteo(
+                loc["latitude"], loc["longitude"], loc["timezone"],
+                past_days=past_days, forecast_days=forecast_days,
+                api_key=api_key, commercial_endpoint=commercial_endpoint,
+            )
+        hourly_frame = hourly_frame.copy()
+        daily_frame = daily_frame.copy()
+        for frame in (hourly_frame, daily_frame):
+            if not frame.empty:
+                frame["location"] = name
+                frame["market_area"] = name.split(" / ", 1)[-1].replace(" proxy", "")
+                frame["latitude"] = float(loc["latitude"])
+                frame["longitude"] = float(loc["longitude"])
+                frame["timezone"] = loc["timezone"]
+        return name, hourly_frame, daily_frame
+
+    hourly_results, daily_results, failures = {}, {}, []
+    # Concurrent I/O keeps a six-zone refresh responsive; the user still controls refresh cadence.
+    with ThreadPoolExecutor(max_workers=min(4, len(selected))) as executor:
+        future_map = {executor.submit(fetch_one, name): name for name in selected}
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                _, hourly_frame, daily_frame = future.result()
+                if not hourly_frame.empty:
+                    hourly_results[name] = hourly_frame
+                if not daily_frame.empty:
+                    daily_results[name] = daily_frame
+            except Exception as exc:
+                failures.append(f"{name}: {type(exc).__name__}: {exc}")
+
+    # Preserve user-selected ordering in charts and tables, not network completion order.
+    hourly = pd.concat([hourly_results[name] for name in selected if name in hourly_results], ignore_index=True) if hourly_results else pd.DataFrame()
+    daily = pd.concat([daily_results[name] for name in selected if name in daily_results], ignore_index=True) if daily_results else pd.DataFrame()
+    if not daily.empty:
+        daily["date"] = pd.to_datetime(daily["date"], errors="coerce")
+        daily = daily.sort_values(["location", "date"]).reset_index(drop=True)
+    if not hourly.empty:
+        hourly["timestamp"] = pd.to_datetime(hourly["timestamp"], errors="coerce")
+        hourly = hourly.sort_values(["location", "timestamp"]).reset_index(drop=True)
+    return hourly, daily, failures
+
+
+def weather_forecast_summary(daily: pd.DataFrame, horizon_days: int = 7,
+                             fallback_location: str = "Selected location") -> pd.DataFrame:
+    """Summarise upcoming future local forecast dates by reference location."""
+    if daily is None or daily.empty or "date" not in daily.columns:
+        return pd.DataFrame()
+    if int(horizon_days) < 1 or int(horizon_days) > 14:
+        raise ValueError("Weather summary horizon must be between 1 and 14 days.")
+    data = daily.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.date
+    if "location" not in data.columns:
+        data["location"] = fallback_location
+    out_rows = []
+    numeric_cols = [
+        "temperature_mean_c", "heating_degree_day_proxy_18c", "cooling_degree_day_proxy_22c",
+        "wind_speed_100m_mean_kmh", "wind_speed_mean_kmh", "solar_radiation_mean_wm2",
+    ]
+    for location, group in data.groupby("location", dropna=False, sort=False):
+        group = group.dropna(subset=["date"]).copy()
+        if group.empty:
+            continue
+        if "local_today" in group.columns and group["local_today"].notna().any():
+            today = pd.to_datetime(group["local_today"].dropna().iloc[0], errors="coerce").date()
+        else:
+            tz_name = str(group["timezone"].dropna().iloc[0]) if "timezone" in group.columns and group["timezone"].notna().any() else "Europe/Paris"
+            try:
+                today = datetime.now(ZoneInfo(tz_name)).date()
+            except Exception:
+                today = date.today()
+        future = group.loc[(group["date"] > today) & (group["date"] <= today + timedelta(days=int(horizon_days)))].copy()
+        row = {"Location": str(location), "Forecast days": int(future["date"].nunique()),
+               "Forecast start": min(future["date"]).isoformat() if not future.empty else "—",
+               "Forecast end": max(future["date"]).isoformat() if not future.empty else "—"}
+        aliases = {
+            "temperature_mean_c": "Mean temperature (°C)",
+            "heating_degree_day_proxy_18c": "Heating degree-day proxy (base 18°C)",
+            "cooling_degree_day_proxy_22c": "Cooling degree-day proxy (base 22°C)",
+            "wind_speed_100m_mean_kmh": "Mean wind at 100 m (km/h)",
+            "wind_speed_mean_kmh": "Mean wind at 10 m (km/h)",
+            "solar_radiation_mean_wm2": "Mean solar radiation (W/m²)",
+            "solar_irradiation_sum_whm2": "Daily solar irradiation (Wh/m²)",
+        }
+        for col, label in aliases.items():
+            if col in future.columns:
+                values = pd.to_numeric(future[col], errors="coerce")
+                row[label] = float(values.sum()) if col.startswith(("heating_degree_day", "cooling_degree_day", "solar_irradiation_sum")) else (float(values.mean()) if values.notna().any() else float("nan"))
+            else:
+                row[label] = float("nan")
+        row["Interpretation"] = "Weather proxy only; not a national weighted index or price forecast."
+        out_rows.append(row)
+    return pd.DataFrame(out_rows)
 
 
 def fetch_provider_table(url: str, api_key: str = "", auth_mode: str = "Bearer token",
@@ -1862,18 +2012,32 @@ def build_live_snapshot() -> dict[str, dict]:
 
     weather = _live_dataset_frame("weather_daily")
     if not weather.empty:
-        row = _latest_row(weather, ("date", "timestamp"))
+        weather_for_snapshot = weather.copy()
+        # Prefer a current-day row when the dataset contains both recent days and forecasts;
+        # choosing the maximum date would incorrectly report the end of the forecast horizon.
+        if "forecast_period" in weather_for_snapshot.columns:
+            current_rows = weather_for_snapshot.loc[weather_for_snapshot["forecast_period"].astype(str).eq("Today (may be partial)")]
+            if not current_rows.empty:
+                weather_for_snapshot = current_rows
+        sort_col = "date" if "date" in weather_for_snapshot.columns else "timestamp"
+        if sort_col in weather_for_snapshot.columns:
+            weather_for_snapshot[sort_col] = pd.to_datetime(weather_for_snapshot[sort_col], errors="coerce")
+            weather_for_snapshot = weather_for_snapshot.sort_values(sort_col)
+        row = weather_for_snapshot.iloc[0] if not weather_for_snapshot.empty else None
         if row is not None:
             def row_num(aliases):
-                col = _find_column(weather, aliases)
+                col = _find_column(weather_for_snapshot, aliases)
                 if not col: return None
                 x = _number_series(pd.Series([row.get(col)])).iloc[0]
                 return float(x) if pd.notna(x) and math.isfinite(float(x)) else None
+            metadata_location = _live_item_meta("weather_daily").get("location", "selected location")
             snapshot["weather"] = {"date": str(row.get("date", "")),
                 "temperature_c": row_num(("temperature_mean_c", "temperature_2m")),
                 "wind_kmh": row_num(("wind_speed_mean_kmh", "wind_speed_10m")),
+                "wind_100m_kmh": row_num(("wind_speed_100m_mean_kmh", "wind_speed_100m")),
                 "solar_wm2": row_num(("solar_radiation_mean_wm2", "shortwave_radiation")),
-                "location": str(_live_item_meta("weather_daily").get("location", "selected location")),
+                "location": str(row.get("location", metadata_location)),
+                "forecast_period": str(row.get("forecast_period", "Weather data")),
                 "fetched_at": _live_item_fetched_at("weather_daily")}
     return snapshot
 
@@ -1896,10 +2060,10 @@ PAGE_HELP = {
     "Forward Curves": "Monthly forward marks are illustrative unless replaced by validated user data. Missing delivery tenors are rejected rather than silently interpolated.",
     "P&L Sensitivity & Exposure": "A parallel curve shock estimates a simplified change in MtM. It is not VaR, realised daily P&L or a full risk measure.",
     "Physical Operations & Delivery Tracking": "Nominations, delivered volumes and invoice status persist in the session and are reconciled to linked confirmed/executed physical trades. External operational feeds are not connected.",
-    "European Energy Fundamentals": "Charts are illustrative until connected to timestamped, licensed market data for European gas and power fundamentals.",
+    "European Energy Fundamentals": "Use real storage, LNG, power, gas-flow and weather datasets. Weather indicators are point forecasts and degree-day/resource proxies, not direct demand or price forecasts.",
     "Model Validation & System Checks": "Runs deterministic unit and integration checks on conversions, delivery calendars, curve validation, trade capture, MtM, portfolio aggregation and scenario calculations.",
     "Data, Conventions & Validation": "Sources, units, delivery calendars and validation rules should be explicit before marks or trades are used for commercial decisions.",
-    "Live Data Integrations": "Connect GIE storage/LNG, ENTSO-E electricity data, ENTSOG gas flows, Open-Meteo weather and a licensed forward-curve feed. Credentials are entered locally and are never embedded in the source file.",
+    "Live Data Integrations": "Connect GIE storage/LNG, ENTSO-E electricity data, ENTSOG gas flows, multi-region Open-Meteo weather and a licensed forward-curve feed. API calls run only on explicit user action.",
 }
 
 
@@ -2460,6 +2624,89 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             raise AssertionError("Weather rows must retain the selected timezone metadata.")
         return "Mocked Open-Meteo hourly observations aggregate into local-date summaries with timezone metadata."
 
+    def check_open_meteo_public_request_variables() -> str:
+        calls = []
+        payload = {"hourly": {
+            "time": ["2026-10-24T00:00"], "temperature_2m": [11.0],
+            "wind_speed_10m": [8.0], "wind_speed_100m": [13.0],
+            "shortwave_radiation": [35.0], "precipitation": [0.0], "cloud_cover": [65.0],
+        }}
+        def fake_get(url, params=None, headers=None):
+            calls.append((url, dict(params or {})))
+            return payload
+        fetch_open_meteo(48.8566, 2.3522, "Europe/Paris", past_days=0,
+                         forecast_days=1, _json_get_fn=fake_get)
+        if len(calls) != 1 or calls[0][0] != OPEN_METEO_FORECAST_BASE:
+            raise AssertionError("Public Open-Meteo endpoint was not selected for non-commercial use.")
+        params = calls[0][1]
+        wanted = {"temperature_2m", "wind_speed_10m", "wind_speed_100m", "shortwave_radiation", "precipitation", "cloud_cover"}
+        if not wanted.issubset(set(str(params.get("hourly", "")).split(","))):
+            raise AssertionError("One or more energy-relevant weather variables were omitted from the request.")
+        if "apikey" in params:
+            raise AssertionError("The public endpoint should not require an API key.")
+        return "Public endpoint request needs no API key and asks for temperature, 10/100 m wind, solar radiation, precipitation and cloud cover."
+
+    def check_open_meteo_multi_location_forecast_pack() -> str:
+        now = date.today()
+        def fake_fetch(name, loc, past_days, forecast_days, api_key, commercial_endpoint):
+            zone = loc["timezone"]
+            today_local = datetime.now(ZoneInfo(zone)).date()
+            t0 = datetime.combine(today_local, time(0, 0)).isoformat()
+            t1 = datetime.combine(today_local + timedelta(days=1), time(0, 0)).isoformat()
+            if name.startswith("Paris"):
+                temps = [5.0, 10.0]
+                winds = [12.0, 14.0]
+                solar = [40.0, 100.0]
+            else:
+                temps = [24.0, 26.0]
+                winds = [20.0, 25.0]
+                solar = [80.0, 160.0]
+            payload = {"hourly": {"time": [t0, t1], "temperature_2m": temps,
+                "wind_speed_10m": winds, "wind_speed_100m": [x * 1.5 for x in winds],
+                "shortwave_radiation": solar, "precipitation": [0.0, 1.0], "cloud_cover": [30.0, 50.0]}}
+            h, d = fetch_open_meteo(loc["latitude"], loc["longitude"], zone, past_days=0,
+                                    forecast_days=2, _json_get_fn=lambda *args, **kwargs: payload)
+            return h, d
+        hourly, daily, failures = fetch_open_meteo_market_pack(
+            ["Paris / French power proxy", "Berlin / German power proxy"],
+            past_days=0, forecast_days=2, _fetch_fn=fake_fetch)
+        if failures:
+            raise AssertionError(f"Unexpected mocked weather failures: {failures}")
+        if set(daily["location"].dropna()) != {"Paris / French power proxy", "Berlin / German power proxy"}:
+            raise AssertionError("Multi-location fetch did not preserve location identity.")
+        if not {"heating_degree_day_proxy_18c", "cooling_degree_day_proxy_22c", "wind_speed_100m_mean_kmh", "solar_irradiation_sum_whm2"}.issubset(daily.columns):
+            raise AssertionError("Weather risk/proxy metrics are missing from daily aggregation.")
+        summary = weather_forecast_summary(daily, horizon_days=7)
+        if len(summary) != 2 or not summary["Forecast days"].eq(1).all():
+            raise AssertionError("Forecast summary did not select upcoming complete local days per location.")
+        paris = summary.loc[summary["Location"].str.startswith("Paris")].iloc[0]
+        berlin = summary.loc[summary["Location"].str.startswith("Berlin")].iloc[0]
+        assert_close(float(paris["Heating degree-day proxy (base 18°C)"]), 8.0)
+        assert_close(float(berlin["Cooling degree-day proxy (base 22°C)"]), 4.0)
+        assert_close(float(paris["Daily solar irradiation (Wh/m²)"]), 100.0)
+        return "Multi-zone Open-Meteo fetch preserves local timezones/locations and derives HDD/CDD, 100 m wind, daily solar irradiation, and per-zone forecast summaries."
+
+    def check_open_meteo_partial_location_failure() -> str:
+        zone = "Europe/Paris"
+        today_local = datetime.now(ZoneInfo(zone)).date()
+        times = [datetime.combine(today_local, time(0, 0)).isoformat(),
+                 datetime.combine(today_local + timedelta(days=1), time(0, 0)).isoformat()]
+        payload = {"hourly": {"time": times, "temperature_2m": [12.0, 13.0],
+            "wind_speed_10m": [8.0, 9.0], "wind_speed_100m": [12.0, 13.5],
+            "shortwave_radiation": [30.0, 60.0], "precipitation": [0.0, 0.0], "cloud_cover": [45.0, 40.0]}}
+        def fake_fetch(name, loc, past_days, forecast_days, api_key, commercial_endpoint):
+            if name.startswith("Berlin"):
+                raise RuntimeError("simulated provider outage")
+            return fetch_open_meteo(loc["latitude"], loc["longitude"], loc["timezone"], past_days=0,
+                forecast_days=2, _json_get_fn=lambda *args, **kwargs: payload)
+        hourly, daily, failures = fetch_open_meteo_market_pack(
+            ["Paris / French power proxy", "Berlin / German power proxy"], _fetch_fn=fake_fetch)
+        if daily.empty or set(daily["location"].dropna()) != {"Paris / French power proxy"}:
+            raise AssertionError("One location failure caused successful weather data to be discarded.")
+        if len(failures) != 1 or "Berlin" not in failures[0]:
+            raise AssertionError("A partial weather-fetch failure was not surfaced against its location.")
+        return "A failed weather location is reported separately while successful regional observations remain available."
+
     def check_generic_provider_rest_csv() -> str:
         calls = []
         def fake_http(url, params=None, headers=None, **kwargs):
@@ -2572,6 +2819,9 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("GIE EU selector, credential header and data mapping", "Live API integration", check_gie_request_and_data_mapping),
         ("ENTSOG JSON envelope normalisation", "Live API integration", check_entsog_envelope_normalisation),
         ("Open-Meteo timezone and daily aggregation", "Live API integration", check_open_meteo_aggregation_and_timezone),
+        ("Open-Meteo public endpoint and market-relevant variables", "Live API integration", check_open_meteo_public_request_variables),
+        ("Open-Meteo multi-location forecast and demand proxies", "Live API integration", check_open_meteo_multi_location_forecast_pack),
+        ("Open-Meteo partial regional failure handling", "Live API integration", check_open_meteo_partial_location_failure),
         ("Licensed REST-provider CSV connector", "Live API integration", check_generic_provider_rest_csv),
         ("Live dashboard indicator integration", "Dashboard integration", check_live_snapshot_indicators),
         ("Cross-market hourly load/generation/price join", "Fundamentals analytics", check_residual_load_proxy_alignment),
@@ -2609,6 +2859,29 @@ if page == "Market Overview":
     st.caption("MtM is reported separately by quote currency. " + "; ".join(source_parts) + ". Not an executable or accounting valuation.")
 
     # Live feeds are consumed here as market context; fundamentals are not used as substitute forward marks.
+    # Weather refresh is explicit (never called on every Streamlit rerun) and needs no API key on the public endpoint.
+    wbutton_col, wnote_col = st.columns([1, 2])
+    with wbutton_col:
+        refresh_weather_home = st.button("Refresh regional weather outlook", key="overview_refresh_weather", use_container_width=True)
+    with wnote_col:
+        st.caption("Open-Meteo forecast across representative European energy-market locations. Public endpoint: no key for eligible non-commercial use; attribution required.")
+    if refresh_weather_home:
+        with st.spinner("Fetching weather forecast for selected energy-market reference locations…"):
+            w_hourly, w_daily, w_failures = fetch_open_meteo_market_pack(
+                list(WEATHER_LOCATIONS.keys()), past_days=3, forecast_days=10)
+        if not w_daily.empty:
+            _stored_live_item("weather_hourly", "Open-Meteo hourly · European energy-market locations", w_hourly,
+                              {"locations": list(WEATHER_LOCATIONS.keys()), "location": "Multiple European energy-market reference locations", "forecast_days": 10})
+            _stored_live_item("weather_daily", "Open-Meteo daily · European energy-market locations", w_daily,
+                              {"locations": list(WEATHER_LOCATIONS.keys()), "location": "Multiple European energy-market reference locations", "forecast_days": 10})
+            st.session_state["weather_fetch_failures"] = w_failures
+            st.success(f"Loaded {len(w_daily):,} location-days across {w_daily['location'].nunique()} energy-market reference locations.")
+            if w_failures:
+                st.warning("Some locations could not be fetched: " + " · ".join(w_failures))
+            st.rerun()
+        else:
+            st.error("Weather refresh failed for all locations: " + " · ".join(w_failures or ["No rows returned."]))
+
     snapshot = build_live_snapshot()
     st.subheader("Live market snapshot")
     if not snapshot:
@@ -2636,16 +2909,36 @@ if page == "Market Overview":
                   help=f"ENTSO-E · {power.get('zone', 'zone')} · {power.get('timestamp', 'n/a')}")
         s5.metric("Actual electricity load", f"{load['value']/1000:.2f} GW" if load.get("value") is not None else "—",
                   help=f"ENTSO-E · {load.get('zone', 'zone')} · {load.get('timestamp', 'n/a')} · source unit {load.get('unit', 'MW')}")
-        s6.metric("Weather temperature", f"{weather['temperature_c']:.1f} °C" if weather.get("temperature_c") is not None else "—",
-                  help=f"Open-Meteo daily mean · {weather.get('location', 'selected location')} · {weather.get('date', 'n/a')}")
+        weather_daily_current = _live_dataset_frame("weather_daily")
+        weather_summary_current = weather_forecast_summary(weather_daily_current, horizon_days=7,
+            fallback_location=str(_live_item_meta("weather_daily").get("location", "Selected location")))
+        weather_zone_count = int(weather_daily_current["location"].nunique()) if not weather_daily_current.empty and "location" in weather_daily_current.columns else (1 if not weather_daily_current.empty else 0)
+        s6.metric("Weather zones", str(weather_zone_count) if weather_zone_count else "—",
+                  help="Number of representative locations with Open-Meteo data. This is not a load-weighted country/region forecast.")
         st.caption("Data sources: GIE AGSI+ (gas storage), GIE ALSI+ (LNG), ENTSO-E Transparency Platform (power prices/load), ENTSOG (selected gas point-direction) and Open-Meteo (weather). Observation timestamps and selected scopes appear in tooltips and the Data freshness expander.")
+        if not weather_summary_current.empty:
+            st.subheader("Weather outlook for energy markets · next 7 future local days")
+            summary_display = weather_summary_current.drop(columns=["Interpretation"], errors="ignore").copy()
+            st.dataframe(summary_display, use_container_width=True, hide_index=True)
+            future_weather = weather_daily_current.copy()
+            if "forecast_period" in future_weather.columns:
+                future_weather = future_weather.loc[future_weather["forecast_period"].eq("Forecast")]
+            if not future_weather.empty and {"date", "temperature_mean_c", "location"}.issubset(future_weather.columns):
+                future_weather["date"] = pd.to_datetime(future_weather["date"], errors="coerce")
+                fig_weather = px.line(future_weather, x="date", y="temperature_mean_c", color="location", markers=True,
+                                      title="Daily mean temperature outlook by market reference location",
+                                      labels={"date": "Local date", "temperature_mean_c": "Temperature (°C)", "location": "Reference location"})
+                fig_weather.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=360)
+                st.plotly_chart(_styled(fig_weather), use_container_width=True)
+            st.caption("Heating degree-day proxy uses max(18°C − daily mean temperature, 0); cooling degree-day proxy uses max(daily mean temperature − 22°C, 0). Wind at 100 m and solar irradiation are renewable-resource proxies only—not forecasts of actual generation, demand, or power prices. Locations are representative points, not weighted national indices. Source: [Open-Meteo](https://open-meteo.com/), data under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); MERIDIAN has processed the data into daily metrics.")
         if gas_flow.get("value") is not None:
             st.caption(f"Latest ENTSOG {gas_flow.get('label', 'indicator')}: {gas_flow['value']:,.2f} {gas_flow.get('unit', 'unit unverified')} · point direction {gas_flow.get('point_direction', 'selected point')} · observation {gas_flow.get('timestamp', 'n/a')}. Confirm the exact unit and direction before using operationally.")
-        if weather.get("wind_kmh") is not None or weather.get("solar_wm2") is not None:
+        if weather.get("wind_kmh") is not None or weather.get("wind_100m_kmh") is not None or weather.get("solar_wm2") is not None:
             bits = []
-            if weather.get("wind_kmh") is not None: bits.append(f"daily mean wind {weather['wind_kmh']:.1f} km/h")
+            if weather.get("wind_kmh") is not None: bits.append(f"daily mean wind at 10 m {weather['wind_kmh']:.1f} km/h")
+            if weather.get("wind_100m_kmh") is not None: bits.append(f"daily mean wind at 100 m {weather['wind_100m_kmh']:.1f} km/h")
             if weather.get("solar_wm2") is not None: bits.append(f"daily mean solar radiation {weather['solar_wm2']:.1f} W/m²")
-            st.caption(f"Weather context — {weather.get('location', 'selected location')}: " + "; ".join(bits) + ". These are weather proxies, not power-price forecasts.")
+            st.caption(f"Weather context — {weather.get('location', 'selected location')}: " + "; ".join(bits) + ". These are weather-resource proxies, not actual generation, system demand, or power-price forecasts.")
         st.subheader("Fundamental observations")
         observations = []
         if storage.get("change_7_reports_twh") is not None:
@@ -3045,6 +3338,8 @@ elif page == "Live Data Integrations":
         gie_api_key = c1.text_input("GIE API key (AGSI+ / ALSI)", value=gie_default, type="password", key="live_gie_api_key", help="The AGSI+ key you supplied is prefilled automatically. ALSI requests require your key to be entitled for that dataset.")
         entsoe_api_token = c2.text_input("ENTSO-E Web API token", value=entsoe_default, type="password", key="live_entsoe_token", help="Register on transparency.entsoe.eu and request RESTful API access by email.")
         openmeteo_api_key = c3.text_input("Open-Meteo commercial API key (optional)", value=openmeteo_default, type="password", key="live_openmeteo_key", help="Leave blank to use the public evaluation endpoint. Follow provider licensing and attribution terms.")
+        # Use the configured GIE default even if Streamlit retains an older empty widget state.
+        effective_gie_api_key = gie_api_key.strip() or gie_default or GIE_AGSI_API_KEY_DEFAULT
         st.markdown("**API access:** [AGSI+ API](https://agsi.gie.eu/#/api) · [ALSI API](https://alsi.gie.eu/#/api) · [ENTSO-E Transparency Platform](https://transparency.entsoe.eu/) · [ENTSOG API manual](https://transparency.entsog.eu/api/archiveDirectories/8/api-manual/ENTSOG_TP_API_UserManual_v3.0.pdf) · [Open-Meteo API](https://open-meteo.com/en/docs) · [ICE Endex data](https://developer.ice.com/fixed-income-data-services/catalog/ice-endex)")
         st.caption("GIE requires a registered personal key and selected access to AGSI+, ALSI, or both. ENTSO-E requires a registered account and activation of RESTful API access. ENTSOG is public. Open-Meteo's public endpoint is subject to non-commercial-use terms; check its commercial plan before commercial deployment.")
         with st.expander("How to obtain your ENTSO-E API token", expanded=False):
@@ -3077,7 +3372,7 @@ Official [token-management instructions](https://transparency.entsoe.eu/content/
             try:
                 dataset_code = "AGSI" if gie_dataset.startswith("AGSI") else "ALSI"
                 with st.spinner("Requesting GIE observations…"):
-                    frame = fetch_gie_history(dataset_code, gie_api_key, gie_scope, gie_from, gie_to, gie_country)
+                    frame = fetch_gie_history(dataset_code, effective_gie_api_key, gie_scope, gie_from, gie_to, gie_country)
                 _stored_live_item(f"gie_{dataset_code.lower()}", gie_dataset, frame, {"scope": gie_scope, "country": gie_country})
                 st.success(f"Loaded {len(frame):,} GIE observation(s).")
             except Exception as exc:
@@ -3191,38 +3486,64 @@ Official [token-management instructions](https://transparency.entsoe.eu/content/
         st.markdown("[Open the ENTSOG Transparency Platform](https://transparency.entsog.eu/) for the official catalogue and point details.")
 
     with tab_weather:
-        st.subheader("Weather-driven demand and renewable proxies")
-        st.write("Open-Meteo provides hourly temperature, wind speed and solar radiation. These are contextual proxies—not forecasts of power prices or exact system demand.")
+        st.subheader("Weather-driven demand and renewable-resource proxies")
+        st.write("Weather is relevant to European energy markets because temperature influences heating/cooling demand, while wind and solar conditions influence potential renewable output. These are contextual indicators—not forecasts of actual generation, system demand or power prices.")
+        default_weather_locations = [
+            "Amsterdam / TTF proxy", "London / NBP proxy", "Paris / French power proxy",
+            "Berlin / German power proxy", "Brussels / Belgian power proxy", "Madrid / Iberian power proxy",
+        ]
         with st.form("open_meteo_live_fetch_form"):
-            w1, w2, w3 = st.columns(3)
-            weather_location = w1.selectbox("Reference location", list(WEATHER_LOCATIONS.keys()), key="weather_location_choice")
-            weather_past = w2.selectbox("Past days", [0, 1, 3, 5, 7], index=2, key="weather_past_days")
-            weather_forecast = w3.selectbox("Forecast days", [3, 5, 7, 10, 14, 16], index=2, key="weather_forecast_days")
+            weather_locations = st.multiselect("Energy-market reference locations", list(WEATHER_LOCATIONS.keys()),
+                default=default_weather_locations, key="weather_location_choices",
+                help="These are representative city points around key European energy markets, not country-weighted weather indices.")
+            w1, w2 = st.columns(2)
+            weather_past = w1.selectbox("Recent days for context", [0, 1, 3, 5, 7], index=2, key="weather_past_days")
+            weather_forecast = w2.selectbox("Forecast horizon (days, including today)", [3, 5, 7, 10, 14, 16], index=3, key="weather_forecast_days")
             weather_commercial = st.checkbox("Use Open-Meteo commercial endpoint", value=False, key="weather_commercial_endpoint")
-            weather_submit = st.form_submit_button("Fetch weather data", type="primary")
+            weather_submit = st.form_submit_button("Fetch regional weather outlook", type="primary")
         if weather_submit:
             try:
-                loc = WEATHER_LOCATIONS[weather_location]
-                with st.spinner("Requesting weather data…"):
-                    hourly, daily = fetch_open_meteo(loc["latitude"], loc["longitude"], loc["timezone"], weather_past,
-                                                    weather_forecast, openmeteo_api_key, weather_commercial)
-                _stored_live_item("weather_hourly", f"Open-Meteo hourly · {weather_location}", hourly, {"location": weather_location})
-                _stored_live_item("weather_daily", f"Open-Meteo daily · {weather_location}", daily, {"location": weather_location})
-                st.success(f"Loaded {len(hourly):,} hourly and {len(daily):,} daily weather observations.")
+                with st.spinner(f"Requesting weather for {len(weather_locations)} selected reference location(s)…"):
+                    hourly, daily, failures = fetch_open_meteo_market_pack(
+                        weather_locations, weather_past, weather_forecast, openmeteo_api_key, weather_commercial)
+                if daily.empty:
+                    raise RuntimeError("No weather data returned. " + " · ".join(failures))
+                _stored_live_item("weather_hourly", "Open-Meteo hourly · European energy-market locations", hourly,
+                    {"locations": weather_locations, "location": "Multiple energy-market reference locations", "forecast_days": weather_forecast})
+                _stored_live_item("weather_daily", "Open-Meteo daily · European energy-market locations", daily,
+                    {"locations": weather_locations, "location": "Multiple energy-market reference locations", "forecast_days": weather_forecast})
+                st.session_state["weather_fetch_failures"] = failures
+                st.success(f"Loaded {len(hourly):,} hourly rows and {len(daily):,} location-days for {daily['location'].nunique()} location(s).")
+                if failures:
+                    st.warning("Partial weather coverage — " + " · ".join(failures))
             except Exception as exc:
                 st.error(f"Open-Meteo request failed: {exc}")
         weather_daily = _live_dataset_frame("weather_daily")
         if not weather_daily.empty:
-            st.caption(f"Last fetch: {st.session_state.live_data['weather_daily']['fetched_at']} · Attribution: Open-Meteo / CC BY 4.0; check applicable usage terms.")
+            st.caption(f"Last fetch: {st.session_state.live_data['weather_daily']['fetched_at']} · Source: [Open-Meteo](https://open-meteo.com/) · Data licence: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Public endpoint requires no API key for eligible non-commercial use; commercial use requires the appropriate plan.")
+            weather_summary = weather_forecast_summary(weather_daily, horizon_days=7,
+                fallback_location=str(_live_item_meta("weather_daily").get("location", "Selected location")))
+            if not weather_summary.empty:
+                st.subheader("Next 7 future local days — commercial context")
+                st.dataframe(weather_summary, use_container_width=True, hide_index=True)
             if "temperature_mean_c" in weather_daily.columns:
-                fig = px.line(weather_daily, x="date", y="temperature_mean_c", markers=True, title="Daily mean temperature")
-                fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=330, yaxis_title="°C")
+                chart_data = weather_daily.copy()
+                chart_data["date"] = pd.to_datetime(chart_data["date"], errors="coerce")
+                fig = px.line(chart_data, x="date", y="temperature_mean_c", color="location" if "location" in chart_data.columns else None,
+                    markers=True, title="Daily mean temperature — recent context and forecast",
+                    labels={"date": "Local date", "temperature_mean_c": "Temperature (°C)", "location": "Reference location"})
+                fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=360)
                 st.plotly_chart(_styled(fig), use_container_width=True)
             st.dataframe(weather_daily, use_container_width=True, hide_index=True)
             hourly_weather = _live_dataset_frame("weather_hourly")
-            st.download_button("Download hourly weather (CSV)", hourly_weather.to_csv(index=False).encode("utf-8"), file_name="open_meteo_hourly.csv", mime="text/csv", key="download_weather_hourly")
+            if not hourly_weather.empty:
+                st.download_button("Download hourly weather (CSV)", hourly_weather.to_csv(index=False).encode("utf-8"), file_name="open_meteo_hourly_weather.csv", mime="text/csv", key="download_weather_hourly")
+            st.caption("Commercial interpretation: HDD proxy (base 18°C) helps contextualise heating demand/gas burn; CDD proxy (base 22°C) flags cooling demand; wind at 100 m and shortwave radiation are weather-resource proxies. Compare them with ENTSO-E load/generation, and do not treat a weather proxy as actual output or a price forecast.")
+            failures = st.session_state.get("weather_fetch_failures", [])
+            if failures:
+                st.warning("Some selected locations failed: " + " · ".join(failures))
         else:
-            st.info("No weather series has been fetched in this session yet. The public endpoint does not require an API key for evaluation.")
+            st.info("No weather series loaded yet. The public Open-Meteo endpoint requires no API key for eligible non-commercial use. Fetch a multi-region outlook above or from Market Overview.")
 
     with tab_forward:
         st.subheader("Licensed ICE Endex / EEX or other vendor forward curves")
@@ -3353,7 +3674,26 @@ elif page == "Market Fundamentals":
         if sample_mean is not None:
             relative = f"; latest observation is {power['value'] - sample_mean:+.2f} {power.get('unit', 'EUR/MWh')} versus fetched-window mean"
         insights.append({"Topic": "Day-ahead power", "Observation": f"{power.get('zone', 'Selected zone')}: {power['value']:.2f} {power.get('unit', 'EUR/MWh')}{relative}", "Commercial reading": f"{power.get('negative_observations', 0)} negative price observations in the most recent 7-day part of the fetched sample. This is a count of observations, not necessarily hours; the data resolution can vary."})
-    if weather:
+    weather_summary_for_insights = weather_forecast_summary(
+        _live_dataset_frame("weather_daily"), horizon_days=7,
+        fallback_location=str(_live_item_meta("weather_daily").get("location", "Selected location")))
+    if not weather_summary_for_insights.empty:
+        for _, weather_row in weather_summary_for_insights.iterrows():
+            notes = []
+            temp = weather_row.get("Mean temperature (°C)")
+            hdd = weather_row.get("Heating degree-day proxy (base 18°C)")
+            cdd = weather_row.get("Cooling degree-day proxy (base 22°C)")
+            wind = weather_row.get("Mean wind at 100 m (km/h)")
+            solar = weather_row.get("Mean solar radiation (W/m²)")
+            if pd.notna(temp): notes.append(f"mean temperature {float(temp):.1f} °C")
+            if pd.notna(hdd): notes.append(f"HDD proxy {float(hdd):.1f} over {int(weather_row.get('Forecast days', 0))} days")
+            if pd.notna(cdd) and float(cdd) > 0: notes.append(f"CDD proxy {float(cdd):.1f}")
+            if pd.notna(wind): notes.append(f"mean wind at 100 m {float(wind):.1f} km/h")
+            if pd.notna(solar): notes.append(f"mean solar radiation {float(solar):.1f} W/m²")
+            commercial_reading = "Use the temperature/HDD proxy to contextualise weather-sensitive heating demand and gas burn; compare with storage, LNG send-out and flows. Wind/solar proxies indicate resource conditions only; compare with ENTSO-E generation and load. Reference-point weather is not a weighted national forecast and does not directly predict hub prices."
+            if notes:
+                insights.append({"Topic": f"Weather · {weather_row['Location']}", "Observation": "; ".join(notes), "Commercial reading": commercial_reading})
+    elif weather:
         w = []
         if weather.get("temperature_c") is not None: w.append(f"mean temperature {weather['temperature_c']:.1f} °C")
         if weather.get("wind_kmh") is not None: w.append(f"mean wind {weather['wind_kmh']:.1f} km/h")
@@ -3481,20 +3821,39 @@ elif page == "Market Fundamentals":
         st.subheader("Weather proxies — Open-Meteo")
         if not data.empty:
             meta = _live_item_meta("weather_daily")
-            st.caption(f"Source: Open-Meteo · location: {meta.get('location', 'selected location')} · last fetched {_live_item_fetched_at('weather_daily')}")
-            y_cols = [c for c in ("temperature_mean_c", "wind_speed_mean_kmh", "solar_radiation_mean_wm2") if c in data.columns]
-            if "date" in data.columns and y_cols:
-                chart = data.copy()
-                chart["date"] = pd.to_datetime(chart["date"], errors="coerce")
-                fig = go.Figure()
-                for col in y_cols:
-                    fig.add_trace(go.Scatter(x=chart["date"], y=chart[col], mode="lines+markers", name=col.replace("_", " ")))
-                fig.update_layout(title="Daily weather context", xaxis_title="Local date", yaxis_title="Each series retains its own native unit")
-                st.plotly_chart(_styled(fig, 360), use_container_width=True)
-            st.dataframe(data, use_container_width=True, hide_index=True)
-            st.caption("Weather data support scenario context but are not a direct power-price forecast. One city should not be treated as a country-wide weighted weather index.")
+            st.caption(f"Source: Open-Meteo · locations: {', '.join(meta.get('locations', [meta.get('location', 'selected location')]))} · last fetched {_live_item_fetched_at('weather_daily')}")
+            weather_summary = weather_forecast_summary(data, horizon_days=7,
+                fallback_location=str(meta.get("location", "Selected location")))
+            if not weather_summary.empty:
+                st.subheader("Commercial weather indicators — next 7 future local days")
+                st.dataframe(weather_summary, use_container_width=True, hide_index=True)
+            chart = data.copy()
+            chart["date"] = pd.to_datetime(chart["date"], errors="coerce")
+            location_field = "location" if "location" in chart.columns else None
+            if "temperature_mean_c" in chart.columns:
+                fig = px.line(chart, x="date", y="temperature_mean_c", color=location_field, markers=True,
+                    title="Daily mean temperature by reference location",
+                    labels={"date": "Local date", "temperature_mean_c": "Temperature (°C)", "location": "Location"})
+                fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=330)
+                st.plotly_chart(_styled(fig), use_container_width=True)
+            if "wind_speed_100m_mean_kmh" in chart.columns:
+                fig = px.line(chart, x="date", y="wind_speed_100m_mean_kmh", color=location_field, markers=True,
+                    title="Wind-resource proxy at 100 m", labels={"date": "Local date", "wind_speed_100m_mean_kmh": "Wind speed (km/h)", "location": "Location"})
+                fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=330)
+                st.plotly_chart(_styled(fig), use_container_width=True)
+            if "solar_radiation_mean_wm2" in chart.columns:
+                fig = px.line(chart, x="date", y="solar_radiation_mean_wm2", color=location_field, markers=True,
+                    title="Solar-resource proxy", labels={"date": "Local date", "solar_radiation_mean_wm2": "Mean shortwave radiation (W/m²)", "location": "Location"})
+                fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG, height=330)
+                st.plotly_chart(_styled(fig), use_container_width=True)
+            with st.expander("Hourly and daily source data"):
+                st.dataframe(data, use_container_width=True, hide_index=True)
+                hourly_weather = _live_dataset_frame("weather_hourly")
+                if not hourly_weather.empty:
+                    st.download_button("Download hourly weather (CSV)", hourly_weather.to_csv(index=False).encode("utf-8"), file_name="open_meteo_hourly_weather.csv", mime="text/csv", key="fundamentals_download_weather_hourly")
+            st.caption("HDD/CDD use simple daily-mean-temperature bases of 18°C/22°C. Wind at 100 m and shortwave radiation are renewable-resource proxies—not generation forecasts. Representative city points are not national weighted averages. Source: Open-Meteo (CC BY 4.0; attribution required).")
         else:
-            st.info("Fetch a location-specific forecast/history from Open-Meteo in Live Data Integrations.")
+            st.info("Fetch a multi-region weather outlook from Live Data Integrations or use Refresh regional weather outlook in Market Overview.")
 
     with fund_tabs[5]:
         st.subheader("Cross-market context: residual load proxy vs day-ahead price")
