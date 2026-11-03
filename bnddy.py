@@ -1,10 +1,10 @@
 """
 Portfolio Lab - build a portfolio, test it honestly, and see where it might take you.
 
-    streamlit run portfolio_lab.py
+    streamlit run Portfolio_Lab_Final.py
     python portfolio_lab.py --selftest
 
-Educational simulation. Not investment advice.
+Research and educational simulation only. Not investment, legal, or tax advice.
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from typing import Callable, Optional, Sequence
 import numpy as np
 import pandas as pd
 from scipy.optimize import linprog, minimize
+from scipy.stats import norm
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -430,6 +431,85 @@ def benchmark_stats(r: pd.Series, rb: pd.Series, rf=0.0, periods=PERIODS) -> dic
             "tracking_error": te,
             "information_ratio": float(active.mean() * periods / te) if te > 1e-12 else float("nan"),
             "r2": corr ** 2, "corr": corr}
+
+
+def sharpe_ratio_periodic(returns: pd.Series, rf_period: float = 0.0) -> float:
+    """Sample Sharpe at the return sampling frequency (not annualised)."""
+    r = pd.Series(returns).dropna().astype(float)
+    if len(r) < 2:
+        return float("nan")
+    sd = float(r.std(ddof=1))
+    return float((r.mean() - rf_period) / sd) if sd > 1e-12 else float("nan")
+
+
+def probabilistic_sharpe_ratio(returns: pd.Series, rf: float = 0.0,
+                               benchmark_sharpe: float = 0.0,
+                               periods: int = PERIODS) -> float:
+    """Approximate PSR: probability true Sharpe exceeds a benchmark Sharpe.
+
+    Sharpe ratios in the formula are periodic. Returns are assumed sufficiently
+    stationary for the moment-based approximation to be informative.
+    """
+    r = pd.Series(returns).dropna().astype(float)
+    n = len(r)
+    if n < 30:
+        return float("nan")
+    sr = sharpe_ratio_periodic(r, rf / periods)
+    sr0 = benchmark_sharpe / np.sqrt(periods)
+    skew = float(r.skew())
+    kurt_excess = float(r.kurt())
+    denom2 = 1.0 - skew * sr + ((kurt_excess + 2.0) / 4.0) * sr**2
+    if not np.isfinite(denom2) or denom2 <= 0:
+        return float("nan")
+    z = (sr - sr0) * np.sqrt(n - 1) / np.sqrt(denom2)
+    return float(norm.cdf(z))
+
+
+def bootstrap_sharpe_ci(returns: pd.Series, rf: float = 0.0,
+                        periods: int = PERIODS, n_boot: int = 400,
+                        block_length: int = 10, seed: int = SEED) -> tuple[float, float]:
+    """Circular moving-block bootstrap CI for annualised Sharpe.
+
+    Blocks preserve short-range dependence better than an iid bootstrap. The
+    interval is still conditional on the observed sample and is not a forecast.
+    """
+    r = pd.Series(returns).dropna().to_numpy(dtype=float)
+    n = len(r)
+    if n < max(60, block_length * 3):
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    n_blocks = int(np.ceil(n / block_length))
+    starts = np.arange(n)
+    estimates = np.empty(n_boot, dtype=float)
+    rf_period = rf / periods
+    for b in range(n_boot):
+        block_starts = rng.choice(starts, size=n_blocks, replace=True)
+        idx = np.concatenate([(st + np.arange(block_length)) % n
+                              for st in block_starts])[:n]
+        sample = r[idx]
+        sd = sample.std(ddof=1)
+        estimates[b] = ((sample.mean() - rf_period) / sd * np.sqrt(periods)
+                        if sd > 1e-12 else np.nan)
+    estimates = estimates[np.isfinite(estimates)]
+    if estimates.size < max(50, n_boot // 2):
+        return float("nan"), float("nan")
+    lo, hi = np.quantile(estimates, [0.025, 0.975])
+    return float(lo), float(hi)
+
+
+def concentration_diagnostics(weights: np.ndarray, labels: Sequence[str]) -> dict:
+    """Weight concentration diagnostics for a fully invested long-only portfolio."""
+    w = np.asarray(weights, dtype=float)
+    order = np.argsort(w)[::-1]
+    hhi = float(np.sum(w**2))
+    return {
+        "largest_holding": float(w[order[0]]) if len(w) else 0.0,
+        "largest_name": str(labels[order[0]]) if len(w) else "—",
+        "top3_weight": float(w[order[:3]].sum()),
+        "hhi": hhi,
+        "effective_holdings": float(1.0 / hhi) if hhi > 1e-12 else float("nan"),
+        "top_holdings": [(str(labels[i]), float(w[i])) for i in order[:min(5, len(w))]],
+    }
 
 
 def full_stats(nav: pd.Series, rets: pd.Series, rf: float,
@@ -2262,8 +2342,8 @@ def sidebar() -> dict:
     rf_auto, rf_src = fetch_risk_free(base) if HAS_YF else (CURRENCIES[base]["rf"], "default")
     adv = {}
     with st.sidebar.expander("⚙️ Advanced settings", expanded=False):
-        st.caption("Sensible defaults are already applied. Only change these if you "
-                   "know what you are adjusting.")
+        st.caption("Default assumptions are preconfigured. Review advanced parameters "
+                   "before interpreting or comparing results.")
         c1, c2 = st.columns(2)
         adv["start"] = c1.date_input("History from", date(2015, 1, 1), key="d0",
                                      help="Longer history means better estimates, but "
@@ -2305,7 +2385,7 @@ def sidebar() -> dict:
             for k, h in holdings.items():
                 v = st.number_input(f"{h['symbol']} — your expected annual return (%)",
                                     -50.0, 100.0, 0.0, .5, key=f"v_{k}")
-                c = st.slider(f"{h['symbol']} — how sure are you?", 0.0, 1.0, 0.0, .05,
+                c = st.slider(f"{h['symbol']} — view confidence", 0.0, 1.0, 0.0, .05,
                               key=f"c_{k}", help="0 means no view at all.")
                 adv["bl_views"][k], adv["bl_conf"][k] = v / 100, c
 
@@ -2325,8 +2405,8 @@ def sidebar() -> dict:
                  "rebalancing usually costs the least.")]
 
         st.markdown("---")
-        adv["use_asset_limits"] = st.checkbox("Limit each holding", key="ual",
-                                              help="Set a floor and a cap per line.")
+        adv["use_asset_limits"] = st.checkbox("Set per-holding allocation bounds", key="ual",
+                                              help="Specify minimum and maximum weights for each holding.")
         adv["per_asset"] = {}
         if adv["use_asset_limits"]:
             for k, h in holdings.items():
@@ -2353,16 +2433,15 @@ def sidebar() -> dict:
                                            key="gp")
 
         st.markdown("---")
-        adv["do_oos"] = st.checkbox("Run the reality check", True, key="oos",
-                                    help="Re-optimises through history using only past "
-                                         "data. Slower, but it is the only honest test.")
+        adv["do_oos"] = st.checkbox("Run walk-forward validation", True, key="oos",
+                                    help="Re-optimises on historical training windows and evaluates subsequent periods. Results remain sample-dependent.")
         adv["lookback"] = st.slider("Training window (years)", 1.0, 8.0, 3.0, .5,
                                     key="lb", disabled=not adv["do_oos"])
         adv["oos_freq"] = {"Monthly": "M", "Quarterly": "Q", "Yearly": "A"}[
             st.selectbox("Re-optimise every", ["Monthly", "Quarterly", "Yearly"],
                          index=1, key="of", disabled=not adv["do_oos"])]
-        adv["do_resample"] = st.checkbox("Stabilise weights (resampling)", True, key="rs")
-        adv["do_cvar"] = st.checkbox("Add a crash-focused portfolio (min CVaR)", False,
+        adv["do_resample"] = st.checkbox("Estimate allocation stability via resampling", True, key="rs")
+        adv["do_cvar"] = st.checkbox("Include a minimum-CVaR strategy", False,
                                      key="cv", help="Minimises average loss on the "
                                                     "worst 5% of days.")
         adv["fractional"] = st.checkbox("My broker allows fractional shares", False,
@@ -2383,7 +2462,7 @@ def sidebar() -> dict:
     st.sidebar.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     ack = st.sidebar.checkbox("I understand this is a simulation, not advice.",
                               key="ack")
-    run = st.sidebar.button("▶  BUILD MY PORTFOLIO", type="primary",
+    run = st.sidebar.button("▶  RUN PORTFOLIO ANALYSIS", type="primary",
                             use_container_width=True, disabled=not ack)
 
     return dict(base_ccy=base, sym=sym, initial=float(initial), monthly=float(monthly),
@@ -2399,10 +2478,11 @@ def tab_portfolio(res):
     p, rec = res["params"], res["recommended"]
     w, s = res["weights"][rec], res["stats"][rec]
     names = {a: res["holdings"][a]["symbol"] for a in res["assets"]}
-    note(f"<b>Your suggested mix: {rec}.</b> It was chosen to match your "
-         f"<b>{p['profile'].lower()}</b> risk profile out of every mix we tested. "
-         f"The percentages below are how much of your money goes into each holding. "
-         f"Every number on this page is <b>after</b> trading fees and fund charges, "
+    note(f"<b>Selected allocation: {rec}.</b> This strategy was selected from the "
+         f"available candidate set using the configured <b>{p['profile'].lower()}</b> "
+         f"profile mapping. It is not a suitability recommendation. "
+         f"Weights represent target allocations. "
+         f"Performance estimates on this page are <b>net of modeled trading costs and fund charges</b>, "
          f"and measured on history from {res['prices'].index.min().date()} to "
          f"{res['prices'].index.max().date()}.", "gold")
 
@@ -2411,24 +2491,24 @@ def tab_portfolio(res):
         st.plotly_chart(chart_pie(w, [names[a] for a in res["assets"]], rec),
                         use_container_width=True, key="pie_main")
     with c2:
-        cards = [("Growth per year", pct(s["cagr"], 1, True),
+        cards = [("Annualised growth (CAGR)", pct(s["cagr"], 1, True),
                   "what this mix returned annually"),
-                 ("Typical swing", pct(s["vol"], 1), "how much it bounces in a year"),
-                 ("Worst fall", pct(s["max_drawdown"], 1),
+                 ("Annualised volatility", pct(s["vol"], 1), "Annualised standard deviation of returns"),
+                 ("Maximum drawdown", pct(s["max_drawdown"], 1),
                   f"took {s['underwater_days']} days to recover", RED),
-                 ("Return per unit of risk", num(s["sharpe"], 2),
-                  "above 1.0 is good"),
-                 ("Bad-day loss", pct(s["cvar95"], 2),
-                  "average of the worst 5% of days", RED),
-                 ("Yearly trading", f"{s['annual_turnover']*100:.0f}%",
-                  "how much gets bought and sold")]
+                 ("Sharpe ratio", num(s["sharpe"], 2),
+                  "Historical excess return per unit of volatility"),
+                 ("Historical CVaR (95%)", pct(s["cvar95"], 2),
+                  "Mean loss in the worst 5% of observations", RED),
+                 ("Annualised turnover", f"{s['annual_turnover']*100:.0f}%",
+                  "Estimated annual trading activity")]
         for row in (cards[:3], cards[3:]):
             cols = st.columns(3)
             for col, c in zip(cols, row):
                 col.markdown(kpi(c[0], c[1], c[2], c[3] if len(c) > 3 else GOLD),
                              unsafe_allow_html=True)
 
-    heading("What is inside", "Grouped the way your broker would show it")
+    heading("What is inside", "Instrument-level allocation and metadata")
     df = pd.DataFrame({"Holding": [names[a] for a in res["assets"]],
                        "What it is": [res["holdings"][a].get("description", "")[:40]
                                       for a in res["assets"]],
@@ -2447,7 +2527,7 @@ def tab_portfolio(res):
             st.caption(f"By {label}: " + " · ".join(
                 f"{k} {v*100:.0f}%" for k, v in g.sort_values(ascending=False).items()))
 
-    with st.expander("See the other mixes we tested, and why they differ"):
+    with st.expander("Strategy definitions and comparison"):
         note("<b>Min Variance</b> takes the calmest possible route. "
              "<b>Risk Parity</b> gives every holding an equal share of the risk rather "
              "than of the money. <b>Max Sharpe</b> chases the best return per unit of "
@@ -2457,8 +2537,8 @@ def tab_portfolio(res):
              "splits evenly and is a surprisingly tough benchmark to beat.")
         st.dataframe(pd.DataFrame([
             {"Mix": k, "Growth/yr": pct(v["cagr"], 1, True), "Swing": pct(v["vol"], 1),
-             "Return per risk": num(v["sharpe"], 2), "Worst fall": pct(v["max_drawdown"], 1),
-             "Bad-day loss": pct(v["cvar95"], 2),
+             "Return per risk": num(v["sharpe"], 2), "Maximum drawdown": pct(v["max_drawdown"], 1),
+             "Historical CVaR (95%)": pct(v["cvar95"], 2),
              "Trading/yr": f"{v['annual_turnover']*100:.0f}%"}
             for k, v in res["stats"].items()]), use_container_width=True, hide_index=True)
         cols = st.columns(min(3, len(res["weights"])))
@@ -2569,7 +2649,7 @@ def tab_reality(res):
          "which is a famously hard benchmark to beat.", "info")
 
     if not res["oos"]:
-        st.info("Turn on 'Run the reality check' in Advanced settings, or extend your "
+        st.info("Enable 'Run walk-forward validation' in Advanced settings, or extend your "
                 "history — this test needs a training window plus a test period.")
     else:
         st.plotly_chart(chart_lines({k: v["nav"] for k, v in res["oos"].items()},
@@ -2581,7 +2661,7 @@ def tab_reality(res):
             stt = full_stats(bt["nav"], bt["returns"], p["rf"])
             row = {"Strategy": k, "Growth/yr": pct(stt["cagr"], 1, True),
                    "Swing": pct(stt["vol"], 1), "Return per risk": num(stt["sharpe"], 2),
-                   "Worst fall": pct(stt["max_drawdown"], 1),
+                   "Maximum drawdown": pct(stt["max_drawdown"], 1),
                    "Trading/yr": f"{bt['annual_turnover']*100:.0f}%",
                    "Rebuilds": bt["n_rebalances"]}
             if naive is not None and k != "Equal weight (1/N)":
@@ -2650,9 +2730,9 @@ def tab_reality(res):
 def tab_risk(res):
     p = res["params"]
     names = [res["holdings"][a]["symbol"] for a in res["assets"]]
-    note("Volatility alone hides what hurts. These views focus on the losses: how "
-         "deep, how long, how correlated your holdings really are, and how the mix "
-         "behaved in real crises.", "info")
+    note("Volatility is only one dimension of risk. This section examines drawdowns, "
+         "drawdown duration, cross-asset dependence, and historical scenario sensitivity. "
+         "Historical scenarios are sensitivity analyses, not forecasts.", "info")
 
     heading("Falls from the previous peak")
     st.plotly_chart(chart_drawdown({k: v["nav"] for k, v in res["stats"].items()}),
@@ -2668,12 +2748,12 @@ def tab_risk(res):
     with c2:
         rc = risk_contributions(res["weights"][res["recommended"]], res["cov"])
         st.plotly_chart(chart_bars(names, list(rc),
-                                   "Where the risk actually comes from",
+                                   "Contribution to portfolio volatility",
                                    "Share of total risk (%)", fmt="{:.0f}%",
                                    colors=[PALETTE[i % len(PALETTE)] for i in range(len(names))]),
                         use_container_width=True, key="rc_main")
-        st.caption("A holding can be 10% of your money and 40% of your risk. That gap "
-                   "is the single most common surprise in a portfolio.")
+        st.caption("Portfolio weights and risk contributions can differ materially. "
+                   "Review both before interpreting diversification.")
 
     heading("Real crises", "Your current mix, dropped into past market shocks")
     note("Honest caveat: these weights were chosen using recent data, so nobody could "
@@ -2793,12 +2873,43 @@ def tab_analytics(res):
                                  y=risk_contributions(res["weights"][k], res["cov"]),
                                  marker=dict(color=PORT_COLORS.get(k, GOLD), opacity=.85,
                                              line=dict(color=BG, width=1))))
-        fig.update_layout(**layout("Marginal risk contribution by holding (%)",
+        fig.update_layout(**layout("Risk contribution by holding (%)",
                                    "", "Share of portfolio variance (%)",
                                    barmode="group", height=400))
         st.plotly_chart(fig, use_container_width=True, key="rc_multi")
 
-    heading("Full metric set", "Net of fees, on the analysis window")
+    heading("Benchmark-relative performance", "Active risk and return versus the configured reference portfolio")
+    benchmark_name = res["bench_key"]
+    benchmark_returns = portfolio_path(res["returns"], res["weights"][benchmark_name],
+                                      rebalance=p["rebalance"], costs=p["costs"])["returns"]
+    benchmark_rows = []
+    for strategy, stt in res["stats"].items():
+        bstats = benchmark_stats(stt["net_returns"], benchmark_returns, p["rf"])
+        benchmark_rows.append({
+            "Strategy": strategy,
+            "Annualised active return": pct((stt["net_returns"].mean() - benchmark_returns.mean()) * PERIODS, 2, True),
+            "Beta": num(bstats["beta"], 2),
+            "Alpha (annualised)": pct(bstats["alpha"], 2, True),
+            "Tracking error": pct(bstats["tracking_error"], 2),
+            "Information ratio": num(bstats["information_ratio"], 2),
+            "Correlation": num(bstats["corr"], 2),
+            "R²": num(bstats["r2"], 2),
+        })
+    st.dataframe(pd.DataFrame(benchmark_rows), use_container_width=True, hide_index=True)
+    st.caption(f"Reference portfolio: {benchmark_name}. Alpha and beta use a single-factor regression on periodic excess returns; active return is arithmetic annualisation. These are historical estimates and depend on the selected benchmark.")
+    comparison = {
+        res["recommended"]: (1.0 + res["stats"][res["recommended"]]["net_returns"]).cumprod(),
+        benchmark_name: (1.0 + benchmark_returns).cumprod(),
+    }
+    if "Equal weight (1/N)" in res["stats"] and "Equal weight (1/N)" not in comparison:
+        comparison["Equal weight (1/N)"] = (1.0 + res["stats"]["Equal weight (1/N)"]["net_returns"]).cumprod()
+    heading("Cumulative performance comparison", "Base 100, historical period, net of modeled costs")
+    st.plotly_chart(chart_lines(comparison, "Selected strategy versus reference portfolios",
+                                "Growth of 100", height=360, base100=True),
+                    use_container_width=True, key="benchmark_compare")
+    st.caption("The chart compares historical paths over the selected sample. It does not imply that the selected allocation would have been known or chosen at the start of the period.")
+
+    heading("Full metric set", "Historical metrics after modeled costs")
     st.dataframe(pd.DataFrame([
         {"Portfolio": k, "CAGR": pct(v["cagr"], 2, True),
          "Arith. return": pct(v["net_returns"].mean() * PERIODS, 2, True),
@@ -2817,6 +2928,67 @@ def tab_analytics(res):
         for k, v in res["stats"].items()]), use_container_width=True, hide_index=True)
     st.caption(f"Beta, alpha, tracking error and information ratio are measured "
                f"against {res['bench_key']}. Risk-free rate {p['rf']*100:.2f}%.")
+
+    heading("Portfolio concentration and diagnostics",
+            "Identify concentration in capital allocation and estimated risk")
+    diag_rows = []
+    for strategy, weights in res["weights"].items():
+        cd = concentration_diagnostics(weights, names)
+        rc = risk_contributions(weights, res["cov"])
+        diag_rows.append({
+            "Strategy": strategy,
+            "Largest holding": f"{cd['largest_name']} ({cd['largest_holding']:.1%})",
+            "Top 3 holdings": pct(cd["top3_weight"], 1),
+            "HHI": num(cd["hhi"], 3),
+            "Effective number of holdings": num(cd["effective_holdings"], 2),
+            "Largest risk contribution": pct(float(np.max(rc)), 1),
+        })
+    st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
+    selected_diag = res["weights"][res["recommended"]]
+    cd = concentration_diagnostics(selected_diag, names)
+    risk_shares = risk_contributions(selected_diag, res["cov"])
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown(kpi("Largest position", pct(cd["largest_holding"], 1), cd["largest_name"]),
+                unsafe_allow_html=True)
+    c2.markdown(kpi("Top-three concentration", pct(cd["top3_weight"], 1),
+                    "Share of portfolio capital"), unsafe_allow_html=True)
+    c3.markdown(kpi("Effective holdings", num(cd["effective_holdings"], 2),
+                    "HHI-based concentration equivalent"), unsafe_allow_html=True)
+    c4.markdown(kpi("Largest risk share", pct(float(np.max(risk_shares)), 1),
+                    names[int(np.argmax(risk_shares))]), unsafe_allow_html=True)
+    diagnostic_messages = []
+    if cd["largest_holding"] >= 0.25:
+        diagnostic_messages.append(f"The largest position ({cd['largest_name']}) represents {cd['largest_holding']:.1%} of capital.")
+    if cd["top3_weight"] >= 0.60:
+        diagnostic_messages.append(f"The three largest positions account for {cd['top3_weight']:.1%} of capital.")
+    if float(np.max(risk_shares)) >= 0.40:
+        diagnostic_messages.append(f"{names[int(np.argmax(risk_shares))]} contributes {float(np.max(risk_shares)):.1%} of estimated portfolio risk.")
+    if float(np.linalg.cond(res["cov"])) > 1e6:
+        diagnostic_messages.append("The covariance matrix is poorly conditioned; optimization weights may be sensitive to estimation error.")
+    if diagnostic_messages:
+        note("<b>Diagnostics to review</b><br>" + "<br>".join(diagnostic_messages), "warn")
+    else:
+        note("No concentration threshold in this diagnostic panel was triggered. This does not establish that the portfolio is low risk.", "good")
+    st.caption("Concentration thresholds are screening rules, not suitability limits. Risk contributions are based on the estimated covariance matrix and may differ from realised contributions.")
+
+    heading("Historical Sharpe uncertainty",
+            "Sampling uncertainty in the selected strategy's realised risk-adjusted return")
+    selected_returns = res["stats"][res["recommended"]]["net_returns"].dropna()
+    sharpe_est = float(res["stats"][res["recommended"]]["sharpe"])
+    ci_lo, ci_hi = bootstrap_sharpe_ci(selected_returns, p["rf"], n_boot=400,
+                                       block_length=10, seed=SEED)
+    psr_zero = probabilistic_sharpe_ratio(selected_returns, p["rf"],
+                                         benchmark_sharpe=0.0)
+    c1, c2, c3 = st.columns(3)
+    c1.markdown(kpi("Observed annualised Sharpe", num(sharpe_est, 3),
+                    "Historical estimate; not a forecast"), unsafe_allow_html=True)
+    c2.markdown(kpi("95% block-bootstrap interval",
+                    f"{num(ci_lo, 2)} to {num(ci_hi, 2)}",
+                    "400 circular block resamples; 10-observation blocks"),
+                unsafe_allow_html=True)
+    c3.markdown(kpi("PSR vs. zero Sharpe", pct(psr_zero, 1),
+                    "Moment-based approximation"), unsafe_allow_html=True)
+    st.caption("The bootstrap interval is conditional on the observed return history. Blocks preserve some short-run dependence, but neither this interval nor the Probabilistic Sharpe Ratio accounts fully for strategy selection, structural breaks, or non-stationarity. Treat the PSR as a diagnostic, not a formal guarantee.")
 
     heading("Stability of the estimates")
     d = res["diag"]
@@ -2850,7 +3022,7 @@ def tab_analytics(res):
     st.caption("A Sharpe that swings widely across windows is a sign the in-sample "
                "figure is period-specific rather than a stable property.")
 
-    heading("Factor exposure", "Is this a real allocation or a disguised index bet?")
+    heading("Factor exposure", "Assess systematic exposures relative to market proxies")
     if not HAS_YF:
         st.info("yfinance is required to download the factor proxies.")
     elif st.button("Run factor regression", key="runfac"):
@@ -2881,7 +3053,7 @@ def tab_method(res):
 
     heading("Pipeline", "In order, from raw prices to an order list")
     st.markdown("""
-1. **Prices** are split- and dividend-adjusted closes, so they are total return.
+1. **Prices** are Yahoo Finance adjusted prices (`auto_adjust=True`), intended to reflect splits and distributions. Data-provider adjustments and coverage may change; verify source data for formal research.
 2. **Currency conversion** happens *before* returns are computed. Converting after
    would mix units inside the covariance matrix and corrupt every correlation.
 3. **Common history** is truncated to the dates every holding shares, so all
@@ -2899,7 +3071,8 @@ def tab_method(res):
 9. **Evaluation** is net of broker fees, half-spread and ongoing charges, on a
    single explicitly chosen rebalancing policy.
 10. **Validation** re-optimises through history on a rolling window using only past
-    data, and compares the result to 1/N with a Memmel test.
+    observations where the implementation permits, and reports out-of-sample results.
+    The validation is not a guarantee against data snooping or regime change.
 """)
 
     heading("Return and risk")
@@ -2948,8 +3121,9 @@ All are solved subject to Σw = 1, per-asset bounds, and group bounds
   intervals on expected returns usually straddle zero.
 - **Ledoit-Wolf δ** — weight given to the structured target. Higher means the raw
   sample correlations were judged too noisy to trust.
-- **Memmel test** — corrects the Jobson-Korkie statistic for the correlation between
-  two Sharpe ratios. p below 0.05 means the gap versus 1/N is unlikely to be luck.
+- **Sharpe uncertainty** — a circular moving-block bootstrap interval and a
+  moment-based Probabilistic Sharpe Ratio are shown as diagnostics. They rely on
+  assumptions about the observed return process and do not eliminate selection bias.
 """)
 
     heading("Assumptions you are accepting")
@@ -2960,9 +3134,12 @@ All are solved subject to Σw = 1, per-asset bounds, and group bounds
   {p['costs'].ter_bps:.0f} bps a year of ongoing charges.
 - Projections resample the observed distribution in blocks: no future crisis can be
   worse than the worst one already in your history.
-- Public price feeds exclude delisted companies, so every backtest is mildly
-  flattering (survivorship bias).
-- Dividends are assumed reinvested with no foreign withholding tax.
+- The default public-data universe may omit delisted securities and historical
+  constituents. Survivorship and look-ahead bias may therefore affect results;
+  point-in-time constituent data is required for rigorous historical universe tests.
+- Adjusted-price history is used as a proxy for total-return performance; dividends
+  are treated as reinvested by the data provider. Foreign withholding taxes and
+  investor-specific tax treatment are not modeled comprehensively.
 - The maximum-holdings limit is solved by a greedy heuristic, not to a proven optimum.
 """)
 
@@ -2973,7 +3150,7 @@ def tab_orders(res):
          "will not sell you 3.47 shares, so we round down to whole units and show you "
          "the cash left over and how far that pushes you from the target mix.", "info")
 
-    pick = st.selectbox("Mix to buy", list(res["weights"]),
+    pick = st.selectbox("Strategy for the implementation plan", list(res["weights"]),
                         index=list(res["weights"]).index(res["recommended"]), key="ord")
     prices = {a: float(res["prices"][a].iloc[-1]) for a in res["assets"]}
     plan = build_execution_plan(res["assets"], res["weights"][pick], p["initial"],
@@ -3100,7 +3277,7 @@ backtest here is slightly flattering.<br>
 • Tax and account-eligibility figures are indicative, not a tax opinion.<br>
 • Dividends are assumed reinvested; foreign withholding tax is ignored.<br>
 • The holdings limit is solved by a shortcut, not to a proven optimum.<br><br>
-Educational simulation. Not investment advice.</div>""", unsafe_allow_html=True)
+Research and educational simulation only. Not investment, legal, or tax advice.</div>""", unsafe_allow_html=True)
 
 
 def landing():
@@ -3108,15 +3285,15 @@ def landing():
 border:1px solid rgba(212,175,55,.18);border-radius:16px;padding:34px;margin-top:14px;">
 <div style="font-size:2.2rem;">📊</div>
 <div style="font-size:1.15rem;font-weight:600;color:#EEF2F7;margin:10px 0;">
-Let's build a portfolio you can actually live with</div>
+Portfolio construction and historical analysis</div>
 <div style="color:#94A3B8;font-size:.88rem;line-height:1.8;max-width:680px;">
-Three steps in the sidebar: tell us about your money, how much risk you can stomach,
-and what you want to hold. Then press the button.<br><br>
-<b style="color:#D4AF37;">What makes this different:</b> most tools show you the mix
-that would have worked best in the past, which is easy and misleading. This one also
-rebuilds the portfolio through history using only what was knowable at the time,
-compares it against simply splitting your money evenly, and shows you how uncertain
-the estimates really are. Fees, rounding to whole shares, and tax are all included.
+Configure the investment amount, risk constraints, and eligible holdings in the sidebar.
+Then run the analysis.<br><br>
+<b style="color:#D4AF37;">Research approach:</b> the application compares constrained
+allocation methods, models selected trading costs, and evaluates strategies using
+historical and walk-forward analysis. Results are estimates conditional on the chosen
+universe, data source, assumptions, and sample period—not forecasts or guarantees.
+Execution, tax, liquidity, and data limitations are documented in the methodology.
 </div></div>""", unsafe_allow_html=True)
 
 
@@ -3133,9 +3310,7 @@ background:linear-gradient(135deg,#C9A440,#F0D060,#C9A440);-webkit-background-cl
 -webkit-text-fill-color:transparent;">Portfolio Lab</div>
 <div style="color:#64748B;font-size:.71rem;letter-spacing:.14em;text-transform:uppercase;">
 Build · test honestly · project</div></div></div>""", unsafe_allow_html=True)
-    st.markdown('<div class="legal">⚖️ Educational simulation — not personalised '
-                'investment advice. Past performance does not predict future returns.'
-                '</div>', unsafe_allow_html=True)
+    st.markdown('<div class="legal">⚖️ Research and educational tool only — not investment, legal, or tax advice. Historical results are not forecasts. Estimates depend on data quality, model assumptions, and the selected sample.</div>', unsafe_allow_html=True)
 
     p = sidebar()
     if p["run"]:
@@ -3157,9 +3332,9 @@ Build · test honestly · project</div></div></div>""", unsafe_allow_html=True)
         landing()
         return
     res = st.session_state.res
-    tabs = st.tabs(["  🥧  Your portfolio  ", "  🔮  Your plan  ",
-                    "  🎯  Reality check  ", "  ⚠️  Risk  ",
-                    "  📐  Analytics  ", "  🧾  What to buy  ",
+    tabs = st.tabs(["  🥧  Your portfolio  ", "  🔮  Projections  ",
+                    "  🎯  Out-of-sample validation  ", "  ⚠️  Risk  ",
+                    "  📐  Analytics  ", "  🧾  Implementation  ",
                     "  📖  Method  ", "  🗂️  Data  "])
     for tab, fn in zip(tabs, [tab_portfolio, tab_plan, tab_reality, tab_risk,
                               tab_analytics, tab_orders, tab_method, tab_data]):
@@ -3640,6 +3815,25 @@ def run_self_tests(verbose=True) -> int:
         assert calls >= 10
         assert len(set(keys)) == len(keys), "duplicate chart keys"
 
+    @test("probabilistic Sharpe ratio is bounded")
+    def _():
+        r = pd.Series(np.random.default_rng(11).normal(.0005, .01, 800))
+        psr = probabilistic_sharpe_ratio(r, rf=0.0, benchmark_sharpe=0.0)
+        assert 0.0 <= psr <= 1.0
+
+    @test("block bootstrap Sharpe interval is finite for adequate history")
+    def _():
+        r = pd.Series(np.random.default_rng(12).normal(.0004, .01, 500))
+        lo, hi = bootstrap_sharpe_ci(r, rf=0.0, n_boot=100, block_length=5)
+        assert np.isfinite(lo) and np.isfinite(hi) and lo <= hi
+
+    @test("concentration diagnostics match weights")
+    def _():
+        d = concentration_diagnostics(np.array([.5, .3, .2]), ["A", "B", "C"])
+        assert abs(d["largest_holding"] - .5) < 1e-12
+        assert abs(d["top3_weight"] - 1.0) < 1e-12
+        assert abs(d["effective_holdings"] - 1 / .38) < 1e-12
+
     @test("data fingerprint is stable and sensitive")
     def _():
         df = pd.DataFrame({"A": [1., 2., 3.]}, index=pd.bdate_range("2020-01-01", periods=3))
@@ -3667,6 +3861,6 @@ if __name__ == "__main__":
         sys.exit(run_self_tests())
     if not HAS_ST:
         print("Streamlit not installed.\n  pip install -r requirements.txt\n"
-              "  streamlit run portfolio_lab.py")
+              "  streamlit run Portfolio_Lab_Final.py")
         sys.exit(1)
     main()
