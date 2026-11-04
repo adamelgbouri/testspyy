@@ -5,7 +5,8 @@ Test with:  pytest etttr.py
 
 Everything is in this one file, in order:
   1 Calculation engine      units, calendars, curves, trades, valuation
-  2 Analytics engine        tenors, curve building, P&L explain, risk, spreads, spot, seasonal
+  2 Analytics engine        tenors, curve building, P&L explain, risk, spreads, spot, seasonal,
+                            Hedge Advisor and Market Read
   3 Saved data              SQLite file beside this script (meridian_desk.db)
   4 Market data connectors  ENTSO-E, GIE, ENTSOG, Open-Meteo, ECB, licensed providers
   5 Design system           colours, styles, chart template, shared components
@@ -29,6 +30,7 @@ from zoneinfo import ZoneInfo
 import gzip
 import hashlib
 import html
+import inspect
 import io
 import json
 import math
@@ -1203,50 +1205,20 @@ def historical_var(buckets: pd.DataFrame, history: pd.DataFrame, eur_per_gbp: fl
     """One-day historical-simulation VaR and expected shortfall of today's positions.
 
     Each saved day's move in a contract is mapped to its distance from delivery, then
-    applied to the bucket at the same distance today. Only same-contract moves are used,
-    so a contract rolling to the next month never registers as a price move.
+    applied to the bucket at the same distance today.
     """
     empty = {"pnl": pd.DataFrame(columns=["date", "pnl_eur"]), "var": {}, "es": {}, "uncovered": [], "observations": 0}
     if buckets is None or buckets.empty or history is None or history.empty:
         return empty
-    data = history[["snapshot_date", "product", "delivery_month", "price"]].copy()
-    data["snapshot_date"] = pd.to_datetime(data["snapshot_date"])
-    data["delivery_month"] = pd.to_datetime(data["delivery_month"])
-    data = data.sort_values(["product", "delivery_month", "snapshot_date"])
-    grouped = data.groupby(["product", "delivery_month"])
-    data["move"] = grouped["price"].diff()
-    data["gap_days"] = grouped["snapshot_date"].diff().dt.days
-    data = data.dropna(subset=["move"]).loc[lambda f: f["gap_days"].le(5)]
-    if data.empty:
+    moves, days = _contract_moves(history)
+    if not days:
         return empty
-    data["tenor"] = ((data["delivery_month"].dt.year - data["snapshot_date"].dt.year) * 12
-                     + data["delivery_month"].dt.month - data["snapshot_date"].dt.month)
-    moves = {product: frame.pivot_table(index="snapshot_date", columns="tenor", values="move")
-             for product, frame in data.groupby("product")}
-    today = date.today()
-    position = buckets.groupby(["product", "currency", "delivery_month"], as_index=False)["net_mwh"].sum()
-    all_days = sorted({day for frame in moves.values() for day in frame.index})
-    pnl = pd.Series(0.0, index=all_days)
-    uncovered = []
-    for row in position.to_dict("records"):
-        frame = moves.get(row["product"])
-        if frame is None or frame.empty:
-            uncovered.append(row["product"])
-            continue
-        tenor = (row["delivery_month"].year - today.year) * 12 + row["delivery_month"].month - today.month
-        # A day missing this exact distance from delivery borrows the closest one it has.
-        filled = frame.sort_index(axis=1).ffill(axis=1).bfill(axis=1)
-        nearest = min(filled.columns, key=lambda t: abs(int(t) - tenor))
-        series = filled[nearest].reindex(all_days).fillna(0.0)
-        pnl = pnl + series * float(row["net_mwh"]) * (float(eur_per_gbp) if row["currency"] == "GBP" else 1.0)
-    result = pd.DataFrame({"date": [d.date() for d in pnl.index], "pnl_eur": pnl.values})
+    pnl, uncovered, _ = _book_series(buckets, moves, days, date.today(), eur_per_gbp)
     var, es = {}, {}
     for level in confidence_levels:
-        threshold = float(np.quantile(result["pnl_eur"], 1.0 - float(level)))
-        var[float(level)] = max(-threshold, 0.0)
-        tail = result.loc[result["pnl_eur"].le(threshold), "pnl_eur"]
-        es[float(level)] = max(-float(tail.mean()), 0.0) if not tail.empty else var[float(level)]
-    return {"pnl": result, "var": var, "es": es, "uncovered": sorted(set(uncovered)), "observations": len(result)}
+        var[float(level)], es[float(level)] = _var_es(pnl, float(level))
+    return {"pnl": pd.DataFrame({"date": [d.date() for d in days], "pnl_eur": pnl}), "var": var, "es": es,
+            "uncovered": uncovered, "observations": len(days)}
 
 
 def spreads_table(curves: dict[str, pd.DataFrame], power_product: str, gas_product: str,
@@ -1436,6 +1408,586 @@ def hdd_vs_normal(daily: pd.DataFrame, normals: pd.DataFrame, horizon_days: int 
                      "hdd_vs_normal": float(group["heating_degree_day_proxy_18c"].sum() - group["normal_hdd"].sum()),
                      "temperature_vs_normal_c": float((group["temperature_mean_c"] - group["normal_temperature_c"]).mean())})
     return pd.DataFrame(rows, columns=columns)
+
+
+# -----------------------------------------------------------------------------
+# Hedge Advisor: which standard contracts remove the most risk from today's book
+# -----------------------------------------------------------------------------
+DEFAULT_HALF_SPREADS = {"Gas": 0.10, "Power": 0.30}     # assumed cost per MWh to cross half the bid/offer
+MIN_HEDGE_OBSERVATIONS = 20
+
+
+def _contract_moves(history: pd.DataFrame) -> tuple[dict, list]:
+    """Daily same-contract price moves by product and distance from delivery.
+
+    Only moves in the same contract are used, so a contract rolling to the next month
+    never registers as a price move. A day missing a distance borrows the closest one.
+    """
+    if history is None or history.empty:
+        return {}, []
+    data = history[["snapshot_date", "product", "delivery_month", "price"]].copy()
+    data["snapshot_date"] = pd.to_datetime(data["snapshot_date"])
+    data["delivery_month"] = pd.to_datetime(data["delivery_month"])
+    data = data.sort_values(["product", "delivery_month", "snapshot_date"])
+    grouped = data.groupby(["product", "delivery_month"])
+    data["move"] = grouped["price"].diff()
+    data["gap_days"] = grouped["snapshot_date"].diff().dt.days
+    data = data.dropna(subset=["move"]).loc[lambda f: f["gap_days"].le(5)]
+    if data.empty:
+        return {}, []
+    data["tenor"] = ((data["delivery_month"].dt.year - data["snapshot_date"].dt.year) * 12
+                     + data["delivery_month"].dt.month - data["snapshot_date"].dt.month)
+    moves = {}
+    for product, frame in data.groupby("product"):
+        table = frame.pivot_table(index="snapshot_date", columns="tenor", values="move").sort_index(axis=1)
+        moves[product] = table.ffill(axis=1).bfill(axis=1)
+    days = sorted({day for table in moves.values() for day in table.index})
+    return moves, days
+
+
+def _position_series(product: str, delivery_month: date, net_mwh: float, currency: str, moves: dict, days: list,
+                     valuation_date: date, eur_per_gbp: float) -> Optional[np.ndarray]:
+    """Hypothetical daily EUR P&L of one delivery bucket under each saved day's moves."""
+    table = moves.get(product)
+    if table is None or table.empty:
+        return None
+    tenor = (delivery_month.year - valuation_date.year) * 12 + delivery_month.month - valuation_date.month
+    nearest = min(table.columns, key=lambda t: abs(int(t) - tenor))
+    fx = float(eur_per_gbp) if currency == "GBP" else 1.0
+    return table[nearest].reindex(days).fillna(0.0).to_numpy() * float(net_mwh) * fx
+
+
+def _book_series(buckets: pd.DataFrame, moves: dict, days: list, valuation_date: date, eur_per_gbp: float) -> tuple[np.ndarray, list, pd.DataFrame]:
+    """Total daily P&L of the book, products with no history, and each bucket's series."""
+    total = np.zeros(len(days))
+    uncovered, rows = [], []
+    position = buckets.groupby(["product", "currency", "delivery_month"], as_index=False)["net_mwh"].sum()
+    for row in position.to_dict("records"):
+        series = _position_series(row["product"], row["delivery_month"], row["net_mwh"], row["currency"], moves, days, valuation_date, eur_per_gbp)
+        if series is None:
+            uncovered.append(row["product"])
+            continue
+        total = total + series
+        rows.append({**row, "series": series})
+    return total, sorted(set(uncovered)), pd.DataFrame(rows)
+
+
+def _var_es(pnl: np.ndarray, confidence: float) -> tuple[float, float]:
+    threshold = float(np.quantile(pnl, 1.0 - float(confidence)))
+    tail = pnl[pnl <= threshold]
+    return max(-threshold, 0.0), max(-float(tail.mean()), 0.0) if tail.size else max(-threshold, 0.0)
+
+
+def risk_drivers(rows: pd.DataFrame, total: np.ndarray, confidence: float) -> pd.DataFrame:
+    """How much each delivery bucket lost, on average, on the book's worst days."""
+    columns = ["product", "delivery_month", "contract", "net_mwh", "tail_loss_eur", "share_pct"]
+    if rows is None or rows.empty:
+        return pd.DataFrame(columns=columns)
+    threshold = np.quantile(total, 1.0 - float(confidence))
+    tail_days = total <= threshold
+    book_tail = -float(total[tail_days].mean()) if tail_days.any() else 0.0
+    output = []
+    for row in rows.to_dict("records"):
+        loss = -float(row["series"][tail_days].mean()) if tail_days.any() else 0.0
+        output.append({"product": row["product"], "delivery_month": row["delivery_month"], "contract": month_contract_label(row["delivery_month"]),
+                       "net_mwh": float(row["net_mwh"]), "tail_loss_eur": loss,
+                       "share_pct": loss / book_tail * 100.0 if abs(book_tail) > 1e-9 else 0.0})
+    return pd.DataFrame(output, columns=columns).sort_values("tail_loss_eur", ascending=False).reset_index(drop=True)
+
+
+def _book_net(buckets: pd.DataFrame) -> dict:
+    """{product: {delivery month: net MWh}} ignoring months that net to nothing."""
+    net: dict = {}
+    for product, month, mwh in zip(buckets["product"], buckets["delivery_month"], buckets["net_mwh"]):
+        net.setdefault(product, {})
+        net[product][month] = net[product].get(month, 0.0) + float(mwh)
+    return {p: {m: v for m, v in months.items() if abs(v) > 1e-6} for p, months in net.items()}
+
+
+def _hedge_fit(product: str, segments: tuple, net: dict) -> Optional[dict]:
+    """Whether a contract can hedge the book, and in which direction and up to what size.
+
+    A contract must sit mostly on months the book actually holds. That rules out hedging
+    a winter position with a far-dated month, which would only swap price risk for
+    calendar-spread risk. A direct hedge must oppose the position and can't exceed it.
+    """
+    hours_total = sum(hours for _, hours in segments)
+    own = net.get(product, {})
+    if own:
+        covered = [(m, h) for m, h in segments if m in own]
+        if sum(h for _, h in covered) / hours_total < 0.6:
+            return None
+        window_net = sum(own[m] for m, _ in covered)
+        if abs(window_net) < 1e-6:
+            return None
+        cap = max(abs(own[m]) / h for m, h in covered)
+        return {"direction": -1.0 if window_net > 0 else 1.0, "cap": cap, "proxy": False}
+    months_held = {m for months in net.values() for m in months}
+    if not months_held or sum(h for m, h in segments if m in months_held) / hours_total < 0.6:
+        return None
+    # A proxy hedge has no position of its own to oppose, so either side can be right.
+    cap = max(abs(v) / h for months in net.values() for m, v in months.items() for s, h in segments if s == m) if any(m in months_held for m, _ in segments) else 0.0
+    return {"direction": 0.0, "cap": cap, "proxy": True}
+
+
+def hedge_candidates(curves: dict[str, pd.DataFrame], valuation_date: date, products: Sequence[str], moves: dict,
+                     days: list, eur_per_gbp: float, half_spreads: Optional[dict] = None, net: Optional[dict] = None) -> list[dict]:
+    """Standard contracts that fit the book and have a mark for every month, with their P&L per 1 MW long."""
+    spreads = {**DEFAULT_HALF_SPREADS, **(half_spreads or {})}
+    book = _CurveBook(curves)
+    net = net or {}
+    candidates = []
+    for product in products:
+        if product not in moves:
+            continue
+        spec = PRODUCTS[product]
+        try:
+            lookup = book.lookup(product)
+        except ValueError:
+            continue
+        for label in contract_choices(valuation_date):
+            start, end = contract_window(label)
+            segments = _month_segments(start, end, spec["profile"], spec["timezone"])
+            if not segments or any(month not in lookup for month, _ in segments):
+                continue
+            fit = _hedge_fit(product, segments, net)
+            if fit is None:
+                continue
+            series = np.zeros(len(days))
+            for month, hours in segments:
+                part = _position_series(product, month, float(hours), spec["currency"], moves, days, valuation_date, eur_per_gbp)
+                if part is not None:
+                    series = series + part
+            hours_total = sum(hours for _, hours in segments)
+            fx = float(eur_per_gbp) if spec["currency"] == "GBP" else 1.0
+            candidates.append({"product": product, "contract": label, "start": start, "end": end, "segments": segments,
+                               "currency": spec["currency"], "profile": spec["profile"], "hours": hours_total,
+                               "mid": _strip_price(lookup, start, end, spec["profile"], spec["timezone"]),
+                               "half_spread": float(spreads.get(spec["commodity"], 0.2)), "fx": fx, "series": series, **fit})
+    return candidates
+
+
+def _stepwise_hedges(pnl: np.ndarray, candidates: list[dict], confidence: float, max_contracts: int, lot_mw: float,
+                     min_improvement: float, net: Optional[dict] = None) -> list[dict]:
+    """Add one contract at a time, resizing the set each step to minimise P&L variance.
+
+    Variance chooses the contracts because it is steadier than a tail quantile on a short
+    history. A contract is kept only if it also cuts VaR by at least min_improvement.
+    """
+    base_var, _ = _var_es(pnl, confidence)
+    if base_var <= 0 or not candidates:
+        return []
+    matrix = np.column_stack([c["series"] for c in candidates])
+    chosen: list[int] = []
+    steps: list[dict] = []
+    current_var = base_var
+
+    def solve(indices: list[int]) -> Optional[np.ndarray]:
+        design = matrix[:, indices]
+        sizes = np.linalg.lstsq(design, -pnl, rcond=None)[0]
+        for position, index in enumerate(indices):
+            c = candidates[index]
+            limited = float(np.clip(sizes[position], -c["cap"], c["cap"]))
+            # A direct hedge must oppose the position it covers.
+            sizes[position] = 0.0 if c["direction"] * limited < 0 else limited
+        sizes = np.round(sizes / lot_mw) * lot_mw
+        if np.any(sizes == 0):
+            return None
+        return sizes if _reduces_positions(indices, sizes) else None
+
+    def _reduces_positions(indices: list[int], sizes: np.ndarray) -> bool:
+        """Hedges together must leave each held product with a smaller total position."""
+        after = {p: dict(months) for p, months in (net or {}).items()}
+        for index, size in zip(indices, sizes):
+            c = candidates[index]
+            if c["product"] in after:
+                for month, hours in c["segments"]:
+                    after[c["product"]][month] = after[c["product"]].get(month, 0.0) + float(size) * hours
+        return all(sum(abs(v) for v in after[p].values()) <= sum(abs(v) for v in (net or {})[p].values()) + 1e-6 for p in after)
+
+    for _ in range(int(max_contracts)):
+        best = None
+        for index in range(len(candidates)):
+            if index in chosen or not np.any(matrix[:, index]):
+                continue
+            trial = chosen + [index]
+            sizes = solve(trial)
+            if sizes is None:
+                continue
+            residual = pnl + matrix[:, trial] @ sizes
+            variance = float(np.var(residual))
+            if best is None or variance < best[0] - 1e-9:
+                best = (variance, index, sizes, residual)
+        if best is None:
+            break
+        _, index, sizes, residual = best
+        new_var, new_es = _var_es(residual, confidence)
+        if current_var - new_var < float(min_improvement) * base_var:
+            break
+        chosen.append(index)
+        current_var = new_var
+        steps.append({"indices": list(chosen), "sizes": sizes.copy(), "var": new_var, "es": new_es, "residual": residual})
+    return steps
+
+
+def hedge_cost_eur(candidate: dict, mw: float) -> float:
+    return abs(float(mw)) * candidate["hours"] * candidate["half_spread"] * candidate["fx"]
+
+
+def hedge_plan(buckets: pd.DataFrame, history: pd.DataFrame, curves: dict[str, pd.DataFrame], valuation_date: date,
+               eur_per_gbp: float, confidence: float = 0.95, max_contracts: int = 3, lot_mw: float = 1.0,
+               half_spreads: Optional[dict] = None, products: Optional[Sequence[str]] = None,
+               min_improvement: float = 0.05) -> dict:
+    """Recommend the few standard contracts that remove the most one-day risk from the book."""
+    plan = {"ready": False, "reason": "", "hedges": [], "steps": [], "observations": 0, "uncovered": [], "drivers": pd.DataFrame(),
+            "base_var": 0.0, "base_es": 0.0, "hedged_var": 0.0, "hedged_es": 0.0, "total_cost": 0.0, "days": [],
+            "base_pnl": np.array([]), "hedged_pnl": np.array([]), "out_of_sample": None, "candidates": 0, "confidence": float(confidence)}
+    if buckets is None or buckets.empty:
+        plan["reason"] = "The book has no executed trades, so there is nothing to hedge yet."
+        return plan
+    moves, days = _contract_moves(history)
+    plan["observations"] = len(days)
+    if len(days) < MIN_HEDGE_OBSERVATIONS:
+        plan["reason"] = f"The advisor needs at least {MIN_HEDGE_OBSERVATIONS} daily curve moves, and {len(days)} are saved so far."
+        return plan
+    pnl, uncovered, rows = _book_series(buckets, moves, days, valuation_date, eur_per_gbp)
+    plan.update({"uncovered": uncovered, "days": [d.date() for d in days], "base_pnl": pnl, "hedged_pnl": pnl})
+    plan["base_var"], plan["base_es"] = _var_es(pnl, confidence)
+    plan["hedged_var"], plan["hedged_es"] = plan["base_var"], plan["base_es"]
+    plan["drivers"] = risk_drivers(rows, pnl, confidence)
+    plan["ready"] = True
+    universe = list(products) if products is not None else list(PRODUCTS)
+    net = _book_net(buckets)
+    candidates = hedge_candidates(curves, valuation_date, universe, moves, days, eur_per_gbp, half_spreads, net)
+    plan["candidates"] = len(candidates)
+    steps = _stepwise_hedges(pnl, candidates, confidence, max_contracts, lot_mw, min_improvement, net)
+    if not steps:
+        return plan
+    final = steps[-1]
+    book_products = set(buckets["product"])
+    hedges = []
+    for position, (index, size) in enumerate(zip(final["indices"], final["sizes"])):
+        c = candidates[index]
+        step = steps[position]
+        hedges.append({"product": c["product"], "contract": c["contract"], "start": c["start"], "end": c["end"], "mw": float(size),
+                       "action": "Buy" if size > 0 else "Sell", "mwh": abs(float(size)) * c["hours"], "mid": c["mid"], "currency": c["currency"],
+                       "profile": c["profile"], "half_spread": c["half_spread"], "cost_eur": hedge_cost_eur(c, size),
+                       "var_after_step": step["var"], "proxy": c["product"] not in book_products})
+    plan.update({"hedges": hedges, "hedged_pnl": final["residual"], "hedged_var": final["var"], "hedged_es": final["es"],
+                 "total_cost": float(sum(h["cost_eur"] for h in hedges)),
+                 "steps": [{"contracts": i + 1, "var": s["var"], "es": s["es"],
+                            "cost": float(sum(hedge_cost_eur(candidates[k], x) for k, x in zip(s["indices"], s["sizes"])))} for i, s in enumerate(steps)]})
+    # Choose on the earlier days only, then test on later days the choice never saw.
+    if len(days) >= 45:
+        cut = int(len(days) * 0.7)
+        train = [{**c, "series": c["series"][:cut]} for c in candidates]
+        fitted = _stepwise_hedges(pnl[:cut], train, confidence, max_contracts, lot_mw, min_improvement, net)
+        if fitted:
+            last = fitted[-1]
+            held = pnl[cut:] + np.column_stack([candidates[i]["series"][cut:] for i in last["indices"]]) @ last["sizes"]
+            plan["out_of_sample"] = {"test_days": len(days) - cut, "train_days": cut,
+                                     "unhedged_std": float(np.std(pnl[cut:])), "hedged_std": float(np.std(held)),
+                                     "unhedged_worst": float(pnl[cut:].min()), "hedged_worst": float(held.min()),
+                                     "contracts": [f"{candidates[i]['product']} {candidates[i]['contract']}" for i in last["indices"]]}
+    return plan
+
+
+def custom_hedge_effect(buckets: pd.DataFrame, history: pd.DataFrame, valuation_date: date, eur_per_gbp: float, product: str,
+                        contract: str, mw: float, confidence: float = 0.95) -> dict:
+    """VaR of the book with one extra contract of your choosing. mw is positive to buy."""
+    moves, days = _contract_moves(history)
+    pnl, _, _ = _book_series(buckets, moves, days, valuation_date, eur_per_gbp)
+    spec = PRODUCTS[product]
+    start, end = contract_window(contract)
+    extra = np.zeros(len(days))
+    covered = False
+    for month, hours in _month_segments(start, end, spec["profile"], spec["timezone"]):
+        part = _position_series(product, month, float(mw) * hours, spec["currency"], moves, days, valuation_date, eur_per_gbp)
+        if part is not None:
+            extra, covered = extra + part, True
+    before, _ = _var_es(pnl, confidence)
+    after, _ = _var_es(pnl + extra, confidence)
+    return {"before": before, "after": after, "covered": covered}
+
+
+def hedge_ladder_rows(buckets: pd.DataFrame, hedges: Sequence[dict]) -> pd.DataFrame:
+    """Net position by product and delivery month once the hedges are added."""
+    rows = buckets[["product", "delivery_month", "net_mwh"]].copy() if buckets is not None and not buckets.empty else pd.DataFrame(columns=["product", "delivery_month", "net_mwh"])
+    extra = []
+    for hedge in hedges:
+        spec = PRODUCTS[hedge["product"]]
+        for month, hours in _month_segments(hedge["start"], hedge["end"], spec["profile"], spec["timezone"]):
+            extra.append({"product": hedge["product"], "delivery_month": month, "net_mwh": float(hedge["mw"]) * hours})
+    combined = pd.concat([rows, pd.DataFrame(extra)], ignore_index=True) if extra else rows
+    return combined.groupby(["product", "delivery_month"], as_index=False)["net_mwh"].sum()
+
+
+def proposed_hedge_trades(hedges: Sequence[dict], valuation_date: date, stamp: str) -> pd.DataFrame:
+    """Turn hedges into proposed trades at mid plus or minus the assumed half-spread."""
+    rows = []
+    for number, hedge in enumerate(hedges, start=1):
+        buying = hedge["mw"] > 0
+        whole_month = hedge["end"] == _add_months(hedge["start"], 1)
+        rows.append({"trade_id": f"H-{stamp}-{number}", "trade_date": valuation_date.isoformat(), "counterparty": "To be agreed",
+                     "product": hedge["product"], "instrument": "FORWARD" if whole_month else "SWAP", "settlement_type": "FINANCIAL",
+                     "side": "BUY_FIXED" if buying else "SELL_FIXED", "delivery_start": hedge["start"].isoformat(), "delivery_end": hedge["end"].isoformat(),
+                     "profile": hedge["profile"], "quantity_mw": abs(float(hedge["mw"])),
+                     "trade_price": round(hedge["mid"] + (hedge["half_spread"] if buying else -hedge["half_spread"]), 4),
+                     "currency": hedge["currency"], "status": "PROPOSED", "notes": f"Suggested by Hedge Advisor ({hedge['contract']})"})
+    return pd.DataFrame(rows)
+
+
+# -----------------------------------------------------------------------------
+# Market Read: rule-based readings of the evidence, with its reasoning shown
+# -----------------------------------------------------------------------------
+ZONE_WEATHER = {"France": "Paris / French power proxy", "Germany-Luxembourg": "Berlin / German power proxy",
+                "Netherlands": "Amsterdam / TTF proxy", "Belgium": "Brussels / Belgian power proxy",
+                "Spain": "Madrid / Iberian power proxy", "Great Britain": "London / NBP proxy"}
+GAS_WEATHER_LOCATIONS = ("Amsterdam / TTF proxy", "London / NBP proxy", "Paris / French power proxy",
+                         "Berlin / German power proxy", "Brussels / Belgian power proxy")
+STALE_DAYS = 10
+
+
+def _signal(key: str, name: str, weight: float, z: Optional[float] = None, value: str = "", why: str = "",
+            flip: str = "", missing: str = "") -> dict:
+    """One piece of evidence. z is in standard-deviation-like units, positive is bullish."""
+    available = z is not None and math.isfinite(float(z))
+    return {"key": key, "name": name, "weight": float(weight), "available": available,
+            "score": float(np.clip(float(z) / 2.0, -1.0, 1.0)) if available else 0.0,
+            "value": value, "why": why, "flip": flip, "missing": missing}
+
+
+def summarise_read(signals: Sequence[dict]) -> dict:
+    """Combine signals into a reading, with confidence from coverage and agreement."""
+    live = [s for s in signals if s["available"]]
+    total_weight = sum(s["weight"] for s in signals) or 1.0
+    live_weight = sum(s["weight"] for s in live)
+    result = {"reading": "Not enough data", "score": 0.0, "confidence": "None", "coverage": live_weight / total_weight,
+              "agreement": 0.0, "supporting": [], "against": [], "live": len(live), "total": len(signals),
+              "missing": [s for s in signals if not s["available"]]}
+    if len(live) < 2:
+        return result
+    score = sum(s["weight"] * s["score"] for s in live) / live_weight
+    label = ("Bullish" if score >= 0.5 else "Leaning bullish" if score >= 0.15 else
+             "Bearish" if score <= -0.5 else "Leaning bearish" if score <= -0.15 else "Balanced")
+    bullish = sum(s["weight"] for s in live if s["score"] >= 0.1)
+    bearish = sum(s["weight"] for s in live if s["score"] <= -0.1)
+    agreement = max(bullish, bearish) / (bullish + bearish) if bullish + bearish else 0.0
+    coverage = result["coverage"]
+    confidence = "High" if coverage >= 0.75 and agreement >= 0.75 else "Medium" if coverage >= 0.5 and agreement >= 0.6 else "Low"
+    # A balanced reading is never a confident call: either signals disagree or none is strong.
+    if label == "Balanced":
+        confidence = "Low" if bullish and bearish else "Medium"
+    direction = 1.0 if score >= 0 else -1.0
+    ranked = sorted(live, key=lambda s: -s["weight"] * abs(s["score"]))
+    result.update({"reading": label, "score": float(score), "confidence": confidence, "agreement": agreement,
+                   "supporting": [s for s in ranked if s["score"] * direction >= 0.1],
+                   "against": [s for s in ranked if s["score"] * direction <= -0.1]})
+    return result
+
+
+def _storage_daily(frame: pd.DataFrame) -> pd.DataFrame:
+    date_col = _find_column(frame, ("observation_date", "gasDayStart", "gas_day")) if frame is not None and not frame.empty else None
+    fill_col = _find_column(frame, ("full", "fillLevel", "fill_level")) if frame is not None and not frame.empty else None
+    if not date_col or not fill_col:
+        return pd.DataFrame(columns=["day", "fill"])
+    data = pd.DataFrame({"day": pd.to_datetime(frame[date_col], errors="coerce"), "fill": _number_series(frame[fill_col])}).dropna()
+    return data.groupby("day", as_index=False)["fill"].mean().sort_values("day")
+
+
+def _heating_signal(daily: pd.DataFrame, normals: pd.DataFrame, locations: Sequence[str], weight: float, market: str) -> dict:
+    name = "Weather against normal"
+    missing = "Fetch the weather forecast and load 10-year normals."
+    anomaly = hdd_vs_normal(daily, normals)
+    anomaly = anomaly.loc[anomaly["location"].isin(locations)] if not anomaly.empty else anomaly
+    if anomaly.empty:
+        return _signal("weather", name, weight, missing=missing)
+    forecast, normal = float(anomaly["forecast_hdd"].sum()), float(anomaly["normal_hdd"].sum())
+    days = int(anomaly["days"].max())
+    if normal < 3.0 * len(anomaly):
+        return _signal("weather", name, weight, 0.0, f"Outside the heating season: only {normal:.0f} normal degree days ahead.",
+                       "Temperature has little effect on heating demand at this time of year.", "This becomes relevant when heating demand returns.")
+    gap = (forecast - normal) / normal
+    return _signal("weather", name, weight, gap / 0.15,
+                   f"Next {days} days: {forecast:.0f} heating degree days against a normal of {normal:.0f} ({gap * 100:+.0f}%).",
+                   f"Colder than normal lifts {market} demand, and milder than normal reduces it.",
+                   f"Reverses if the forecast moves {'below' if gap > 0 else 'above'} {normal:.0f} degree days.")
+
+
+def gas_signals(history: pd.DataFrame, alsi: pd.DataFrame, daily: pd.DataFrame, normals: pd.DataFrame,
+                imported: dict, curves: dict, today: date, eur_per_usd: float = 0.92) -> list[dict]:
+    """Evidence for European gas. Curve signals use imported marks only, never demo prices."""
+    signals = []
+    store = _storage_daily(history)
+    level = _signal("storage_level", "Storage against the five-year average", 3.0, missing="Load 6 years of storage history.")
+    pace = _signal("storage_pace", "Storage pace against normal", 2.0, missing="Load 6 years of storage history.")
+    if not store.empty:
+        latest = store.iloc[-1]
+        age = (pd.Timestamp(today) - latest["day"]).days
+        if age > STALE_DAYS:
+            level["missing"] = pace["missing"] = f"Storage data is {age} days old. Load it again."
+        else:
+            seasonal = storage_seasonal(history, today=today)
+            band = seasonal["band"]
+            if not band.empty:
+                target = pd.Timestamp(year=2000, month=latest["day"].month, day=latest["day"].day)
+                near = band.iloc[(band["calendar_day"] - target).abs().argsort()[:1]].iloc[0]
+                gap = float(latest["fill"]) - float(near["average"])
+                spread = max((float(near["high"]) - float(near["low"])) / 2.0, 3.0)
+                level = _signal("storage_level", level["name"], 3.0, -gap / spread,
+                                f"{latest['fill']:.1f}% full, {abs(gap):.1f} points {'above' if gap >= 0 else 'below'} the five-year average of {near['average']:.1f}% for this date.",
+                                "Less gas in store than usual leaves less cushion for the rest of the season.",
+                                f"Reverses if fill moves {'below' if gap >= 0 else 'above'} {near['average']:.1f}% at this time of year.")
+            lookup = dict(zip(store["day"], store["fill"]))
+            then = lookup.get(latest["day"] - pd.Timedelta(days=7))
+            history_changes = []
+            for offset in range(1, 6):
+                a = lookup.get(latest["day"] - pd.DateOffset(years=offset))
+                b = lookup.get(latest["day"] - pd.DateOffset(years=offset) - pd.Timedelta(days=7))
+                if a is not None and b is not None:
+                    history_changes.append(float(a) - float(b))
+            if then is not None and len(history_changes) >= 2:
+                change = float(latest["fill"]) - float(then)
+                usual = float(np.mean(history_changes))
+                scale = max(float(np.std(history_changes)), 0.3)
+                pace = _signal("storage_pace", pace["name"], 2.0, -(change - usual) / scale,
+                               f"Changed {change:+.1f} points in 7 days, against {usual:+.1f} usually at this time of year.",
+                               "Storage falling faster, or filling slower, than normal points to a tighter balance.",
+                               f"Reverses if the weekly change moves {'below' if change > usual else 'above'} {usual:+.1f} points.")
+    signals += [level, pace, _heating_signal(daily, normals, GAS_WEATHER_LOCATIONS, 2.5, "gas")]
+
+    lng = _signal("lng", "LNG send-out against the past month", 1.5, missing="Fetch at least 14 days of ALSI LNG data.")
+    if alsi is not None and not alsi.empty:
+        date_col = _find_column(alsi, ("observation_date", "gasDayStart", "gas_day"))
+        send_col = _find_column(alsi, ("sendOut", "sendout", "send_out"))
+        if date_col and send_col:
+            flow = pd.DataFrame({"day": pd.to_datetime(alsi[date_col], errors="coerce"), "value": _number_series(alsi[send_col])}).dropna()
+            flow = flow.groupby("day", as_index=False)["value"].mean().sort_values("day")
+            if len(flow) >= 14:
+                recent, prior = flow["value"].tail(7), flow["value"].iloc[:-7].tail(23)
+                base = float(prior.mean())
+                scale = max(float(prior.std()), abs(base) * 0.01, 1.0)
+                gap = float(recent.mean()) - base
+                lng = _signal("lng", lng["name"], 1.5, -gap / scale,
+                              f"{recent.mean():,.0f} GWh/d over the last week, against {base:,.0f} GWh/d before that.",
+                              "More LNG reaching Europe adds supply, and less removes it.",
+                              f"Reverses if send-out moves {'below' if gap >= 0 else 'above'} {base:,.0f} GWh/d.")
+    signals.append(lng)
+
+    season = _signal("summer_winter", "Summer-to-winter spread", 1.5, missing="Import a real TTF curve in Forward Curves.")
+    switching = _signal("switching", "TTF against the coal switching price", 1.0, missing="Import real TTF, EUA and API2 coal curves in Forward Curves.")
+    if "TTF Natural Gas" in imported:
+        lookup = _curve_lookup(validate_curve(imported["TTF Natural Gas"]))
+        spec = PRODUCTS["TTF Natural Gas"]
+        for year in range(today.year, today.year + 3):
+            summer, winter = f"Sum-{year % 100:02d}", f"Win-{year % 100:02d}"
+            if contract_window(summer)[0] > today:
+                try:
+                    s_price = _strip_price(lookup, *contract_window(summer), "BASE", spec["timezone"])
+                    w_price = _strip_price(lookup, *contract_window(winter), "BASE", spec["timezone"])
+                except ValueError:
+                    break
+                spread = w_price - s_price
+                season = _signal("summer_winter", season["name"], 1.5, -spread / 2.0,
+                                 f"{winter} minus {summer} is {spread:+.2f} EUR/MWh.",
+                                 "A thin or inverted winter premium gives little reason to inject, which can tighten next winter.",
+                                 "Reverses if the spread moves through zero." if spread < 0 else f"Weakens as the spread narrows from {spread:+.2f} EUR/MWh.")
+                break
+        if {"EUA Carbon", "API2 Coal"} <= set(imported):
+            table = spreads_table(curves, "French Power Base", "TTF Natural Gas", None, 1.17, eur_per_usd)
+            if not table.empty:
+                row = table.iloc[0]
+                gap = float(row["gas_eur_mwh"]) - float(row["switching_gas_price"])
+                switching = _signal("switching", switching["name"], 1.0, -gap / max(float(row["switching_gas_price"]) * 0.1, 1.0),
+                                    f"{row['contract']} TTF is {abs(gap):.2f} EUR/MWh {'above' if gap >= 0 else 'below'} the {row['switching_gas_price']:.2f} switching price.",
+                                    "Gas above the switching price loses power-sector demand to coal, and gas below it gains that demand.",
+                                    f"Reverses if TTF moves through {row['switching_gas_price']:.2f} EUR/MWh.")
+    return signals + [season, switching]
+
+
+def _hourly_residual(load: pd.DataFrame, generation: pd.DataFrame) -> pd.DataFrame:
+    if load is None or load.empty or generation is None or generation.empty:
+        return pd.DataFrame(columns=["hour", "residual"])
+    demand = pd.DataFrame({"hour": pd.to_datetime(load["timestamp"], errors="coerce", utc=True).dt.floor("h"), "load": _number_series(load["value"])}).dropna()
+    demand = demand.groupby("hour", as_index=False)["load"].mean()
+    labels = generation["series"].astype(str).str.casefold()
+    subset = generation.loc[labels.str.contains("wind onshore|wind offshore|solar", regex=True) & ~labels.str.contains("consumption")]
+    if subset.empty:
+        return pd.DataFrame(columns=["hour", "residual"])
+    output = pd.DataFrame({"hour": pd.to_datetime(subset["timestamp"], errors="coerce", utc=True).dt.floor("h"), "series": subset["series"], "mw": _number_series(subset["value"])}).dropna()
+    output = output.groupby(["hour", "series"], as_index=False)["mw"].mean().groupby("hour", as_index=False)["mw"].sum()
+    joined = demand.merge(output, on="hour")
+    joined["residual"] = joined["load"] - joined["mw"]
+    return joined[["hour", "residual"]]
+
+
+def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generation: pd.DataFrame, daily: pd.DataFrame,
+                  normals: pd.DataFrame, imported: dict, today: date) -> list[dict]:
+    """Evidence for one power zone. Prices come from day-ahead data, never forward demo marks."""
+    tz = ENTSOE_ZONES[zone]["timezone"]
+    series = spot_series(prices, tz)
+    momentum = _signal("momentum", "Day-ahead price against the past weeks", 2.0, missing="Fetch at least 14 days of day-ahead prices.")
+    negative = _signal("negative", "Negative-price hours", 1.5, missing="Fetch at least 14 days of day-ahead prices.")
+    if not series.empty:
+        by_day = series.assign(day=series["local"].dt.date).groupby("day", as_index=False)["value"].mean()
+        age = (today - by_day["day"].max()).days
+        if age > STALE_DAYS:
+            momentum["missing"] = negative["missing"] = f"Day-ahead prices are {age} days old. Fetch them again."
+        elif len(by_day) >= 14:
+            recent, prior = by_day["value"].tail(7), by_day["value"].iloc[:-7].tail(21)
+            gap = float(recent.mean()) - float(prior.mean())
+            momentum = _signal("momentum", momentum["name"], 2.0, gap / max(float(prior.std()), 3.0),
+                               f"{recent.mean():.1f} EUR/MWh over the last 7 days, against {prior.mean():.1f} before that.",
+                               "Shows the direction prices are already moving in, not why.",
+                               f"Reverses if the 7-day average moves {'below' if gap >= 0 else 'above'} {prior.mean():.1f} EUR/MWh.")
+            cut = series["local"].dt.date >= by_day["day"].iloc[-7]
+            share = lambda part: float(part.loc[part["value"] < 0, "hours"].sum() / part["hours"].sum() * 100.0) if not part.empty else 0.0
+            recent_share, prior_share = share(series.loc[cut]), share(series.loc[~cut])
+            hours = float(series.loc[cut & series["value"].lt(0), "hours"].sum())
+            negative = _signal("negative", negative["name"], 1.5, -(recent_share - prior_share) / 2.5,
+                               f"{hours:.0f} negative hours in the last 7 days, {recent_share:.1f}% of the time against {prior_share:.1f}% before.",
+                               "More negative hours mean renewables are oversupplying the system, which pushes prices down.",
+                               f"Reverses if the share moves {'below' if recent_share > prior_share else 'above'} {prior_share:.1f}%.")
+    residual = _signal("residual", "Residual load against the past weeks", 2.5, missing=f"Fetch actual load and generation for {zone}.")
+    hourly = _hourly_residual(load, generation)
+    if not hourly.empty:
+        days = hourly.assign(day=hourly["hour"].dt.tz_convert(tz).dt.date).groupby("day", as_index=False)["residual"].mean()
+        if len(days) >= 14 and (today - days["day"].max()).days <= STALE_DAYS:
+            recent, prior = days["residual"].tail(7), days["residual"].iloc[:-7].tail(21)
+            gap = float(recent.mean()) - float(prior.mean())
+            scale = max(float(prior.std()), abs(float(prior.mean())) * 0.02, 1.0)
+            residual = _signal("residual", residual["name"], 2.5, gap / scale,
+                               f"{recent.mean() / 1000:.1f} GW over the last 7 days, against {prior.mean() / 1000:.1f} GW before that.",
+                               "Residual load is what wind and solar leave for other plants. More of it brings dearer plants into the merit order.",
+                               f"Reverses if it moves {'below' if gap >= 0 else 'above'} {prior.mean() / 1000:.1f} GW.")
+    location = ZONE_WEATHER.get(zone)
+    heating = _heating_signal(daily, normals, (location,) if location else (), 2.0, "power")
+    wind = _signal("wind", "Wind outlook against recent days", 1.5, missing="Fetch the weather forecast.")
+    if daily is not None and not daily.empty and {"location", "forecast_period", "wind_speed_100m_mean_kmh"}.issubset(daily.columns) and location:
+        here = daily.loc[daily["location"].eq(location)]
+        ahead = pd.to_numeric(here.loc[here["forecast_period"].eq("Forecast"), "wind_speed_100m_mean_kmh"], errors="coerce").head(7).dropna()
+        before = pd.to_numeric(here.loc[here["forecast_period"].ne("Forecast"), "wind_speed_100m_mean_kmh"], errors="coerce").dropna()
+        if len(ahead) >= 3 and len(before) >= 2 and before.mean() > 0:
+            gap = float(ahead.mean()) - float(before.mean())
+            wind = _signal("wind", wind["name"], 1.5, -gap / (0.2 * float(before.mean())),
+                           f"{ahead.mean():.0f} km/h forecast at 100 m, against {before.mean():.0f} km/h in recent days.",
+                           "Windier weather adds cheap output and calmer weather removes it. This uses one reference city, so treat it as a rough guide.",
+                           f"Reverses if the forecast moves {'above' if gap < 0 else 'below'} {before.mean():.0f} km/h.")
+    fuel = _signal("fuel", "Day-ahead against gas plant cost", 1.5, missing="Import real TTF and EUA curves in Forward Curves.")
+    if {"TTF Natural Gas", "EUA Carbon"} <= set(imported) and not series.empty:
+        gas = _curve_lookup(validate_curve(imported["TTF Natural Gas"]))
+        carbon = _curve_lookup(validate_curve(imported["EUA Carbon"]))
+        shared = sorted(set(gas) & set(carbon))
+        if shared:
+            eta, factor = DEFAULT_SPREAD_PARAMS["gas_efficiency"], DEFAULT_SPREAD_PARAMS["gas_emission_factor"]
+            cost = gas[shared[0]] / eta + carbon[shared[0]] * factor / eta
+            spot = float(series.tail(int(7 * 24 / max(float(series["hours"].median()), 0.25)))["value"].mean())
+            gap = spot - cost
+            fuel = _signal("fuel", fuel["name"], 1.5, -gap / 15.0,
+                           f"{spot:.1f} EUR/MWh over the last week, against a {cost:.1f} EUR/MWh cost for a 50% efficient gas plant.",
+                           "Prices far above gas plant cost tend to attract supply, and prices far below it leave little room to fall.",
+                           f"Reverses if the price moves through {cost:.1f} EUR/MWh.")
+    return [residual, momentum, heating, negative, wind, fuel]
 
 
 # =============================================================================
@@ -2883,15 +3435,21 @@ def _build_residual_load_proxy(zone: Optional[str] = None) -> pd.DataFrame:
 # North Sea at dusk: deep petrol surfaces, a sodium-lamp accent for actions, and
 # one fixed colour per market so gas, power and carbon read the same on every chart.
 # =============================================================================
-BG = "#102A33"          # page
-PANEL = "#16353F"       # sidebar, raised surfaces
-PANEL_SOFT = "#1B3E49"  # hover, table headers
+BG = "#0B202A"          # deepest layer of the page
+PANEL = "#16353F"       # body of a raised surface
+PANEL_SOFT = "#20485A"  # raised controls
+PLATE_HI = "#1F4656"    # lit top-left edge of a plate
+PLATE_LO = "#122B36"    # shaded bottom-right edge of a plate
 BORDER = "#2F515C"      # hairlines
-TEXT = "#EDF3F2"        # primary ink
-GRAY = "#A7BBBE"        # secondary ink
-SODIUM = "#F5B83D"      # actions and the current page
-GAIN = "#62D9A5"        # profit, long
-LOSS = "#FF9483"        # loss, short
+TEXT = "#F0F6F5"        # primary ink
+GRAY = "#A9BEC2"        # secondary ink
+SODIUM = "#F7BC45"      # actions
+GAIN = "#5EE0A8"        # profit, long
+LOSS = "#FF8F7E"        # loss, short
+
+# Each part of the app has its own light, so you can tell where you are at a glance.
+SECTION_COLORS = {"Market": "#4FB3F6", "Pricing": "#F7BC45", "Book and risk": "#34D6B4", "Data and controls": "#A893F5"}
+_NAV_SECTION_CSS = "\n".join(f".st-key-nav_{i} {{{{ --sec:{c}; }}}}".replace("{{", "{").replace("}}", "}") for i, c in enumerate(SECTION_COLORS.values()))
 
 # Chart series, validated for colour-blind separation on the page colour.
 SERIES = ["#4C97E6", "#C2870C", "#17A891", "#E0703C", "#9180EE", "#6EA62E", "#DA6694"]
@@ -2915,15 +3473,15 @@ pio.templates["meridian"] = go.layout.Template(layout=dict(
     colorway=SERIES,
     font=dict(family=UI_FONT, size=13, color=TEXT),
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-    title=dict(font=dict(size=14, color=TEXT), x=0.004, xanchor="left", xref="container", y=0.985, yanchor="top"),
+    title=dict(font=dict(size=14, color=TEXT), x=0.015, xanchor="left", xref="container", y=0.975, yanchor="top"),
     xaxis=dict(showgrid=False, linecolor=BORDER, tickcolor=BORDER, ticks="outside", ticklen=4, automargin=True,
                zeroline=False, separatethousands=True, title=dict(font=dict(size=12, color=GRAY)), tickfont=dict(color=GRAY)),
-    yaxis=dict(gridcolor="rgba(167,187,190,0.13)", zeroline=True, zerolinecolor=BORDER, linecolor="rgba(0,0,0,0)",
+    yaxis=dict(gridcolor="rgba(190,214,218,0.12)", zeroline=True, zerolinecolor=BORDER, linecolor="rgba(0,0,0,0)",
                automargin=True, separatethousands=True, title=dict(font=dict(size=12, color=GRAY)), tickfont=dict(color=GRAY)),
     legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0, xanchor="left", bgcolor="rgba(0,0,0,0)",
                 title=dict(text=""), font=dict(size=12, color=GRAY)),
     hoverlabel=dict(bgcolor=PANEL, bordercolor=BORDER, font=dict(family=UI_FONT, size=13, color=TEXT)),
-    bargap=0.25,
+    bargap=0.25, barcornerradius=4,
 ))
 px.defaults.template = "meridian"
 px.defaults.color_discrete_sequence = SERIES
@@ -2931,105 +3489,201 @@ px.defaults.color_discrete_sequence = SERIES
 _CSS = f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100,400;100,500;100,600;100,700&family=Newsreader:opsz,wght@6..72,400;6..72,500&display=swap');
-:root {{ color-scheme: dark; }}
+:root {{
+  color-scheme: dark;
+  --accent: {SODIUM};
+  --plate: linear-gradient(158deg, {PLATE_HI} 0%, {PANEL} 52%, {PLATE_LO} 100%);
+  --raise: inset 0 1px 0 rgba(255,255,255,0.09), inset 0 -1px 0 rgba(0,0,0,0.30), 0 12px 26px rgba(2,12,18,0.42), 0 2px 5px rgba(2,12,18,0.34);
+  --raise-small: inset 0 1px 0 rgba(255,255,255,0.11), inset 0 -1px 0 rgba(0,0,0,0.28), 0 4px 10px rgba(2,12,18,0.40);
+  --well: inset 0 2px 5px rgba(2,12,18,0.55), inset 0 -1px 0 rgba(255,255,255,0.05);
+}}
 html, body, .stApp, button, input, textarea, select, .stMarkdown, [data-testid="stWidgetLabel"] {{ font-family:{UI_FONT}; }}
-.stApp {{ background:{BG}; color:{TEXT}; font-size:15px; font-feature-settings:"tnum" 1; }}
-[data-testid="stHeader"] {{ background:transparent; }}
+.stApp {{ color:{TEXT}; font-size:15px; font-feature-settings:"tnum" 1;
+  background:
+    radial-gradient(1150px 620px at 8% -12%, rgba(52,214,180,0.17), transparent 62%),
+    radial-gradient(1050px 560px at 96% -8%, rgba(247,188,69,0.11), transparent 60%),
+    radial-gradient(1300px 800px at 60% 118%, rgba(79,179,246,0.09), transparent 62%),
+    linear-gradient(180deg, #0F2B37 0%, {BG} 100%); }}
+[data-testid="stAppViewContainer"], [data-testid="stMain"], [data-testid="stHeader"] {{ background:transparent; }}
 [data-testid="stDeployButton"], [data-testid="stToolbarActions"], [data-testid="stAppDeployButton"] {{ display:none; }}
-[data-testid="stMainBlockContainer"] {{ max-width:1360px; padding:2rem 2.5rem 3.5rem; }}
+[data-testid="stMainBlockContainer"] {{ max-width:1400px; padding:1.5rem 2.5rem 3.5rem; }}
 :focus-visible {{ outline:2px solid {SODIUM} !important; outline-offset:2px; }}
 
 h1, h2, h3, h4 {{ color:{TEXT}; font-weight:600; letter-spacing:-0.005em; font-family:{UI_FONT}; }}
-.stApp h2, .stApp h3 {{ font-size:1.14rem; font-weight:600; padding:1.3rem 0 0.35rem; line-height:1.3; }}
+.stApp h2, .stApp h3 {{ font-size:1.14rem; font-weight:600; padding:1.25rem 0 0.45rem; line-height:1.3; }}
+.stApp h2::before, .stApp h3::before {{ content:""; display:inline-block; width:4px; height:0.95em; margin-right:9px; border-radius:3px; vertical-align:-0.1em; background:var(--accent); box-shadow:0 0 10px var(--accent); }}
 p, li {{ line-height:1.55; }}
 a {{ color:{SODIUM}; }}
-[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {{ color:{GRAY}; font-size:0.86rem; line-height:1.5; max-width:88ch; }}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {{ color:{GRAY}; font-size:0.86rem; line-height:1.5; max-width:92ch; }}
 hr {{ border-color:{BORDER}; margin:1.2rem 0; }}
 
-/* Page title */
-.stApp h1.page-title {{ font-family:{NOTE_FONT}; font-weight:500; font-size:2.25rem; line-height:1.15; color:{TEXT}; margin:0; padding:0; letter-spacing:-0.012em; }}
-.page-sub {{ color:{GRAY}; font-size:0.95rem; margin:0.3rem 0 0; max-width:78ch; }}
-.pill {{ display:inline-flex; align-items:center; gap:7px; padding:3px 11px; border-radius:999px; font-size:0.8rem; color:{TEXT}; border:1px solid {BORDER}; white-space:nowrap; }}
-.pill i {{ width:7px; height:7px; border-radius:50%; display:inline-block; background:{GRAY}; }}
-.pill.good i {{ background:{GAIN}; }} .pill.warn i {{ background:{SODIUM}; }}
+/* Page header: a lit band in the colour of this part of the app */
+.st-key-page_head {{ position:relative; padding:18px 22px; margin-bottom:0.9rem; border-radius:16px; overflow:hidden;
+  background:linear-gradient(100deg, color-mix(in srgb, var(--accent) 24%, {PANEL}) 0%, {PANEL} 46%, {PLATE_LO} 100%);
+  box-shadow:var(--raise); }}
+.st-key-page_head::after {{ content:""; position:absolute; left:0; right:0; bottom:0; height:2px; background:linear-gradient(90deg, var(--accent), transparent 70%); }}
+.head-row {{ display:flex; gap:16px; align-items:center; }}
+.head-icon {{ flex:none; width:54px; height:54px; border-radius:14px; display:flex; align-items:center; justify-content:center; color:#0D2029;
+  background:linear-gradient(150deg, color-mix(in srgb, var(--accent) 80%, white) 0%, var(--accent) 62%, color-mix(in srgb, var(--accent) 72%, black) 100%);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.45), inset 0 -2px 0 rgba(0,0,0,0.18), 0 8px 18px color-mix(in srgb, var(--accent) 34%, transparent); }}
+.head-icon span {{ font-family:'Material Symbols Rounded'; font-size:30px; line-height:1; font-weight:400; }}
+.stApp h1.page-title {{ font-family:{NOTE_FONT}; font-weight:500; font-size:2.15rem; line-height:1.12; color:{TEXT}; margin:0; padding:0; letter-spacing:-0.012em; }}
+.page-sub {{ color:#C2D3D5; font-size:0.95rem; margin:0.25rem 0 0; max-width:78ch; }}
+.pill {{ display:inline-flex; align-items:center; gap:7px; padding:5px 12px; border-radius:999px; font-size:0.8rem; color:{TEXT}; white-space:nowrap; background:rgba(5,20,27,0.42); box-shadow:var(--well); }}
+.pill i {{ width:8px; height:8px; border-radius:50%; display:inline-block; background:{GRAY}; }}
+.pill.good i {{ background:{GAIN}; box-shadow:0 0 8px {GAIN}; }} .pill.warn i {{ background:{SODIUM}; box-shadow:0 0 8px {SODIUM}; }}
 
-/* The desk note, the one voice-led element in the app */
+/* The desk note panel */
+.st-key-hero {{ padding:24px 26px 20px; border-radius:18px; position:relative; overflow:hidden;
+  background:
+    radial-gradient(620px 300px at 100% 0%, rgba(79,179,246,0.20), transparent 70%),
+    radial-gradient(520px 320px at 0% 100%, rgba(52,214,180,0.16), transparent 70%),
+    var(--plate);
+  box-shadow:var(--raise); }}
+.st-key-hero [data-testid="stPlotlyChart"] {{ background:none; box-shadow:none; }}
 .desk-note {{ font-family:{NOTE_FONT}; font-size:1.42rem; line-height:1.42; color:{TEXT}; max-width:34em; margin:0.2rem 0 1rem; }}
 .desk-note p {{ margin:0 0 0.7rem; font-size:inherit; line-height:inherit; }}
-.desk-note b {{ font-weight:500; font-family:{UI_FONT}; font-size:0.92em; white-space:nowrap; }}
+.desk-note b {{ font-weight:600; font-family:{UI_FONT}; font-size:0.92em; white-space:nowrap; }}
 .desk-note .soft {{ color:{GRAY}; font-size:0.86em; }}
 .desk-note b.gain {{ color:{GAIN}; }} .desk-note b.loss {{ color:{LOSS}; }}
 
-/* Figures: a label, a number and a thin rule, never a box */
-.fig, [data-testid="stMetric"] {{ border-left:1px solid {BORDER}; padding:2px 0 4px 14px; background:none; margin-bottom:0.7rem; }}
+/* Figures: raised tiles lit along the top edge */
+.fig, [data-testid="stMetric"] {{ position:relative; overflow:hidden; border-radius:13px; padding:13px 15px 12px; margin-bottom:0.65rem; min-height:92px;
+  background:var(--plate); box-shadow:var(--raise); }}
+.fig::before, [data-testid="stMetric"]::before {{ content:""; position:absolute; left:0; right:0; top:0; height:3px; background:linear-gradient(90deg, var(--tile, var(--accent)), transparent 85%); }}
 .fig .l, [data-testid="stMetricLabel"] p {{ color:{GRAY}; font-size:0.84rem; line-height:1.3; font-weight:400; }}
-.fig .v, [data-testid="stMetricValue"] {{ color:{TEXT}; font-size:1.42rem; font-weight:500; line-height:1.3; }}
-[data-testid="stMetricValue"] > div {{ font-size:1.42rem; }}
-.fig .n {{ color:{GRAY}; font-size:0.8rem; margin-top:1px; line-height:1.35; }}
+.fig .v, [data-testid="stMetricValue"] {{ color:{TEXT}; font-size:1.5rem; font-weight:600; line-height:1.3; position:relative; }}
+[data-testid="stMetricValue"] > div {{ font-size:1.5rem; }}
+.fig .n {{ color:{GRAY}; font-size:0.8rem; margin-top:1px; line-height:1.35; position:relative; }}
 .fig .v.gain {{ color:{GAIN}; }} .fig .v.loss {{ color:{LOSS}; }}
+.fig svg.spark {{ position:absolute; right:0; bottom:0; width:48%; height:38px; opacity:0.92; pointer-events:none; }}
+.fig .meter {{ height:7px; border-radius:6px; margin-top:8px; background:rgba(4,17,24,0.6); box-shadow:var(--well); overflow:hidden; }}
+.fig .meter i {{ display:block; height:100%; border-radius:6px; background:linear-gradient(90deg, color-mix(in srgb, var(--tile) 62%, black), var(--tile)); box-shadow:0 0 10px var(--tile); }}
+
+/* Charts and tables */
+[data-testid="stPlotlyChart"] {{ background:var(--plate); border-radius:15px; box-shadow:var(--raise); overflow:hidden; }}
+[data-testid="stDataFrame"] {{ border-radius:12px; box-shadow:0 8px 20px rgba(2,12,18,0.36); }}
 
 /* Sidebar */
-section[data-testid="stSidebar"] {{ background:{PANEL}; border-right:1px solid {BORDER}; width:252px !important; }}
-section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {{ padding:0 !important; }}
+section[data-testid="stSidebar"] {{ width:256px !important; border-right:1px solid rgba(255,255,255,0.05);
+  background:linear-gradient(180deg, #17394A 0%, #102B38 55%, #0C232E 100%); box-shadow:6px 0 22px rgba(2,12,18,0.40); }}
+section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {{ padding:0 !important; background:none; }}
 section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{ padding:0 12px 24px !important; margin:0 !important; }}
-[data-testid="stSidebarHeader"] {{ padding:12px 12px 4px; }}
-.brand {{ font-family:{NOTE_FONT}; font-size:1.42rem; font-weight:500; color:{TEXT}; line-height:1.1; display:flex; align-items:center; gap:9px; padding:0 6px; }}
-.brand small {{ display:block; font-family:{UI_FONT}; font-size:0.78rem; font-weight:400; color:{GRAY}; margin-top:3px; }}
-section[data-testid="stSidebar"] [data-testid="stRadio"] {{ margin-bottom:-4px; }}
-section[data-testid="stSidebar"] [data-testid="stRadio"] [data-testid="stWidgetLabel"] p {{ color:{GRAY}; font-size:0.8rem; padding:0 8px; margin-top:4px; }}
+[data-testid="stSidebarHeader"] {{ padding:12px 12px 2px; }}
+.brand {{ display:flex; align-items:center; gap:11px; padding:0 4px; }}
+.brand .mark {{ flex:none; width:40px; height:40px; border-radius:11px; display:flex; align-items:center; justify-content:center; color:#14262C;
+  background:linear-gradient(150deg, #FFE08A 0%, {SODIUM} 58%, #C98A16 100%); box-shadow:inset 0 1px 0 rgba(255,255,255,0.55), inset 0 -2px 0 rgba(0,0,0,0.16), 0 6px 16px rgba(247,188,69,0.32); }}
+.brand .mark span {{ font-family:'Material Symbols Rounded'; font-size:25px; line-height:1; }}
+.brand .name {{ font-family:{NOTE_FONT}; font-size:1.42rem; font-weight:500; color:{TEXT}; line-height:1.05; }}
+.brand small {{ display:block; font-family:{UI_FONT}; font-size:0.74rem; font-weight:400; color:{GRAY}; margin-top:3px; }}
 section[data-testid="stSidebar"] [data-testid="stRadio"], section[data-testid="stSidebar"] [data-testid="stRadio"] > div, section[data-testid="stSidebar"] [role="radiogroup"] {{ width:100% !important; }}
-section[data-testid="stSidebar"] [role="radiogroup"] {{ gap:1px; flex-direction:column; }}
+section[data-testid="stSidebar"] [data-testid="stRadio"] [data-testid="stWidgetLabel"] p {{ color:var(--sec); font-size:0.8rem; font-weight:600; padding:0 8px; margin-top:6px; }}
+section[data-testid="stSidebar"] [role="radiogroup"] {{ gap:2px; flex-direction:column; }}
 section[data-testid="stSidebar"] [role="radiogroup"] > div {{ width:100%; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"] {{ width:100%; margin:0; padding:5px 8px; border-radius:6px; cursor:pointer; display:block; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"] {{ width:100% !important; box-sizing:border-box; margin:0; padding:5px 8px; border-radius:8px; cursor:pointer; display:block; transition:background 120ms ease; }}
 section[data-testid="stSidebar"] [data-testid="stRadioOption"] > div > div:first-child {{ display:none; }}
 section[data-testid="stSidebar"] [data-testid="stRadioOption"] p {{ font-size:0.93rem; color:{TEXT}; }}
 section[data-testid="stSidebar"] [data-testid="stRadioOption"] [role="img"] {{ color:{GRAY}; margin-right:4px; font-size:1.05rem !important; vertical-align:-3px; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"]:hover {{ background:{PANEL_SOFT}; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] {{ background:rgba(245,184,61,0.13); box-shadow:inset 2px 0 0 {SODIUM}; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] [role="img"] {{ color:{SODIUM}; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"]:hover {{ background:rgba(255,255,255,0.06); }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] {{
+  background:linear-gradient(95deg, color-mix(in srgb, var(--sec) 30%, transparent), color-mix(in srgb, var(--sec) 9%, transparent));
+  box-shadow:inset 3px 0 0 var(--sec), inset 0 1px 0 rgba(255,255,255,0.09), 0 4px 10px rgba(2,12,18,0.34); }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] p {{ font-weight:600; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] [role="img"] {{ color:var(--sec); }}
 .side-foot {{ color:{GRAY}; font-size:0.8rem; line-height:1.5; padding:0 8px; }}
 .side-foot b {{ color:{TEXT}; font-weight:500; }}
+section[data-testid="stSidebar"] label[data-baseweb="radio"] {{ width:100% !important; margin:0; padding:5px 8px; border-radius:8px; }}
+section[data-testid="stSidebar"] label[data-baseweb="radio"] > div:first-child {{ display:none; }}
+section[data-testid="stSidebar"] label[data-baseweb="radio"]:hover {{ background:rgba(255,255,255,0.06); }}
+section[data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) {{ background:linear-gradient(95deg, color-mix(in srgb, var(--sec) 30%, transparent), color-mix(in srgb, var(--sec) 9%, transparent)); box-shadow:inset 3px 0 0 var(--sec), 0 4px 10px rgba(2,12,18,0.34); }}
+{_NAV_SECTION_CSS}
 
-/* Tabs: an underline, not a pill bar */
-.stTabs [data-baseweb="tab-list"] {{ gap:22px; border-bottom:1px solid {BORDER}; background:none; }}
-.stTabs [data-baseweb="tab"] {{ background:none; padding:7px 1px; height:auto; color:{GRAY}; }}
-.stTabs [data-baseweb="tab"] p {{ font-size:0.95rem; }}
-.stTabs [aria-selected="true"], .stTabs [aria-selected="true"] p {{ color:{TEXT}; }}
-.stTabs [data-baseweb="tab-highlight"] {{ background:{SODIUM}; height:2px; }}
-.stTabs [data-baseweb="tab-border"] {{ display:none; }}
-.stTabs [data-baseweb="tab-panel"] {{ padding-top:1rem; }}
+/* Tabs: a recessed tray with a raised active key */
+.stTabs [role="tablist"] {{ gap:3px; padding:4px; border:0 !important; border-radius:11px; width:fit-content; max-width:100%; background:rgba(4,17,24,0.5); box-shadow:var(--well); }}
+.stTabs > div:first-child {{ border:0 !important; box-shadow:none !important; }}
+.stTabs [role="tab"] {{ background:none; padding:7px 14px; height:auto; color:{GRAY}; border:0 !important; border-radius:8px; }}
+.stTabs [role="tab"] p {{ font-size:0.93rem; }}
+.stTabs [role="tab"]:hover {{ background:rgba(255,255,255,0.05); }}
+.stTabs [role="tab"][aria-selected="true"] {{ background:linear-gradient(170deg, {PLATE_HI}, {PANEL}); box-shadow:var(--raise-small), inset 0 -2px 0 var(--accent); }}
+.stTabs [role="tab"][aria-selected="true"]::after, .stTabs [role="tab"]::after {{ display:none !important; }}
+.stTabs [role="tab"][aria-selected="true"] p {{ color:{TEXT}; font-weight:600; }}
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] {{ display:none; }}
+.stTabs [role="tabpanel"] {{ padding-top:1rem; }}
 
-/* Controls */
-.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button {{ border-radius:6px; border:1px solid {BORDER}; background:transparent; color:{TEXT}; font-weight:500; min-height:2.45rem; }}
-.stButton > button:hover, .stDownloadButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {{ border-color:{SODIUM}; color:{SODIUM}; background:transparent; }}
-.stButton > button[kind="primary"], [data-testid="stFormSubmitButton"] > button[kind^="primary"], [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] {{ background:{SODIUM}; border-color:{SODIUM}; color:#14262C; }}
-.stButton > button[kind="primary"]:hover, [data-testid="stFormSubmitButton"] > button[kind^="primary"]:hover, [data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primaryFormSubmit"]:hover {{ background:#FFCB5E; border-color:#FFCB5E; color:#14262C; }}
+/* Controls: buttons stand proud and press in, fields sit in wells */
+.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button {{ border-radius:9px; border:0; color:{TEXT}; font-weight:600; min-height:2.5rem;
+  background:linear-gradient(170deg, {PANEL_SOFT}, {PANEL}); box-shadow:var(--raise-small); transition:transform 90ms ease, box-shadow 90ms ease, filter 120ms ease; }}
+.stButton > button:hover, .stDownloadButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {{ color:{TEXT}; filter:brightness(1.16); }}
+.stButton > button:active, .stDownloadButton > button:active, [data-testid="stFormSubmitButton"] > button:active {{ transform:translateY(1px); box-shadow:var(--well); }}
+.stButton > button[kind="primary"], [data-testid="stFormSubmitButton"] > button[kind^="primary"], [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] {{ color:#14262C;
+  background:linear-gradient(170deg, #FFD97A 0%, {SODIUM} 55%, #DD9C22 100%);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,0.5), inset 0 -2px 0 rgba(0,0,0,0.14), 0 7px 16px rgba(247,188,69,0.30); }}
+.stButton > button[kind="primary"]:hover, [data-testid="stFormSubmitButton"] > button[kind^="primary"]:hover, [data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primaryFormSubmit"]:hover {{ color:#14262C; filter:brightness(1.07); }}
 .stButton > button[kind="primary"] p, [data-testid="stBaseButton-primary"] p, [data-testid="stBaseButton-primaryFormSubmit"] p {{ color:#14262C; }}
-[data-baseweb="select"] > div, [data-baseweb="input"], [data-baseweb="base-input"], .stTextArea textarea {{ background:{PANEL} !important; border-color:{BORDER} !important; border-radius:6px; }}
+[data-testid="stSelectbox"] [role="group"], [data-testid="stMultiSelect"] [role="group"], [data-testid="stTextInputRootElement"], [data-testid="stDateInput"] [role="group"], [data-baseweb="select"] > div, [data-baseweb="input"], [data-baseweb="base-input"], .stTextArea textarea, [data-testid="stNumberInputContainer"] {{ background:rgba(5,20,27,0.46) !important; border-color:rgba(255,255,255,0.06) !important; border-radius:9px; box-shadow:var(--well); }}
 [data-testid="stWidgetLabel"] p {{ color:{GRAY}; font-size:0.86rem; }}
-[data-baseweb="tag"] {{ background:{PANEL_SOFT} !important; border:1px solid {BORDER}; }}
-[data-baseweb="tag"] span, [data-baseweb="tag"] svg {{ color:{TEXT} !important; fill:{TEXT}; }}
+[data-testid="stTextInputRootElement"] input, [data-testid="stSelectbox"] input, [data-testid="stNumberInputContainer"] input, [data-testid="stDateInput"] input {{ background:transparent !important; }}
+[data-tag], [data-baseweb="tag"] {{ background:linear-gradient(170deg, {PANEL_SOFT}, {PANEL}) !important; box-shadow:var(--raise-small); }}
+[data-tag] span, [data-tag] button, [data-baseweb="tag"] span, [data-baseweb="tag"] svg {{ color:{TEXT} !important; fill:{TEXT}; }}
 
-/* Expanders and notes */
-[data-testid="stExpander"] details {{ border:1px solid {BORDER}; border-radius:8px; background:none; }}
-[data-testid="stExpander"] summary {{ padding:0.55rem 0.8rem; }}
-[data-testid="stExpander"] summary:hover {{ color:{SODIUM}; }}
-[data-testid="stAlert"] > div {{ border-radius:8px; }}
-[data-testid="stAlertContainer"] {{ background:{PANEL} !important; border:1px solid {BORDER}; color:{TEXT} !important; }}
+/* Panels and notes */
+.st-key-panel {{ padding:16px 18px 6px; border-radius:15px; background:var(--plate); box-shadow:var(--raise); margin-bottom:0.8rem; }}
+[data-testid="stExpander"] details {{ border:0; border-radius:12px; background:var(--plate); box-shadow:var(--raise); }}
+[data-testid="stExpander"] summary {{ padding:0.6rem 0.9rem; }}
+[data-testid="stExpander"] summary:hover {{ color:var(--accent); }}
+[data-testid="stAlertContainer"] {{ border-radius:11px; border:0; color:{TEXT} !important; background:{PANEL} !important; box-shadow:var(--raise-small); }}
 [data-testid="stAlertContainer"] p {{ color:{TEXT}; }}
-[data-testid="stAlertContentWarning"] p::before {{ content:""; }}
-[data-testid="stVerticalBlockBorderWrapper"] {{ border-color:{BORDER}; }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentWarning"]) {{ background:linear-gradient(95deg, rgba(247,188,69,0.24), rgba(247,188,69,0.07)) !important; box-shadow:inset 3px 0 0 {SODIUM}, var(--raise-small); }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]) {{ background:linear-gradient(95deg, rgba(79,179,246,0.24), rgba(79,179,246,0.07)) !important; box-shadow:inset 3px 0 0 #4FB3F6, var(--raise-small); }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentError"]) {{ background:linear-gradient(95deg, rgba(255,143,126,0.26), rgba(255,143,126,0.07)) !important; box-shadow:inset 3px 0 0 {LOSS}, var(--raise-small); }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentSuccess"]) {{ background:linear-gradient(95deg, rgba(94,224,168,0.22), rgba(94,224,168,0.06)) !important; box-shadow:inset 3px 0 0 {GAIN}, var(--raise-small); }}
+[data-testid="stVerticalBlockBorderWrapper"] {{ border-color:rgba(255,255,255,0.07); }}
 
 /* Quote ticket */
-.ticket-price {{ font-family:{NOTE_FONT}; font-size:2.5rem; line-height:1.1; font-weight:500; margin:0.15rem 0 0.1rem; }}
+.st-key-ticket {{ position:relative; overflow:hidden; padding:20px 22px; border-radius:16px; box-shadow:var(--raise);
+  background:radial-gradient(420px 200px at 100% 0%, rgba(247,188,69,0.22), transparent 70%), var(--plate); }}
+.st-key-ticket::before {{ content:""; position:absolute; left:0; right:0; top:0; height:3px; background:linear-gradient(90deg, {SODIUM}, transparent 90%); }}
+.ticket-price {{ font-family:{NOTE_FONT}; font-size:2.9rem; line-height:1.1; font-weight:500; margin:0.15rem 0 0.1rem; color:#FFD97A; text-shadow:0 0 26px rgba(247,188,69,0.36); }}
 .ticket-unit {{ color:{GRAY}; font-size:0.9rem; margin-bottom:0.9rem; }}
-.ticket-row {{ display:flex; justify-content:space-between; gap:18px; padding:6px 0; border-top:1px solid {BORDER}; font-size:0.94rem; }}
+.ticket-row {{ display:flex; justify-content:space-between; gap:18px; padding:6px 0; border-top:1px solid rgba(255,255,255,0.08); font-size:0.94rem; }}
 .ticket-row span:first-child {{ color:{GRAY}; }}
 
+/* Market Read */
+.dial {{ position:relative; overflow:hidden; border-radius:16px; padding:17px 19px 15px; margin-bottom:0.8rem; min-height:206px; box-shadow:var(--raise);
+  background:radial-gradient(420px 170px at 100% 0%, color-mix(in srgb, var(--accent) 20%, transparent), transparent 72%), var(--plate); }}
+.dial-top {{ display:flex; justify-content:space-between; align-items:center; gap:10px; }}
+.dial-name {{ color:{GRAY}; font-size:0.92rem; }}
+.dial-verdict {{ font-family:{NOTE_FONT}; font-size:1.95rem; font-weight:500; line-height:1.15; margin:0.5rem 0 0.75rem; color:{TEXT}; }}
+.dial-verdict.gain {{ color:{GAIN}; }} .dial-verdict.loss {{ color:{LOSS}; }}
+.scale {{ position:relative; height:12px; margin:0 8px; }}
+.scale .track {{ position:absolute; left:-8px; right:-8px; top:2px; height:8px; border-radius:6px; box-shadow:var(--well); background:linear-gradient(90deg, {LOSS} 0%, #4A5F66 50%, {GAIN} 100%); }}
+.scale .knob {{ position:absolute; top:-4px; width:20px; height:20px; margin-left:-10px; border-radius:50%; background:linear-gradient(160deg, #FFFFFF, #B9C9CC); box-shadow:inset 0 -2px 2px rgba(0,0,0,0.22), 0 3px 8px rgba(2,12,18,0.6); }}
+.scale-ends {{ display:flex; justify-content:space-between; color:{GRAY}; font-size:0.76rem; margin-top:7px; }}
+.dial-line {{ color:#C2D3D5; font-size:0.86rem; line-height:1.4; margin-top:0.55rem; }}
+.ev {{ display:flex; gap:22px; justify-content:space-between; align-items:center; padding:13px 17px; margin-bottom:9px; border-radius:12px; background:var(--plate); box-shadow:var(--raise-small); }}
+.ev-main {{ min-width:0; flex:1; }}
+.ev-name {{ font-weight:600; font-size:0.96rem; }}
+.ev-value {{ color:{TEXT}; font-size:0.93rem; margin-top:2px; line-height:1.4; }}
+.ev-why {{ color:{GRAY}; font-size:0.84rem; margin-top:2px; line-height:1.4; }}
+.ev-side {{ flex:none; width:170px; }}
+.ev-tag {{ text-align:right; font-size:0.84rem; font-weight:600; margin-bottom:6px; color:{GRAY}; }}
+.ev-tag.gain {{ color:{GAIN}; }} .ev-tag.loss {{ color:{LOSS}; }}
+.ev-bar {{ position:relative; height:8px; border-radius:5px; background:rgba(4,17,24,0.6); box-shadow:var(--well); }}
+.ev-bar::after {{ content:""; position:absolute; left:50%; top:-2px; bottom:-2px; width:1px; background:{GRAY}; }}
+.ev-bar i {{ position:absolute; top:0; bottom:0; border-radius:5px; background:{GRAY}; }}
+.ev-bar i.gain {{ background:{GAIN}; }} .ev-bar i.loss {{ background:{LOSS}; }}
+.flip {{ padding:9px 0; border-top:1px solid rgba(255,255,255,0.08); font-size:0.92rem; line-height:1.45; }}
+.flip b {{ font-weight:600; }}
+
+@media (prefers-reduced-motion: reduce) {{ * {{ transition:none !important; }} }}
 @media (max-width: 720px) {{
   [data-testid="stMainBlockContainer"] {{ padding:3rem 1rem 2.5rem; }}
-  .stApp h1.page-title {{ font-size:1.7rem; }}
+  .stApp h1.page-title {{ font-size:1.65rem; }}
+  .head-icon {{ width:44px; height:44px; }}
   .desk-note {{ font-size:1.2rem; }}
+  .st-key-hero, .st-key-page_head {{ padding:15px; }}
+  .ev {{ flex-direction:column; align-items:stretch; gap:10px; }}
+  .ev-side {{ width:100%; }}
 }}
 </style>
 """
@@ -3039,11 +3693,12 @@ def _styled(fig: go.Figure, height: Optional[int] = None) -> go.Figure:
     """Apply the house chart style. Entity colours are fixed, so a filter never repaints a series."""
     resolved_height = height or fig.layout.height or 360
     has_title = bool(fig.layout.title and fig.layout.title.text)
-    fig.update_layout(template="meridian", height=resolved_height,
-                      margin=dict(l=8, r=12, t=62 if has_title else 34, b=8),
+    # Set here as well as in the template: Streamlit fills any background the figure itself leaves blank.
+    fig.update_layout(template="meridian", height=resolved_height, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      margin=dict(l=18, r=20, t=70 if has_title else 34, b=14),
                       hovermode=fig.layout.hovermode or ("x unified" if any(t.type == "scatter" and "lines" in str(t.mode) for t in fig.data) else "closest"))
     if fig.layout.title and fig.layout.title.text:
-        fig.update_layout(title=dict(x=0.004, xanchor="left", xref="container", y=0.985, yanchor="top", font=dict(size=14, color=TEXT)))
+        fig.update_layout(title=dict(x=0.015, xanchor="left", xref="container", y=0.975, yanchor="top", font=dict(size=14, color=TEXT, weight=600)))
     fig.update_xaxes(title_font=dict(size=12, color=GRAY))
     fig.update_yaxes(title_font=dict(size=12, color=GRAY))
     for trace in fig.data:
@@ -3058,7 +3713,7 @@ def _styled(fig: go.Figure, height: Optional[int] = None) -> go.Figure:
                     trace.line.width = 2
             if "markers" in str(trace.mode):
                 trace.marker.size = trace.marker.size or 8
-                trace.marker.line = dict(width=2, color=BG)
+                trace.marker.line = dict(width=2, color=PANEL)
             if color:
                 if "lines" in str(trace.mode):
                     trace.line.color = color
@@ -3067,11 +3722,33 @@ def _styled(fig: go.Figure, height: Optional[int] = None) -> go.Figure:
             if color:
                 trace.marker.color = color
             trace.marker.line = dict(width=0)
+    _add_line_glow(fig)
     return fig
 
 
+def _add_line_glow(fig: go.Figure) -> None:
+    """Lay a soft, wide stroke under each line so it lifts off the plate. Purely visual."""
+    glows = []
+    for index, trace in enumerate(fig.data):
+        if trace.type != "scatter" or "lines" not in str(trace.mode) or trace.fill not in (None, "none"):
+            continue
+        if trace.line.dash not in (None, "solid") or trace.line.width == 0 or trace.x is None or len(trace.x) > 800:
+            continue
+        color = trace.line.color or SERIES[index % len(SERIES)]
+        trace.line.color = color
+        glows.append(go.Scatter(x=trace.x, y=trace.y, mode="lines", line=dict(color=color, width=7), opacity=0.17,
+                                hoverinfo="skip", showlegend=False, xaxis=trace.xaxis, yaxis=trace.yaxis))
+    if glows:
+        original = len(fig.data)
+        fig.add_traces(glows)
+        fig.data = tuple(fig.data[original:]) + tuple(fig.data[:original])
+
+
 def chart(fig: go.Figure, height: Optional[int] = None) -> None:
-    st.plotly_chart(_styled(fig, height), width="stretch", config={"displayModeBar": False, "responsive": True})
+    # Early 1.5x releases size charts with use_container_width instead of width.
+    sizing = {"width": "stretch"} if "width" in inspect.signature(st.plotly_chart).parameters else {"use_container_width": True}
+    # theme=None keeps the house template; Streamlit's theme would paint an opaque plot background.
+    st.plotly_chart(_styled(fig, height), theme=None, config={"displayModeBar": False, "responsive": True}, **sizing)
 
 
 def _pretty_column(name: object) -> str:
@@ -3125,11 +3802,36 @@ def tone_of(value: float) -> str:
     return "gain" if value > 0 else "loss" if value < 0 else ""
 
 
-def kpi(col, label: str, value: str, sub: str = "", accent: str = "", tone: str = "") -> None:
-    """One figure: label, number and optional note, separated by a thin rule."""
+def _sparkline(values: Sequence[float], color: str) -> str:
+    """A small inline trend drawn from real values. Returns nothing if there are too few."""
+    points = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    if len(points) < 3:
+        return ""
+    if len(points) > 90:
+        step = len(points) / 90
+        points = [points[int(i * step)] for i in range(90)]
+    low, high = min(points), max(points)
+    span = (high - low) or 1.0
+    coords = [(i / (len(points) - 1) * 120, 30 - (p - low) / span * 26) for i, p in enumerate(points)]
+    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in coords)
+    gradient = "g" + hashlib.sha1(f"{line}{color}".encode()).hexdigest()[:10]
+    return (f'<svg class="spark" viewBox="0 0 120 34" preserveAspectRatio="none" aria-hidden="true">'
+            f'<defs><linearGradient id="{gradient}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{color}" stop-opacity="0.34"/>'
+            f'<stop offset="1" stop-color="{color}" stop-opacity="0"/></linearGradient></defs>'
+            f'<polygon points="0,34 {line} 120,34" fill="url(#{gradient})"/>'
+            f'<polyline points="{line}" fill="none" stroke="{color}" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>')
+
+
+def kpi(col, label: str, value: str, sub: str = "", accent: str = "", tone: str = "",
+        spark: Optional[Sequence[float]] = None, meter: Optional[float] = None) -> None:
+    """A raised figure tile: label, number, optional note, trend line or fill meter."""
+    color = accent or {"gain": GAIN, "loss": LOSS}.get(tone, "")
+    tile = f' style="--tile:{color}"' if color else ""
     note = f'<div class="n">{html.escape(sub)}</div>' if sub else ""
-    col.markdown(f'<div class="fig"><div class="l">{html.escape(label)}</div>'
-                 f'<div class="v {tone}">{html.escape(value)}</div>{note}</div>', unsafe_allow_html=True)
+    trend = _sparkline(spark, color or "#4FB3F6") if spark is not None else ""
+    bar = f'<div class="meter"><i style="width:{max(0.0, min(100.0, float(meter))):.1f}%"></i></div>' if meter is not None else ""
+    col.markdown(f'<div class="fig"{tile}>{trend}<div class="l">{html.escape(label)}</div>'
+                 f'<div class="v {tone}">{html.escape(value)}</div>{note}{bar}</div>', unsafe_allow_html=True)
 
 
 def curve_status_pill() -> str:
@@ -3142,10 +3844,21 @@ def curve_status_pill() -> str:
 
 
 def render_header(title: str, subtitle: str) -> None:
-    left, right = st.columns([5, 2], vertical_alignment="top")
-    left.markdown(f'<h1 class="page-title">{html.escape(title)}</h1><p class="page-sub">{html.escape(subtitle)}</p>', unsafe_allow_html=True)
-    right.markdown(f'<div style="text-align:right;padding-top:8px">{curve_status_pill()}</div>', unsafe_allow_html=True)
-    st.markdown('<div style="height:0.7rem"></div>', unsafe_allow_html=True)
+    label = st.session_state.get("nav_page", DEFAULT_NAV_ITEM)
+    icon = label.split("/", 1)[1].split(":", 1)[0] if label.startswith(":material/") else "bolt"
+    with st.container(key="page_head"):
+        left, right = st.columns([5, 2], vertical_alignment="center")
+        left.markdown(f'<div class="head-row"><div class="head-icon"><span aria-hidden="true">{html.escape(icon)}</span></div>'
+                      f'<div><h1 class="page-title">{html.escape(title)}</h1><p class="page-sub">{html.escape(subtitle)}</p></div></div>', unsafe_allow_html=True)
+        right.markdown(f'<div style="text-align:right">{curve_status_pill()}</div>', unsafe_allow_html=True)
+
+
+def page_accent_css(label: str) -> str:
+    """Set the accent colour for the section the current page belongs to."""
+    for section, items in NAV_SECTIONS.items():
+        if label in items:
+            return f"<style>:root {{ --accent:{SECTION_COLORS[section]}; }}</style>"
+    return ""
 
 
 def title_block(title: str, subtitle: str) -> None:
@@ -3171,11 +3884,11 @@ def need_data_note(message: str) -> None:
 # SECTION 6 · NAVIGATION AND SESSION
 # =============================================================================
 NAV_SECTIONS = {
-    "Market": [":material/dashboard:  Market Overview", ":material/public:  Market Fundamentals",
+    "Market": [":material/dashboard:  Market Overview", ":material/psychology:  Market Read", ":material/public:  Market Fundamentals",
                ":material/bolt:  Power Spot", ":material/compare_arrows:  Spreads & Margins"],
     "Pricing": [":material/show_chart:  Forward Curves", ":material/request_quote:  OTC Quote Builder"],
     "Book and risk": [":material/menu_book:  Trading Book & MtM", ":material/calendar_today:  Daily P&L",
-                      ":material/shield:  Risk & Exposure", ":material/local_shipping:  Physical Operations"],
+                      ":material/shield:  Risk & Exposure", ":material/verified_user:  Hedge Advisor", ":material/local_shipping:  Physical Operations"],
     "Data and controls": [":material/cable:  Live Data Integrations", ":material/tune:  Data & Assumptions",
                           ":material/rule:  Model Validation"],
 }
@@ -3184,7 +3897,8 @@ DEFAULT_NAV_ITEM = ALL_NAV_ITEMS[0]
 NAV_TO_PAGE = {label: label.split("  ", 1)[1] for label in ALL_NAV_ITEMS}
 
 WORKFLOW_NEXT = {
-    "Market Overview": "Market Fundamentals",
+    "Market Overview": "Market Read",
+    "Market Read": "Market Fundamentals",
     "Market Fundamentals": "Power Spot",
     "Power Spot": "Spreads & Margins",
     "Spreads & Margins": "Forward Curves",
@@ -3192,7 +3906,8 @@ WORKFLOW_NEXT = {
     "OTC Quote Builder": "Trading Book & MtM",
     "Trading Book & MtM": "Daily P&L",
     "Daily P&L": "Risk & Exposure",
-    "Risk & Exposure": "Physical Operations",
+    "Risk & Exposure": "Hedge Advisor",
+    "Hedge Advisor": "Physical Operations",
 }
 
 valuation_date = date.today()
@@ -3224,13 +3939,15 @@ def render_sidebar() -> str:
         st.session_state.nav_page = DEFAULT_NAV_ITEM
     current = st.session_state.nav_page
     with st.sidebar:
-        st.markdown('<div class="brand"><span>Meridian<small>European gas and power desk</small></span></div>', unsafe_allow_html=True)
-        st.markdown('<div style="height:0.5rem"></div>', unsafe_allow_html=True)
-        for section, items in NAV_SECTIONS.items():
+        st.markdown('<div class="brand"><div class="mark"><span aria-hidden="true">bolt</span></div>'
+                    '<div class="name">Meridian<small>European gas and power desk</small></div></div>', unsafe_allow_html=True)
+        st.markdown('<div style="height:0.4rem"></div>', unsafe_allow_html=True)
+        for index, (section, items) in enumerate(NAV_SECTIONS.items()):
             key = f"navsec_{section}"
             if key not in st.session_state:
                 st.session_state[key] = current if current in items else None
-            st.radio(section, items, key=key, on_change=_on_nav, args=(section,))
+            with st.container(key=f"nav_{index}"):
+                st.radio(section, items, key=key, on_change=_on_nav, args=(section,))
         st.markdown('<div style="height:0.8rem"></div>', unsafe_allow_html=True)
         loaded = sum(1 for value in st.session_state.get("live_data", {}).values()
                      if isinstance(value, dict) and isinstance(value.get("data"), pd.DataFrame) and not value["data"].empty)
@@ -3343,8 +4060,8 @@ def refresh_market_data() -> list[tuple[str, bool, str]]:
     keys = resolved_credentials()
     today = date.today()
     tasks = {
-        "France day-ahead": lambda: fetch_entsoe_series(keys["entsoe"], "Day-ahead price", "France", today - timedelta(days=14), today + timedelta(days=2)),
-        "Germany day-ahead": lambda: fetch_entsoe_series(keys["entsoe"], "Day-ahead price", "Germany-Luxembourg", today - timedelta(days=14), today + timedelta(days=2)),
+        "France day-ahead": lambda: fetch_entsoe_series(keys["entsoe"], "Day-ahead price", "France", today - timedelta(days=30), today + timedelta(days=2)),
+        "Germany day-ahead": lambda: fetch_entsoe_series(keys["entsoe"], "Day-ahead price", "Germany-Luxembourg", today - timedelta(days=30), today + timedelta(days=2)),
         "EU gas storage": lambda: fetch_gie_history("AGSI", keys["gie"], "Europe / EU datasets", today - timedelta(days=30), today),
         "EU LNG terminals": lambda: fetch_gie_history("ALSI", keys["gie"], "Europe / EU datasets", today - timedelta(days=30), today),
         "Weather forecast": lambda: fetch_open_meteo_market_pack(list(WEATHER_LOCATIONS.keys()), past_days=3, forecast_days=10),
@@ -3606,7 +4323,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
     def check_navigation_registry() -> str:
         pages = set(NAV_TO_PAGE.values())
         required = {"Market Overview", "Forward Curves", "OTC Quote Builder", "Trading Book & MtM", "Daily P&L", "Risk & Exposure",
-                    "Physical Operations", "Market Fundamentals", "Power Spot", "Spreads & Margins", "Live Data Integrations", "Model Validation", "Data & Assumptions"}
+                    "Physical Operations", "Market Fundamentals", "Power Spot", "Spreads & Margins", "Market Read", "Hedge Advisor", "Live Data Integrations", "Model Validation", "Data & Assumptions"}
         missing = required - pages
         if missing:
             raise AssertionError(f"Navigation is missing page(s): {sorted(missing)}")
@@ -4286,6 +5003,203 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         assert_close(float(normals.iloc[0]["normal_temperature_c"]), 3.0)
         return "Mocked ECB and Open-Meteo archive responses parse into a rate and temperature normals."
 
+    # ---- Hedge Advisor and Market Read ---------------------------------------------
+    def _advisor_fixture():
+        day = date(2026, 11, 4)
+        history = synthetic_curve_history(day, list(PRODUCTS), business_days=80)
+        sample_curves = {p: make_sample_curve(p, day, 36) for p in PRODUCTS}
+        return day, history, sample_curves
+
+    def _advisor_book(day, product="TTF Natural Gas", contract="Q1-27", mw=10.0, side="BUY_FIXED"):
+        start, end = contract_window(contract)
+        spec = PRODUCTS[product]
+        return normalise_trades(pd.DataFrame([{"trade_id": f"A{side}{product}", "trade_date": day.isoformat(), "product": product, "side": side, "delivery_start": start, "delivery_end": end,
+                                               "profile": spec["profile"], "quantity_mw": mw, "trade_price": 30.0, "currency": spec["currency"], "status": "EXECUTED"}]))
+
+    def check_hedge_exact_offset() -> str:
+        day, history, sample_curves = _advisor_fixture()
+        buckets = book_buckets(_advisor_book(day))
+        plan = hedge_plan(buckets, history, sample_curves, day, 1.17, products=["TTF Natural Gas"])
+        first = plan["hedges"][0]
+        if (first["product"], first["contract"], first["action"]) != ("TTF Natural Gas", "Q1-27", "Sell"):
+            raise AssertionError(f"Expected to sell TTF Q1-27, got {first['action']} {first['product']} {first['contract']}.")
+        assert_close(first["mw"], -10.0)
+        if plan["hedged_var"] > 1.0 or plan["base_var"] < 100.0:
+            raise AssertionError(f"An identical offset should remove the risk: {plan['base_var']} to {plan['hedged_var']}.")
+        assert_close(first["cost_eur"], 10.0 * 2159 * DEFAULT_HALF_SPREADS["Gas"], 1e-6)
+        return "A 10 MW long in TTF Q1-27 gets 'sell 10 MW TTF Q1-27', VaR falls to zero, and the cost matches volume times half-spread."
+
+    def check_hedge_var_matches_engine() -> str:
+        day, history, sample_curves = _advisor_fixture()
+        moves, days = _contract_moves(history)
+        buckets = book_buckets(_advisor_book(day))
+        pnl, _, rows = _book_series(buckets, moves, days, day, 1.17)
+        by_hand = np.zeros(len(days))
+        for month, hours in _month_segments(*contract_window("Q1-27"), "BASE", "Europe/Amsterdam"):
+            tenor = (month.year - day.year) * 12 + month.month - day.month
+            table_ = moves["TTF Natural Gas"]
+            nearest = min(table_.columns, key=lambda t: abs(int(t) - tenor))
+            by_hand += table_[nearest].reindex(days).fillna(0.0).to_numpy() * 10.0 * hours
+        if not np.allclose(pnl, by_hand):
+            raise AssertionError("Book P&L doesn't match a separate calculation.")
+        drivers = risk_drivers(rows, pnl, 0.95)
+        assert_close(float(drivers["share_pct"].sum()), 100.0, 1e-6)
+        return "Book P&L matches a separate calculation, and risk driver shares add to 100%."
+
+    def check_hedge_edge_cases() -> str:
+        day, history, sample_curves = _advisor_fixture()
+        flat = pd.concat([_advisor_book(day), _advisor_book(day, side="SELL_FIXED")], ignore_index=True)
+        plan = hedge_plan(book_buckets(flat), history, sample_curves, day, 1.17)
+        if plan["hedges"]:
+            raise AssertionError("A flat book must get no hedge.")
+        short = history.loc[history["snapshot_date"].isin(sorted(history["snapshot_date"].unique())[:5])]
+        if hedge_plan(book_buckets(_advisor_book(day)), short, sample_curves, day, 1.17)["ready"]:
+            raise AssertionError("Too little history must not produce a plan.")
+        if hedge_plan(pd.DataFrame(), history, sample_curves, day, 1.17)["ready"]:
+            raise AssertionError("An empty book must not produce a plan.")
+        no_history = hedge_plan(book_buckets(_advisor_book(day)), history.loc[history["product"].ne("TTF Natural Gas")], sample_curves, day, 1.17)
+        if no_history["uncovered"] != ["TTF Natural Gas"] or any(h["product"] == "TTF Natural Gas" for h in no_history["hedges"]):
+            raise AssertionError("A product with no history must be reported, not hedged.")
+        proxy = hedge_plan(book_buckets(_advisor_book(day)), history, sample_curves, day, 1.17, products=["NBP Natural Gas"], min_improvement=0.01)
+        if proxy["hedges"] and not all(h["proxy"] for h in proxy["hedges"]):
+            raise AssertionError("A hedge in another product must be labelled as a proxy.")
+        gbp = hedge_plan(book_buckets(_advisor_book(day, "NBP Natural Gas")), history, sample_curves, day, 2.0, products=["NBP Natural Gas"])
+        low = hedge_plan(book_buckets(_advisor_book(day, "NBP Natural Gas")), history, sample_curves, day, 1.0, products=["NBP Natural Gas"])
+        assert_close(gbp["base_var"], low["base_var"] * 2.0, 1e-6)
+        return "Flat books, thin history, empty books and missing products behave correctly, proxies are labelled and GBP converts."
+
+    def check_hedge_proposed_trades() -> str:
+        day, history, sample_curves = _advisor_fixture()
+        book = _advisor_book(day)
+        plan = hedge_plan(book_buckets(book), history, sample_curves, day, 1.17, products=["TTF Natural Gas"])
+        trades = proposed_hedge_trades(plan["hedges"], day, "T")
+        row = trades.iloc[0]
+        if row["status"] != "PROPOSED" or row["side"] != "SELL_FIXED":
+            raise AssertionError("A hedge must enter the book as a proposed sale.")
+        assert_close(float(row["trade_price"]), round(plan["hedges"][0]["mid"] - DEFAULT_HALF_SPREADS["Gas"], 4))
+        combined = add_trade_to_book(book, trades)
+        if len(combined) != len(book) + len(trades):
+            raise AssertionError("Proposed hedges didn't join the book.")
+        executed = combined.copy()
+        executed["status"] = "EXECUTED"
+        after = hedge_plan(book_buckets(executed), history, sample_curves, day, 1.17, products=["TTF Natural Gas"])
+        if after["base_var"] > 1.0 or after["hedges"]:
+            raise AssertionError("Once executed, the hedge should leave almost no risk and need no further hedge.")
+        if plan["out_of_sample"] is None or plan["out_of_sample"]["hedged_std"] > plan["out_of_sample"]["unhedged_std"]:
+            raise AssertionError("The direct hedge should hold up on unseen days.")
+        own = custom_hedge_effect(book_buckets(book), history, day, 1.17, "TTF Natural Gas", "Q1-27", -10.0)
+        if own["after"] > 1.0:
+            raise AssertionError("Test-your-own should match the recommended hedge.")
+        worse = custom_hedge_effect(book_buckets(book), history, day, 1.17, "TTF Natural Gas", "Q1-27", 10.0)
+        assert_close(worse["after"], own["before"] * 2.0, 1e-6)
+        return "Hedges enter as proposed trades at mid less the spread, remove the risk once executed, and hold up on unseen days."
+
+    def check_hedge_fits_the_book() -> str:
+        day, history, sample_curves = _advisor_fixture()
+        book = normalise_trades(pd.concat([_advisor_book(day, "TTF Natural Gas", "Q1-27", 10.0), _advisor_book(day, "German Power Base", "Q2-27", 8.0)], ignore_index=True))
+        buckets = book_buckets(book)
+        net = _book_net(buckets)
+        plan = hedge_plan(buckets, history, sample_curves, day, 1.17, products=["TTF Natural Gas", "German Power Base"], max_contracts=5, min_improvement=0.001)
+        if not plan["hedges"]:
+            raise AssertionError("This book should get a hedge.")
+        for hedge in plan["hedges"]:
+            spec = PRODUCTS[hedge["product"]]
+            segments = _month_segments(hedge["start"], hedge["end"], spec["profile"], spec["timezone"])
+            held = sum(h for m, h in segments if m in net[hedge["product"]]) / sum(h for _, h in segments)
+            if held < 0.6:
+                raise AssertionError(f"{hedge['contract']} doesn't sit on months the book holds.")
+            if hedge["action"] != "Sell" or abs(hedge["mw"]) > (10.0 if hedge["product"].startswith("TTF") else 8.0) + 1e-9:
+                raise AssertionError(f"{hedge['action']} {hedge['mw']} MW doesn't oppose or exceeds the position.")
+        after = hedge_ladder_rows(buckets, plan["hedges"])
+        for product in net:
+            before_gross = sum(abs(v) for v in net[product].values())
+            after_gross = after.loc[after["product"].eq(product), "net_mwh"].abs().sum()
+            if after_gross > before_gross + 1e-6:
+                raise AssertionError(f"Hedges increased the total {product} position.")
+        if _hedge_fit("TTF Natural Gas", _month_segments(*contract_window("Cal-28"), "BASE", "Europe/Amsterdam"), net) is not None:
+            raise AssertionError("A contract away from the book's months must not be offered.")
+        return "Hedges sit on months the book holds, oppose the position, never exceed it, and leave each total position smaller."
+
+    def check_read_summary_logic() -> str:
+        strong = [_signal("a", "A", 2.0, 2.0, flip="x"), _signal("b", "B", 1.0, 2.0), _signal("c", "C", 1.0, 1.0)]
+        result = summarise_read(strong)
+        assert_close(result["score"], (2 + 1 + 0.5) / 4)
+        if result["reading"] != "Bullish" or result["confidence"] != "High":
+            raise AssertionError(f"Unanimous evidence read as {result['reading']}, {result['confidence']}.")
+        mixed = summarise_read([_signal("a", "A", 1.0, 2.0), _signal("b", "B", 1.0, -2.0), _signal("c", "C", 1.0, 0.0)])
+        if mixed["reading"] != "Balanced" or mixed["confidence"] != "Low":
+            raise AssertionError(f"Opposing evidence read as {mixed['reading']}, {mixed['confidence']}.")
+        bearish = summarise_read([_signal("a", "A", 1.0, -1.0), _signal("b", "B", 1.0, -0.4), _signal("c", "C", 2.0, None, missing="m")])
+        if not bearish["reading"].endswith("earish") or bearish["confidence"] == "High" or len(bearish["missing"]) != 1:
+            raise AssertionError(f"Partial bearish evidence handled wrongly: {bearish['reading']}, {bearish['confidence']}.")
+        weak = summarise_read([_signal("a", "A", 3.0, 0.3), _signal("b", "B", 1.0, 0.0)])
+        if weak["reading"] != "Balanced" or weak["confidence"] == "High":
+            raise AssertionError("Weak evidence must not read as a high-confidence call.")
+        one = summarise_read([_signal("a", "A", 1.0, 2.0), _signal("b", "B", 1.0)])
+        if one["reading"] != "Not enough data":
+            raise AssertionError("One signal must not produce a reading.")
+        if _signal("x", "X", 1.0, 99.0)["score"] != 1.0 or _signal("x", "X", 1.0, float("nan"))["available"]:
+            raise AssertionError("Scores must be capped and invalid values refused.")
+        return "Weighted scores, labels, confidence, missing data and score limits all behave as defined."
+
+    def check_gas_read_by_hand() -> str:
+        today = date(2026, 11, 4)
+        rows = []
+        for year in range(2021, 2027):
+            for offset in range(0, 40):
+                day = date(year, 10, 1) + timedelta(days=offset)
+                if day <= today:
+                    fill = 60.0 + (year - 2021) * 2.0 if year < 2026 else 50.0
+                    change = -0.1 * offset if year < 2026 else -0.5 * offset
+                    rows.append({"gasDayStart": day.isoformat(), "full": fill + change})
+        history = pd.DataFrame(rows)
+        lng = pd.DataFrame({"gasDayStart": [(today - timedelta(days=i)).isoformat() for i in range(30)],
+                            "sendOut": [5000.0 if i < 7 else 4000.0 + (i % 3) for i in range(30)]})
+        signals = {s["key"]: s for s in gas_signals(history, lng, pd.DataFrame(), pd.DataFrame(), {}, {}, today)}
+        if not signals["storage_level"]["available"] or signals["storage_level"]["score"] <= 0:
+            raise AssertionError("Storage below its average must read as bullish.")
+        if not signals["storage_pace"]["available"] or signals["storage_pace"]["score"] <= 0:
+            raise AssertionError("A faster draw than normal must read as bullish.")
+        if not signals["lng"]["available"] or signals["lng"]["score"] >= 0:
+            raise AssertionError("More LNG must read as bearish.")
+        for key in ("summer_winter", "switching", "weather"):
+            if signals[key]["available"]:
+                raise AssertionError(f"{key} must wait for its data. Demo prices must never count.")
+        stale = {s["key"]: s for s in gas_signals(history, lng, pd.DataFrame(), pd.DataFrame(), {}, {}, date(2027, 2, 1))}
+        if stale["storage_level"]["available"] or "days old" not in stale["storage_level"]["missing"]:
+            raise AssertionError("Old storage data must not drive a reading.")
+        ttf = pd.DataFrame({"delivery_month": [_add_months(date(2027, 4, 1), i) for i in range(12)], "product": "TTF Natural Gas", "price": [40.0] * 6 + [36.0] * 6, "currency": "EUR", "unit": "EUR/MWh"})
+        inverted = {s["key"]: s for s in gas_signals(history, lng, pd.DataFrame(), pd.DataFrame(), {"TTF Natural Gas": ttf}, {}, today)}
+        if inverted["summer_winter"]["score"] <= 0:
+            raise AssertionError("Winter below summer must read as bullish.")
+        return "Low storage, a fast draw and an inverted winter read bullish, more LNG reads bearish, and old data and demo curves never count."
+
+    def check_power_read_by_hand() -> str:
+        today = date(2026, 11, 4)
+        hours = pd.date_range("2026-10-05T00:00:00Z", periods=24 * 30, freq="h")
+        rising = np.where(hours >= pd.Timestamp("2026-10-28", tz="UTC"), 100.0, 60.0) + np.sin(np.arange(len(hours)))
+        prices = pd.DataFrame({"timestamp": hours, "value": rising, "resolution": "PT60M"})
+        load = pd.DataFrame({"timestamp": hours, "value": np.where(hours >= pd.Timestamp("2026-10-28", tz="UTC"), 60000.0, 50000.0) + 100 * np.sin(np.arange(len(hours)))})
+        generation = pd.concat([pd.DataFrame({"timestamp": hours, "value": 5000.0, "series": "Solar"}),
+                                pd.DataFrame({"timestamp": hours, "value": 900.0, "series": "Solar (consumption)"})])
+        signals = {s["key"]: s for s in power_signals("France", prices, load, generation, pd.DataFrame(), pd.DataFrame(), {}, today)}
+        if signals["momentum"]["score"] <= 0 or signals["residual"]["score"] <= 0:
+            raise AssertionError("Rising prices and residual load must read as bullish.")
+        if "GW" not in signals["residual"]["value"] or signals["heating" if "heating" in signals else "weather"]["available"]:
+            raise AssertionError("Residual text or missing weather handled wrongly.")
+        residual = _hourly_residual(load, generation)
+        assert_close(float(residual.iloc[0]["residual"]), float(load.iloc[0]["value"]) - 5000.0)
+        falling = prices.assign(value=np.where(hours >= pd.Timestamp("2026-10-28", tz="UTC"), -5.0, 60.0))
+        negative = {s["key"]: s for s in power_signals("France", falling, load, generation, pd.DataFrame(), pd.DataFrame(), {}, today)}["negative"]
+        if negative["score"] >= 0:
+            raise AssertionError("More negative hours must read as bearish.")
+        gas = pd.DataFrame({"delivery_month": [date(2026, 12, 1)], "product": "TTF Natural Gas", "price": [30.0], "currency": "EUR", "unit": "EUR/MWh"})
+        eua = pd.DataFrame({"delivery_month": [date(2026, 12, 1)], "product": "EUA Carbon", "price": [70.0], "currency": "EUR", "unit": "EUR/tCO2"})
+        fuel = {s["key"]: s for s in power_signals("France", prices, load, generation, pd.DataFrame(), pd.DataFrame(), {"TTF Natural Gas": gas, "EUA Carbon": eua}, today)}["fuel"]
+        if "88.3" not in fuel["value"] or fuel["score"] >= 0:
+            raise AssertionError(f"Gas plant cost should be 30/0.5 + 70×0.202/0.5 = 88.3: {fuel['value']}")
+        return "Rising prices and residual load read bullish, negative hours read bearish, consumption stays out of residual load, and plant cost matches by hand."
+
     cases = [
         ("Product registry and market timezones", "Configuration", check_product_registry),
         ("MWh ↔ MMBtu conversions", "Units & conversions", check_energy_conversion),
@@ -4352,6 +5266,14 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Spot analytics by hand", "Power spot", check_spot_analytics_by_hand),
         ("Seasonal storage and degree-day normals", "Fundamentals analytics", check_storage_season_and_hdd),
         ("ECB and weather archive parsers", "Live API integration", check_ecb_and_archive_parsers),
+        ("Hedge advisor: exact offset by hand", "Hedge Advisor", check_hedge_exact_offset),
+        ("Hedge advisor: P&L and risk drivers", "Hedge Advisor", check_hedge_var_matches_engine),
+        ("Hedge advisor: edge cases", "Hedge Advisor", check_hedge_edge_cases),
+        ("Hedge advisor: proposed trades and unseen days", "Hedge Advisor", check_hedge_proposed_trades),
+        ("Hedge advisor: hedges fit the book", "Hedge Advisor", check_hedge_fits_the_book),
+        ("Market read: scoring and confidence", "Market Read", check_read_summary_logic),
+        ("Market read: gas evidence by hand", "Market Read", check_gas_read_by_hand),
+        ("Market read: power evidence by hand", "Market Read", check_power_read_by_hand),
     ]
     for name, area, fn in cases:
         run_case(name, area, fn)
@@ -4410,7 +5332,7 @@ def contract_picker(prefix: str, product: str) -> tuple[date, date, str, str]:
     return start, end, instrument, label
 
 
-def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float]) -> str:
+def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float], reads_line: str = "") -> str:
     """The morning note, written from whatever is actually loaded. Missing data stays unsaid."""
     parts = []
     total = metrics["eur_total"]
@@ -4439,7 +5361,9 @@ def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float]) ->
                 market.append(f'{label} day-ahead averages <b>{spot_kpis(current)["base"]:.1f} €/MWh</b> today')
     if market:
         parts.append("<p>" + "; ".join(market) + ".</p>")
-    else:
+    if reads_line:
+        parts.append(f'<p class="soft">{reads_line}</p>')
+    if not market:
         parts.append('<p class="soft">Refresh market data to add storage, day-ahead power and weather to this note.</p>')
     if metrics["unmarked"]:
         word = "trade needs" if metrics["unmarked"] == 1 else "trades need"
@@ -4448,7 +5372,7 @@ def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float]) ->
 
 
 def page_market_overview():
-    title_block("Today at the desk", f"{valuation_date:%A %d %B %Y}. Your book and the European gas and power markets in one view.")
+    title_block("Today at the desk", f"{valuation_date:%A %d %B %Y}. Your book and the market in one view.")
     marked = get_marked_trades()
     executed = marked.loc[marked["status"].eq("EXECUTED") & marked["mark_status"].eq("MARKED")] if not marked.empty else pd.DataFrame()
     unmarked = int(marked.loc[~marked["status"].isin(["CANCELLED", "EXPIRED"]) & ~marked["mark_status"].eq("MARKED")].shape[0]) if not marked.empty else 0
@@ -4466,9 +5390,11 @@ def page_market_overview():
             pnl_today = float((step["total_pnl"] * step["currency"].map({"EUR": 1.0, "GBP": eur_per_gbp})).sum())
 
     snapshot = build_live_snapshot()
-    note_col, chart_col = st.columns([1, 1.05], gap="large")
+    hero = st.container(key="hero")
+    note_col, chart_col = hero.columns([1, 1.05], gap="large")
     with note_col:
-        st.markdown(desk_note_html(metrics, snapshot, pnl_today), unsafe_allow_html=True)
+        reads = [f"{name} {read['summary']['reading'].lower()}" for name, read in market_reads().items() if read["summary"]["confidence"] != "None"]
+        st.markdown(desk_note_html(metrics, snapshot, pnl_today, f"Market read: {', '.join(reads)}." if reads else ""), unsafe_allow_html=True)
         if st.button("Refresh market data", type="primary", key="overview_refresh"):
             with st.status("Fetching prices, storage, weather and FX", expanded=True) as status:
                 results = refresh_market_data()
@@ -4487,20 +5413,31 @@ def page_market_overview():
                       labels={"delivery_month": "", "price": "", "product": ""})
         chart(fig, 290)
 
+    mtm_trend = None
+    if len(days) >= 4:
+        trend = pnl_history(book_buckets(st.session_state.trades), {d: lookups[d] for d in days[-31:]}, eur_per_gbp)
+        mtm_trend = trend["mtm_eur"].tolist()
     st.subheader("Book")
     c1, c2, c3, c4 = st.columns(4)
-    kpi(c1, "Open MtM, EUR trades", fmt_money(eur_mtm), tone=tone_of(eur_mtm))
-    kpi(c2, "Open MtM, GBP trades", fmt_money(gbp_mtm, "GBP"), tone=tone_of(gbp_mtm))
-    kpi(c3, "Total in EUR", fmt_money(metrics["eur_total"]), f"At {eur_per_gbp:.4f} EUR per GBP", tone=tone_of(metrics["eur_total"]))
-    kpi(c4, "Trades needing a price", f"{unmarked}", "All marked" if not unmarked else "See Trading Book")
+    kpi(c1, "Open MtM, EUR trades", fmt_money(eur_mtm), tone=tone_of(eur_mtm), accent=BLUE)
+    kpi(c2, "Open MtM, GBP trades", fmt_money(gbp_mtm, "GBP"), tone=tone_of(gbp_mtm), accent=TEAL)
+    kpi(c3, "Total in EUR", fmt_money(metrics["eur_total"]), "Last 30 saved days" if mtm_trend else f"At {eur_per_gbp:.4f} EUR per GBP", tone=tone_of(metrics["eur_total"]), spark=mtm_trend)
+    kpi(c4, "Trades needing a price", f"{unmarked}", "All marked" if not unmarked else "See Trading Book", accent=GAIN if not unmarked else LOSS)
 
     st.subheader("Market")
     storage, lng, load = snapshot.get("storage", {}), snapshot.get("lng", {}), snapshot.get("power_load", {})
+    alsi = _live_dataset_frame("gie_alsi")
+    send_col = _find_column(alsi, ("sendOut", "sendout", "send_out"))
+    france = spot_series(_live_dataset_frame("entsoe_price|France"), "Europe/Paris")
     m1, m2, m3, m4 = st.columns(4)
-    kpi(m1, "EU gas storage", f"{storage['fill_pct']:.1f}%" if storage.get("fill_pct") is not None else "Not loaded", str(storage.get("date") or ""))
-    kpi(m2, "Gas in storage", f"{storage['inventory_twh']:.0f} TWh" if storage.get("inventory_twh") is not None else "Not loaded")
-    kpi(m3, "LNG send-out", f"{lng['sendout']:,.0f} GWh/d" if lng.get("sendout") is not None else "Not loaded", str(lng.get("date") or ""))
-    kpi(m4, "Actual power load", f"{load['value'] / 1000:.1f} GW" if load.get("value") is not None else "Not loaded", str(load.get("zone") or ""))
+    kpi(m1, "EU gas storage", f"{storage['fill_pct']:.1f}%" if storage.get("fill_pct") is not None else "Not loaded",
+        f"{storage['inventory_twh']:.0f} TWh in store" if storage.get("inventory_twh") is not None else "",
+        accent=ENTITY_COLORS["TTF Natural Gas"], meter=storage.get("fill_pct"))
+    kpi(m2, "LNG send-out", f"{lng['sendout']:,.0f} GWh/d" if lng.get("sendout") is not None else "Not loaded", accent="#17A891",
+        spark=_number_series(alsi[send_col]).tail(30).tolist() if send_col else None)
+    kpi(m3, "French day-ahead", f"{spot_kpis(france.tail(24))['base']:.1f} €/MWh" if not france.empty else "Not loaded", "Last 24 hours" if not france.empty else "", accent=SODIUM,
+        spark=spot_hourly(france)["value"].tail(72).tolist() if not france.empty else None)
+    kpi(m4, "Actual power load", f"{load['value'] / 1000:.1f} GW" if load.get("value") is not None else "Not loaded", str(load.get("zone") or ""), accent="#9180EE")
 
     st.markdown('<div style="height:0.9rem"></div>', unsafe_allow_html=True)
     weather_daily = _live_dataset_frame("weather_daily")
@@ -4537,7 +5474,7 @@ def page_market_overview():
 def page_power_spot():
     title_block("Power spot", "Compare day-ahead prices across bidding zones: levels, shape, spreads and what wind and solar actually earn.")
     zones = list(ENTSOE_ZONES)
-    with st.container(border=True):
+    with st.container(key="panel"):
         c1, c2, c3 = st.columns([3, 1, 1], vertical_alignment="bottom")
         selected = c1.multiselect("Bidding zones", zones, default=[z for z in ("France", "Germany-Luxembourg", "Netherlands") if z in zones], key="spot_zones")
         horizon = c2.selectbox("Period", [7, 30, 90, 365], index=1, format_func=lambda d: f"Last {d} days", key="spot_days")
@@ -4873,7 +5810,7 @@ def page_otc_quote_builder():
         st.caption(f"Profile: {PRODUCTS[product]['profile'].title()}, set by the product. Choose a peak product to quote peak hours.")
     profile = PRODUCTS[product]["profile"]
     with ticket:
-        with st.container(border=True):
+        with st.container(key="ticket"):
             try:
                 ref = (forward_month_price(curves[product], product, start, end) if instrument == "FORWARD"
                        else reference_mark(product, start, end, profile))
@@ -5170,6 +6107,356 @@ def page_risk_exposure():
             st.caption("Historical simulation: each saved daily move is applied to today's position at the same distance from delivery. Results depend entirely on the days saved, and don't cover liquidity or basis risks those days didn't contain.")
 
 
+def market_reads() -> dict:
+    """Readings for gas and each covered power zone, reused while their inputs are unchanged."""
+    items = st.session_state.get("live_data", {})
+    imported = st.session_state.get("custom_curves", {})
+    key = (tuple(sorted((k, str(v.get("fetched_at", ""))) for k, v in items.items())),
+           tuple(sorted((p, str(st.session_state.get("curve_metadata", {}).get(p, {}).get("imported_at_utc", ""))) for p in imported)),
+           valuation_date)
+    memo = st.session_state.get("market_read_memo")
+    if memo and memo[0] == key:
+        return memo[1]
+    today = valuation_date
+    daily, normals = _live_dataset_frame("weather_daily"), _live_dataset_frame("weather_normals")
+    reads = {"European gas": gas_signals(_live_dataset_frame("gie_agsi_history"), _live_dataset_frame("gie_alsi"), daily, normals,
+                                         imported, curves, today, fx_rate("eur_per_usd"))}
+    labels = {"France": "French power", "Germany-Luxembourg": "German power", "Netherlands": "Dutch power",
+              "Belgium": "Belgian power", "Spain": "Spanish power", "Great Britain": "British power"}
+    loaded = set(_live_variants("entsoe_price"))
+    for zone, label in labels.items():
+        if zone in ("France", "Germany-Luxembourg") or zone in loaded:
+            reads[label] = power_signals(zone, _live_dataset_frame(f"entsoe_price|{zone}"), _live_dataset_frame(f"entsoe_load|{zone}"),
+                                         _live_dataset_frame(f"entsoe_generation|{zone}"), daily, normals, imported, today)
+    result = {name: {"signals": signals, "summary": summarise_read(signals)} for name, signals in reads.items()}
+    st.session_state.market_read_memo = (key, result)
+    return result
+
+
+def load_market_read_data() -> list[tuple[str, bool, str]]:
+    """Fetch everything Market Read uses. One failed source never blocks the others."""
+    keys = resolved_credentials()
+    today = date.today()
+    start = today - timedelta(days=30)
+    tasks = {"EU storage, 6 years": lambda: fetch_gie_history("AGSI", keys["gie"], "Europe / EU datasets", date(today.year - 5, 1, 1), today),
+             "EU LNG terminals": lambda: fetch_gie_history("ALSI", keys["gie"], "Europe / EU datasets", start, today),
+             "Weather forecast": lambda: fetch_open_meteo_market_pack(list(WEATHER_LOCATIONS.keys()), past_days=3, forecast_days=10),
+             "Weather normals": lambda: fetch_temperature_normals(list(WEATHER_LOCATIONS))}
+    for zone in ("France", "Germany-Luxembourg"):
+        tasks[f"{zone} day-ahead"] = lambda z=zone: fetch_entsoe_series(keys["entsoe"], "Day-ahead price", z, start, today + timedelta(days=2))
+        tasks[f"{zone} load"] = lambda z=zone: fetch_entsoe_series(keys["entsoe"], "Actual load", z, start, today + timedelta(days=1))
+        tasks[f"{zone} generation"] = lambda z=zone: fetch_entsoe_series(keys["entsoe"], "Actual generation by type", z, start, today + timedelta(days=1))
+    outcomes: dict[str, object] = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_map = {executor.submit(task): name for name, task in tasks.items()}
+        for future in as_completed(future_map):
+            try:
+                outcomes[future_map[future]] = future.result()
+            except Exception as exc:
+                outcomes[future_map[future]] = exc
+    results = []
+    for name in tasks:
+        outcome = outcomes[name]
+        if isinstance(outcome, Exception):
+            results.append((name, False, str(outcome).split(" Check your internet")[0]))
+        elif name == "EU storage, 6 years":
+            _stored_live_item("gie_agsi_history", "AGSI gas storage, 6 years", outcome, {"scope": "Europe / EU datasets", "country": ""})
+            _stored_live_item("gie_agsi", "AGSI gas storage", outcome.tail(40), {"scope": "Europe / EU datasets", "country": ""})
+            results.append((name, True, f"{len(outcome):,} days"))
+        elif name == "EU LNG terminals":
+            _stored_live_item("gie_alsi", "ALSI LNG terminals", outcome, {"scope": "Europe / EU datasets", "country": ""})
+            results.append((name, True, f"{len(outcome):,} days"))
+        elif name == "Weather forecast":
+            hourly, daily, failures = outcome
+            if daily.empty:
+                results.append((name, False, f"All {len(failures) or len(WEATHER_LOCATIONS)} locations failed."))
+                continue
+            meta = {"locations": list(WEATHER_LOCATIONS.keys()), "location": "Multiple locations", "forecast_days": 10}
+            _stored_live_item("weather_hourly", "Open-Meteo hourly weather", hourly, meta)
+            _stored_live_item("weather_daily", "Open-Meteo daily weather", daily, meta)
+            results.append((name, True, f"{daily['location'].nunique()} locations"))
+        elif name == "Weather normals":
+            frame, failures = outcome
+            if frame.empty:
+                results.append((name, False, f"All {len(failures) or len(WEATHER_LOCATIONS)} locations failed."))
+                continue
+            _stored_live_item("weather_normals", "Open-Meteo temperature normals", frame, {"years": 10})
+            results.append((name, True, f"{frame['location'].nunique()} locations"))
+        else:
+            zone, kind = name.rsplit(" ", 1)
+            store_key = {"day-ahead": "entsoe_price", "load": "entsoe_load", "generation": "entsoe_generation"}[kind]
+            label = {"day-ahead": "Day-ahead price", "load": "Actual load", "generation": "Actual generation"}[kind]
+            _stored_live_item(f"{store_key}|{zone}", f"{label}, {zone}", outcome, {"zone": zone})
+            results.append((name, True, f"{len(outcome):,} rows"))
+    return results
+
+
+def _read_tone(summary: dict) -> str:
+    return "gain" if summary["score"] >= 0.15 else "loss" if summary["score"] <= -0.15 else ""
+
+
+def _read_dial(name: str, read: dict) -> str:
+    """A market's verdict on a physical bearish-to-bullish scale."""
+    summary = read["summary"]
+    position = (summary["score"] + 1.0) / 2.0 * 100.0
+    enough = summary["confidence"] != "None"
+    lead = summary["supporting"][0]["name"] if summary["supporting"] else ""
+    line = f"Led by: {lead.lower()}." if enough and lead else "Load the missing data to form a reading." if not enough else "The evidence is evenly split."
+    knob = f'<div class="knob {_read_tone(summary)}" style="left:{position:.1f}%"></div>' if enough else ""
+    confidence = f'{summary["confidence"]} confidence' if enough else f'{summary["live"]} of {summary["total"]} signals'
+    return (f'<div class="dial"><div class="dial-top"><span class="dial-name">{html.escape(name)}</span><span class="pill">{html.escape(confidence)}</span></div>'
+            f'<div class="dial-verdict {_read_tone(summary)}">{html.escape(summary["reading"])}</div>'
+            f'<div class="scale"><div class="track"></div>{knob}</div><div class="scale-ends"><span>Bearish</span><span>Balanced</span><span>Bullish</span></div>'
+            f'<div class="dial-line">{html.escape(line)}</div></div>')
+
+
+def _evidence_row(signal: dict) -> str:
+    score = signal["score"]
+    label = "Bullish" if score >= 0.1 else "Bearish" if score <= -0.1 else "Neutral"
+    tone = "gain" if score >= 0.1 else "loss" if score <= -0.1 else ""
+    width = abs(score) * 50.0
+    left = 50.0 if score >= 0 else 50.0 - width
+    return (f'<div class="ev"><div class="ev-main"><div class="ev-name">{html.escape(signal["name"])}</div>'
+            f'<div class="ev-value">{html.escape(signal["value"])}</div><div class="ev-why">{html.escape(signal["why"])}</div></div>'
+            f'<div class="ev-side"><div class="ev-tag {tone}">{label}</div><div class="ev-bar"><i class="{tone}" style="left:{left:.1f}%;width:{width:.1f}%"></i></div></div></div>')
+
+
+def page_market_read():
+    title_block("Market read", "What the evidence says for each market, how sure it is, and what would change the view.")
+    reads = market_reads()
+    columns = st.columns(min(len(reads), 3))
+    for index, (name, read) in enumerate(list(reads.items())[:3]):
+        columns[index].markdown(_read_dial(name, read), unsafe_allow_html=True)
+    missing_count = sum(len(r["summary"]["missing"]) for r in reads.values())
+    c1, c2 = st.columns([1, 3], vertical_alignment="center")
+    if c1.button("Load everything this page uses", type="primary", key="read_load_all", width="stretch"):
+        with st.status("Fetching storage, LNG, weather, prices, load and generation", expanded=True) as status:
+            results = load_market_read_data()
+            for name, ok, detail in results:
+                st.write(f"{'Done' if ok else 'Failed'}: {name}. {detail}")
+            good = all(ok for _, ok, _ in results)
+            status.update(label="Market data loaded" if good else "Some sources could not be loaded", state="complete" if good else "error", expanded=not good)
+        if good:
+            st.rerun()
+    c2.caption(f"{missing_count} signal(s) are waiting for data." if missing_count else "All signals have data.")
+
+    tabs = st.tabs(list(reads))
+    for tab, (name, read) in zip(tabs, reads.items()):
+        summary = read["summary"]
+        with tab:
+            live = [s for s in read["signals"] if s["available"]]
+            if live:
+                ranked = sorted(live, key=lambda s: -s["weight"] * abs(s["score"]))
+                st.markdown("".join(_evidence_row(s) for s in ranked), unsafe_allow_html=True)
+            else:
+                need_data_note("No evidence loaded for this market yet. Use the button above to load it.")
+            left, right = st.columns(2, gap="large")
+            with left:
+                st.subheader("What would change this read")
+                flips = (summary["supporting"] or live)[:3]
+                if flips:
+                    st.markdown("".join(f'<div class="flip"><b>{html.escape(s["name"])}.</b> {html.escape(s["flip"])}</div>' for s in flips), unsafe_allow_html=True)
+                else:
+                    st.caption("Nothing to test yet.")
+            with right:
+                st.subheader("Evidence against it")
+                if summary["against"]:
+                    st.markdown("".join(f'<div class="flip"><b>{html.escape(s["name"])}.</b> {html.escape(s["value"])}</div>' for s in summary["against"]), unsafe_allow_html=True)
+                elif summary["confidence"] != "None":
+                    st.caption("No loaded signal points strongly the other way.")
+                else:
+                    st.caption("Nothing to test yet.")
+            if summary["missing"]:
+                with st.expander(f"Waiting for data ({len(summary['missing'])} of {summary['total']} signals)"):
+                    for signal in summary["missing"]:
+                        st.markdown(f"**{signal['name']}.** {signal['missing']}")
+    with st.expander("How this reading works"):
+        st.markdown("Each signal compares a current figure with its own history and becomes a score from -1 (bearish) to +1 (bullish). "
+                    "The reading is the weighted average, with these fixed thresholds: 0.15 for leaning and 0.50 for a full call.\n\n"
+                    "Confidence combines how much of the evidence is loaded with how far the signals agree.")
+        rows = [{"Market": name, "Signal": s["name"], "Weight": s["weight"], "Score": round(s["score"], 2) if s["available"] else None, "Status": "Loaded" if s["available"] else "Waiting for data"}
+                for name, read in reads.items() for s in read["signals"]]
+        table(pd.DataFrame(rows))
+        st.caption("The weights are expert judgement. They aren't fitted to prices and haven't been back-tested, so this organises the evidence rather than forecasting prices. It isn't trading advice. Curve signals only use imported marks, never demo prices.")
+
+
+def _ladder_figure(rows: pd.DataFrame, title: str, limit: float) -> go.Figure:
+    pivot = rows.pivot(index="product", columns="delivery_month", values="net_mwh").sort_index()
+    pivot = pivot[sorted(pivot.columns)]
+    fig = go.Figure(go.Heatmap(z=pivot.values, x=[month_contract_label(m) for m in pivot.columns], y=list(pivot.index), xgap=2, ygap=2,
+                               colorscale=[[0, LOSS], [0.5, "#23434E"], [1, BLUE]], zmid=0, zmin=-limit, zmax=limit,
+                               colorbar=dict(title="MWh", thickness=12, outlinewidth=0),
+                               hovertemplate="%{y}, %{x}: %{z:,.0f} MWh<extra></extra>"))
+    fig.update_layout(title=title, hovermode="closest")
+    fig.update_xaxes(type="category")
+    return fig
+
+
+def page_hedge_advisor():
+    title_block("Hedge advisor", "The few standard contracts that would remove the most risk from your book, and what they would cost.")
+    trades = st.session_state.trades
+    buckets = book_buckets(trades)
+    if buckets.empty:
+        need_data_note("No executed trades yet. Execute a trade in Trading Book and the advisor will size a hedge for it.")
+        return
+    history = saved_snapshots()
+    eur_per_gbp = fx_rate("eur_per_gbp")
+    with st.container(key="panel"):
+        c1, c2, c3, c4, c5 = st.columns(5, vertical_alignment="bottom")
+        confidence = c1.selectbox("Confidence", [0.95, 0.99], format_func=lambda v: f"{v * 100:.0f}%", key="hedge_conf")
+        max_contracts = c2.selectbox("Contracts at most", [1, 2, 3, 4, 5], index=2, key="hedge_max")
+        lot = c3.selectbox("Round to", [0.5, 1.0, 5.0], index=1, format_func=lambda v: f"{v:g} MW", key="hedge_lot")
+        gas_cost = c4.number_input("Gas half-spread, per MWh", min_value=0.0, max_value=5.0, value=DEFAULT_HALF_SPREADS["Gas"], step=0.01, key="hedge_gas_cost",
+                                   help="Your assumption for half the bid/offer spread. It isn't a market quote.")
+        power_cost = c5.number_input("Power half-spread, per MWh", min_value=0.0, max_value=10.0, value=DEFAULT_HALF_SPREADS["Power"], step=0.05, key="hedge_power_cost",
+                                     help="Your assumption for half the bid/offer spread. It isn't a market quote.")
+        own_only = st.checkbox("Only use products already in my book", value=True, key="hedge_own_only",
+                               help="Untick to allow proxy hedges, which rely on two markets continuing to move together.")
+    products = sorted(set(buckets["product"])) if own_only else list(PRODUCTS)
+    spreads = {"Gas": gas_cost, "Power": power_cost}
+    digest = hashlib.sha1((trades.to_csv(index=False) + f"{len(history)}|{history['snapshot_date'].max() if not history.empty else ''}|{eur_per_gbp}|{confidence}|{max_contracts}|{lot}|{gas_cost}|{power_cost}|{products}|{valuation_date}").encode("utf-8")).hexdigest()
+    for product in sorted(curves):
+        digest += hashlib.sha1(curves[product][["delivery_month", "price"]].to_csv(index=False).encode("utf-8")).hexdigest()[:8]
+    memo = st.session_state.get("hedge_memo")
+    if memo and memo[0] == digest:
+        plan = memo[1]
+    else:
+        plan = hedge_plan(buckets, history, curves, valuation_date, eur_per_gbp, confidence, max_contracts, lot, spreads, products)
+        st.session_state.hedge_memo = (digest, plan)
+    if not plan["ready"]:
+        need_data_note(plan["reason"] + " Curves save each day you open the app. To explore now, create demo history, or import past curves in Forward Curves.")
+        if st.button("Create demo history", type="primary", key="seed_history_hedge"):
+            seed_demo_history()
+            st.rerun()
+        return
+    if not history.empty and history["source"].eq(SYNTHETIC_HISTORY_SOURCE).any():
+        st.warning("Part of this history is synthetic demo data, so these hedges only show how the advisor works. Don't act on them.")
+    if plan["uncovered"]:
+        st.warning(f"No saved history for {', '.join(plan['uncovered'])}, so these products aren't in the risk figures or the hedges.")
+
+    level = f"{confidence * 100:.0f}%"
+    hedges = plan["hedges"]
+    hero = st.container(key="hero")
+    note, picture = hero.columns([1, 1.05], gap="large")
+    with note:
+        if hedges:
+            actions = [f'<b>{h["action"].lower()} {h["mw"] if h["mw"] > 0 else -h["mw"]:g} MW {html.escape(h["product"])} {html.escape(h["contract"])}</b>' for h in hedges]
+            joined = actions[0] if len(actions) == 1 else ", ".join(actions[:-1]) + " and " + actions[-1]
+            cut = (1.0 - plan["hedged_var"] / plan["base_var"]) * 100.0 if plan["base_var"] else 0.0
+            text = (f'<p>To cut risk the most, {joined}.</p>'
+                    f'<p>That would take your one-day VaR from <b>{fmt_money(plan["base_var"], signed=False)}</b> to '
+                    f'<b class="gain">{fmt_money(plan["hedged_var"], signed=False)}</b>, a {cut:.0f}% reduction, for about <b>{fmt_money(plan["total_cost"], signed=False)}</b> in spread.</p>')
+        else:
+            text = (f'<p>No standard contract would cut your one-day VaR of <b>{fmt_money(plan["base_var"], signed=False)}</b> by at least 5%.</p>'
+                    '<p class="soft">Your book may already be well balanced, or its risk may sit in products you can allow by unticking the option above.</p>')
+        st.markdown(f'<div class="desk-note">{text}</div>', unsafe_allow_html=True)
+        if hedges and st.button("Add these hedges to the book as proposed", type="primary", key="hedge_add"):
+            proposed = proposed_hedge_trades(hedges, valuation_date, pd.Timestamp.now().strftime("%y%m%d%H%M%S"))
+            try:
+                commit_trades(add_trade_to_book(st.session_state.trades, proposed))
+                st.session_state["flash_message"] = f"Added {len(proposed)} proposed hedge(s). Execute them in Trading Book for them to count in risk."
+                st.session_state["pending_nav_page"] = "Trading Book & MtM"
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not add these hedges: {exc}")
+    with picture:
+        dist = pd.DataFrame({"pnl": np.concatenate([plan["base_pnl"], plan["hedged_pnl"]]),
+                             "Book": ["As it is"] * len(plan["base_pnl"]) + ["With hedges"] * len(plan["hedged_pnl"])})
+        fig = px.histogram(dist.loc[dist["Book"].eq("As it is")] if not hedges else dist, x="pnl", color="Book", barmode="overlay", nbins=30, opacity=0.72,
+                           title="Daily P&L of today's book on each saved day, EUR", labels={"pnl": "", "Book": ""},
+                           color_discrete_map={"As it is": AMBER, "With hedges": BLUE})
+        fig.update_traces(marker_line_width=0)
+        fig.update_yaxes(title="Days")
+        fig.update_layout(hovermode="closest")
+        chart(fig, 300)
+
+    k1, k2, k3, k4 = st.columns(4)
+    kpi(k1, f"VaR now, {level}", fmt_money(plan["base_var"], signed=False), f"Expected shortfall {fmt_money(plan['base_es'], signed=False)}", accent=AMBER)
+    kpi(k2, f"VaR with hedges, {level}", fmt_money(plan["hedged_var"], signed=False), f"Expected shortfall {fmt_money(plan['hedged_es'], signed=False)}", accent=BLUE)
+    kpi(k3, "Risk removed", fmt_money(plan["base_var"] - plan["hedged_var"], signed=False), tone="gain" if hedges else "")
+    kpi(k4, "Estimated spread cost", fmt_money(plan["total_cost"], signed=False), f"Assumed half-spreads on {plan['observations']} saved days")
+
+    tab_plan, tab_drivers, tab_ladder, tab_own, tab_trust = st.tabs(["The hedges", "What drives the risk", "Positions before and after", "Test your own hedge", "How far to trust this"])
+    with tab_plan:
+        if hedges:
+            rows = [{"Action": h["action"], "Product": h["product"], "Contract": h["contract"], "MW": abs(h["mw"]), "Energy, MWh": h["mwh"],
+                     "Mid": h["mid"], "Quote currency": h["currency"], "Spread cost, EUR": h["cost_eur"], "VaR after adding it, EUR": h["var_after_step"],
+                     "Type": "Proxy" if h["proxy"] else "Direct"} for h in hedges]
+            table(pd.DataFrame(rows))
+            steps = pd.DataFrame([{"Contracts": "None", "VaR": plan["base_var"], "Cost": 0.0}] +
+                                 [{"Contracts": f"{s['contracts']}", "VaR": s["var"], "Cost": s["cost"]} for s in plan["steps"]])
+            fig = go.Figure(go.Bar(x=steps["Contracts"], y=steps["VaR"], marker=dict(color=[AMBER] + [BLUE] * (len(steps) - 1)),
+                                   customdata=steps["Cost"], hovertemplate="%{x} contract(s): VaR €%{y:,.0f}, spread cost €%{customdata:,.0f}<extra></extra>"))
+            fig.update_layout(title="One-day VaR as each contract is added, EUR", hovermode="closest", xaxis_title="Contracts in the hedge")
+            fig.update_xaxes(type="category")
+            chart(fig, 320)
+            st.caption("Each step resizes the earlier contracts too, so the table shows the final sizes and the VaR reached at each step. Proposed hedges don't change risk until you execute them in Trading Book.")
+            before_net = _book_net(buckets)
+            grown = []
+            for row in hedge_ladder_rows(buckets, hedges).to_dict("records"):
+                previous = before_net.get(row["product"], {}).get(row["delivery_month"], 0.0)
+                if abs(row["net_mwh"]) > abs(previous) + 1e-6:
+                    side = "long" if row["net_mwh"] > 0 else "short"
+                    grown.append(f"{row['product']} {month_contract_label(row['delivery_month'])} ({side} {abs(row['net_mwh']):,.0f} MWh)")
+            if grown:
+                st.warning(f"Check before using this: the hedge makes these months larger, because a quarter or season also covers months you hold less of: {', '.join(grown)}. It works only if those months keep moving with the rest of the contract.")
+        else:
+            need_data_note("No hedge cleared the 5% improvement bar with these settings.")
+    with tab_drivers:
+        drivers = plan["drivers"]
+        if drivers.empty:
+            need_data_note("No delivery months with history to analyse.")
+        else:
+            shown = drivers.copy()
+            shown["Bucket"] = shown["product"] + " " + shown["contract"]
+            top = pd.concat([shown.head(6), shown.tail(4)]).drop_duplicates("Bucket").sort_values("tail_loss_eur")
+            fig = go.Figure(go.Bar(x=top["tail_loss_eur"], y=top["Bucket"], orientation="h", marker=dict(color=[LOSS if v > 0 else GAIN for v in top["tail_loss_eur"]]),
+                                   hovertemplate="%{y}: €%{x:,.0f}<extra></extra>"))
+            fig.update_layout(title=f"Average gain or loss on the worst {100 - confidence * 100:.0f}% of days, EUR. Positive bars lose money, negative bars offset.", hovermode="closest")
+            chart(fig, max(300, 34 * len(top) + 110))
+            lead = drivers.iloc[0]
+            st.caption(f"{lead['product']} {lead['contract']} is the largest single source, at {lead['share_pct']:.0f}% of the loss on those days.")
+            table(shown[["product", "contract", "net_mwh", "tail_loss_eur", "share_pct"]].rename(columns={"product": "Product", "contract": "Delivery", "net_mwh": "Net MWh", "tail_loss_eur": "Loss on worst days, EUR", "share_pct": "Share, %"}), height=280)
+    with tab_ladder:
+        before = hedge_ladder_rows(buckets, [])
+        after = hedge_ladder_rows(buckets, hedges)
+        limit = float(max(before["net_mwh"].abs().max(), after["net_mwh"].abs().max())) or 1.0
+        height = max(240, 90 + 40 * max(before["product"].nunique(), after["product"].nunique()))
+        chart(_ladder_figure(before, "Before, net MWh by delivery month", limit), height)
+        if hedges:
+            chart(_ladder_figure(after, "After, net MWh by delivery month", limit), height)
+            st.caption("Blue is long and red is short. The hedges cut total risk, which isn't always the same as flattening every month, because some months offset others.")
+    with tab_own:
+        c1, c2, c3, c4 = st.columns(4, vertical_alignment="bottom")
+        own_product = c1.selectbox("Product", list(PRODUCTS), key="own_product")
+        own_contract = c2.selectbox("Contract", contract_choices(valuation_date), index=12, key="own_contract")
+        own_side = c3.selectbox("Side", ["Sell", "Buy"], key="own_side")
+        own_mw = c4.number_input("MW", min_value=0.5, max_value=10000.0, value=5.0, step=0.5, key="own_mw")
+        effect = custom_hedge_effect(buckets, history, valuation_date, eur_per_gbp, own_product, own_contract, own_mw if own_side == "Buy" else -own_mw, confidence)
+        if not effect["covered"]:
+            need_data_note(f"No saved history for {own_product}, so its effect can't be estimated.")
+        else:
+            change = effect["after"] - effect["before"]
+            r1, r2, r3 = st.columns(3)
+            kpi(r1, f"VaR now, {level}", fmt_money(effect["before"], signed=False))
+            kpi(r2, "VaR with this trade", fmt_money(effect["after"], signed=False))
+            kpi(r3, "Change in VaR", fmt_money(change), "This trade lowers risk" if change < 0 else "This trade adds risk" if change > 0 else "No change", tone="gain" if change < 0 else "loss" if change > 0 else "")
+    with tab_trust:
+        test = plan["out_of_sample"]
+        if test:
+            reduction = (1.0 - test["hedged_std"] / test["unhedged_std"]) * 100.0 if test["unhedged_std"] else 0.0
+            st.write(f"**Test on unseen days.** A hedge chosen using only the first {test['train_days']} days ({', '.join(test['contracts'])}) was then applied to the last {test['test_days']} days, which it had never seen.")
+            t1, t2, t3 = st.columns(3)
+            kpi(t1, "Daily volatility on those days", f"{reduction:+.0f}%" if reduction < 0 else f"−{reduction:.0f}%", f"{fmt_money(test['unhedged_std'], signed=False)} down to {fmt_money(test['hedged_std'], signed=False)}" if reduction >= 0 else "The hedge added volatility", tone="gain" if reduction > 0 else "loss")
+            kpi(t2, "Worst day unhedged", fmt_money(test["unhedged_worst"]), tone="loss" if test["unhedged_worst"] < 0 else "")
+            kpi(t3, "Worst day hedged", fmt_money(test["hedged_worst"]), tone="loss" if test["hedged_worst"] < 0 else "gain")
+        else:
+            st.write(f"**Test on unseen days.** This needs at least 45 saved days, and you have {plan['observations']}. With no suitable hedge in the earlier days, the test is also skipped.")
+        st.markdown(f"**What this uses.** {plan['observations']} saved days and {plan['candidates']} contracts that fit your book. A contract must sit mostly on delivery months you hold, oppose your position, and leave your total position in that product smaller. Sizes minimise day-to-day P&L swings, and a contract is kept only if it cuts VaR by at least 5%.\n\n"
+                    "**What it leaves out.** Liquidity and your real bid/offer, margin and collateral, credit limits, trade timing and physical constraints. Spread costs are your own assumptions.\n\n"
+                    "**Main risk.** The hedge assumes markets keep moving as they did on the saved days. A short history or a change in market regime can make it wrong, and proxy hedges are the most exposed. It's a starting point for your own judgement, not trading advice.")
+
+
 def page_market_fundamentals():
     title_block("Market fundamentals", "Storage, LNG, power, gas flows and weather, read together. These describe the market. They are not price forecasts.")
     data_items = st.session_state.get("live_data", {})
@@ -5218,7 +6505,7 @@ def page_market_fundamentals():
               help="Change across latest and eighth-latest available reporting observations; assumes the same aggregate series and unit.")
     d3.metric("LNG send-out", f"{lng['sendout']:.1f} GWh/d" if lng.get("sendout") is not None else "Not loaded",
               help=f"GIE ALSI+ · {lng.get('date', 'n/a')}")
-    d4.metric("Latest day-ahead", f"{power['value']:.2f} {power.get('unit', 'EUR/MWh')}" if power.get("value") is not None else "Not loaded",
+    d4.metric("Latest day-ahead", f"{power['value']:.2f} €/MWh" if power.get("value") is not None else "Not loaded",
               help=f"ENTSO-E · {power.get('zone', 'selected zone')} · {power.get('timestamp', 'n/a')}")
     d5.metric("Actual load", f"{load['value']/1000:.2f} GW" if load.get("value") is not None else "Not loaded",
               help=f"ENTSO-E · {load.get('zone', 'selected zone')} · {load.get('timestamp', 'n/a')}")
@@ -5937,6 +7224,7 @@ def page_model_validation():
 # =============================================================================
 PAGES = {
     "Market Overview": page_market_overview,
+    "Market Read": page_market_read,
     "Market Fundamentals": page_market_fundamentals,
     "Power Spot": page_power_spot,
     "Spreads & Margins": page_spreads,
@@ -5945,6 +7233,7 @@ PAGES = {
     "Trading Book & MtM": page_trading_book_mtm,
     "Daily P&L": page_daily_pnl,
     "Risk & Exposure": page_risk_exposure,
+    "Hedge Advisor": page_hedge_advisor,
     "Physical Operations": page_physical_operations,
     "Live Data Integrations": page_live_data_integrations,
     "Data & Assumptions": page_data_assumptions,
@@ -5989,6 +7278,7 @@ def main() -> None:
     if pending_nav_page:
         set_nav_page(str(pending_nav_page))
     page = render_sidebar()
+    st.markdown(page_accent_css(st.session_state.nav_page), unsafe_allow_html=True)
     flash_message = st.session_state.pop("flash_message", None)
     if flash_message:
         st.toast(str(flash_message), icon=":material/check_circle:")
