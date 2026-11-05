@@ -1,0 +1,8 @@
+# Meridian API keys. Keep this file beside etttr.py.
+# Never share it or add it to a repository. If you use git, add this file's name to .gitignore.
+
+ENTSOE_API_TOKEN = "65be7143-4662-4381-a527-45492d59fb9b"
+GIE_API_KEY = "76556429239ab949472fb6f5714c9017"
+
+# Optional, only for Open-Meteo's commercial plan:
+# OPEN_METEO_API_KEY = ""
