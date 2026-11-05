@@ -17,7 +17,7 @@ Everything is in this one file, in order:
 
 The sections above the pages import without opening the app. Built-in curves and trades
 are synthetic demo data, not market quotes. This is an educational prototype, not a
-production ETRM or valuation system. API keys are embedded in plain text: keep this file private.
+production ETRM or valuation system. API keys live in meridian_keys.toml beside this file: never share that one.
 """
 from __future__ import annotations
 
@@ -36,7 +36,9 @@ import io
 import json
 import math
 import os
+import re
 import sqlite3
+import textwrap
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
@@ -1060,6 +1062,12 @@ def snapshot_lookup(history: pd.DataFrame) -> dict:
     for day, product, month, price in zip(history["snapshot_date"].tolist(), history["product"].tolist(),
                                           history["delivery_month"].tolist(), history["price"].tolist()):
         result.setdefault(as_date(day), {}).setdefault(product, {})[as_date(month)] = float(price)
+    # A product with no marks on a day keeps its last ones: no new price isn't the same as leaving the curve.
+    latest: dict = {}
+    for day in sorted(result):
+        for product, marks in latest.items():
+            result[day].setdefault(product, marks)
+        latest.update(result[day])
     return result
 
 
@@ -1845,8 +1853,8 @@ def _heating_signal(daily: pd.DataFrame, normals: pd.DataFrame, locations: Seque
 
 
 def gas_signals(history: pd.DataFrame, alsi: pd.DataFrame, daily: pd.DataFrame, normals: pd.DataFrame,
-                imported: dict, curves: dict, today: date, eur_per_usd: float = 0.92) -> list[dict]:
-    """Evidence for European gas. Curve signals use imported marks only, never demo prices."""
+                imported: dict, curves: dict, today: date, eur_per_usd: float = 0.92, outlook: Optional[dict] = None) -> list[dict]:
+    """Evidence for European gas. Curve signals use recent imported marks only, never demo prices."""
     signals = []
     store = _storage_daily(history)
     level = _signal("storage_level", "Storage against the five-year average", 3.0, missing="Load 6 years of storage history.")
@@ -1932,7 +1940,8 @@ def gas_signals(history: pd.DataFrame, alsi: pd.DataFrame, daily: pd.DataFrame, 
                                     f"{row['contract']} TTF is {abs(gap):.2f} EUR/MWh {'above' if gap >= 0 else 'below'} the {row['switching_gas_price']:.2f} switching price.",
                                     "Gas above the switching price loses power-sector demand to coal, and gas below it gains that demand.",
                                     f"Reverses if TTF moves through {row['switching_gas_price']:.2f} EUR/MWh.")
-    return signals + [season, switching]
+    forward = outlook_signal(outlook)
+    return signals + [season, switching] + ([forward] if forward else [])
 
 
 def _hourly_residual(load: pd.DataFrame, generation: pd.DataFrame) -> pd.DataFrame:
@@ -1971,8 +1980,9 @@ def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generatio
                                "Shows the direction prices are already moving in, not why.",
                                f"Reverses if the 7-day average moves {'below' if gap >= 0 else 'above'} {prior.mean():.1f} EUR/MWh.")
             cut = series["local"].dt.date >= by_day["day"].iloc[-7]
+            earlier = series["local"].dt.date >= by_day["day"].iloc[max(len(by_day) - 28, 0)]
             share = lambda part: float(part.loc[part["value"] < 0, "hours"].sum() / part["hours"].sum() * 100.0) if not part.empty else 0.0
-            recent_share, prior_share = share(series.loc[cut]), share(series.loc[~cut])
+            recent_share, prior_share = share(series.loc[cut]), share(series.loc[earlier & ~cut])
             hours = float(series.loc[cut & series["value"].lt(0), "hours"].sum())
             negative = _signal("negative", negative["name"], 1.5, -(recent_share - prior_share) / 2.5,
                                f"{hours:.0f} negative hours in the last 7 days, {recent_share:.1f}% of the time against {prior_share:.1f}% before.",
@@ -2020,6 +2030,1005 @@ def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generatio
     return [residual, momentum, heating, negative, wind, fuel]
 
 
+# -----------------------------------------------------------------------------
+# Forward curve files: marks dropped in a folder, with their true date
+# -----------------------------------------------------------------------------
+CURVE_FOLDER_NAME = "meridian_curves"
+CURVE_FILE_TYPES = (".csv", ".xlsx")
+CURVE_STALE_DAYS = 3            # a Friday close is still current on Monday
+CURVE_JUMP_LIMIT = 2.0          # a price this many times the last marks is probably a unit error
+PRODUCT_ALIASES = {"ttf": "TTF Natural Gas", "nbp": "NBP Natural Gas", "eua": "EUA Carbon", "carbon": "EUA Carbon",
+                   "api2": "API2 Coal", "coal": "API2 Coal", "fr base": "French Power Base", "fr peak": "French Power Peak",
+                   "french base": "French Power Base", "french peak": "French Power Peak", "de base": "German Power Base",
+                   "de peak": "German Power Peak", "german base": "German Power Base", "german peak": "German Power Peak"}
+
+
+def _pick_column(frame: pd.DataFrame, names: Sequence[str]) -> Optional[str]:
+    return next((name for name in names if name in frame.columns), None)
+
+
+def _curve_label(value: object) -> str:
+    """Accept Dec-26, Q1-27, 2026-12, 2026-12-01 or 01/12/2026. Anything ambiguous is refused."""
+    if isinstance(value, (date, datetime, pd.Timestamp)):
+        return month_contract_label(date(value.year, value.month, 1))
+    text = str(value).strip()
+    match = re.fullmatch(r"(\d{4})-(\d{1,2})(?:-\d{1,2})?(?:[ T].*)?", text)
+    if match:
+        return month_contract_label(date(int(match[1]), int(match[2]), 1))
+    match = re.fullmatch(r"0?1/(\d{1,2})/(\d{4})", text)
+    if match:
+        return month_contract_label(date(int(match[2]), int(match[1]), 1))
+    contract_window(text)
+    return text
+
+
+def _curve_day(value: object) -> date:
+    if isinstance(value, (date, datetime, pd.Timestamp)):
+        return date(value.year, value.month, value.day)
+    text = str(value).strip()
+    match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T].*)?", text)
+    if match:
+        return date(int(match[1]), int(match[2]), int(match[3]))
+    match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", text)
+    if match:
+        return date(int(match[3]), int(match[2]), int(match[1]))
+    raise ValueError(f"Can't read the date '{text}'. Use 2026-11-04 or 04/11/2026.")
+
+
+def curve_file_day(file_name: str, fallback: date) -> date:
+    """A date in the file name wins, otherwise the day the file was last saved."""
+    match = re.search(r"(20\d{2})[-_.]?(\d{2})[-_.]?(\d{2})", file_name)
+    if match:
+        try:
+            return date(int(match[1]), int(match[2]), int(match[3]))
+        except ValueError:
+            pass
+    return fallback
+
+
+def parse_curve_table(raw: pd.DataFrame, file_name: str, fallback_day: date, shapes: dict, latest: dict, today: date) -> list[dict]:
+    """Turn one file into monthly curves, one for each product and date in it.
+
+    shapes holds the curve used to shape quarters and years into months. latest holds
+    {product: (date, curve)} of the last imported marks, used to catch unit errors.
+    """
+    frame = raw.copy()
+    frame.columns = [re.sub(r"[^a-z0-9]+", "_", str(c).strip().casefold()).strip("_") for c in frame.columns]
+    product_col = _pick_column(frame, ("product", "commodity", "instrument"))
+    price_col = _pick_column(frame, ("price", "settlement_price", "settlement", "settle", "mid", "close", "mark"))
+    period_col = _pick_column(frame, ("contract", "tenor", "delivery_month", "delivery", "month", "period"))
+    day_col = _pick_column(frame, ("curve_date", "snapshot_date", "as_of", "asof", "date"))
+    missing = [name for name, col in (("product", product_col), ("price", price_col), ("contract or delivery_month", period_col)) if col is None]
+    if missing:
+        raise ValueError(f"Missing column: {', '.join(missing)}.")
+    frame = frame.dropna(subset=[price_col, period_col])
+    if frame.empty:
+        raise ValueError("The file has no prices.")
+    names = {p.casefold(): p for p in CURVE_PRODUCTS} | PRODUCT_ALIASES
+    labels = frame[product_col].astype(str).str.strip().str.casefold()
+    unknown = sorted(set(frame.loc[~labels.isin(names), product_col].astype(str)))
+    if unknown:
+        raise ValueError(f"Unknown product: {', '.join(unknown[:3])}.")
+    data = pd.DataFrame({"product": labels.map(names), "label": [_curve_label(v) for v in frame[period_col]],
+                         "price": _number_series(frame[price_col]),
+                         "day": [_curve_day(v) for v in frame[day_col]] if day_col else curve_file_day(file_name, fallback_day)})
+    bad = data.loc[data["price"].isna(), "label"].tolist()
+    if bad:
+        raise ValueError(f"No readable price for {', '.join(bad[:3])}.")
+    if max(data["day"]) > today:
+        raise ValueError(f"The file is dated {max(data['day']):%d %b %Y}, which is in the future.")
+    results = []
+    for (product, day), group in data.groupby(["product", "day"], sort=True):
+        spec = CURVE_PRODUCTS[product]
+        if group["label"].duplicated().any():
+            raise ValueError(f"{product} has the same contract twice on {day:%d %b %Y}.")
+        months_only = all(_add_months(contract_window(label)[0], 1) == contract_window(label)[1] for label in group["label"])
+        if months_only:
+            curve = validate_curve(pd.DataFrame({"delivery_month": [contract_window(label)[0] for label in group["label"]], "product": product,
+                                                 "price": group["price"].to_numpy(), "currency": spec["currency"], "unit": spec["unit"]}))
+        else:
+            curve = decompose_tenor_quotes(list(zip(group["label"], group["price"])), product, shapes.get(product))
+        known = latest.get(product)
+        if known is not None and abs((day - known[0]).days) <= 10:
+            before = _curve_lookup(validate_curve(known[1]))
+            ratios = [price / before[month] for month, price in zip(curve["delivery_month"], curve["price"]) if before.get(month, 0.0) > 0 and price > 0]
+            if ratios and not 1.0 / CURVE_JUMP_LIMIT <= float(np.median(ratios)) <= CURVE_JUMP_LIMIT:
+                raise ValueError(f"{product} prices are {float(np.median(ratios)):.1f} times the marks of {known[0]:%d %b}. Check the unit and the product name.")
+        results.append({"product": product, "day": day, "curve": curve})
+    return results
+
+
+def curve_mark_date(metadata: Optional[dict]) -> Optional[date]:
+    """The market date of imported marks, which can be older than the import."""
+    for key in ("curve_date", "imported_at_utc"):
+        text = str((metadata or {}).get(key, ""))[:10]
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            continue
+    return None
+
+
+def curve_state(product: str, custom: dict, metadata: dict, today: date) -> dict:
+    if product not in custom:
+        return {"state": "Demo", "day": None, "age": None}
+    day = curve_mark_date(metadata.get(product))
+    age = (today - day).days if day else None
+    return {"state": "Unknown date" if age is None else "Current" if age <= CURVE_STALE_DAYS else "Stale", "day": day, "age": age}
+
+
+def fresh_curves(custom: dict, metadata: dict, today: date, max_age: int = 10) -> dict:
+    """Imported curves recent enough to count as evidence of today's market."""
+    fresh = {}
+    for product, curve in custom.items():
+        age = curve_state(product, custom, metadata, today)["age"]
+        if age is not None and age <= max_age:
+            fresh[product] = curve
+    return fresh
+
+
+def curve_warning(products: Sequence[str], custom: dict, metadata: dict, today: date) -> str:
+    """One sentence naming the prices a result relies on that aren't current market marks."""
+    demo, stale = [], []
+    for product in products:
+        status = curve_state(product, custom, metadata, today)
+        if status["state"] == "Demo":
+            demo.append(product)
+        elif status["state"] != "Current":
+            stale.append(f"{product} ({status['age']} days old)" if status["age"] is not None else product)
+    parts = []
+    if demo:
+        parts.append(f"{', '.join(demo)} {'uses' if len(demo) == 1 else 'use'} demo prices")
+    if stale:
+        parts.append(f"{', '.join(stale)} {'has' if len(stale) == 1 else 'have'} old marks")
+    return ("; ".join(parts) + ". Treat these results as an illustration until you add current marks in Forward Curves.") if parts else ""
+
+
+# -----------------------------------------------------------------------------
+# Market Read track record: was the read right, compared with chance?
+# -----------------------------------------------------------------------------
+TRACK_HORIZONS = (1, 5, 20)
+TRACK_MIN_INDEPENDENT = 20
+CALL_THRESHOLD = 0.15
+SIGNAL_THRESHOLD = 0.10
+REPLAY_LOOKBACK_DAYS = 40
+MARKET_ZONES = {"French power": "France", "German power": "Germany-Luxembourg", "Dutch power": "Netherlands",
+                "Belgian power": "Belgium", "Spanish power": "Spain", "British power": "Great Britain"}
+REAL_MARK_EXCLUSIONS = ("Demo marks", SYNTHETIC_HISTORY_SOURCE)
+
+
+def read_row(read_date: date, market: str, signals: Sequence[dict], summary: dict, price_through: date, source: str) -> dict:
+    return {"read_date": read_date.isoformat(), "market": market, "source": source, "reading": summary["reading"], "score": float(summary["score"]),
+            "confidence": summary["confidence"], "price_through": price_through.isoformat(),
+            "signals": json.dumps({s["key"]: [round(s["score"], 4), s["name"]] for s in signals if s["available"]})}
+
+
+def wilson_interval(hits: float, n: float, z: float = 1.645) -> tuple[float, float]:
+    """The likely range of a true hit rate. z=1.645 gives a 90% range."""
+    if n <= 0:
+        return 0.0, 1.0
+    rate = hits / n
+    denominator = 1.0 + z * z / n
+    middle = (rate + z * z / (2.0 * n)) / denominator
+    half = z * math.sqrt(rate * (1.0 - rate) / n + z * z / (4.0 * n * n)) / denominator
+    return max(0.0, middle - half), min(1.0, middle + half)
+
+
+def working_days_after(day: date, horizon: int) -> date:
+    return np.busday_offset(np.datetime64(day), int(horizon), roll="backward").astype("datetime64[D]").astype(object)
+
+
+def independent_call_count(anchors: Sequence[date], horizon: int) -> int:
+    """Calls whose outcome windows don't overlap. Twenty 20-day calls a day apart are one test, not twenty."""
+    count, free_from = 0, None
+    for day in sorted(set(anchors)):
+        if free_from is None or day >= free_from:
+            count += 1
+            free_from = working_days_after(day, max(int(horizon), 1))
+    return count
+
+
+def spot_path(series: pd.DataFrame) -> dict:
+    """Daily day-ahead base price, with the usual weekday pattern removed for scoring."""
+    if series is None or series.empty:
+        return {"kind": "spot", "values": {}, "raw": pd.Series(dtype=float)}
+    daily = series.assign(day=series["local"].dt.date).groupby("day")["value"].mean()
+    weekdays = np.array([d.weekday() for d in daily.index])
+    overall = float(daily.mean())
+    effect = {w: float(daily.to_numpy()[weekdays == w].mean()) - overall for w in set(weekdays.tolist())}
+    adjusted = daily.to_numpy() - np.array([effect[w] for w in weekdays])
+    values = dict(zip(daily.index, adjusted.tolist()))
+    return {"kind": "spot", "values": values, "raw": daily}
+
+
+def marks_path(history: pd.DataFrame, product: str) -> dict:
+    """Saved real marks for one product. Demo and synthetic prices never count as outcomes."""
+    table: dict = {}
+    if history is not None and not history.empty:
+        rows = history.loc[history["product"].eq(product) & ~history["source"].isin(REAL_MARK_EXCLUSIONS)]
+        for day, month, price in zip(rows["snapshot_date"], rows["delivery_month"], rows["price"]):
+            table.setdefault(_to_date(day), {})[_to_date(month)] = float(price)
+    return {"kind": "marks", "table": table, "days": sorted(table)}
+
+
+def path_move(path: dict, anchor: date, horizon: int) -> Optional[float]:
+    """How far the price moved after a read, using only prices later than it."""
+    target = working_days_after(anchor, horizon)
+    if path["kind"] == "spot":
+        # Against the price when the call was made. An average of past days would flatter
+        # any call that follows a trend, even in a market with no trend to find.
+        later, base = path["values"].get(target), path["values"].get(anchor)
+        return None if later is None or base is None else later - base
+    days = path["days"]
+    start = next((d for d in reversed(days) if d <= anchor), None)
+    end = next((d for d in days if d >= target), None)
+    if start is None or end is None or end <= start or (anchor - start).days > 3 or (end - target).days > 3:
+        return None
+    # The same delivery month at both dates, so a contract rolling never counts as a move.
+    first_month = _add_months(date(end.year, end.month, 1), 1)
+    months = sorted(m for m in path["table"][start] if m >= first_month and m in path["table"][end])
+    return path["table"][end][months[0]] - path["table"][start][months[0]] if months else None
+
+
+def path_anchors(path: dict) -> list[date]:
+    return list(path["values"]) if path["kind"] == "spot" else list(path["days"])
+
+
+def up_share(path: dict, horizon: int, first: Optional[date] = None, last: Optional[date] = None) -> float:
+    """How often the price rose over this horizon on any day, whatever the read said."""
+    moves = [path_move(path, day, horizon) for day in path_anchors(path) if (first is None or day >= first) and (last is None or day <= last)]
+    moves = [m for m in moves if m]
+    return sum(1 for m in moves if m > 0) / len(moves) if moves else 0.5
+
+
+def score_calls(calls: pd.DataFrame, path: dict, horizon: int) -> dict:
+    """calls has anchor and direction (+1 or -1). The result compares them with always guessing the same way."""
+    outcomes = [(a, d, path_move(path, a, horizon)) for a, d in zip(calls["anchor"], calls["direction"])] if not calls.empty else []
+    outcomes = [row for row in outcomes if row[2]]
+    result = {"calls": len(outcomes), "independent": 0, "right": None, "chance": None, "low": None, "high": None, "average_move": None, "verdict": "No results yet"}
+    if not outcomes:
+        return result
+    anchors = [row[0] for row in outcomes]
+    hits = sum(1 for _, d, move in outcomes if d * move > 0)
+    independent = independent_call_count(anchors, horizon)
+    rate = hits / len(outcomes)
+    rising = up_share(path, horizon, min(anchors), max(anchors))
+    bullish = sum(1 for _, d, _m in outcomes if d > 0)
+    chance = (bullish * rising + (len(outcomes) - bullish) * (1.0 - rising)) / len(outcomes)
+    low, high = wilson_interval(rate * independent, independent)
+    verdict = ("Too few to judge" if independent < TRACK_MIN_INDEPENDENT else "Better than chance" if low > chance else
+               "Worse than chance" if high < chance else "No clear edge")
+    result.update({"independent": independent, "right": rate, "chance": chance, "low": low, "high": high,
+                   "average_move": float(np.mean([d * move for _, d, move in outcomes])), "verdict": verdict})
+    return result
+
+
+def _direction(score: float, threshold: float) -> int:
+    return 1 if score >= threshold else -1 if score <= -threshold else 0
+
+
+def track_tables(reads: pd.DataFrame, paths: dict) -> dict:
+    """Score every saved read, overall, by confidence and by signal."""
+    overall, by_confidence, by_signal = [], [], []
+    if reads is None or reads.empty:
+        return {"overall": pd.DataFrame(), "confidence": pd.DataFrame(), "signals": pd.DataFrame()}
+    data = reads.copy()
+    data["anchor"] = data["price_through"].map(date.fromisoformat)
+    # One read per price date: reopening the app before new prices arrive isn't a new call.
+    data = data.sort_values("read_date").drop_duplicates(["market", "source", "anchor"], keep="last")
+    for (market, source), group in data.groupby(["market", "source"], sort=False):
+        path = paths.get(market)
+        if not path or not path_anchors(path):
+            continue
+        calls = group.assign(direction=group["score"].map(lambda s: _direction(float(s), CALL_THRESHOLD)))
+        directional = calls.loc[calls["direction"].ne(0)]
+        decoded = [(a, json.loads(text)) for a, text in zip(group["anchor"], group["signals"])]
+        names = {key: value[1] for _, signals in decoded for key, value in signals.items()}
+        for horizon in TRACK_HORIZONS:
+            overall.append({"market": market, "source": source, "horizon": horizon, "balanced": int(calls["direction"].eq(0).sum()), **score_calls(directional, path, horizon)})
+            for level, part in directional.groupby("confidence"):
+                by_confidence.append({"market": market, "source": source, "horizon": horizon, "confidence": level, **score_calls(part, path, horizon)})
+            for key, name in names.items():
+                rows = [(a, _direction(signals[key][0], SIGNAL_THRESHOLD)) for a, signals in decoded if key in signals]
+                frame = pd.DataFrame([r for r in rows if r[1]], columns=["anchor", "direction"])
+                by_signal.append({"market": market, "source": source, "horizon": horizon, "signal": name, **score_calls(frame, path, horizon)})
+    return {"overall": pd.DataFrame(overall), "confidence": pd.DataFrame(by_confidence), "signals": pd.DataFrame(by_signal)}
+
+
+def replay_power_reads(market: str, zone: str, prices: pd.DataFrame, load: pd.DataFrame, generation: pd.DataFrame, skip: set, today: date) -> list[dict]:
+    """Rebuild past reads using only what was known at the time. Forecast and curve signals are left out."""
+    if prices is None or prices.empty or "timestamp" not in prices.columns:
+        return []
+    tz = ENTSOE_ZONES[zone]["timezone"]
+    stamps = pd.to_datetime(prices["timestamp"], errors="coerce", utc=True)
+    local_days = stamps.dt.tz_convert(tz).dt.date
+    days = sorted(set(local_days.dropna()))
+    if len(days) < 30:
+        return []
+    frames = []
+    for frame in (load, generation):
+        held = frame is not None and not frame.empty and "timestamp" in frame.columns
+        frames.append((frame, pd.to_datetime(frame["timestamp"], errors="coerce", utc=True)) if held else (None, None))
+    rows = []
+    for day in days[28:-1]:
+        if day.weekday() >= 5 or (day.isoformat(), market) in skip or day >= today:
+            continue
+        end = pd.Timestamp(day + timedelta(days=1), tz=tz).tz_convert("UTC")
+        begin = end - pd.Timedelta(days=REPLAY_LOOKBACK_DAYS)
+        known_until = end - pd.Timedelta(days=1)   # actual load and output for this day aren't known yet
+        window = [frame.loc[(times >= begin) & (times < known_until)] if frame is not None else None for frame, times in frames]
+        signals = power_signals(zone, prices.loc[(stamps >= begin) & (stamps < end)], window[0], window[1], None, None, {}, day)
+        summary = summarise_read(signals)
+        if summary["confidence"] != "None":
+            rows.append(read_row(day, market, signals, summary, day, "Replayed"))
+    return rows
+
+
+def replay_gas_reads(history: pd.DataFrame, alsi: pd.DataFrame, days: Sequence[date], skip: set) -> list[dict]:
+    """Past gas reads on the days with real TTF marks to score them against."""
+    if history is None or history.empty:
+        return []
+    date_col = _find_column(history, ("observation_date", "gasDayStart", "gas_day"))
+    if not date_col:
+        return []
+    stamps = pd.to_datetime(history[date_col], errors="coerce")
+    alsi_col = _find_column(alsi, ("observation_date", "gasDayStart", "gas_day")) if alsi is not None and not alsi.empty else None
+    alsi_stamps = pd.to_datetime(alsi[alsi_col], errors="coerce") if alsi_col else None
+    rows = []
+    for day in days:
+        if (day.isoformat(), "European gas") in skip:
+            continue
+        # A gas day is published the day after it ends, so the read on day t sees up to t-1.
+        cut = pd.Timestamp(day)
+        lng = alsi.loc[alsi_stamps < cut] if alsi_col else None
+        signals = gas_signals(history.loc[stamps < cut], lng, None, None, {}, {}, day)
+        summary = summarise_read(signals)
+        if summary["confidence"] != "None":
+            rows.append(read_row(day, "European gas", signals, summary, day, "Replayed"))
+    return rows
+
+
+# -----------------------------------------------------------------------------
+# Winter storage projection: where EU storage ends March under different weather
+# -----------------------------------------------------------------------------
+WINTER_MONTHS = (10, 11, 12, 1, 2, 3)
+OUTLOOK_MIN_WINTERS = 2
+OUTLOOK_MIN_WEATHER_YEARS = 3
+BIAS_DAYS = 14
+BIAS_HALF_LIFE_DAYS = 30.0
+
+
+def winter_of(day: date) -> int:
+    return day.year if day.month >= 7 else day.year - 1
+
+
+def winter_label(year: int) -> str:
+    return f"{year}-{(year + 1) % 100:02d}"
+
+
+def _in_other_winter(day: date, year: int, winter: int) -> date:
+    """The same calendar day in another winter. 29 February falls back to the 28th."""
+    target = day.year + (winter - year)
+    return date(target, day.month, 28 if day.month == 2 and day.day == 29 else day.day)
+
+
+def daily_fill(history: pd.DataFrame) -> pd.Series:
+    """Fill level by gas day, with gaps of up to three days bridged."""
+    daily = _storage_daily(history)
+    if daily.empty:
+        return pd.Series(dtype=float)
+    series = daily.set_index("day")["fill"].sort_index()
+    return series.asfreq("D").interpolate(limit=3)
+
+
+def archive_hdd(archive: pd.DataFrame, locations: Sequence[str] = GAS_WEATHER_LOCATIONS) -> pd.Series:
+    """Average heating degree days across the north-west European reference cities."""
+    if archive is None or archive.empty or not {"date", "location", "hdd"}.issubset(archive.columns):
+        return pd.Series(dtype=float)
+    part = archive.loc[archive["location"].isin(locations)]
+    if part.empty:
+        return pd.Series(dtype=float)
+    out = pd.DataFrame({"date": pd.to_datetime(part["date"], errors="coerce"), "hdd": pd.to_numeric(part["hdd"], errors="coerce")}).dropna()
+    return out.groupby("date")["hdd"].mean().sort_index()
+
+
+def _weather_terms(days: pd.DatetimeIndex, hdd: np.ndarray) -> np.ndarray:
+    """Month of winter, heating demand and weekend. Fill level is added separately."""
+    months = np.array([days.month == m for m in WINTER_MONTHS], dtype=float).T
+    return np.column_stack([months, np.asarray(hdd, dtype=float), (days.dayofweek >= 5).astype(float)])
+
+
+def fit_storage_model(fill: pd.Series, hdd: pd.Series, exclude: Optional[int] = None, until: Optional[pd.Timestamp] = None) -> Optional[dict]:
+    """Daily fill change = month + heating demand + weekend + fill level, on winter days.
+
+    The fill term lets withdrawals slow as storage empties. Older winters count half.
+    """
+    frame = pd.DataFrame({"change": fill.diff(), "before": fill.shift(1)}).join(hdd.rename("hdd"), how="inner").dropna()
+    frame = frame.loc[frame.index.month.isin(WINTER_MONTHS)]
+    if until is not None:
+        frame = frame.loc[frame.index <= until]
+    winters = np.array([winter_of(d) for d in frame.index.date]) if not frame.empty else np.array([])
+    if exclude is not None and len(frame):
+        keep = winters != exclude
+        frame, winters = frame.loc[keep], winters[keep]
+    full = [w for w in sorted(set(winters.tolist())) if (winters == w).sum() >= 100]
+    if len(full) < OUTLOOK_MIN_WINTERS:
+        return None
+    weather = _weather_terms(frame.index, frame["hdd"].to_numpy())
+    design = np.column_stack([weather, frame["before"].to_numpy() - 60.0])
+    weights = np.where(winters >= max(full) - 2, 1.0, 0.5)
+    root = np.sqrt(weights)
+    target = frame["change"].to_numpy()
+    beta = np.linalg.lstsq(design * root[:, None], target * root, rcond=None)[0]
+    fitted = design @ beta
+    spread = float(np.sum((target - target.mean()) ** 2))
+    return {"beta": beta, "n": int(len(frame)), "winters": full, "hdd_effect": float(beta[6]), "weekend_effect": float(beta[7]), "fill_effect": float(beta[8]),
+            "r2": 1.0 - float(np.sum((target - fitted) ** 2)) / spread if spread > 0 else 0.0,
+            "low": float(target.min()), "high": float(target.max())}
+
+
+def recent_model_bias(model: dict, fill: pd.Series, hdd: pd.Series, start: pd.Timestamp) -> float:
+    """How far storage has recently run above or below the model, for example from strong LNG supply."""
+    frame = pd.DataFrame({"change": fill.diff(), "before": fill.shift(1)}).join(hdd.rename("hdd"), how="inner").dropna()
+    frame = frame.loc[(frame.index <= start) & (frame.index > start - pd.Timedelta(days=BIAS_DAYS)) & frame.index.month.isin(WINTER_MONTHS)]
+    if len(frame) < 7:
+        return 0.0
+    design = np.column_stack([_weather_terms(frame.index, frame["hdd"].to_numpy()), frame["before"].to_numpy() - 60.0])
+    return float((frame["change"].to_numpy() - design @ model["beta"]).mean())
+
+
+def simulate_fill(model: dict, start_fill: float, days: pd.DatetimeIndex, hdd: Sequence[float], bias: float = 0.0) -> np.ndarray:
+    """Step forward one day at a time, so each day's withdrawal depends on what's left."""
+    base = _weather_terms(days, np.asarray(hdd, dtype=float)) @ model["beta"][:8]
+    effect = float(model["beta"][8])
+    path = np.empty(len(days))
+    level = float(start_fill)
+    for i, value in enumerate(base):
+        step = value + effect * (level - 60.0) + bias * 0.5 ** ((i + 1) / BIAS_HALF_LIFE_DAYS)
+        level = float(np.clip(level + np.clip(step, model["low"], model["high"]), 0.0, 100.0))
+        path[i] = level
+    return path
+
+
+def _fill_on(fill: pd.Series, day: date) -> Optional[float]:
+    value = fill.get(pd.Timestamp(day))
+    return float(value) if value is not None and pd.notna(value) else None
+
+
+def past_winter_changes(fill: pd.Series, start: date, year: int) -> dict:
+    """Change in fill from this calendar day to 31 March, for each finished winter."""
+    changes = {}
+    for winter in range(year - 12, year):
+        begin, end = _fill_on(fill, _in_other_winter(start, year, winter)), _fill_on(fill, date(winter + 1, 3, 31))
+        if begin is not None and end is not None:
+            changes[winter] = end - begin
+    return changes
+
+
+def backtest_outlook(fill: pd.Series, hdd: pd.Series, start: date, year: int) -> pd.DataFrame:
+    """Test the method on each past winter, using a model that never saw that winter."""
+    columns = ["Winter", "Fill at this date", "Actual end", "Model end", "Model miss", "Average-winter end", "Average-winter miss"]
+    changes = past_winter_changes(fill, start, year)
+    rows = []
+    for winter in sorted(changes):
+        model = fit_storage_model(fill, hdd, exclude=winter, until=pd.Timestamp(start))
+        others = [v for w, v in changes.items() if w != winter]
+        if model is None or len(others) < 2:
+            continue
+        begin = _in_other_winter(start, year, winter)
+        days = pd.date_range(begin + timedelta(days=1), date(winter + 1, 3, 31), freq="D")
+        weather = hdd.reindex(days)
+        if weather.isna().mean() > 0.02:
+            continue
+        begin_fill = _fill_on(fill, begin)
+        bias = recent_model_bias(model, fill, hdd, pd.Timestamp(begin))
+        modelled = float(simulate_fill(model, begin_fill, days, weather.ffill().bfill().to_numpy(), bias)[-1])
+        actual = begin_fill + changes[winter]
+        average = begin_fill + float(np.mean(others))
+        rows.append({"Winter": winter_label(winter), "Fill at this date": begin_fill, "Actual end": actual, "Model end": modelled,
+                     "Model miss": modelled - actual, "Average-winter end": average, "Average-winter miss": average - actual})
+    return pd.DataFrame(rows, columns=columns)
+
+
+def winter_band(fill: pd.Series, year: int) -> pd.DataFrame:
+    """The five previous winters on this winter's dates."""
+    axis = pd.date_range(date(year, 10, 1), date(year + 1, 3, 31), freq="D")
+    columns = {}
+    for winter in range(year - 5, year):
+        columns[winter] = [_fill_on(fill, _in_other_winter(day.date(), year, winter)) for day in axis]
+    table = pd.DataFrame(columns, index=axis).astype(float)
+    usable = table.notna().sum(axis=1) >= 3
+    return pd.DataFrame({"day": axis, "low": table.min(axis=1), "high": table.max(axis=1), "average": table.mean(axis=1)}).loc[usable].reset_index(drop=True)
+
+
+def forecast_hdd(daily: pd.DataFrame, locations: Sequence[str] = GAS_WEATHER_LOCATIONS) -> pd.Series:
+    if daily is None or daily.empty or not {"date", "location", "forecast_period", "heating_degree_day_proxy_18c"}.issubset(daily.columns):
+        return pd.Series(dtype=float)
+    part = daily.loc[daily["forecast_period"].eq("Forecast") & daily["location"].isin(locations)]
+    frame = pd.DataFrame({"date": pd.to_datetime(part["date"], errors="coerce"), "hdd": pd.to_numeric(part["heating_degree_day_proxy_18c"], errors="coerce")}).dropna()
+    return frame.groupby("date")["hdd"].mean().sort_index() if not frame.empty else pd.Series(dtype=float)
+
+
+def project_winter(history: pd.DataFrame, archive: pd.DataFrame, daily_weather: pd.DataFrame, today: date) -> dict:
+    """Project EU storage to 31 March under cold, normal and mild weather."""
+    if today.month in (4, 5, 6, 7, 8, 9):
+        return {"ready": False, "off_season": True, "reason": "The winter projection runs from October to March. It starts again on 1 October."}
+    fill = daily_fill(history)
+    if fill.dropna().empty:
+        return {"ready": False, "off_season": False, "reason": "Select Update market data to load storage history."}
+    fill = fill.dropna()
+    fill = fill.asfreq("D")
+    start_stamp = fill.dropna().index[-1]
+    start = start_stamp.date()
+    if (today - start).days > STALE_DAYS:
+        return {"ready": False, "off_season": False, "reason": f"Storage data is {(today - start).days} days old. Select Update market data."}
+    year = winter_of(today)
+    end = date(year + 1, 3, 31)
+    days = pd.date_range(start + timedelta(days=1), end, freq="D")
+    if days.empty:
+        return {"ready": False, "off_season": False, "reason": "This winter has finished. The next projection starts on 1 October."}
+    start_fill = float(fill.loc[start_stamp])
+    band = winter_band(fill, year)
+    band_end = band.loc[band["day"].eq(pd.Timestamp(end))].iloc[0].to_dict() if band["day"].eq(pd.Timestamp(end)).any() else None
+    actual = fill.loc[pd.Timestamp(year, 10, 1):start_stamp].dropna()
+    result = {"ready": True, "off_season": False, "reason": "", "start": start, "start_fill": start_fill, "end": end, "year": year, "band": band, "band_end": band_end,
+              "actual": actual, "model": None, "backtest": pd.DataFrame(), "error": None, "average_error": None, "forecast_days": 0, "bias": 0.0, "years": pd.DataFrame()}
+    hdd = archive_hdd(archive)
+    model = fit_storage_model(fill, hdd) if not hdd.empty else None
+    weather_years = {}
+    if model is not None and model["hdd_effect"] < 0:
+        ahead = forecast_hdd(daily_weather)
+        for winter in range(year - 12, year):
+            mapped = pd.DatetimeIndex([_in_other_winter(d.date(), year, winter) for d in days])
+            values = hdd.reindex(mapped)
+            if values.notna().all():
+                series = pd.Series(values.to_numpy(), index=days)
+                known = ahead.reindex(days).dropna()
+                series.loc[known.index] = known.to_numpy()
+                weather_years[winter] = series
+    if len(weather_years) >= OUTLOOK_MIN_WEATHER_YEARS:
+        totals = {w: float(s.sum()) for w, s in weather_years.items()}
+        bias = recent_model_bias(model, fill, hdd, start_stamp)
+        coldest, mildest = max(totals, key=totals.get), min(totals, key=totals.get)
+        normal = pd.concat(weather_years.values(), axis=1).mean(axis=1)
+        def path(weather: pd.Series) -> np.ndarray:
+            return simulate_fill(model, start_fill, days, weather.to_numpy(), bias)
+        ends = {w: float(path(s)[-1]) for w, s in weather_years.items()}
+        result["scenarios"] = [
+            {"name": "Cold", "note": f"Weather like {winter_label(coldest)}, the coldest of the {len(weather_years)} past winters", "path": path(weather_years[coldest])},
+            {"name": "Normal", "note": f"Average weather of the {len(weather_years)} past winters", "path": path(normal)},
+            {"name": "Mild", "note": f"Weather like {winter_label(mildest)}, the mildest of the {len(weather_years)} past winters", "path": path(weather_years[mildest])}]
+        result["days"] = days
+        result["central"] = 1
+        result["basis"] = "weather"
+        result["model"] = model
+        result["bias"] = bias
+        result["forecast_days"] = int(ahead.reindex(days).notna().sum())
+        result["years"] = pd.DataFrame([{"Weather of winter": winter_label(w), "Heating degree days ahead": totals[w], "March end, %": ends[w]}
+                                        for w in sorted(ends, key=lambda w: -totals[w])])
+    else:
+        changes = past_winter_changes(fill, start, year)
+        if len(changes) < OUTLOOK_MIN_WINTERS:
+            return {"ready": False, "off_season": False, "reason": "Select Update market data to load six years of storage history and the weather archive."}
+        biggest, smallest = min(changes, key=changes.get), max(changes, key=changes.get)
+        def analog(winter: int) -> np.ndarray:
+            mapped = pd.DatetimeIndex([_in_other_winter(d.date(), year, winter) for d in days])
+            base = _fill_on(fill, _in_other_winter(start, year, winter))
+            return np.clip(start_fill + fill.reindex(mapped).ffill().bfill().to_numpy() - base, 0.0, 100.0)
+        average = np.mean([analog(w) for w in changes], axis=0)
+        result["scenarios"] = [
+            {"name": "Largest draw", "note": f"Storage falls as it did in {winter_label(biggest)}", "path": analog(biggest)},
+            {"name": "Average draw", "note": f"Storage falls as it did on average over {len(changes)} past winters", "path": average},
+            {"name": "Smallest draw", "note": f"Storage falls as it did in {winter_label(smallest)}", "path": analog(smallest)}]
+        result["days"] = days
+        result["central"] = 1
+        result["basis"] = "past winters"
+    for scenario in result["scenarios"]:
+        scenario["end"] = float(scenario["path"][-1])
+    if not hdd.empty:
+        test = backtest_outlook(fill, hdd, start, year)
+        if not test.empty:
+            result["backtest"] = test
+            result["error"] = float(test["Model miss"].abs().mean())
+            result["average_error"] = float(test["Average-winter miss"].abs().mean())
+    return result
+
+
+def versus_range(level: float, band_end: Optional[dict]) -> str:
+    """Compare a March level with the five-year range, in words."""
+    if not band_end:
+        return ""
+    if level < band_end["low"] - 0.5:
+        return f"{band_end['low'] - level:.0f} points below the five-year range"
+    if level > band_end["high"] + 0.5:
+        return f"{level - band_end['high']:.0f} points above the five-year range"
+    gap = level - band_end["average"]
+    if abs(gap) < 0.5:
+        return "in line with the five-year average"
+    return f"{abs(gap):.0f} points {'above' if gap > 0 else 'below'} the five-year average"
+
+
+def outlook_signal(outlook: Optional[dict]) -> Optional[dict]:
+    """The projection as forward-looking evidence for gas. Absent outside the season."""
+    name = "Winter storage outlook"
+    if not outlook or outlook.get("off_season"):
+        return None
+    if not outlook["ready"]:
+        return _signal("winter_outlook", name, 2.0, missing=outlook["reason"])
+    band = outlook.get("band_end")
+    if not band or outlook.get("basis") != "weather":
+        return _signal("winter_outlook", name, 2.0, missing="Select Update market data to load the weather archive and the five-year range.")
+    central = outlook["scenarios"][outlook["central"]]["end"]
+    gap = central - band["average"]
+    return _signal("winter_outlook", name, 2.0, -gap / max((band["high"] - band["low"]) / 2.0, 5.0),
+                   f"Normal weather ends March at {central:.0f}%, against a five-year average of {band['average']:.0f}%.",
+                   "A low end to winter means more gas to buy back next summer, and a high end means less.",
+                   f"Reverses if the projected end moves {'below' if gap >= 0 else 'above'} {band['average']:.0f}%.")
+
+
+# -----------------------------------------------------------------------------
+# Next-day power price estimate
+# -----------------------------------------------------------------------------
+ESTIMATE_TRAIN_DAYS = 180
+ESTIMATE_MIN_DAYS = 60
+ESTIMATE_TEST_DAYS = 90
+ESTIMATE_REFIT_EVERY = 5
+ESTIMATE_COLUMNS = ("lag1", "avg7", "lag7", "hdd", "wind", "solar", "weekend", "monday")
+
+
+def daily_base_prices(series: pd.DataFrame) -> pd.Series:
+    """Average day-ahead price by delivery day, leaving out days with few published prices."""
+    if series is None or series.empty:
+        return pd.Series(dtype=float)
+    grouped = series.assign(day=pd.to_datetime(series["local"].dt.date)).groupby("day")["value"]
+    counts = grouped.count()
+    return grouped.mean().loc[counts >= 0.8 * counts.median()].sort_index()
+
+
+def power_weather(history: pd.DataFrame, daily: pd.DataFrame, location: str) -> pd.DataFrame:
+    """Heating demand, wind and solar by day for one city. Recent and forecast days replace the archive."""
+    names = {"temperature_mean_c": "temperature", "wind_speed_100m_mean_kmh": "wind", "solar_radiation_mean_wm2": "solar"}
+    frames = []
+    for frame in (history, daily):
+        if frame is not None and not frame.empty and {"date", "location", *names}.issubset(frame.columns):
+            part = frame.loc[frame["location"].eq(location), ["date", *names]].rename(columns=names)
+            part = part.assign(date=pd.to_datetime(part["date"], errors="coerce")).dropna(subset=["date"])
+            frames.append(part)
+    if not frames:
+        return pd.DataFrame(columns=["hdd", "wind", "solar"])
+    joined = pd.concat(frames, ignore_index=True).drop_duplicates("date", keep="last").set_index("date").sort_index().astype(float)
+    return pd.DataFrame({"hdd": (18.0 - joined["temperature"]).clip(lower=0), "wind": joined["wind"], "solar": joined["solar"]})
+
+
+def estimate_features(base: pd.Series, weather: pd.DataFrame, last_day: pd.Timestamp) -> pd.DataFrame:
+    """One row per delivery day. Prices come only from earlier days, as at auction time."""
+    days = pd.date_range(base.index.min(), last_day, freq="D")
+    prices = base.reindex(days)
+    frame = pd.DataFrame({"base": prices, "lag1": prices.shift(1), "avg7": prices.shift(1).rolling(7, min_periods=5).mean(), "lag7": prices.shift(7)}, index=days)
+    frame = frame.join(weather.reindex(days))
+    frame["weekend"] = (days.dayofweek >= 5).astype(float)
+    frame["monday"] = (days.dayofweek == 0).astype(float)
+    return frame
+
+
+def _fit_estimate(frame: pd.DataFrame) -> np.ndarray:
+    design = np.column_stack([np.ones(len(frame)), frame[list(ESTIMATE_COLUMNS)].to_numpy(float)])
+    return np.linalg.lstsq(design, frame["base"].to_numpy(float), rcond=None)[0]
+
+
+def _apply_estimate(beta: np.ndarray, frame: pd.DataFrame) -> np.ndarray:
+    return np.column_stack([np.ones(len(frame)), frame[list(ESTIMATE_COLUMNS)].to_numpy(float)]) @ beta
+
+
+def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, daily: pd.DataFrame) -> dict:
+    """Estimate the next unpublished delivery day, and test the method one day at a time."""
+    location = ZONE_WEATHER.get(zone)
+    base = daily_base_prices(series)
+    if not location or len(base) < ESTIMATE_MIN_DAYS + 20:
+        return {"ready": False, "reason": f"This needs at least {ESTIMATE_MIN_DAYS + 20} days of day-ahead prices. Select Update market data."}
+    weather = power_weather(history, daily, location)
+    if weather.empty or weather["wind"].notna().sum() < ESTIMATE_MIN_DAYS:
+        return {"ready": False, "reason": "This needs the wind and solar history. Select Update market data."}
+    target = base.index[-1] + pd.Timedelta(days=1)
+    frame = estimate_features(base, weather, target)
+    known = frame.iloc[:-1].dropna()
+    ahead = frame.iloc[[-1]]
+    if ahead[list(ESTIMATE_COLUMNS)].isna().any(axis=None):
+        return {"ready": False, "reason": f"There's no weather forecast for {target:%d %b}. Select Update market data."}
+    if len(known) < ESTIMATE_MIN_DAYS + 10:
+        return {"ready": False, "reason": "Prices and weather overlap on too few days so far."}
+    rows, beta = [], None
+    for position in range(max(ESTIMATE_MIN_DAYS, len(known) - ESTIMATE_TEST_DAYS), len(known)):
+        if beta is None or (position - max(ESTIMATE_MIN_DAYS, len(known) - ESTIMATE_TEST_DAYS)) % ESTIMATE_REFIT_EVERY == 0:
+            beta = _fit_estimate(known.iloc[max(0, position - ESTIMATE_TRAIN_DAYS):position])
+        row = known.iloc[[position]]
+        rows.append({"day": row.index[0], "actual": float(row["base"].iloc[0]), "estimate": float(_apply_estimate(beta, row)[0]),
+                     "last_week": float(row["lag7"].iloc[0]), "yesterday": float(row["lag1"].iloc[0])})
+    test = pd.DataFrame(rows)
+    errors = test["actual"] - test["estimate"]
+    final = _fit_estimate(known.tail(ESTIMATE_TRAIN_DAYS))
+    value = float(_apply_estimate(final, ahead)[0])
+    latest = test.iloc[-1]
+    gap = float(latest["actual"] - latest["estimate"])
+    typical = float(errors.abs().quantile(0.9))
+    return {"ready": True, "reason": "", "zone": zone, "day": target.date(), "estimate": value,
+            "low": value + float(errors.quantile(0.1)), "high": value + float(errors.quantile(0.9)), "test": test, "n": len(test),
+            "error": float(errors.abs().mean()), "error_last_week": float((test["actual"] - test["last_week"]).abs().mean()),
+            "error_yesterday": float((test["actual"] - test["yesterday"]).abs().mean()),
+            "latest_day": latest["day"].date(), "latest_actual": float(latest["actual"]), "latest_estimate": float(latest["estimate"]),
+            "latest_gap": gap, "unusual": abs(gap) > typical, "wind_effect": float(final[ESTIMATE_COLUMNS.index("wind") + 1]),
+            "hdd_effect": float(final[ESTIMATE_COLUMNS.index("hdd") + 1]), "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1])}
+
+
+def score_recorded_estimates(log: pd.DataFrame, base: pd.Series) -> dict:
+    """Estimates saved on the day, using real forecasts, against the prices that followed."""
+    if log is None or log.empty or base is None or base.empty:
+        return {"n": 0, "error": None, "error_last_week": None}
+    days = pd.to_datetime(log["delivery_date"])
+    actual = base.reindex(days).to_numpy(float)
+    last_week = base.reindex(days - pd.Timedelta(days=7)).to_numpy(float)
+    estimate = log["estimate"].to_numpy(float)
+    both = ~np.isnan(actual) & ~np.isnan(last_week)
+    if not both.any():
+        return {"n": 0, "error": None, "error_last_week": None}
+    return {"n": int(both.sum()), "error": float(np.abs(actual[both] - estimate[both]).mean()), "error_last_week": float(np.abs(actual[both] - last_week[both]).mean())}
+
+
+# -----------------------------------------------------------------------------
+# P&L drivers: which product and month made the day's result
+# -----------------------------------------------------------------------------
+def pnl_drivers(step: pd.DataFrame, factor: pd.Series) -> pd.DataFrame:
+    """Combine a period's P&L by product and delivery month, in EUR, largest first."""
+    columns = ["product", "delivery_month", "net_mwh", "previous_mark", "current_mark", "mark_change", "price_move", "new_trades", "first_marks", "total"]
+    if step is None or step.empty:
+        return pd.DataFrame(columns=columns)
+    data = step.assign(price_move=step["price_move"] * factor, new_trades=step["new_trade"] * factor, first_marks=step["first_mark"] * factor, total=step["total_pnl"] * factor)
+    grouped = data.groupby(["product", "delivery_month"], as_index=False).agg(net_mwh=("net_mwh", "sum"), previous_mark=("previous_mark", "first"), current_mark=("current_mark", "first"),
+                                                                              price_move=("price_move", "sum"), new_trades=("new_trades", "sum"), first_marks=("first_marks", "sum"), total=("total", "sum"))
+    grouped["mark_change"] = grouped["current_mark"] - grouped["previous_mark"]
+    return grouped.loc[grouped["total"].abs().argsort()[::-1], columns].reset_index(drop=True)
+
+
+def pnl_sentence(drivers: pd.DataFrame) -> str:
+    """The period's result in words, naming what moved it most."""
+    if drivers is None or drivers.empty:
+        return "There's no P&L to explain in this period."
+    total, moves, new = float(drivers["total"].sum()), float(drivers["price_move"].sum()), float(drivers["new_trades"].sum())
+    parts = [f"P&L was {fmt_money(total)}: {fmt_money(moves)} from price moves and {fmt_money(new)} from new trades."]
+    top = drivers.loc[drivers["price_move"].abs().idxmax()]
+    if abs(float(top["price_move"])) > 0.005:
+        side = "long" if top["net_mwh"] > 0 else "short"
+        parts.append(f"The largest price effect was {top['product']} {month_contract_label(top['delivery_month'])}: {side} {abs(top['net_mwh']):,.0f} MWh while the mark moved {top['mark_change']:+.2f}, worth {fmt_money(float(top['price_move']))}.")
+    return " ".join(parts)
+
+
+# -----------------------------------------------------------------------------
+# Crisis replay and VaR check
+# -----------------------------------------------------------------------------
+CRISIS_EPISODES = (
+    {"name": "Invasion spike, Feb to 7 Mar 2022", "gas": (100.0, 345.0), "eua": (98.5, 68.0),
+     "what": "Front-month TTF went from about EUR 100/MWh, the top of its January and February range, to an intraday peak of EUR 345. EUA fell from about EUR 98.50/t to about EUR 68/t by late March.",
+     "sources": ("Elenger, Q1 2022 gas market overview", "Cemnet, 24 March 2022")},
+    {"name": "August squeeze, 16 to 26 Aug 2022", "gas": (225.0, 338.0), "eua": None,
+     "what": "Front-month TTF went from about EUR 225/MWh to a record close of about EUR 338. No carbon move is applied.",
+     "sources": ("European Gas Hub, 17 August 2022", "Hostile.eco, TTF record")},
+    {"name": "Collapse, 26 Aug to Dec 2022", "gas": (338.0, 77.0), "eua": None,
+     "what": "Front-month TTF fell from about EUR 338/MWh to about EUR 77 by late December. No carbon move is applied.",
+     "sources": ("Hostile.eco, TTF record", "CNBC, 29 December 2022")},
+)
+CRISIS_GAS_FLOOR = 1.0
+CRISIS_DECAY_MONTHS = 6.0
+
+
+def _nearest_mark(lookup: dict, month: date) -> Optional[float]:
+    if not lookup:
+        return None
+    return lookup.get(month, lookup[min(lookup, key=lambda m: abs((m - month).days))])
+
+
+def crisis_replay(buckets: pd.DataFrame, curve_set: dict, first_month: date, same_percent: bool = True, far_share: float = 0.5,
+                  eur_per_gbp: float = 1.17, params: Optional[dict] = None) -> pd.DataFrame:
+    """Each episode's move applied to today's book. Power follows gas and carbon through a gas plant's costs."""
+    columns = ["episode", "product", "delivery_month", "net_mwh", "price_change", "pnl_eur"]
+    if buckets is None or buckets.empty:
+        return pd.DataFrame(columns=columns)
+    p = {**DEFAULT_SPREAD_PARAMS, **(params or {})}
+    position = buckets.groupby(["product", "currency", "delivery_month"], as_index=False)["net_mwh"].sum()
+    ttf = _curve_lookup(validate_curve(curve_set["TTF Natural Gas"]))
+    eua = _curve_lookup(validate_curve(curve_set["EUA Carbon"])) if "EUA Carbon" in curve_set else {}
+    nbp = _curve_lookup(validate_curve(curve_set["NBP Natural Gas"])) if "NBP Natural Gas" in curve_set else {}
+    rows = []
+    for episode in CRISIS_EPISODES:
+        gas_start, gas_end = episode["gas"]
+        for row in position.to_dict("records"):
+            month = row["delivery_month"]
+            distance = max((month.year - first_month.year) * 12 + month.month - first_month.month, 0)
+            scale = far_share + (1.0 - far_share) * math.exp(-distance / CRISIS_DECAY_MONTHS)
+            def gas_change(price: float, per_unit: float = 1.0) -> float:
+                change = price * (gas_end / gas_start - 1.0) * scale if same_percent else (gas_end - gas_start) * scale * per_unit
+                return max(change, CRISIS_GAS_FLOOR * per_unit - price)
+            ttf_price = _nearest_mark(ttf, month) or 0.0
+            if row["product"] == "TTF Natural Gas":
+                change = gas_change(ttf_price)
+            elif row["product"] == "NBP Natural Gas":
+                change = gas_change(_nearest_mark(nbp, month) or ttf_price / eur_per_gbp, 1.0 / eur_per_gbp)
+            else:
+                carbon = 0.0
+                if episode["eua"]:
+                    carbon_price = _nearest_mark(eua, month) or 0.0
+                    carbon = (carbon_price * (episode["eua"][1] / episode["eua"][0] - 1.0) if same_percent else episode["eua"][1] - episode["eua"][0]) * scale
+                change = (gas_change(ttf_price) + carbon * p["gas_emission_factor"]) / p["gas_efficiency"]
+            fx = float(eur_per_gbp) if row["currency"] == "GBP" else 1.0
+            rows.append({"episode": episode["name"], "product": row["product"], "delivery_month": month, "net_mwh": float(row["net_mwh"]), "price_change": change, "pnl_eur": float(row["net_mwh"]) * change * fx})
+    return pd.DataFrame(rows, columns=columns)
+
+
+def worst_stretch(pnl: pd.DataFrame, days: int) -> Optional[dict]:
+    """The worst run of consecutive saved days for today's book."""
+    if pnl is None or len(pnl) < days:
+        return None
+    rolling = pd.Series(pnl["pnl_eur"].to_numpy(float)).rolling(days).sum()
+    last = int(rolling.idxmin())
+    return {"days": days, "pnl_eur": float(rolling.iloc[last]), "start": pnl["date"].iloc[last - days + 1], "end": pnl["date"].iloc[last]}
+
+
+VAR_CHECK_WINDOW = 250
+VAR_CHECK_MIN_HISTORY = 60
+VAR_CHECK_MIN_TESTS = 100
+
+
+def kupiec_test(days: int, exceptions: int, confidence: float) -> tuple[float, float]:
+    """Kupiec's test: does the share of losses beyond VaR match what the confidence level promises?"""
+    expected = 1.0 - float(confidence)
+    def log_likelihood(share: float) -> float:
+        total = 0.0
+        if exceptions:
+            total += exceptions * math.log(share)
+        if days - exceptions:
+            total += (days - exceptions) * math.log(1.0 - share)
+        return total
+    observed = exceptions / days if days else 0.0
+    statistic = max(-2.0 * (log_likelihood(expected) - log_likelihood(observed if 0 < observed < 1 else expected)), 0.0) if 0 < exceptions < days else (
+        -2.0 * days * math.log(1.0 - expected) if exceptions == 0 and days else -2.0 * days * math.log(expected) if days else 0.0)
+    return statistic, math.erfc(math.sqrt(statistic / 2.0))
+
+
+def var_backtest(pnl: pd.DataFrame, confidence: float = 0.99, window: int = VAR_CHECK_WINDOW, min_history: int = VAR_CHECK_MIN_HISTORY) -> dict:
+    """Each day's VaR uses only earlier days. The day's result then either stays inside it or doesn't."""
+    values = pnl["pnl_eur"].to_numpy(float) if pnl is not None and not pnl.empty else np.array([])
+    empty = {"tests": 0, "exceptions": 0, "expected": 0.0, "statistic": 0.0, "p_value": 1.0, "verdict": "Not enough history", "table": pd.DataFrame(), "pairs": 0, "zone": ""}
+    if len(values) <= min_history:
+        return empty
+    rows = []
+    for i in range(min_history, len(values)):
+        var = max(-float(np.quantile(values[max(0, i - window):i], 1.0 - confidence)), 0.0)
+        rows.append({"date": pnl["date"].iloc[i], "pnl_eur": float(values[i]), "var_eur": var, "exception": bool(values[i] < -var)})
+    table_ = pd.DataFrame(rows)
+    tests, exceptions = len(table_), int(table_["exception"].sum())
+    statistic, p_value = kupiec_test(tests, exceptions, confidence)
+    if tests < VAR_CHECK_MIN_TESTS:
+        verdict = "Too few days to judge"
+    elif p_value >= 0.05:
+        verdict = "Consistent with the confidence level"
+    else:
+        verdict = "VaR looks too low" if exceptions / tests > 1.0 - confidence else "VaR looks too high"
+    flags = table_["exception"].to_numpy()
+    zone = ""
+    if abs(confidence - 0.99) < 1e-9 and tests >= 250:
+        recent = int(flags[-250:].sum())
+        zone = "Green" if recent <= 4 else "Yellow" if recent <= 9 else "Red"
+    return {"tests": tests, "exceptions": exceptions, "expected": tests * (1.0 - confidence), "statistic": statistic, "p_value": p_value, "verdict": verdict,
+            "table": table_, "pairs": int((flags[1:] & flags[:-1]).sum()), "zone": zone}
+
+
+# -----------------------------------------------------------------------------
+# Thresholds and a PDF writer that needs no extra package
+# -----------------------------------------------------------------------------
+def threshold_alerts(rules: pd.DataFrame, metrics: dict) -> list[dict]:
+    """Rules whose condition holds now, and whether it's new since the previous value."""
+    alerts = []
+    if rules is None or rules.empty:
+        return alerts
+    for metric, condition, level in zip(rules["metric"], rules["condition"], rules["level"]):
+        reading = metrics.get(metric)
+        if not reading or reading.get("now") is None or pd.isna(level):
+            continue
+        now, before, level = reading["now"], reading.get("before"), float(level)
+        check = (lambda v: v > level) if condition == "Above" else (lambda v: v < level)
+        if check(now):
+            alerts.append({"metric": metric, "condition": condition, "level": level, "now": now, "unit": reading.get("unit", ""),
+                           "new": before is not None and not check(before)})
+    return alerts
+
+
+def _pdf_text(text: object) -> bytes:
+    raw = str(text).replace("−", "-").replace("–", "-").replace("—", "-").encode("cp1252", "replace")
+    return raw.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+
+
+def simple_pdf(blocks: Sequence[tuple], title: str = "") -> bytes:
+    """Build an A4 PDF from (kind, content) blocks: title, subtitle, heading, text, note, table."""
+    width, height, margin = 595, 842, 48
+    usable = width - 2 * margin
+    pages: list[list[bytes]] = [[]]
+    y = height - margin
+
+    def line(text: object, size: float, bold: bool = False, x: float = margin, color: str = "0.10 0.17 0.20") -> None:
+        pages[-1].append(b"BT /F%d %s Tf %s rg %s %s Td (" % (2 if bold else 1, str(size).encode(), color.encode(), str(x).encode(), f"{y:.1f}".encode()) + _pdf_text(text) + b") Tj ET\n")
+
+    def room(needed: float) -> None:
+        nonlocal y
+        if y - needed < margin:
+            pages.append([])
+            y = height - margin
+
+    def wrapped(text: str, size: float, bold: bool = False, color: str = "0.10 0.17 0.20", gap: float = 1.35) -> None:
+        nonlocal y
+        for piece in textwrap.wrap(str(text), max(int(usable / (size * 0.50)), 10)) or [""]:
+            room(size * gap)
+            y -= size * gap
+            line(piece, size, bold, color=color)
+
+    for kind, content in blocks:
+        if kind == "title":
+            wrapped(content, 20, True, "0.05 0.25 0.30")
+            y -= 2
+        elif kind == "subtitle":
+            wrapped(content, 10, False, "0.35 0.42 0.45")
+            y -= 6
+        elif kind == "heading":
+            room(44)
+            y -= 10
+            wrapped(content, 12, True, "0.05 0.25 0.30")
+            y -= 3
+            pages[-1].append(b"0.75 0.82 0.84 RG 0.6 w %d %.1f m %d %.1f l S\n" % (margin, y, width - margin, y))
+            y -= 2
+        elif kind == "text":
+            wrapped(content, 10)
+            y -= 3
+        elif kind == "note":
+            wrapped(content, 8.5, False, "0.35 0.42 0.45")
+            y -= 2
+        elif kind == "table":
+            columns, rows, shares = content
+            offsets = [margin + usable * sum(shares[:i]) for i in range(len(shares))]
+            for index, row in enumerate([columns] + [list(r) for r in rows]):
+                cells = [textwrap.wrap(str(cell), max(int(usable * share / (9 * 0.50)) - 1, 4)) or [""] for cell, share in zip(row, shares)]
+                depth = max(len(c) for c in cells)
+                room(depth * 12.5 + 3)
+                top = y
+                for depth_index in range(depth):
+                    y = top - 12.5 * (depth_index + 1)
+                    for cell, offset in zip(cells, offsets):
+                        if depth_index < len(cell):
+                            line(cell[depth_index], 9, index == 0, x=round(offset, 1), color="0.05 0.25 0.30" if index == 0 else "0.10 0.17 0.20")
+                y -= 3
+                pages[-1].append(b"0.88 0.91 0.92 RG 0.4 w %d %.1f m %d %.1f l S\n" % (margin, y, width - margin, y))
+            y -= 6
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", None, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+               b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>", b"<< /Title (" + _pdf_text(title) + b") >>"]
+    kids = []
+    for number, commands in enumerate(pages, start=1):
+        footer = b"BT /F1 8 Tf 0.45 0.50 0.52 rg %d 28 Td (" % margin + _pdf_text(f"Page {number} of {len(pages)}") + b") Tj ET\n"
+        stream = b"".join(commands) + footer
+        objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"endstream")
+        content_id = len(objects)
+        objects.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents %d 0 R >>" % (width, height, content_id))
+        kids.append(len(objects))
+    objects[1] = b"<< /Type /Pages /Count %d /Kids [" % len(kids) + b" ".join(b"%d 0 R" % k for k in kids) + b"] >>"
+    output = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(output))
+        output += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    start = len(output)
+    output += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for offset in offsets:
+        output += b"%010d 00000 n \n" % offset
+    output += b"trailer\n<< /Size %d /Root 1 0 R /Info 5 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, start)
+    return bytes(output)
+
+
 # =============================================================================
 # SECTION 3 · SAVED DATA (SQLite)
 # Everything the desk needs tomorrow lives in one local database file.
@@ -2050,6 +3059,16 @@ class DeskStore:
                     key TEXT PRIMARY KEY, label TEXT NOT NULL, metadata TEXT NOT NULL,
                     fetched_at TEXT NOT NULL, payload BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS read_log (
+                    read_date TEXT NOT NULL, market TEXT NOT NULL, source TEXT NOT NULL, reading TEXT NOT NULL, score REAL NOT NULL,
+                    confidence TEXT NOT NULL, price_through TEXT NOT NULL, signals TEXT NOT NULL,
+                    PRIMARY KEY (read_date, market, source));
+                CREATE TABLE IF NOT EXISTS price_estimates (
+                    delivery_date TEXT NOT NULL, zone TEXT NOT NULL, estimate REAL NOT NULL, low REAL NOT NULL, high REAL NOT NULL, made_on TEXT NOT NULL,
+                    PRIMARY KEY (delivery_date, zone));
+                CREATE TABLE IF NOT EXISTS alert_rules (metric TEXT NOT NULL, condition TEXT NOT NULL, level REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS curve_files (
+                    name TEXT PRIMARY KEY, sha TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, processed_at TEXT NOT NULL);
             """)
 
     def _connect(self) -> sqlite3.Connection:
@@ -2109,6 +3128,11 @@ class DeskStore:
             conn.executemany(f"{verb} INTO curve_snapshots VALUES (?,?,?,?,?)", payload)
             return conn.total_changes - before
 
+    def remove_demo_marks(self, product: str) -> None:
+        """Real marks replace a product's demo history, so demo prices never become a day's P&L or risk."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM curve_snapshots WHERE product=? AND source='Demo marks'", (product,))
+
     def load_snapshots(self) -> pd.DataFrame:
         with self._connect() as conn:
             return pd.read_sql_query("SELECT * FROM curve_snapshots ORDER BY snapshot_date, product, delivery_month", conn)
@@ -2165,6 +3189,50 @@ class DeskStore:
                     continue
                 items[key] = {"label": label, "data": frame, "fetched_at": fetched_at, "metadata": json.loads(metadata)}
         return items
+
+    READ_COLUMNS = ("read_date", "market", "source", "reading", "score", "confidence", "price_through", "signals")
+
+    def save_reads(self, rows: Sequence[dict]) -> None:
+        """Today's read can be refreshed. Earlier dates are never rewritten, so the record stays honest."""
+        today = date.today().isoformat()
+        with self._connect() as conn:
+            for row in rows:
+                verb = "INSERT OR REPLACE" if row["source"] == "Recorded" and row["read_date"] == today else "INSERT OR IGNORE"
+                conn.execute(f"{verb} INTO read_log VALUES (?,?,?,?,?,?,?,?)", tuple(row[c] for c in self.READ_COLUMNS))
+
+    def load_reads(self) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query("SELECT * FROM read_log ORDER BY read_date, market", conn)
+
+    def save_price_estimates(self, rows: Sequence[tuple]) -> None:
+        """The first estimate for a day stands, so the record can't be improved afterwards."""
+        with self._connect() as conn:
+            conn.executemany("INSERT OR IGNORE INTO price_estimates VALUES (?,?,?,?,?,?)", rows)
+
+    def load_price_estimates(self, zone: str) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query("SELECT * FROM price_estimates WHERE zone=? ORDER BY delivery_date", conn, params=(zone,))
+
+    def load_alerts(self) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query("SELECT metric, condition, level FROM alert_rules", conn)
+
+    def save_alerts(self, rules: pd.DataFrame) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM alert_rules")
+            conn.executemany("INSERT INTO alert_rules VALUES (?,?,?)", [(str(m), str(c), float(l)) for m, c, l in zip(rules["metric"], rules["condition"], rules["level"])])
+
+    def curve_file_seen(self) -> dict:
+        with self._connect() as conn:
+            return dict(conn.execute("SELECT name, sha FROM curve_files").fetchall())
+
+    def record_curve_file(self, name: str, sha: str, status: str, detail: str) -> None:
+        with self._connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO curve_files VALUES (?,?,?,?,?)", (name, sha, status, detail, datetime.now(timezone.utc).isoformat(timespec="seconds")))
+
+    def load_curve_files(self) -> pd.DataFrame:
+        with self._connect() as conn:
+            return pd.read_sql_query("SELECT * FROM curve_files ORDER BY processed_at DESC", conn)
 
     def get_setting(self, key: str, default: float) -> float:
         with self._connect() as conn:
@@ -2237,15 +3305,17 @@ def commit_ops(operations: pd.DataFrame) -> None:
     _save(lambda s: s.save_table("physical_ops", operations))
 
 
-def commit_custom_curve(product: str, curve: pd.DataFrame, metadata: dict) -> None:
-    """Apply an imported curve for pricing and record it as today's saved marks."""
+def commit_custom_curve(product: str, curve: pd.DataFrame, metadata: dict, curve_date: Optional[date] = None) -> None:
+    """Apply an imported curve for pricing and save it under the market date of its marks."""
+    day = curve_date or date.today()
+    metadata = {**metadata, "curve_date": day.isoformat()}
     st.session_state.custom_curves[product] = curve
     st.session_state.curve_metadata[product] = metadata
     st.session_state.pop("last_quote", None)
     bump("curves")
     bump("snapshots")
-    _save(lambda s: (s.save_custom_curve(product, curve, metadata),
-                     s.save_snapshot(date.today(), curve, str(metadata.get("source_label", "Imported curve")), replace=True)))
+    _save(lambda s: (s.save_custom_curve(product, curve, metadata), s.remove_demo_marks(product),
+                     s.save_snapshot(day, curve, str(metadata.get("source_label", "Imported curve")), replace=True)))
 
 
 def fx_rate(key: str) -> float:
@@ -2262,18 +3332,17 @@ DEFAULT_SETTINGS = {"eur_per_gbp": 1.17, "eur_per_usd": 0.92, "auto_update": 1.0
 
 # =============================================================================
 # SECTION 4 · MARKET DATA CONNECTORS
-# Requests run only on a user action. Secrets and environment variables override
-# the credentials embedded below. Keep this file private; they are in plain text.
+# Keys are never stored in this file. They come from Streamlit secrets, environment
+# variables or a keys file beside the app. Keep that file out of any shared folder or repository.
 # =============================================================================
 HTTP_TIMEOUT_SECONDS = 25
 MAX_API_RESPONSE_BYTES = 20 * 1024 * 1024
+KEYS_FILE_NAME = "meridian_keys.toml"
 RETRY_HTTP_CODES = {429, 500, 502, 503, 504}
 RETRY_WAIT_SECONDS = 1.5
 ENTSOE_MAX_DAYS = 1096
 ECB_FX_BASE = "https://data-api.ecb.europa.eu/service/data/EXR"
 OPEN_METEO_ARCHIVE_BASE = "https://archive-api.open-meteo.com/v1/archive"
-GIE_AGSI_API_KEY_DEFAULT = "76556429239ab949472fb6f5714c9017"
-ENTSOE_API_TOKEN_DEFAULT = "65be7143-4662-4381-a527-45492d59fb9b"
 GIE_AGSI_BASE = "https://agsi.gie.eu/api"
 GIE_ALSI_BASE = "https://alsi.gie.eu/api"
 ENTSOE_BASE = "https://web-api.tp.entsoe.eu/api"
@@ -3370,13 +4439,13 @@ def fetch_ecb_rate(quote_currency: str, _http_fn=None) -> tuple[float, str]:
     return rate, str(frame["TIME_PERIOD"].iloc[-1]) if "TIME_PERIOD" in frame.columns else ""
 
 
-def fetch_temperature_normals(location_names: Sequence[str], years: int = 10, _json_get_fn=None) -> tuple[pd.DataFrame, list[str]]:
-    """Calendar-day temperature and degree-day normals from Open-Meteo's historical archive."""
+def fetch_weather_archive(location_names: Sequence[str], years: int = 10, _json_get_fn=None) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Daily temperatures from Open-Meteo's archive, with calendar-day normals made from them."""
     request_json = _json_get_fn or _json_get
     end = date.today() - timedelta(days=7)
     start = date(end.year - int(years), end.month, 1)
 
-    def fetch_one(name: str) -> pd.DataFrame:
+    def fetch_one(name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         loc = WEATHER_LOCATIONS[name]
         payload = request_json(OPEN_METEO_ARCHIVE_BASE, params={
             "latitude": loc["latitude"], "longitude": loc["longitude"], "start_date": start.isoformat(),
@@ -3384,10 +4453,44 @@ def fetch_temperature_normals(location_names: Sequence[str], years: int = 10, _j
         daily = payload.get("daily", {}) if isinstance(payload, dict) else {}
         if not daily.get("time"):
             raise RuntimeError("no archive data returned")
-        normals = temperature_normals_from_daily(pd.DataFrame({"date": daily["time"], "temperature": daily.get("temperature_2m_mean", [])}))
+        raw = pd.DataFrame({"date": daily["time"], "temperature": daily.get("temperature_2m_mean", [])})
+        normals = temperature_normals_from_daily(raw)
         normals["location"] = name
-        return normals
+        kept = raw.assign(temperature=pd.to_numeric(raw["temperature"], errors="coerce")).dropna()
+        kept = kept.assign(location=name, hdd=(18.0 - kept["temperature"]).clip(lower=0))
+        return kept, normals
 
+    days, normals, failures = [], [], []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_map = {executor.submit(fetch_one, name): name for name in location_names}
+        for future in as_completed(future_map):
+            try:
+                kept, normal = future.result()
+                days.append(kept)
+                normals.append(normal)
+            except Exception as exc:
+                failures.append(f"{future_map[future]}: {exc}")
+    return (pd.concat(days, ignore_index=True) if days else pd.DataFrame(),
+            pd.concat(normals, ignore_index=True) if normals else pd.DataFrame(), failures)
+
+
+def fetch_power_weather(location_names: Sequence[str], days: int = 430, _json_get_fn=None) -> tuple[pd.DataFrame, list[str]]:
+    """Daily temperature, wind at 100 m and solar radiation from Open-Meteo's archive, for the price estimate."""
+    request_json = _json_get_fn or _json_get
+    end = date.today() - timedelta(days=5)
+    start = end - timedelta(days=int(days))
+    def fetch_one(name: str) -> pd.DataFrame:
+        loc = WEATHER_LOCATIONS[name]
+        payload = request_json(OPEN_METEO_ARCHIVE_BASE, params={
+            "latitude": loc["latitude"], "longitude": loc["longitude"], "start_date": start.isoformat(), "end_date": end.isoformat(),
+            "hourly": "temperature_2m,wind_speed_100m,shortwave_radiation", "timezone": loc["timezone"]})
+        hourly = payload.get("hourly", {}) if isinstance(payload, dict) else {}
+        if not hourly.get("time"):
+            raise RuntimeError("no archive data returned")
+        frame = pd.DataFrame({"date": [str(t)[:10] for t in hourly["time"]], "temperature_mean_c": pd.to_numeric(pd.Series(hourly.get("temperature_2m", [])), errors="coerce"),
+                              "wind_speed_100m_mean_kmh": pd.to_numeric(pd.Series(hourly.get("wind_speed_100m", [])), errors="coerce"),
+                              "solar_radiation_mean_wm2": pd.to_numeric(pd.Series(hourly.get("shortwave_radiation", [])), errors="coerce")})
+        return frame.groupby("date", as_index=False).mean().assign(location=name)
     frames, failures = [], []
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_map = {executor.submit(fetch_one, name): name for name in location_names}
@@ -3396,8 +4499,13 @@ def fetch_temperature_normals(location_names: Sequence[str], years: int = 10, _j
                 frames.append(future.result())
             except Exception as exc:
                 failures.append(f"{future_map[future]}: {exc}")
-    return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), failures
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(), failures
 
+
+def fetch_temperature_normals(location_names: Sequence[str], years: int = 10, _json_get_fn=None) -> tuple[pd.DataFrame, list[str]]:
+    """Calendar-day temperature and degree-day normals from Open-Meteo's historical archive."""
+    _, normals, failures = fetch_weather_archive(location_names, years, _json_get_fn)
+    return normals, failures
 
 def _stored_live_item(source_key: str, label: str, data, metadata: Optional[dict] = None) -> None:
     item = {
@@ -3922,6 +5030,10 @@ def kpi(col, label: str, value: str, sub: str = "", accent: str = "", tone: str 
 
 def curve_status_pill() -> str:
     user_curves = st.session_state.get("custom_curves", {})
+    metadata = st.session_state.get("curve_metadata", {})
+    stale = sum(1 for p in user_curves if curve_state(p, user_curves, metadata, date.today())["state"] != "Current")
+    if stale:
+        return f'<span class="pill warn"><i></i>{stale} imported curve{"s" if stale > 1 else ""} out of date</span>'
     if user_curves and len(user_curves) >= len(CURVE_PRODUCTS):
         return '<span class="pill good"><i></i>Your imported marks</span>'
     if user_curves:
@@ -3978,7 +5090,7 @@ def need_data_note(message: str) -> None:
 # SECTION 6 · NAVIGATION AND SESSION
 # =============================================================================
 NAV_SECTIONS = {
-    "Market": [":material/dashboard:  Market Overview", ":material/psychology:  Market Read", ":material/public:  Market Fundamentals",
+    "Market": [":material/dashboard:  Market Overview", ":material/wb_twilight:  Morning Brief", ":material/psychology:  Market Read", ":material/public:  Market Fundamentals",
                ":material/bolt:  Power Spot", ":material/compare_arrows:  Spreads & Margins"],
     "Pricing": [":material/show_chart:  Forward Curves", ":material/request_quote:  OTC Quote Builder"],
     "Book and risk": [":material/menu_book:  Trading Book & MtM", ":material/calendar_today:  Daily P&L",
@@ -3991,7 +5103,8 @@ DEFAULT_NAV_ITEM = ALL_NAV_ITEMS[0]
 NAV_TO_PAGE = {label: label.split("  ", 1)[1] for label in ALL_NAV_ITEMS}
 
 WORKFLOW_NEXT = {
-    "Market Overview": "Market Read",
+    "Market Overview": "Morning Brief",
+    "Morning Brief": "Market Read",
     "Market Read": "Market Fundamentals",
     "Market Fundamentals": "Power Spot",
     "Power Spot": "Spreads & Margins",
@@ -4091,7 +5204,12 @@ def ensure_daily_snapshot() -> None:
     """Record today's marks the first time the desk opens each day. History builds by itself."""
     if st.session_state.get("snapshot_day") == valuation_date:
         return
+    custom, metadata = st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {})
     for product, curve in curves.items():
+        # Old imported marks aren't today's price. Saving them again would show a false day of no movement.
+        marked = curve_mark_date(metadata.get(product)) if product in custom else None
+        if marked is not None and marked < valuation_date:
+            continue
         source = str(st.session_state.get("curve_metadata", {}).get(product, {}).get("source_label", "Demo marks")) if product in st.session_state.get("custom_curves", {}) else "Demo marks"
         _save(lambda s, c=curve, src=source: s.save_snapshot(valuation_date, c, src, replace=False))
     st.session_state.snapshot_day = valuation_date
@@ -4155,14 +5273,38 @@ def curve_source_label(product: str) -> str:
     return str(metadata.get("source_label", "Imported marks")).strip() or "Imported marks"
 
 
+def keys_file_path() -> Path:
+    configured = os.getenv("MERIDIAN_KEYS_FILE", "").strip()
+    return Path(configured) if configured else Path(__file__).resolve().with_name(KEYS_FILE_NAME)
+
+
+def keys_from_file(path: Optional[Path] = None) -> dict[str, str]:
+    """Read NAME = "value" lines from the keys file beside the app. The values are never logged."""
+    try:
+        text = Path(path or keys_file_path()).read_text(encoding="utf-8-sig")
+    except OSError:
+        return {}
+    found = {}
+    for line in text.splitlines():
+        match = re.match(r"""\s*([A-Za-z0-9_]+)\s*=\s*["']([^"']*)["']""", line)
+        if match and match[2].strip():
+            found[match[1]] = match[2].strip()
+    return found
+
+
 def resolved_credentials() -> dict[str, str]:
-    """Credentials in priority order: replaced this session, secrets, environment, this file."""
+    """Credentials in priority order: entered this session, Streamlit secrets, environment, keys file."""
     overrides = st.session_state.get("credential_overrides", {})
-    def pick(name: str, secret: str, default: str) -> str:
-        return overrides.get(name) or _secret_or_env(secret, secret) or default
-    return {"gie": pick("gie", "GIE_API_KEY", GIE_AGSI_API_KEY_DEFAULT),
-            "entsoe": pick("entsoe", "ENTSOE_API_TOKEN", ENTSOE_API_TOKEN_DEFAULT),
-            "open_meteo": pick("open_meteo", "OPEN_METEO_API_KEY", "")}
+    from_file = keys_from_file()
+    def pick(name: str, secret: str) -> str:
+        return overrides.get(name) or _secret_or_env(secret, secret) or from_file.get(secret, "")
+    return {"gie": pick("gie", "GIE_API_KEY"), "entsoe": pick("entsoe", "ENTSOE_API_TOKEN"), "open_meteo": pick("open_meteo", "OPEN_METEO_API_KEY")}
+
+
+def missing_keys_text() -> str:
+    keys = resolved_credentials()
+    absent = [label for label, value in (("ENTSO-E", keys["entsoe"]), ("GIE", keys["gie"])) if not value]
+    return f"No {' or '.join(absent)} key found. Put {KEYS_FILE_NAME} in the same folder as this app." if absent else ""
 
 
 # =============================================================================
@@ -4170,7 +5312,8 @@ def resolved_credentials() -> dict[str, str]:
 # Saved keys, background fetching, and requests only for what isn't held yet.
 # =============================================================================
 UPDATE_DEFAULT_ZONES = ("France", "Germany-Luxembourg")
-STALE_HOURS = {"prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0}
+PRICE_HISTORY_DAYS = 365
+STALE_HOURS = {"prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0}
 KEEP_DAYS = {"prices": 400, "load": 90, "generation": 90, "lng": 400}
 MAX_UPDATE_WORKERS = 4
 
@@ -4253,17 +5396,32 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
     keys = resolved_credentials()
     tasks: list[UpdateTask] = []
 
+    def keyed(kind: str, fetch: Callable[[], object]) -> Callable[[], object]:
+        """A source with no key reports what to do, rather than a provider's error."""
+        if keys[kind]:
+            return fetch
+        label = "ENTSO-E" if kind == "entsoe" else "GIE"
+        def no_key() -> None:
+            raise RuntimeError(f"No {label} key found. Put {KEYS_FILE_NAME} in the same folder as this app.")
+        return no_key
+
     def entsoe_task(kind: str, store_key: str, label: str, series_kind: str, zone: str, keep: int, first_days: int, end: date,
                     source: Optional[str] = None, target: Optional[str] = None, variant: Optional[str] = None) -> None:
         name = variant or zone
         full_key = f"{store_key}|{name}"
         if not _needs_update(full_key, kind, force):
             return
-        start = incremental_start(_held_frame(full_key), "timestamp", first_days, 2, today)
+        held = _held_frame(full_key)
+        start = incremental_start(held, "timestamp", first_days, 2, today)
+        # Prices held for less than a year are extended once, so past reads can be scored straight away.
+        if store_key == "entsoe_price" and held is not None:
+            earliest = pd.to_datetime(held["timestamp"], errors="coerce", utc=True).min()
+            if pd.notna(earliest) and earliest.date() > today - timedelta(days=PRICE_HISTORY_DAYS - 35):
+                start = today - timedelta(days=PRICE_HISTORY_DAYS)
         metadata = {"zone": zone}
         if source:
             metadata.update({"source_zone": source, "target_zone": target, "variant": name})
-        fetch = lambda: fetch_entsoe_series(keys["entsoe"], series_kind, zone, start, max(end, start + timedelta(days=1)), source_zone=source, target_zone=target)
+        fetch = keyed("entsoe", lambda: fetch_entsoe_series(keys["entsoe"], series_kind, zone, start, max(end, start + timedelta(days=1)), source_zone=source, target_zone=target))
         def apply(frame: pd.DataFrame) -> str:
             merged = store_entsoe(full_key, f"{label}, {name}", frame, metadata, keep)
             return f"{len(frame):,} new rows, {len(merged):,} held"
@@ -4271,7 +5429,7 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
 
     price_zones = list(dict.fromkeys(list(UPDATE_DEFAULT_ZONES) + [z for z in _live_variants("entsoe_price") if z in ENTSOE_ZONES]))
     for zone in price_zones:
-        entsoe_task("prices", "entsoe_price", "Day-ahead price", "Day-ahead price", zone, KEEP_DAYS["prices"], 30, today + timedelta(days=2))
+        entsoe_task("prices", "entsoe_price", "Day-ahead price", "Day-ahead price", zone, KEEP_DAYS["prices"], PRICE_HISTORY_DAYS, today + timedelta(days=2))
     for store_key, label, series_kind, keep in (("entsoe_load", "Actual load", "Actual load", KEEP_DAYS["load"]),
                                                 ("entsoe_generation", "Actual generation", "Actual generation by type", KEEP_DAYS["generation"])):
         for zone in dict.fromkeys(list(UPDATE_DEFAULT_ZONES) + [z for z in _live_variants(store_key) if z in ENTSOE_ZONES]):
@@ -4291,14 +5449,14 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             merged = store_observations("gie_agsi_history", "AGSI gas storage, 6 years", frame, meta, ("gasDayStart", "name"), "gasDayStart")
             _stored_live_item("gie_agsi", "AGSI gas storage", merged.tail(40).reset_index(drop=True), meta)
             return f"{len(frame):,} new rows, {len(merged):,} held"
-        tasks.append(UpdateTask("EU gas storage", lambda: fetch_gie_history("AGSI", keys["gie"], "Europe / EU datasets", start, today), apply_storage, start))
+        tasks.append(UpdateTask("EU gas storage", keyed("gie", lambda: fetch_gie_history("AGSI", keys["gie"], "Europe / EU datasets", start, today)), apply_storage, start))
     if _needs_update("gie_alsi", "fundamentals", force):
         held = _held_frame("gie_alsi")
         lng_start = incremental_start(held, "gasDayStart", 60, 30, today)
         def apply_lng(frame: pd.DataFrame) -> str:
             merged = store_observations("gie_alsi", "ALSI LNG terminals", frame, {"scope": "Europe / EU datasets", "country": ""}, ("gasDayStart", "name"), "gasDayStart", KEEP_DAYS["lng"])
             return f"{len(frame):,} new rows, {len(merged):,} held"
-        tasks.append(UpdateTask("EU LNG terminals", lambda: fetch_gie_history("ALSI", keys["gie"], "Europe / EU datasets", lng_start, today), apply_lng, lng_start))
+        tasks.append(UpdateTask("EU LNG terminals", keyed("gie", lambda: fetch_gie_history("ALSI", keys["gie"], "Europe / EU datasets", lng_start, today)), apply_lng, lng_start))
     flow_item = st.session_state.get("live_data", {}).get("entsog_flow")
     if isinstance(flow_item, dict) and flow_item.get("metadata", {}).get("point_direction") and _needs_update("entsog_flow", "fundamentals", force):
         point, indicator = flow_item["metadata"]["point_direction"], flow_item["metadata"].get("indicator", "Physical Flow")
@@ -4320,14 +5478,24 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             st.session_state["weather_fetch_failures"] = failures
             return f"{daily['location'].nunique()} of {len(WEATHER_LOCATIONS)} locations"
         tasks.append(UpdateTask("Weather forecast", fetch_weather, apply_weather))
-    if _needs_update("weather_normals", "normals", False):
-        def apply_normals(outcome: tuple) -> str:
+    if _needs_update("weather_normals", "normals", False) or _needs_update("weather_archive", "normals", False):
+        def apply_archive(outcome: tuple) -> str:
+            archive, normals, failures = outcome
+            if normals.empty:
+                raise RuntimeError(f"All {len(failures) or len(WEATHER_LOCATIONS)} locations failed.")
+            _stored_live_item("weather_normals", "Open-Meteo temperature normals", normals, {"years": 10})
+            _stored_live_item("weather_archive", "Open-Meteo daily temperature history", archive, {"years": 10})
+            return f"{normals['location'].nunique()} of {len(WEATHER_LOCATIONS)} locations"
+        tasks.append(UpdateTask("Weather history", lambda: fetch_weather_archive(list(WEATHER_LOCATIONS)), apply_archive))
+    power_zones = [z for z in dict.fromkeys(list(UPDATE_DEFAULT_ZONES) + list(_live_variants("entsoe_price"))) if z in ZONE_WEATHER]
+    if power_zones and _needs_update("weather_power_history", "power_weather", False):
+        def apply_power_weather(outcome: tuple) -> str:
             frame, failures = outcome
             if frame.empty:
-                raise RuntimeError(f"All {len(failures) or len(WEATHER_LOCATIONS)} locations failed.")
-            _stored_live_item("weather_normals", "Open-Meteo temperature normals", frame, {"years": 10})
-            return f"{frame['location'].nunique()} of {len(WEATHER_LOCATIONS)} locations"
-        tasks.append(UpdateTask("Weather normals", lambda: fetch_temperature_normals(list(WEATHER_LOCATIONS)), apply_normals))
+                raise RuntimeError(f"All {len(failures) or len(power_zones)} locations failed.")
+            _stored_live_item("weather_power_history", "Open-Meteo wind and solar history", frame, {"days": 430})
+            return f"{frame['location'].nunique()} of {len(power_zones)} locations"
+        tasks.append(UpdateTask("Wind and solar history", lambda: fetch_power_weather([ZONE_WEATHER[z] for z in power_zones]), apply_power_weather))
     fx_age = st.session_state.get("fx_updated_at")
     if force or fx_age is None or (datetime.now(timezone.utc) - fx_age).total_seconds() / 3600.0 >= STALE_HOURS["fx"]:
         def apply_fx(outcome: tuple) -> str:
@@ -4346,6 +5514,8 @@ def start_update(force: bool = True, tasks: Optional[list[UpdateTask]] = None) -
     """Start fetching in the background so the app stays usable. Returns the number of sources."""
     if st.session_state.get("update_job"):
         return 0
+    if tasks is None:
+        import_curve_folder()
     planned = plan_update(force) if tasks is None else tasks
     if not planned:
         return 0
@@ -4376,6 +5546,7 @@ def collect_update() -> bool:
     st.session_state.update_job = None
     st.session_state.update_results = results
     st.session_state.update_finished_at = datetime.now(timezone.utc)
+    st.session_state.reads_recorded = False
     return True
 
 
@@ -4434,10 +5605,16 @@ def _update_panel() -> None:
     failed = [r for r in results if not r[1]]
     line = f"Data updated {_ago(latest)}." if latest else "No market data yet."
     st.markdown(f'<div class="side-foot"><b>{html.escape(line)}</b></div>', unsafe_allow_html=True)
+    absent = missing_keys_text()
+    if absent:
+        st.warning(absent, icon=":material/key:")
     if failed:
         with st.expander(f"{len(failed)} of {len(results)} sources failed"):
             for name, _, detail in failed:
                 st.caption(f"{name}: {detail}")
+    bad_files = [r for r in st.session_state.get("curve_import_results", []) if r["status"] != "Imported"]
+    if bad_files:
+        st.caption(f"{len(bad_files)} curve file(s) couldn't be imported. See Forward Curves.")
 
 
 def render_update_panel() -> None:
@@ -4459,6 +5636,156 @@ def update_button(key: str, label: str = "Update market data") -> None:
             st.rerun()
 
 
+# =============================================================================
+# SECTION 6C · CURVE FILES, READ RECORD AND WINTER OUTLOOK
+# =============================================================================
+def curve_folder() -> Path:
+    configured = os.getenv("MERIDIAN_CURVES_DIR", "").strip()
+    return Path(configured) if configured else Path(__file__).resolve().with_name(CURVE_FOLDER_NAME)
+
+
+def _read_curve_bytes(content: bytes, suffix: str) -> pd.DataFrame:
+    if suffix == ".xlsx":
+        try:
+            return pd.read_excel(io.BytesIO(content))
+        except ImportError as exc:
+            raise ValueError("Excel files need the openpyxl package. Save the file as CSV, or run: pip install openpyxl") from exc
+    # sep=None detects commas or semicolons, which French Excel uses.
+    return pd.read_csv(io.BytesIO(content), sep=None, engine="python", encoding="utf-8-sig", dtype=str)
+
+
+def import_curve_folder() -> list[dict]:
+    """Bring in any new file from the curve folder. Each version of a file is processed once."""
+    store = desk_store()
+    folder = curve_folder()
+    if store is None:
+        return []
+    try:
+        folder.mkdir(exist_ok=True)
+        files = sorted((p for p in folder.iterdir() if p.is_file() and p.suffix.casefold() in CURVE_FILE_TYPES and not p.name.startswith(("~", "."))),
+                       key=lambda p: p.stat().st_mtime)
+        seen = store.curve_file_seen()
+    except Exception:
+        return []
+    results = []
+    for path in files:
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            results.append({"name": path.name, "status": "Failed", "detail": str(exc)})
+            continue
+        sha = hashlib.sha256(content).hexdigest()
+        if seen.get(path.name) == sha:
+            continue
+        custom, metadata = st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {})
+        today = date.today()
+        shapes = {p: custom.get(p, make_sample_curve(p, today, DEMO_CURVE_MONTHS)) for p in CURVE_PRODUCTS}
+        latest = {p: (curve_mark_date(metadata.get(p)), custom[p]) for p in custom if curve_mark_date(metadata.get(p))}
+        try:
+            modified = datetime.fromtimestamp(path.stat().st_mtime).date()
+            parsed = parse_curve_table(_read_curve_bytes(content, path.suffix.casefold()), path.name, modified, shapes, latest, today)
+            source = f"File: {path.name}"
+            newest: dict = {}
+            for item in parsed:
+                store.save_snapshot(item["day"], item["curve"], source, replace=True)
+                newest[item["product"]] = item
+            applied = []
+            for product, item in newest.items():
+                held = curve_mark_date(metadata.get(product)) if product in custom else None
+                if held is None or item["day"] >= held:
+                    commit_custom_curve(product, item["curve"], {"source_label": source, "source_type": "Curve folder", "file_name": path.name,
+                                                                 "imported_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}, curve_date=item["day"])
+                    applied.append(product)
+            bump("snapshots")
+            days = sorted({item["day"] for item in parsed})
+            when = f"{days[0]:%d %b %Y}" if len(days) == 1 else f"{len(days)} days to {days[-1]:%d %b %Y}"
+            status, detail = "Imported", f"{len(newest)} product{'s' if len(newest) > 1 else ''}, {when}" + ("" if len(applied) == len(newest) else ". Newer marks kept for the others.")
+        except Exception as exc:
+            status, detail = "Failed", str(exc)
+        store.record_curve_file(path.name, sha, status, detail)
+        results.append({"name": path.name, "status": status, "detail": detail})
+    if results:
+        st.session_state.curve_import_results = results
+        imported = sum(1 for r in results if r["status"] == "Imported")
+        if imported:
+            st.session_state["flash_message"] = f"Imported {imported} curve file(s)."
+    return results
+
+
+def saved_reads() -> pd.DataFrame:
+    def load() -> pd.DataFrame:
+        store = desk_store()
+        return store.load_reads() if store is not None else pd.DataFrame(columns=list(DeskStore.READ_COLUMNS))
+    return session_memo("saved_reads", data_version("reads"), load)
+
+
+def _price_through(market: str, today: date) -> Optional[date]:
+    """The last price date behind a read, or None when the data is too old to call it today's read."""
+    if market == "European gas":
+        fill = _storage_daily(_live_dataset_frame("gie_agsi_history"))
+        return today if not fill.empty and (today - fill["day"].iloc[-1].date()).days <= 4 else None
+    zone = MARKET_ZONES.get(market)
+    series = zone_prices(zone) if zone else pd.DataFrame()
+    if series is None or series.empty:
+        return None
+    last = series["local"].dt.date.max()
+    return last if (today - last).days <= 3 else None
+
+
+def record_market_reads() -> None:
+    """Save today's reads once they rest on current data. This builds the track record."""
+    if st.session_state.get("reads_recorded"):
+        return
+    st.session_state.reads_recorded = True
+    rows = []
+    for market, read in market_reads().items():
+        through = _price_through(market, valuation_date)
+        if through is not None and read["summary"]["confidence"] != "None":
+            rows.append(read_row(valuation_date, market, read["signals"], read["summary"], through, "Recorded"))
+    if rows:
+        _save(lambda s: s.save_reads(rows))
+        bump("reads")
+    record_price_estimates()
+
+
+def track_paths() -> dict:
+    def build() -> dict:
+        paths = {"European gas": marks_path(saved_snapshots(), "TTF Natural Gas")}
+        for market, zone in MARKET_ZONES.items():
+            series = zone_prices(zone)
+            if series is not None and not series.empty:
+                paths[market] = spot_path(series)
+        return paths
+    return session_memo("track_paths", data_version("live", "snapshots"), build)
+
+
+def ensure_replayed_reads() -> None:
+    """Rebuild past reads from held data. Only dates not done yet are calculated."""
+    def run() -> int:
+        store = desk_store()
+        if store is None:
+            return 0
+        held = saved_reads()
+        replayed = held.loc[held["source"].eq("Replayed")] if not held.empty else held
+        skip = set(zip(replayed["read_date"], replayed["market"])) if not replayed.empty else set()
+        rows = []
+        for market, zone in MARKET_ZONES.items():
+            if zone in _live_variants("entsoe_price"):
+                rows += replay_power_reads(market, zone, _live_dataset_frame(f"entsoe_price|{zone}"), _live_dataset_frame(f"entsoe_load|{zone}"),
+                                           _live_dataset_frame(f"entsoe_generation|{zone}"), skip, valuation_date)
+        gas_days = [d for d in track_paths()["European gas"]["days"] if d < valuation_date]
+        rows += replay_gas_reads(_live_dataset_frame("gie_agsi_history"), _live_dataset_frame("gie_alsi"), gas_days, skip)
+        if rows:
+            _save(lambda s: s.save_reads(rows))
+            bump("reads")
+        return len(rows)
+    session_memo("replay_done", data_version("live", "snapshots"), run)
+
+
+def winter_outlook() -> dict:
+    return session_memo("winter_outlook", (data_version("live"), valuation_date),
+                        lambda: project_winter(_live_dataset_frame("gie_agsi_history"), _live_dataset_frame("weather_archive"),
+                                               _live_dataset_frame("weather_daily"), valuation_date))
 # =============================================================================
 # SECTION 7 · MODEL CHECKS
 # =============================================================================
@@ -5577,25 +6904,28 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             st.session_state.live_data = {}
             st.session_state.pop("fx_updated_at", None)
             first = {t.name: t for t in plan_update(force=True, today=today)}
-            for wanted in ("Day-ahead price, France", "Day-ahead price, Germany-Luxembourg", "Actual load, France", "Actual generation, Germany-Luxembourg", "EU gas storage", "EU LNG terminals", "Weather forecast", "Weather normals", "ECB FX rates"):
+            for wanted in ("Day-ahead price, France", "Day-ahead price, Germany-Luxembourg", "Actual load, France", "Actual generation, Germany-Luxembourg", "EU gas storage", "EU LNG terminals", "Weather forecast", "Weather history", "ECB FX rates"):
                 if wanted not in first:
                     raise AssertionError(f"{wanted} is missing from a first update.")
-            if first["Day-ahead price, France"].start != today - timedelta(days=30) or first["EU gas storage"].start != date(2021, 1, 1):
+            if first["Day-ahead price, France"].start != today - timedelta(days=PRICE_HISTORY_DAYS) or first["EU gas storage"].start != date(2021, 1, 1):
                 raise AssertionError("A first update must fetch the full window.")
             now = datetime.now(timezone.utc).isoformat()
             stamp = pd.Timestamp("2026-11-03T22:00:00Z")
             st.session_state.live_data = {
-                "entsoe_price|France": {"data": pd.DataFrame({"timestamp": [stamp], "value": [1.0], "series": ["P"]}), "fetched_at": now, "metadata": {}},
+                "entsoe_price|France": {"data": pd.DataFrame({"timestamp": [stamp - pd.Timedelta(days=360), stamp], "value": [1.0, 1.0], "series": ["P", "P"]}), "fetched_at": now, "metadata": {}},
                 "entsoe_price|Spain": {"data": pd.DataFrame({"timestamp": [stamp], "value": [1.0], "series": ["P"]}), "fetched_at": "2026-11-01T00:00:00+00:00", "metadata": {}},
                 "gie_agsi_history": {"data": pd.DataFrame({"gasDayStart": ["2026-11-03"], "full": [80.0]}), "fetched_at": now, "metadata": {}},
                 "weather_normals": {"data": pd.DataFrame({"x": [1]}), "fetched_at": now, "metadata": {}},
+                "weather_archive": {"data": pd.DataFrame({"x": [1]}), "fetched_at": now, "metadata": {}},
             }
             again = {t.name: t for t in plan_update(force=True, today=today)}
             if again["Day-ahead price, France"].start != date(2026, 11, 1):
                 raise AssertionError(f"Only new days should be requested: {again['Day-ahead price, France'].start}")
             if again["EU gas storage"].start != date(2026, 9, 19):
                 raise AssertionError(f"Storage should reload only recent days: {again['EU gas storage'].start}")
-            if "Day-ahead price, Spain" not in again or "Weather normals" in again:
+            if again["Day-ahead price, Spain"].start != today - timedelta(days=PRICE_HISTORY_DAYS):
+                raise AssertionError("Prices held for less than a year should be extended once.")
+            if "Day-ahead price, Spain" not in again or "Weather history" in again:
                 raise AssertionError("Zones you added must update, and recent normals must not reload.")
             quiet = {t.name for t in plan_update(force=False, today=today)}
             if "Day-ahead price, France" in quiet or "Day-ahead price, Spain" not in quiet:
@@ -5697,6 +7027,328 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             raise AssertionError("Coal-derived gas and hard coal must be separate.")
         return "All ENTSO-E generation types stay separate, including coal-derived gas and hard coal."
 
+    # ---- Keys, curve files, track record and winter outlook ------------------------
+    def check_keys_file() -> str:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "keys.toml"
+            path.write_text('# my keys\nENTSOE_API_TOKEN = "abc-123"\nGIE_API_KEY=\'xyz\'\nOPEN_METEO_API_KEY = ""\n', encoding="utf-8")
+            found = keys_from_file(path)
+        if found != {"ENTSOE_API_TOKEN": "abc-123", "GIE_API_KEY": "xyz"}:
+            raise AssertionError("The keys file was read incorrectly.")
+        if keys_from_file(Path("/nonexistent/keys.toml")) != {}:
+            raise AssertionError("A missing keys file must give no keys, not an error.")
+        return "Keys are read from the file, blank ones are ignored, and a missing file gives no keys."
+
+    def check_curve_files() -> str:
+        today = date(2026, 11, 5)
+        shapes = {"TTF Natural Gas": make_sample_curve("TTF Natural Gas", today, 36)}
+        monthly = pd.DataFrame({"Product": ["TTF", "TTF"], "Delivery Month": ["2026-12-01", "01/01/2027"], "Settle": ["31,50", "32.25"]})
+        parsed = parse_curve_table(monthly, "ttf_2026-11-04.csv", today, shapes, {}, today)
+        assert_close(parsed[0]["curve"]["price"].iloc[0], 31.5)
+        if parsed[0]["day"] != date(2026, 11, 4) or len(parsed[0]["curve"]) != 2 or parsed[0]["curve"]["delivery_month"].iloc[1] != date(2027, 1, 1):
+            raise AssertionError("Monthly file parsed incorrectly.")
+        quotes = pd.DataFrame({"curve_date": ["2026-11-03"] * 2 + ["04/11/2026"] * 2, "product": ["TTF Natural Gas"] * 4, "contract": ["Q1-27", "Cal-28"] * 2, "price": [30.0, 28.0, 31.0, 28.5]})
+        parsed = parse_curve_table(quotes, "x.csv", today, shapes, {}, today)
+        if [p["day"] for p in parsed] != [date(2026, 11, 3), date(2026, 11, 4)] or len(parsed[1]["curve"]) != 15:
+            raise AssertionError("A file with two dates and contracts was parsed incorrectly.")
+        lookup = _curve_lookup(parsed[1]["curve"])
+        spec = PRODUCTS["TTF Natural Gas"]
+        assert_close(_strip_price(lookup, *contract_window("Q1-27"), "BASE", spec["timezone"]), 31.0, 1e-3)
+        refused = {"unknown product": pd.DataFrame({"product": ["Brent"], "contract": ["Dec-26"], "price": [80]}),
+                   "ambiguous month": pd.DataFrame({"product": ["TTF"], "delivery_month": ["12/01/2026"], "price": [30]}),
+                   "no price": pd.DataFrame({"product": ["TTF", "TTF"], "contract": ["Dec-26", "Jan-27"], "price": ["31", "n/a"]}),
+                   "missing column": pd.DataFrame({"product": ["TTF"], "price": [30]}),
+                   "future date": pd.DataFrame({"curve_date": ["2026-12-01"], "product": ["TTF"], "contract": ["Dec-26"], "price": [30]})}
+        for name, frame in refused.items():
+            try:
+                parse_curve_table(frame, "x.csv", today, shapes, {}, today)
+            except ValueError:
+                continue
+            raise AssertionError(f"A file with {name} should be refused.")
+        last = pd.DataFrame({"delivery_month": [date(2026, 12, 1)], "product": ["TTF Natural Gas"], "price": [30.0], "currency": ["EUR"], "unit": ["EUR/MWh"]})
+        try:
+            parse_curve_table(pd.DataFrame({"product": ["TTF"], "contract": ["Dec-26"], "price": [300.0]}), "x.csv", today, shapes, {"TTF Natural Gas": (date(2026, 11, 4), last)}, today)
+        except ValueError:
+            return "Monthly and contract files, French decimals and several dates all import. Unknown products, unclear dates, future dates and unit errors are refused."
+        raise AssertionError("A price ten times the last marks should be refused.")
+
+    def check_curve_dates_and_gaps() -> str:
+        today = date(2026, 11, 10)
+        custom = {"TTF Natural Gas": 1, "EUA Carbon": 1}
+        meta = {"TTF Natural Gas": {"curve_date": "2026-11-09"}, "EUA Carbon": {"curve_date": "2026-11-01"}}
+        if curve_state("TTF Natural Gas", custom, meta, today)["state"] != "Current" or curve_state("EUA Carbon", custom, meta, today)["state"] != "Stale" or curve_state("API2 Coal", custom, meta, today)["state"] != "Demo":
+            raise AssertionError("Curve status is wrong.")
+        if set(fresh_curves(custom, {**meta, "EUA Carbon": {"curve_date": "2026-10-01"}}, today)) != {"TTF Natural Gas"}:
+            raise AssertionError("Old marks must not count as today's evidence.")
+        note = curve_warning(["TTF Natural Gas", "EUA Carbon", "API2 Coal"], custom, meta, today)
+        if "API2 Coal uses demo" not in note or "EUA Carbon (9 days old)" not in note or "TTF" in note:
+            raise AssertionError(f"Warning names the wrong curves: {note}")
+        month = date(2026, 12, 1)
+        rows = pd.DataFrame({"snapshot_date": ["2026-11-03", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-05"], "product": ["TTF Natural Gas", "EUA Carbon", "EUA Carbon", "TTF Natural Gas", "EUA Carbon"],
+                             "delivery_month": [month.isoformat()] * 5, "price": [30.0, 70.0, 71.0, 33.0, 72.0], "source": "x"})
+        lookups = snapshot_lookup(rows)
+        trade = normalise_trades(pd.DataFrame([{"trade_id": "G", "trade_date": "2026-11-01", "product": "TTF Natural Gas", "instrument": "SWAP", "settlement_type": "FINANCIAL", "side": "BUY_FIXED",
+                                                "delivery_start": "2026-12-01", "delivery_end": "2027-01-01", "profile": "BASE", "quantity_mw": 1.0, "trade_price": 30.0, "currency": "EUR", "status": "EXECUTED", "counterparty": "X"}]))
+        history = pnl_history(book_buckets(trade), lookups, 1.17)
+        assert_close(float(history["pnl_eur"].iloc[0]), 0.0)
+        assert_close(float(history["pnl_eur"].iloc[1]), 3.0 * 744.0)
+        return "Curve status and warnings are right, and a product missing for a day keeps its last marks: 0 P&L that day, then the full 3.00 move on 744 MWh."
+
+    def check_track_scoring() -> str:
+        low, high = wilson_interval(50, 100)
+        assert_close(low, 0.4190, 1e-3)
+        assert_close(high, 0.5810, 1e-3)
+        monday = date(2026, 11, 2)
+        if independent_call_count([monday + timedelta(days=i) for i in range(5)], 5) != 1 or independent_call_count([monday, monday + timedelta(days=7)], 5) != 2:
+            raise AssertionError("Overlapping outcome windows must count once.")
+        if working_days_after(date(2026, 11, 6), 1) != date(2026, 11, 9) or working_days_after(date(2026, 11, 7), 1) != date(2026, 11, 9):
+            raise AssertionError("One working day after a Friday or Saturday is Monday.")
+        # Weekends always trade 20 lower. That pattern must not count as a price move.
+        days = pd.date_range("2026-01-05", periods=56, freq="D")
+        hourly = pd.DataFrame({"local": days, "value": [30.0 if d.weekday() >= 5 else 50.0 for d in days], "hours": 24.0})
+        path = spot_path(hourly)
+        move = path_move(path, date(2026, 2, 6), 1)
+        assert_close(move, 0.0)
+        # A path that rises every day: bullish is always right, bearish never.
+        days = pd.bdate_range("2026-01-05", periods=200)
+        table_ = {d.date(): {date(2028, 1, 1): 30.0 + i} for i, d in enumerate(days)}
+        rising = {"kind": "marks", "table": table_, "days": sorted(table_)}
+        always = pd.DataFrame({"anchor": [d.date() for d in days[:150]], "direction": 1})
+        result = score_calls(always, rising, 1)
+        assert_close(result["right"], 1.0)
+        assert_close(result["chance"], 1.0)
+        assert_close(result["average_move"], 1.0)
+        if result["verdict"] != "No clear edge":
+            raise AssertionError(f"Always bullish in a rising market isn't skill: {result['verdict']}")
+        few = score_calls(always.head(10), rising, 1)
+        if few["verdict"] != "Too few to judge":
+            raise AssertionError("Ten calls can't produce a verdict.")
+        alternating = {d.date(): {date(2028, 1, 1): 30.0 + (i % 2)} for i, d in enumerate(days)}
+        swing = {"kind": "marks", "table": alternating, "days": sorted(alternating)}
+        good = pd.DataFrame({"anchor": [d.date() for d in days[:150]], "direction": [1 if i % 2 == 0 else -1 for i in range(150)]})
+        verdict = score_calls(good, swing, 1)
+        assert_close(verdict["right"], 1.0)
+        if verdict["verdict"] != "Better than chance" or abs(verdict["chance"] - 0.5) > 0.01:
+            raise AssertionError(f"Perfect timing should beat 50%: {verdict}")
+        demo = pd.DataFrame({"snapshot_date": ["2026-01-05"], "product": ["TTF Natural Gas"], "delivery_month": ["2027-01-01"], "price": [30.0], "source": ["Demo marks"]})
+        if marks_path(demo, "TTF Natural Gas")["days"]:
+            raise AssertionError("Demo prices must never score a read.")
+        return "Wilson range, overlap count, weekday removal and verdicts match hand results. Always-bullish in a rising market shows no edge, and demo prices are never used."
+
+    def check_track_no_lookahead() -> str:
+        zone = "France"
+        tz = ENTSOE_ZONES[zone]["timezone"]
+        stamps = pd.date_range("2026-06-01", periods=24 * 60, freq="h", tz="UTC")
+        rng = np.random.default_rng(5)
+        prices = pd.DataFrame({"timestamp": stamps, "value": 50.0 + np.cumsum(rng.normal(size=len(stamps))) * 0.2, "resolution": "PT60M"})
+        changed = prices.copy()
+        cutoff = pd.Timestamp("2026-07-13", tz=tz).tz_convert("UTC")
+        changed.loc[changed["timestamp"] >= cutoff, "value"] = 500.0
+        one = replay_power_reads("French power", zone, prices, None, None, set(), date(2026, 12, 1))
+        two = replay_power_reads("French power", zone, changed, None, None, set(), date(2026, 12, 1))
+        day = date(2026, 7, 10)
+        a, b = [next(r for r in rows if r["read_date"] == day.isoformat()) for rows in (one, two)]
+        if a["score"] != b["score"] or a["signals"] != b["signals"]:
+            raise AssertionError("Changing later prices changed an earlier read.")
+        if not any(r["score"] != s["score"] for r, s in zip(one, two) if r["read_date"] >= "2026-07-13"):
+            raise AssertionError("Test problem: the change had no effect at all.")
+        path, moved = spot_path(spot_series(prices, tz)), spot_path(spot_series(changed, tz))
+        if abs(path["raw"][day] - moved["raw"][day]) > 1e-9:
+            raise AssertionError("The starting price of a call used later data.")
+        return "Replacing every price after a date leaves all earlier reads unchanged."
+
+    def _winter_fixture(hdd_effect: float = -0.04, years: tuple = (2016, 2026)) -> tuple:
+        """Synthetic storage driven by a known rule, so the fit can be checked against the truth."""
+        rng = np.random.default_rng(11)
+        days = pd.date_range(date(years[0], 1, 1), date(years[1], 11, 3), freq="D")
+        winter_cold = {y: rng.normal(0, 1.5) for y in range(years[0] - 1, years[1] + 1)}
+        seasonal = 9.0 + 8.0 * np.cos(2 * np.pi * (days.dayofyear.to_numpy() - 15) / 365.25)
+        hdd = np.clip(seasonal + np.array([winter_cold[winter_of(d)] for d in days.date]) + rng.normal(0, 1.5, len(days)), 0, None)
+        fill = np.empty(len(days))
+        level = 88.0
+        for i, day in enumerate(days):
+            if day.month in WINTER_MONTHS:
+                step = 0.35 + hdd_effect * hdd[i] - 0.12 * (day.dayofweek >= 5) + 0.002 * (level - 60.0) + rng.normal(0, 0.03)
+            else:
+                step = 0.02 * (90.0 - level)
+            level = float(np.clip(level + step, 2.0, 100.0))
+            fill[i] = level
+        return pd.Series(fill, index=days), pd.Series(hdd, index=days)
+
+    def check_winter_model() -> str:
+        fill, hdd = _winter_fixture()
+        model = fit_storage_model(fill, hdd)
+        assert_close(model["hdd_effect"], -0.04, 0.003)
+        assert_close(model["weekend_effect"], -0.12, 0.01)
+        assert_close(model["fill_effect"], 0.002, 0.0015)
+        if model["r2"] < 0.8:
+            raise AssertionError(f"The model should explain a clean rule: {model['r2']}")
+        start = pd.Timestamp(2020, 11, 1)
+        days = pd.date_range("2020-11-02", "2021-03-31", freq="D")
+        one = simulate_fill(model, 80.0, days, hdd.reindex(days).to_numpy())
+        two = simulate_fill(model, 80.0, days, hdd.reindex(days).to_numpy() + 1.0)
+        if not two[-1] < one[-1]:
+            raise AssertionError("Colder weather must leave less in storage.")
+        return "On storage built from a known rule, the fit recovers the heating, weekend and fill effects, and colder weather leaves less gas."
+
+    def check_winter_projection() -> str:
+        fill, hdd = _winter_fixture()
+        today = date(2026, 11, 5)
+        history = pd.DataFrame({"gasDayStart": fill.index.strftime("%Y-%m-%d"), "full": fill.to_numpy()})
+        archive = pd.DataFrame({"date": hdd.index.strftime("%Y-%m-%d"), "location": GAS_WEATHER_LOCATIONS[0], "hdd": hdd.to_numpy()})
+        outlook = project_winter(history, archive, pd.DataFrame(), today)
+        if not outlook["ready"] or outlook["basis"] != "weather":
+            raise AssertionError(f"Projection not ready: {outlook['reason']}")
+        cold, normal, mild = [s["end"] for s in outlook["scenarios"]]
+        if not cold < normal < mild:
+            raise AssertionError(f"Expected cold < normal < mild, got {cold}, {normal}, {mild}.")
+        if outlook["days"][-1] != pd.Timestamp(2027, 3, 31) or outlook["start"] != date(2026, 11, 3):
+            raise AssertionError("The projection must run from the latest gas day to 31 March.")
+        if outlook["error"] is None or outlook["error"] > 3.0 or outlook["error"] >= outlook["average_error"]:
+            raise AssertionError(f"On a clean rule the method should beat an average winter: {outlook['error']} against {outlook['average_error']}.")
+        analog = project_winter(history, pd.DataFrame(), pd.DataFrame(), today)
+        if analog["basis"] != "past winters" or len(analog["scenarios"]) != 3:
+            raise AssertionError("Without weather, the projection should fall back to past winters.")
+        summer = project_winter(history, archive, pd.DataFrame(), date(2026, 7, 1))
+        if summer["ready"] or not summer["off_season"] or outlook_signal(summer) is not None:
+            raise AssertionError("Outside the season there should be no projection and no signal.")
+        signal = outlook_signal(outlook)
+        band = outlook["band_end"]
+        assert_close(signal["score"], float(np.clip(-(normal - band["average"]) / max((band["high"] - band["low"]) / 2.0, 5.0) / 2.0, -1.0, 1.0)))
+        if not outlook_signal({"ready": False, "off_season": False, "reason": "x"})["missing"]:
+            raise AssertionError("Missing data should show as a signal waiting for data.")
+        return f"Cold {cold:.0f}% is below normal {normal:.0f}%, below mild {mild:.0f}%. The past-winter test beats assuming an average winter, and the projection falls back or stops when it should."
+
+    # ---- Next-day estimate, drivers, crisis replay, VaR check, thresholds and PDF ----
+    def check_next_day_estimate() -> str:
+        rng = np.random.default_rng(21)
+        days = pd.date_range("2025-10-01", periods=300, freq="D")
+        wind = rng.uniform(5, 40, len(days))
+        hdd = np.clip(10 + 8 * np.cos(2 * np.pi * days.dayofyear.to_numpy() / 365.25) + rng.normal(0, 2, len(days)), 0, None)
+        solar = rng.uniform(20, 250, len(days))
+        price = np.empty(len(days))
+        price[0] = 70.0
+        for i in range(1, len(days)):
+            price[i] = 25 + 0.6 * price[i - 1] - 0.5 * wind[i] + 0.8 * hdd[i] - 0.02 * solar[i] - 12.0 * (days[i].dayofweek >= 5) + rng.normal(0, 1.0)
+        hourly = pd.DataFrame({"local": days.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(days)), unit="h"), "value": price.repeat(24), "hours": 1.0})
+        location = ZONE_WEATHER["France"]
+        weather = pd.DataFrame({"date": days, "location": location, "temperature_mean_c": 18.0 - hdd, "wind_speed_100m_mean_kmh": wind, "solar_radiation_mean_wm2": solar})
+        forecast = weather.tail(1).assign(date=days[-1] + pd.Timedelta(days=1), wind_speed_100m_mean_kmh=20.0, temperature_mean_c=10.0, solar_radiation_mean_wm2=100.0)
+        result = next_day_estimate("France", hourly, weather, forecast)
+        if not result["ready"]:
+            raise AssertionError(result["reason"])
+        assert_close(result["wind_effect"], -0.5, 0.06)
+        assert_close(result["hdd_effect"], 0.8, 0.15)
+        if not result["error"] < min(result["error_last_week"], result["error_yesterday"]) or not result["low"] < result["estimate"] < result["high"]:
+            raise AssertionError("On a clean rule the estimate should beat simple methods and sit inside its range.")
+        if result["day"] != (days[-1] + pd.Timedelta(days=1)).date():
+            raise AssertionError("The estimate must be for the first unpublished day.")
+        changed = hourly.copy()
+        changed.loc[changed["local"] >= days[-1], "value"] = 900.0
+        again = next_day_estimate("France", changed, weather, forecast)
+        if abs(float(again["test"].iloc[-2]["estimate"]) - float(result["test"].iloc[-2]["estimate"])) > 1e-9:
+            raise AssertionError("A later price changed an earlier estimate.")
+        short = next_day_estimate("France", hourly.head(24 * 30), weather, forecast)
+        no_forecast = next_day_estimate("France", hourly, weather, pd.DataFrame())
+        if short["ready"] or no_forecast["ready"]:
+            raise AssertionError("Without enough prices or a forecast there should be no estimate.")
+        log = pd.DataFrame({"delivery_date": [days[-1].date().isoformat(), "2030-01-01"], "estimate": [price[-1] + 2.0, 1.0]})
+        score = score_recorded_estimates(log, pd.Series(price, index=days))
+        if score["n"] != 1:
+            raise AssertionError("Only estimates with a published price can be scored.")
+        assert_close(score["error"], 2.0)
+        return "On prices built from a known rule, the fit recovers the wind and heating effects and beats simple methods. Later prices never change earlier estimates."
+
+    def check_pnl_drivers() -> str:
+        month, other = date(2026, 12, 1), date(2027, 1, 1)
+        buckets = pd.DataFrame([{"trade_id": "A", "product": "TTF Natural Gas", "currency": "EUR", "delivery_month": month, "net_mwh": 1000.0, "trade_price": 30.0, "trade_date": date(2026, 11, 1)},
+                                {"trade_id": "B", "product": "TTF Natural Gas", "currency": "EUR", "delivery_month": month, "net_mwh": -200.0, "trade_price": 31.0, "trade_date": date(2026, 11, 1)},
+                                {"trade_id": "C", "product": "NBP Natural Gas", "currency": "GBP", "delivery_month": other, "net_mwh": 500.0, "trade_price": 25.0, "trade_date": date(2026, 11, 5)}])
+        previous = {"TTF Natural Gas": {month: 32.0}, "NBP Natural Gas": {other: 26.0}}
+        current = {"TTF Natural Gas": {month: 30.0}, "NBP Natural Gas": {other: 27.0}}
+        step = pnl_explain(buckets, previous, current, date(2026, 11, 4), date(2026, 11, 5))
+        drivers = pnl_drivers(step, step["currency"].map({"EUR": 1.0, "GBP": 1.2}))
+        ttf, nbp = drivers.loc[drivers["product"].eq("TTF Natural Gas")].iloc[0], drivers.loc[drivers["product"].eq("NBP Natural Gas")].iloc[0]
+        assert_close(ttf["price_move"], 800.0 * -2.0)
+        assert_close(nbp["new_trades"], 500.0 * 2.0 * 1.2)
+        assert_close(float(drivers["total"].sum()), -1600.0 + 1200.0)
+        assert_close(float((drivers["price_move"] + drivers["new_trades"] + drivers["first_marks"] - drivers["total"]).abs().max()), 0.0)
+        sentence = pnl_sentence(drivers)
+        if "TTF Natural Gas Dec-26" not in sentence or "long 800 MWh" not in sentence or "-2.00" not in sentence:
+            raise AssertionError(sentence)
+        return "Parts add up to the total, GBP converts, and the sentence names long 800 MWh of TTF Dec-26 moving -2.00, worth -€1,600."
+
+    def check_crisis_replay() -> str:
+        month = date(2026, 12, 1)
+        lookup = lambda product, price: pd.DataFrame({"delivery_month": [month], "product": [product], "price": [price], "currency": [PRODUCTS.get(product, REFERENCE_PRODUCTS.get(product))["currency"]], "unit": [PRODUCTS.get(product, REFERENCE_PRODUCTS.get(product))["unit"]]})
+        curve_set = {"TTF Natural Gas": lookup("TTF Natural Gas", 30.0), "EUA Carbon": lookup("EUA Carbon", 80.0), "NBP Natural Gas": lookup("NBP Natural Gas", 25.0)}
+        book = pd.DataFrame([{"product": "TTF Natural Gas", "currency": "EUR", "delivery_month": month, "net_mwh": 100.0}, {"product": "French Power Base", "currency": "EUR", "delivery_month": month, "net_mwh": 10.0}, {"product": "NBP Natural Gas", "currency": "GBP", "delivery_month": month, "net_mwh": 10.0}])
+        first = crisis_replay(book, curve_set, month, True, 1.0, 1.2).query("episode == @CRISIS_EPISODES[0]['name']").set_index("product")
+        assert_close(first.loc["TTF Natural Gas", "price_change"], 30.0 * 2.45)
+        carbon = 80.0 * (68.0 / 98.5 - 1.0)
+        assert_close(first.loc["French Power Base", "price_change"], (73.5 + carbon * 0.202) / 0.5)
+        assert_close(first.loc["NBP Natural Gas", "pnl_eur"], 10.0 * 25.0 * 2.45 * 1.2)
+        far_book = book.head(1).assign(delivery_month=date(2028, 12, 1))
+        far = crisis_replay(far_book, curve_set, month, True, 0.0, 1.2)["price_change"].iloc[0]
+        assert_close(far, 73.5 * math.exp(-24.0 / 6.0))
+        absolute = crisis_replay(book.head(1), curve_set, month, False, 1.0, 1.2).set_index("episode")["price_change"]
+        assert_close(absolute[CRISIS_EPISODES[1]["name"]], 113.0)
+        assert_close(absolute[CRISIS_EPISODES[2]["name"]], 1.0 - 30.0)
+        stretch = worst_stretch(pd.DataFrame({"date": pd.date_range("2026-01-01", periods=6).date, "pnl_eur": [1, -5, -6, 2, -1, 3]}), 2)
+        assert_close(stretch["pnl_eur"], -11.0)
+        if stretch["end"] != date(2026, 1, 3):
+            raise AssertionError("Worst stretch dates are wrong.")
+        return "Gas moves, carbon, the gas-plant link to power, GBP, fading along the curve and the gas price floor all match hand calculations."
+
+    def check_var_backtest() -> str:
+        statistic, p_value = kupiec_test(250, 5, 0.99)
+        expected = -2.0 * (5 * math.log(0.01) + 245 * math.log(0.99) - 5 * math.log(0.02) - 245 * math.log(0.98))
+        assert_close(statistic, expected)
+        assert_close(p_value, math.erfc(math.sqrt(expected / 2.0)))
+        zero, zero_p = kupiec_test(250, 0, 0.99)
+        assert_close(zero, -2.0 * 250 * math.log(0.99))
+        if not 0.05 < p_value < 0.2 or zero_p > 0.05 + 0.1:
+            raise AssertionError(f"Kupiec p-values look wrong: {p_value}, {zero_p}.")
+        rng = np.random.default_rng(4)
+        days = pd.bdate_range("2023-01-02", periods=800).date
+        steady = pd.DataFrame({"date": days, "pnl_eur": rng.normal(0, 1000, len(days))})
+        check = var_backtest(steady, 0.99)
+        if check["verdict"] != "Consistent with the confidence level" or check["zone"] == "":
+            raise AssertionError(f"Stable markets should pass: {check['verdict']}, {check['exceptions']} of {check['tests']}.")
+        shifted = steady["pnl_eur"].to_numpy().copy()
+        shifted[500:] *= 4.0
+        broken = var_backtest(steady.assign(pnl_eur=shifted), 0.99)
+        if broken["verdict"] != "VaR looks too low":
+            raise AssertionError(f"A jump in volatility should fail: {broken['verdict']}.")
+        later = steady.copy()
+        later.loc[700:, "pnl_eur"] = -1e9
+        a, b = var_backtest(steady, 0.99)["table"], var_backtest(later, 0.99)["table"]
+        assert_close(float(a["var_eur"].iloc[300]), float(b["var_eur"].iloc[300]))
+        if var_backtest(steady.head(50))["tests"] != 0 or var_backtest(steady.head(100))["verdict"] != "Too few days to judge":
+            raise AssertionError("Short samples should give no verdict.")
+        return f"Kupiec matches the formula, stable markets pass ({check['exceptions']} of {check['tests']}), a jump in volatility fails, and later losses never change earlier VaR."
+
+    def check_alerts_and_pdf() -> str:
+        rules = pd.DataFrame({"metric": ["A", "A", "B", "Missing"], "condition": ["Above", "Below", "Below", "Above"], "level": [10.0, 10.0, 5.0, 1.0]})
+        fired = threshold_alerts(rules, {"A": {"now": 12.0, "before": 9.0, "unit": "%"}, "B": {"now": 4.0, "before": 4.5, "unit": "EUR"}})
+        if [(a["metric"], a["condition"], a["new"]) for a in fired] != [("A", "Above", True), ("B", "Below", False)]:
+            raise AssertionError(f"Wrong thresholds fired: {fired}")
+        blocks = [("title", "Morning brief (test)"), ("subtitle", "Ünïcode, € and back\\slash"), ("heading", "Section"), ("text", "word " * 400),
+                  ("table", (["A", "B"], [["one", "two"]] * 90, (0.5, 0.5))), ("note", "End")]
+        pdf = simple_pdf(blocks, "Test")
+        if not pdf.startswith(b"%PDF-1.4") or not pdf.rstrip().endswith(b"%%EOF"):
+            raise AssertionError("The file isn't a complete PDF.")
+        start = int(pdf[pdf.rindex(b"startxref") + 10:].split()[0])
+        if pdf[start:start + 4] != b"xref":
+            raise AssertionError("The PDF's file table is in the wrong place.")
+        count = int(re.search(rb"/Count (\d+)", pdf)[1])
+        if count < 3 or b"\x80" not in pdf or b"\\(test\\)" not in pdf:
+            raise AssertionError("Paging, the euro sign or brackets went wrong.")
+        for offset, number in zip(re.findall(rb"(\d{10}) 00000 n", pdf)[:5], range(1, 6)):
+            if not pdf[int(offset):].startswith(b"%d 0 obj" % number):
+                raise AssertionError("A PDF object is at the wrong position.")
+        return f"Thresholds fire only when their condition holds and mark what's new. A long PDF has {count} pages with a valid file table, the euro sign and escaped brackets."
+
     cases = [
         ("Product registry and market timezones", "Configuration", check_product_registry),
         ("MWh ↔ MMBtu conversions", "Units & conversions", check_energy_conversion),
@@ -5763,6 +7415,18 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Spot analytics by hand", "Power spot", check_spot_analytics_by_hand),
         ("Seasonal storage and degree-day normals", "Fundamentals analytics", check_storage_season_and_hdd),
         ("ECB and weather archive parsers", "Live API integration", check_ecb_and_archive_parsers),
+        ("Next-day estimate recovers known effects", "Next-day estimate", check_next_day_estimate),
+        ("P&L drivers add up", "Daily P&L", check_pnl_drivers),
+        ("Crisis replay by hand", "Risk", check_crisis_replay),
+        ("VaR check and Kupiec test", "Risk", check_var_backtest),
+        ("Thresholds and PDF", "Morning brief", check_alerts_and_pdf),
+        ("Keys file reading", "Saved data", check_keys_file),
+        ("Curve files: formats and refusals", "Market data", check_curve_files),
+        ("Old marks aren't saved as a new day", "Market data", check_curve_dates_and_gaps),
+        ("Track record scoring by hand", "Track record", check_track_scoring),
+        ("Track record can't see the future", "Track record", check_track_no_lookahead),
+        ("Winter model recovers known effects", "Winter outlook", check_winter_model),
+        ("Winter scenarios are ordered and dated", "Winter outlook", check_winter_projection),
         ("Hedge advisor: exact offset by hand", "Hedge Advisor", check_hedge_exact_offset),
         ("Hedge advisor: P&L and risk drivers", "Hedge Advisor", check_hedge_var_matches_engine),
         ("Hedge advisor: edge cases", "Hedge Advisor", check_hedge_edge_cases),
@@ -5875,6 +7539,13 @@ def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float], re
     return f'<div class="desk-note">{"".join(parts)}</div>'
 
 
+def _outlook_line() -> str:
+    outlook = winter_outlook()
+    if not outlook.get("ready") or outlook.get("basis") != "weather":
+        return ""
+    return f" With normal weather, EU storage ends March at about {outlook['scenarios'][outlook['central']]['end']:.0f}%."
+
+
 def page_market_overview():
     title_block("Today at the desk", f"{valuation_date:%A %d %B %Y}. Your book and the market in one view.")
     marked = get_marked_trades()
@@ -5897,7 +7568,7 @@ def page_market_overview():
     note_col, chart_col = hero.columns([1, 1.05], gap="large")
     with note_col:
         reads = [f"{name} {read['summary']['reading'].lower()}" for name, read in market_reads().items() if read["summary"]["confidence"] != "None"]
-        st.markdown(desk_note_html(metrics, snapshot, pnl_today, f"Market read: {', '.join(reads)}." if reads else ""), unsafe_allow_html=True)
+        st.markdown(desk_note_html(metrics, snapshot, pnl_today, (f"Market read: {', '.join(reads)}." if reads else "") + _outlook_line()), unsafe_allow_html=True)
         update_button("overview_refresh")
     with chart_col:
         names = ["TTF Natural Gas", "French Power Base", "German Power Base"]
@@ -6000,7 +7671,9 @@ def page_power_spot():
     st.caption(f"EUR/MWh. Peak is weekdays 08:00 to 20:00 local time. Averages are weighted by time, so 15-minute and hourly data compare fairly. Data through {max(s['local'].max() for s in active.values()):%d %b %Y}.")
     table(pd.DataFrame(rows))
 
-    tabs = view_tabs(["Prices", "Daily shape", "Heatmap", "Duration curve", "Zone spread", "Wind and solar capture"])
+    tabs = view_tabs(["Prices", "Daily shape", "Heatmap", "Duration curve", "Zone spread", "Wind and solar capture", "Next-day estimate"])
+    if tabs[6]:
+        render_next_day(list(active))
     if tabs[0]:
         long_view = max(k.total_seconds() for k in (s["timestamp"].max() - s["timestamp"].min() for s in active.values())) > 60 * 86400
         frames = []
@@ -6191,16 +7864,17 @@ def page_forward_curves():
 
     if selected in st.session_state.get("custom_curves", {}):
         meta = st.session_state.get("curve_metadata", {}).get(selected, {})
-        st.caption(f"Source: {curve_source_label(selected)}, imported {str(meta.get('imported_at_utc', 'at an unrecorded time'))[:16].replace('T', ' ')} UTC. Check the valuation date and your data licence.")
+        marked = curve_mark_date(meta)
+        st.caption(f"Source: {curve_source_label(selected)}. Marks dated {marked:%d %b %Y}. Check your data licence." if marked else f"Source: {curve_source_label(selected)}. Check your data licence.")
     else:
-        st.caption("These are demo marks, not a market quote. Import real marks below to use this curve for valuation.")
+        st.warning("These are demo prices, not market quotes. Add real marks below before relying on any valuation that uses this curve.")
     if spec["commodity"] == "Power":
         zone = "France" if spec["zone"] == "France" else "Germany-Luxembourg"
         series = zone_prices(zone)
         if not series.empty:
             st.caption(f"For context, {zone} day-ahead averaged {spot_kpis(series)['base']:.2f} €/MWh over the loaded period. Day-ahead prices never replace forward marks.")
 
-    tab_table, tab_build, tab_import, tab_history = view_tabs(["Monthly marks", "Build from contract quotes", "Import a CSV", "Import past curves"])
+    tab_table, tab_status, tab_build, tab_import, tab_history = view_tabs(["Monthly marks", "Curve status and folder", "Build from contract quotes", "Import a CSV", "Import past curves"])
     if tab_table:
         display_curve = curve.copy()
         display_curve["delivery_month"] = display_curve["delivery_month"].dt.date
@@ -6210,6 +7884,8 @@ def page_forward_curves():
         table(display_curve[[c for c in display_curve.columns if c in ("delivery_month", "price", "change", "unit")]], height=320)
         st.download_button("Download this curve as CSV", data=display_curve.to_csv(index=False).encode("utf-8"),
                            file_name=f"{selected.lower().replace(' ', '_')}_forward_curve.csv", mime="text/csv")
+    if tab_status:
+        render_curve_status()
     if tab_build:
         st.caption("Enter the contracts you can see quoted, in any mix of months, quarters, seasons and years. Meridian finds monthly marks that reprice each one exactly while keeping the current curve's shape.")
         default_quotes = pd.DataFrame({"Contract": [c for c in contract_choices(valuation_date) if c.startswith(("Q", "Cal"))][:3], "Price": [None, None, None]})
@@ -6475,6 +8151,7 @@ def page_daily_pnl():
     kpi(k2, "From price moves", fmt_money(total["price_move"]), tone=tone_of(total["price_move"]))
     kpi(k3, "From new trades", fmt_money(total["new_trade"]), tone=tone_of(total["new_trade"]))
     kpi(k4, "Open MtM now", fmt_money(total["current_mtm"]), tone=tone_of(total["current_mtm"]))
+    drivers = render_pnl_drivers(step, factor)
     left, right = st.columns(2, gap="large")
     with left:
         fig = go.Figure(go.Waterfall(
@@ -6505,6 +8182,7 @@ def page_daily_pnl():
             fig.update_traces(line_color=BLUE)
             chart(fig, 300)
         st.caption("Trades enter the history from their trade date. Status changes aren't replayed, so a trade cancelled today is left out of past days too.")
+    render_driver_table(drivers)
     with st.expander("P&L by trade and delivery month"):
         table(step.drop(columns=["previous_mtm"]))
     st.caption("New trade: today's value of trades done since the first date. Price move: volume times the change in mark. To delivery: a month that left the curve; its value moves from open MtM to realised, so it doesn't change P&L.")
@@ -6541,7 +8219,13 @@ def page_risk_exposure():
     kpi(k3, "Largest position", f"{net_by_product.abs().max():,.0f} MWh", str(net_by_product.abs().idxmax()))
     kpi(k4, "Value of a +1 move, all products", fmt_money(float((buckets["net_mwh"] * buckets["currency"].map({"EUR": 1.0, "GBP": eur_per_gbp})).sum())), "Per 1 unit per MWh")
 
-    tab_ladder, tab_scenarios, tab_var = view_tabs(["Delivery ladder", "Scenarios", "Value at risk"])
+    tab_ladder, tab_scenarios, tab_crisis, tab_var, tab_check = view_tabs(["Delivery ladder", "Scenarios", "Crisis replay", "Value at risk", "VaR check"])
+    if tab_crisis or tab_check:
+        var_outcome = session_memo("var", (data_version("trades", "snapshots"), eur_per_gbp), lambda: historical_var(buckets, saved_snapshots(), eur_per_gbp, prepared=saved_moves()))
+    if tab_crisis:
+        render_crisis_replay(buckets, eur_per_gbp, var_outcome)
+    if tab_check:
+        render_var_check(var_outcome)
     if tab_ladder:
         ladder = buckets.groupby(["product", "delivery_month"], as_index=False)["net_mwh"].sum()
         pivot = ladder.pivot(index="product", columns="delivery_month", values="net_mwh").sort_index()
@@ -6597,15 +8281,13 @@ def market_reads() -> dict:
 
 
 def _build_market_reads() -> dict:
-    imported = st.session_state.get("custom_curves", {})
     today = valuation_date
+    imported = fresh_curves(st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {}), today)
     daily, normals = _live_dataset_frame("weather_daily"), _live_dataset_frame("weather_normals")
     reads = {"European gas": gas_signals(_live_dataset_frame("gie_agsi_history"), _live_dataset_frame("gie_alsi"), daily, normals,
-                                         imported, curves, today, fx_rate("eur_per_usd"))}
-    labels = {"France": "French power", "Germany-Luxembourg": "German power", "Netherlands": "Dutch power",
-              "Belgium": "Belgian power", "Spain": "Spanish power", "Great Britain": "British power"}
+                                         imported, curves, today, fx_rate("eur_per_usd"), winter_outlook())}
     loaded = set(_live_variants("entsoe_price"))
-    for zone, label in labels.items():
+    for label, zone in MARKET_ZONES.items():
         if zone in ("France", "Germany-Luxembourg") or zone in loaded:
             reads[label] = power_signals(zone, _live_dataset_frame(f"entsoe_price|{zone}"), _live_dataset_frame(f"entsoe_load|{zone}"),
                                          _live_dataset_frame(f"entsoe_generation|{zone}"), daily, normals, imported, today)
@@ -6654,7 +8336,9 @@ def page_market_read():
         update_button("read_load_all")
     c2.caption(f"{missing_count} signal(s) are waiting for data." if missing_count else "All signals have data.")
 
-    tabs = view_tabs(list(reads))
+    tabs = view_tabs(list(reads) + ["Track record"])
+    if tabs[-1]:
+        render_track_record()
     for tab, (name, read) in zip(tabs, reads.items()):
         summary = read["summary"]
         if tab:
@@ -6691,7 +8375,7 @@ def page_market_read():
         rows = [{"Market": name, "Signal": s["name"], "Weight": s["weight"], "Score": round(s["score"], 2) if s["available"] else None, "Status": "Loaded" if s["available"] else "Waiting for data"}
                 for name, read in reads.items() for s in read["signals"]]
         table(pd.DataFrame(rows))
-        st.caption("The weights are expert judgement. They aren't fitted to prices and haven't been back-tested, so this organises the evidence rather than forecasting prices. It isn't trading advice. Curve signals only use imported marks, never demo prices.")
+        st.caption("The weights are expert judgement. They aren't fitted to prices, and the Track record view shows how the reads have done, so this organises the evidence rather than forecasting prices. It isn't trading advice. Curve signals only use imported marks, never demo prices.")
 
 
 def _ladder_figure(rows: pd.DataFrame, title: str, limit: float) -> go.Figure:
@@ -6737,6 +8421,9 @@ def page_hedge_advisor():
         return
     if not history.empty and history["source"].eq(SYNTHETIC_HISTORY_SOURCE).any():
         st.warning("Part of this history is synthetic demo data, so these hedges only show how the advisor works. Don't act on them.")
+    marks_note = curve_warning(products, st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {}), valuation_date)
+    if marks_note:
+        st.warning(marks_note)
     if plan["uncovered"]:
         st.warning(f"No saved history for {', '.join(plan['uncovered'])}, so these products aren't in the risk figures or the hedges.")
 
@@ -6863,6 +8550,551 @@ def page_hedge_advisor():
                     "**Main risk.** The hedge assumes markets keep moving as they did on the saved days. A short history or a change in market regime can make it wrong, and proxy hedges are the most exposed. It's a starting point for your own judgement, not trading advice.")
 
 
+# -----------------------------------------------------------------------------
+# Curve status, track record and winter outlook views
+# -----------------------------------------------------------------------------
+def curve_template_csv(today: date) -> bytes:
+    """A file to fill in: twelve months and the next two calendar years, with no overlaps."""
+    first = _add_months(date(today.year, today.month, 1), 1)
+    months = [month_contract_label(_add_months(first, i)) for i in range(12)]
+    last_year = _add_months(first, 11).year
+    years = [f"Cal-{(last_year + i) % 100:02d}" for i in (1, 2)]
+    rows = [{"curve_date": today.isoformat(), "product": product, "contract": contract, "price": ""} for product in CURVE_PRODUCTS for contract in months + years]
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
+
+
+def render_curve_status() -> None:
+    today = valuation_date
+    custom, metadata = st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {})
+    rows = []
+    for product in CURVE_PRODUCTS:
+        status = curve_state(product, custom, metadata, today)
+        rows.append({"Curve": product, "Status": {"Demo": "Demo prices", "Current": "Current", "Stale": "Out of date"}.get(status["state"], status["state"]),
+                     "Marks dated": f"{status['day']:%d %b %Y}" if status["day"] else "", "Age, days": str(status["age"]) if status["age"] is not None else "",
+                     "Source": curve_source_label(product), "Months": str(len(custom[product])) if product in custom else ""})
+    table(pd.DataFrame(rows))
+    current = sum(1 for r in rows if r["Status"] == "Current")
+    st.caption(f"{current} of {len(rows)} curves are current. Marks older than {CURVE_STALE_DAYS} days count as out of date, and those older than {STALE_DAYS} days no longer feed Market Read.")
+    st.subheader("Add marks without opening the app")
+    st.markdown(f"Save your broker sheet or settlement file in the folder below. New files are imported when you open the app or select Update market data.\n\n`{curve_folder()}`")
+    left, right = st.columns(2)
+    with left:
+        st.download_button("Download a template", data=curve_template_csv(today), file_name="curve_template.csv", mime="text/csv", key="curve_template")
+    with right:
+        if st.button("Check the folder now", key="curve_folder_check"):
+            results = import_curve_folder()
+            if results:
+                st.rerun()
+            st.toast("No new files.", icon=":material/info:")
+    st.caption("Columns: product, price, and contract or delivery_month. Add curve_date to set the market date, otherwise a date in the file name or the file's saved date is used. "
+               "One file can hold many dates, which also builds Daily P&L and VaR history. CSV works with commas or semicolons, and Excel files need the openpyxl package. "
+               "A contract list such as Q1-27 or Cal-27 is split into months using the current curve's shape. Months you don't supply stay unpriced rather than using demo prices.")
+    store = desk_store()
+    log = store.load_curve_files() if store is not None else pd.DataFrame()
+    if not log.empty:
+        st.subheader("Files processed")
+        table(log.assign(processed_at=log["processed_at"].str[:16].str.replace("T", " "))[["name", "status", "detail", "processed_at"]]
+              .rename(columns={"name": "File", "status": "Result", "detail": "Detail", "processed_at": "Processed, UTC"}))
+
+
+def _track_row(row: dict) -> dict:
+    percent = lambda v: None if v is None or pd.isna(v) else f"{v * 100:.0f}%"
+    has_range = row.get("low") is not None and pd.notna(row.get("low"))
+    return {"Calls": row["calls"], "Independent tests": row["independent"], "Right": percent(row["right"]), "By chance": percent(row["chance"]),
+            "Likely range": f"{row['low'] * 100:.0f}% to {row['high'] * 100:.0f}%" if has_range else None,
+            "Average move in the call's favour": None if row["average_move"] is None or pd.isna(row["average_move"]) else round(float(row["average_move"]), 2), "Verdict": row["verdict"]}
+
+
+def _track_figure(market: str, path: dict, reads: pd.DataFrame) -> go.Figure:
+    if path["kind"] == "spot":
+        prices = path["raw"].tail(250)
+        title, lookup = f"{market}: day-ahead base price and the calls made, EUR/MWh", prices.to_dict()
+    else:
+        fronts = {}
+        for day in path["days"]:
+            months = sorted(m for m in path["table"][day] if m > date(day.year, day.month, 1))
+            if months:
+                fronts[day] = path["table"][day][months[0]]
+        prices = pd.Series(fronts, dtype=float).tail(250)
+        title, lookup = f"{market}: nearest TTF month and the calls made, EUR/MWh", fronts
+    fig = go.Figure(go.Scatter(x=list(prices.index), y=prices.to_numpy(), mode="lines", name="Price", line=dict(color=GRAY, width=2)))
+    part = reads.loc[reads["market"].eq(market)].copy()
+    part["anchor"] = part["price_through"].map(date.fromisoformat)
+    part = part.loc[part["anchor"].isin(set(prices.index))]
+    styles = (("Recorded", 1, "Bullish call", "triangle-up", GAIN), ("Recorded", -1, "Bearish call", "triangle-down", LOSS),
+              ("Replayed", 1, "Bullish, replayed", "triangle-up-open", GAIN), ("Replayed", -1, "Bearish, replayed", "triangle-down-open", LOSS))
+    for source, direction, name, symbol, color in styles:
+        chosen = part.loc[part["source"].eq(source) & part["score"].map(lambda s: _direction(float(s), CALL_THRESHOLD) == direction)]
+        if not chosen.empty:
+            fig.add_trace(go.Scatter(x=chosen["anchor"].tolist(), y=[lookup[a] for a in chosen["anchor"]], mode="markers", name=name,
+                                     marker=dict(symbol=symbol, size=9, color=color, line=dict(width=1.5, color=color))))
+    fig.update_layout(title=title)
+    return fig
+
+
+def render_track_record() -> None:
+    with st.spinner("Scoring past reads"):
+        ensure_replayed_reads()
+        reads = saved_reads()
+        paths = track_paths()
+        tables = session_memo("track_tables", data_version("reads", "live", "snapshots"), lambda: track_tables(reads, paths))
+    recorded = reads.loc[reads["source"].eq("Recorded")] if not reads.empty else reads
+    horizon = st.radio("Days ahead", list(TRACK_HORIZONS), index=1, horizontal=True, key="track_horizon", format_func=lambda d: f"{d} working day{'s' if d > 1 else ''} ahead")
+    overall = tables["overall"]
+    chosen = overall.loc[overall["horizon"].eq(horizon)] if not overall.empty else overall
+    def line(row: dict) -> str:
+        return (f"<b>{html.escape(row['market'])}:</b> right {row['right'] * 100:.0f}% of the time on {row['calls']} calls, "
+                f"against {row['chance'] * 100:.0f}% by chance. {html.escape(row['verdict'])}.")
+    started = f"Recording since {date.fromisoformat(recorded['read_date'].min()):%d %b %Y}, with {len(recorded)} reads saved. Saved reads are never rewritten." if not recorded.empty else "Recording starts with your first update of current data."
+    rows = chosen.to_dict("records") if not chosen.empty else []
+    scored = lambda source: [r for r in rows if r["source"] == source and r["right"] is not None and pd.notna(r["right"])]
+    live, replayed = scored("Recorded"), scored("Replayed")
+    parts = [f"<p>{html.escape(started)}</p>"]
+    parts += [f"<p>{line(r)}</p>" for r in live]
+    if not live:
+        parts.append(f'<p class="soft">Recorded reads can be scored once {horizon} working day{"s have" if horizon > 1 else " has"} passed and new prices are in.</p>')
+    if replayed:
+        parts.append("<p>On past data, without forecasts or curve signals:</p>" + "".join(f"<p>{line(r)}</p>" for r in replayed))
+    if not rows:
+        parts.append('<p class="soft">Select Update market data to load prices. Past reads are then rebuilt and scored here.</p>')
+    with st.container(key="hero"):
+        st.markdown(f'<div class="desk-note">{"".join(parts)}</div>', unsafe_allow_html=True)
+    if not paths["European gas"]["days"]:
+        need_data_note("European gas can't be scored yet because it needs real TTF prices to compare against. Add dated TTF marks in Forward Curves and the gas reads will be scored too.")
+    if chosen.empty:
+        return
+    shown = chosen.loc[chosen["calls"].gt(0)]
+    if not shown.empty:
+        table(pd.DataFrame([{"Market": r["market"], "Reads": r["source"], **_track_row(r), "Balanced, no call": r["balanced"]} for r in shown.to_dict("records")]))
+    st.caption("Likely range is a 90% range for the true hit rate, based on independent tests. A verdict needs at least "
+               f"{TRACK_MIN_INDEPENDENT} independent tests, and the range must clear the chance rate.")
+    options = [m for m in paths if path_anchors(paths[m]) and not reads.empty and reads["market"].eq(m).any()]
+    if options:
+        market = st.selectbox("Market", options, key="track_market")
+        chart(_track_figure(market, paths[market], reads), 380)
+        signals = tables["signals"]
+        part = signals.loc[signals["horizon"].eq(horizon) & signals["market"].eq(market) & signals["calls"].gt(0)] if not signals.empty else signals
+        if not part.empty:
+            st.subheader("Which signals have worked")
+            table(pd.DataFrame([{"Signal": r["signal"], "Reads": r["source"], **_track_row(r)} for r in part.sort_values(["source", "signal"]).to_dict("records")]))
+        levels = tables["confidence"]
+        part = levels.loc[levels["horizon"].eq(horizon) & levels["market"].eq(market) & levels["calls"].gt(0)] if not levels.empty else levels
+        if not part.empty:
+            st.subheader("Does higher confidence mean better calls")
+            table(pd.DataFrame([{"Confidence": r["confidence"], "Reads": r["source"], **_track_row(r)} for r in part.sort_values(["source", "confidence"]).to_dict("records")]))
+    with st.expander("How the scoring works"):
+        st.markdown("**Recorded** reads were saved on the day, with all the evidence then available. They are the real test.\n\n"
+                    "**Replayed** reads are rebuilt from past data using only what was known at the time. They leave out forecasts and curve signals, so they test only part of the method.\n\n"
+                    "**A call is right** when the price moves its way. Bullish and bearish count as calls, and a balanced read makes no call.\n\n"
+                    "**Power** compares day-ahead base on the later day with its level when the read was made, with the usual weekday pattern removed. "
+                    "**Gas** compares the same TTF delivery month at both dates, using real marks only.\n\n"
+                    "**By chance** is how often you'd be right by making the same mix of calls at random in this period, which allows for a market that mostly rose or fell.\n\n"
+                    "**Independent tests** count calls whose outcome windows don't overlap, because reads a day apart are mostly watching the same price move. Consecutive reads also tend to agree, so even this can flatter the result.")
+    st.download_button("Download all saved reads", data=reads.drop(columns=["signals"]).to_csv(index=False).encode("utf-8"), file_name="meridian_read_log.csv", mime="text/csv", key="download_reads")
+
+
+OUTLOOK_COLORS = (BLUE, AMBER, TEAL)
+
+
+def _outlook_figure(outlook: dict) -> go.Figure:
+    fig = go.Figure()
+    band = outlook["band"]
+    if not band.empty:
+        fig.add_trace(go.Scatter(x=band["day"], y=band["high"], mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=band["day"], y=band["low"], mode="lines", line=dict(width=0), fill="tonexty", fillcolor="rgba(169,190,194,0.20)", name="Five-year range", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=band["day"], y=band["average"], mode="lines", name="Five-year average", line=dict(color=GRAY, width=1.5, dash="dot")))
+    fig.add_trace(go.Scatter(x=outlook["actual"].index, y=outlook["actual"].to_numpy(), mode="lines", name="This winter", line=dict(color=TEXT, width=2.5)))
+    start_day = pd.Timestamp(outlook["start"])
+    for scenario, color in zip(outlook["scenarios"], OUTLOOK_COLORS):
+        x = [start_day] + list(outlook["days"])
+        y = [outlook["start_fill"]] + scenario["path"].tolist()
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=scenario["name"], line=dict(color=color, width=2.5, dash="dash" if scenario["name"] != outlook["scenarios"][outlook["central"]]["name"] else "solid")))
+        fig.add_annotation(x=x[-1], y=y[-1], text=f"{scenario['name']} {scenario['end']:.0f}%", showarrow=False, xanchor="left", xshift=8, font=dict(color=TEXT, size=12))
+    fig.update_layout(title="EU gas storage this winter, % full", margin=dict(r=90))
+    fig.update_yaxes(title="", rangemode="tozero")
+    return fig
+
+
+def render_winter_outlook() -> None:
+    st.subheader("Where EU storage could end this winter")
+    outlook = winter_outlook()
+    if not outlook["ready"]:
+        need_data_note(outlook["reason"])
+        if not outlook.get("off_season"):
+            update_button("outlook_update")
+        return
+    scenarios = outlook["scenarios"]
+    central = scenarios[outlook["central"]]
+    band_end = outlook["band_end"]
+    comparison = lambda level: f", {versus_range(level, band_end)}" if band_end else ""
+    weather_based = outlook["basis"] == "weather"
+    first = (f"With normal weather, EU storage ends March at about <b>{central['end']:.0f}%</b>{comparison(central['end'])}."
+             if weather_based else f"If storage falls as it has on average, it ends March at about <b>{central['end']:.0f}%</b>{comparison(central['end'])}.")
+    if weather_based:
+        second = (f"The coldest winter of the past {len(outlook['years'])} would take it to <b>{scenarios[0]['end']:.0f}%</b>{comparison(scenarios[0]['end'])}, "
+                  f"and the mildest to <b>{scenarios[2]['end']:.0f}%</b>{comparison(scenarios[2]['end'])}.")
+    else:
+        second = "This repeats past withdrawals because the weather history isn't loaded, so it doesn't separate weather from anything else. Select Update market data to load it."
+    if outlook["error"] is not None and weather_based:
+        beat = outlook["error"] < outlook["average_error"]
+        third = (f"Tested on {len(outlook['backtest'])} past winters with their actual weather, the method missed the March level by {outlook['error']:.1f} points on average, "
+                 f"against {outlook['average_error']:.1f} for assuming an average winter. "
+                 + ("" if beat else "It hasn't beaten that simple average, so rely on the range more than the central number."))
+    else:
+        third = ""
+    with st.container(key="hero"):
+        paragraph = f'<p class="soft">{html.escape(third)}</p>' if third else ""
+        st.markdown(f'<div class="desk-note"><p>{first} {second}</p>{paragraph}</div>', unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    kpi(c1, f"Now, {outlook['start']:%d %b}", f"{outlook['start_fill']:.1f}%", "Latest published gas day")
+    for column, scenario, color in zip((c2, c3, c4), scenarios, OUTLOOK_COLORS):
+        kpi(column, f"{scenario['name']}, 31 March", f"{scenario['end']:.0f}%", scenario["note"], accent=color)
+    chart(_outlook_figure(outlook), 440)
+    if outlook["forecast_days"]:
+        st.caption(f"The first {outlook['forecast_days']} days use the current weather forecast in every scenario. After that, each scenario uses past weather on the same calendar days.")
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.subheader("How the method did on past winters")
+        if not outlook["backtest"].empty:
+            shown = outlook["backtest"].round(1).rename(columns={"Fill at this date": "Start", "Actual end": "Actual", "Model end": "Model", "Model miss": "Miss", "Average-winter miss": "Miss if average"}).drop(columns=["Average-winter end"])
+            table(shown, height=37 * (len(shown) + 1) + 3)
+            st.caption("Fill levels in %. Each winter was predicted by a model fitted without it, using that winter's actual weather. This tests the link between weather and storage, not a weather forecast, so real errors will be larger. "
+                       "It's also a small sample, and later winters helped predict earlier ones.")
+        else:
+            st.caption("This needs storage and weather history for at least three past winters.")
+    with right:
+        if not outlook["years"].empty:
+            st.subheader("March end under each past winter's weather")
+            table(outlook["years"].round(1), height=37 * (len(outlook["years"]) + 1) + 3)
+    with st.expander("How this projection works"):
+        model = outlook["model"]
+        if model:
+            st.markdown(f"Each winter day's storage change is estimated from the month, heating demand, weekends and how full storage is. The result is then run forward one day at a time.\n\n"
+                        f"- Each extra heating degree day changes storage by **{model['hdd_effect']:+.3f} points** that day.\n"
+                        f"- A weekend day changes it by **{model['weekend_effect']:+.3f} points**.\n"
+                        f"- Each extra point of fill changes the daily move by **{model['fill_effect']:+.4f} points**.\n"
+                        f"- These explain **{model['r2'] * 100:.0f}%** of daily changes across {model['n']:,} days in {len(model['winters'])} winters. The last three winters count fully and older ones count half.\n"
+                        f"- Storage has lately run **{outlook['bias']:+.3f} points a day** against the model. That gap is carried forward and halves every {BIAS_HALF_LIFE_DAYS:.0f} days.\n\n")
+        st.markdown("Heating demand is the simple average of five north-west European cities, which is a rough stand-in for the weather that drives EU demand. "
+                    "The projection doesn't know about supply outages, LNG arrivals, prices or policy, and the crisis winters of 2021-22 and 2022-23 sit in the sample. Treat it as a guide to the size of the weather risk, not as a forecast.")
+
+
+# -----------------------------------------------------------------------------
+# Next-day estimate, P&L drivers, crisis replay, VaR check and morning brief
+# -----------------------------------------------------------------------------
+def zone_estimate(zone: str) -> dict:
+    return session_memo(f"estimate|{zone}", data_version("live"),
+                        lambda: next_day_estimate(zone, zone_prices(zone), _live_dataset_frame("weather_power_history"), _live_dataset_frame("weather_daily")))
+
+
+def record_price_estimates() -> None:
+    rows = []
+    for zone in _live_variants("entsoe_price"):
+        if zone in ZONE_WEATHER:
+            result = zone_estimate(zone)
+            if result["ready"]:
+                rows.append((result["day"].isoformat(), zone, result["estimate"], result["low"], result["high"], valuation_date.isoformat()))
+    if rows:
+        _save(lambda s: s.save_price_estimates(rows))
+        bump("estimates")
+
+
+def render_next_day(zones: Sequence[str]) -> None:
+    usable = [z for z in zones if z in ZONE_WEATHER]
+    if not usable:
+        need_data_note("Choose a zone with a weather reference city, such as France or Germany-Luxembourg.")
+        return
+    zone = st.selectbox("Zone", usable, key="estimate_zone") if len(usable) > 1 else usable[0]
+    result = zone_estimate(zone)
+    if not result["ready"]:
+        need_data_note(result["reason"])
+        update_button("estimate_update")
+        return
+    beat = result["error"] < min(result["error_last_week"], result["error_yesterday"])
+    gap_word = "above" if result["latest_gap"] > 0 else "below"
+    with st.container(key="hero"):
+        st.markdown(
+            f'<div class="desk-note"><p>Base price for {result["day"]:%a %d %b} in {html.escape(zone)}: about <b>€{result["estimate"]:.0f}/MWh</b>, likely between €{result["low"]:.0f} and €{result["high"]:.0f}.</p>'
+            f'<p>The latest published day, {result["latest_day"]:%a %d %b}, came in at €{result["latest_actual"]:.0f}, €{abs(result["latest_gap"]):.0f} {gap_word} the estimate of €{result["latest_estimate"]:.0f}. '
+            f'{"That is an unusually large gap, so check for something the method can&#39;t see." if result["unusual"] else "That is within the usual range of error."}</p>'
+            f'<p class="soft">Over the last {result["n"]} days, it missed by €{result["error"]:.1f} on average, against €{result["error_last_week"]:.1f} for using the same weekday last week and €{result["error_yesterday"]:.1f} for using the previous day. '
+            f'{"" if beat else "It has not beaten both simple methods, so don&#39;t rely on it over them."}</p></div>', unsafe_allow_html=True)
+    test = result["test"].tail(60)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=test["day"], y=test["actual"], mode="lines", name="Published price", line=dict(color=TEXT, width=2)))
+    fig.add_trace(go.Scatter(x=test["day"], y=test["estimate"], mode="lines", name="Estimate made the day before", line=dict(color=AMBER, width=2, dash="dash")))
+    fig.add_trace(go.Scatter(x=[pd.Timestamp(result["day"])], y=[result["estimate"]], mode="markers", name="Next day, with likely range", marker=dict(color=AMBER, size=11, symbol="diamond"),
+                             error_y=dict(type="data", symmetric=False, array=[result["high"] - result["estimate"]], arrayminus=[result["estimate"] - result["low"]], color=AMBER, thickness=2)))
+    fig.update_layout(title=f"{zone}: day-ahead base price, EUR/MWh")
+    chart(fig, 380)
+    store = desk_store()
+    log = store.load_price_estimates(zone) if store is not None else pd.DataFrame()
+    live = score_recorded_estimates(log, daily_base_prices(zone_prices(zone)))
+    if live["n"]:
+        st.caption(f"Estimates saved on the day with real forecasts: {live['n']} scored so far, missing by €{live['error']:.1f} on average, against €{live['error_last_week']:.1f} for the same weekday last week.")
+    else:
+        st.caption("Each estimate is also saved on the day, using the real forecast. They're scored here once the prices are published.")
+    with st.expander("How this estimate works"):
+        st.markdown("It's a regression on the last 180 days. It uses the previous day's price, the last 7 days' average, the same weekday last week, the weekday pattern, and heating demand, wind and solar in one reference city.\n\n"
+                    f"- 10 km/h more wind changes the price by **€{result['wind_effect'] * 10:+.2f}**.\n"
+                    f"- One more heating degree day changes it by **€{result['hdd_effect']:+.2f}**.\n"
+                    f"- 10 W/m² more solar radiation changes it by **€{result['solar_effect'] * 10:+.2f}**.\n\n"
+                    "The test above uses the weather that actually happened, because past forecasts aren't available, so real errors will be larger. The saved estimates show those real errors over time.\n\n"
+                    "It knows nothing about plant outages, French nuclear availability, gas prices, public holidays or the auction itself. One city is a rough stand-in for a whole country's wind and solar.")
+
+
+def render_pnl_drivers(step: pd.DataFrame, factor: pd.Series) -> pd.DataFrame:
+    drivers = pnl_drivers(step, factor)
+    with st.container(key="hero"):
+        st.markdown(f'<div class="desk-note"><p>{html.escape(pnl_sentence(drivers))}</p></div>', unsafe_allow_html=True)
+    return drivers
+
+
+def render_driver_table(drivers: pd.DataFrame) -> None:
+    if drivers.empty:
+        return
+    st.subheader("What drove it, by delivery month")
+    shown = drivers.assign(delivery_month=drivers["delivery_month"].map(month_contract_label)).rename(columns={
+        "product": "Product", "delivery_month": "Month", "net_mwh": "Net MWh", "previous_mark": "Mark before", "current_mark": "Mark now", "mark_change": "Change",
+        "price_move": "Price move, EUR", "new_trades": "New trades, EUR", "first_marks": "First marks, EUR", "total": "Total, EUR"})
+    table(shown.round({"Net MWh": 0, "Mark before": 2, "Mark now": 2, "Change": 2, "Price move, EUR": 0, "New trades, EUR": 0, "First marks, EUR": 0, "Total, EUR": 0}))
+
+
+def render_crisis_replay(buckets: pd.DataFrame, eur_per_gbp: float, outcome: dict) -> None:
+    c1, c2 = st.columns(2, vertical_alignment="bottom")
+    mode = c1.radio("Apply the move as", ["The same percentage", "The same EUR/MWh"], horizontal=True, key="crisis_mode")
+    far = c2.slider("How much far-dated months move, as a share of the nearest month", min_value=0.0, max_value=1.0, value=0.5, step=0.05, key="crisis_far")
+    same_percent = mode == "The same percentage"
+    detail = crisis_replay(buckets, curves, _add_months(valuation_date, 1), same_percent, float(far), eur_per_gbp)
+    totals = detail.groupby("episode", sort=False)["pnl_eur"].sum()
+    var99 = outcome.get("var", {}).get(0.99)
+    worst_name = totals.idxmin()
+    multiple = f", or {abs(totals.min()) / var99:.0f} times the 99% one-day VaR" if var99 and totals.min() < 0 else ""
+    with st.container(key="hero"):
+        st.markdown(f'<div class="desk-note"><p>The worst of these for today\'s book is <b>{html.escape(worst_name)}</b>: <span style="white-space:nowrap">{fmt_money(float(totals.min()))}</span>{multiple}.</p></div>', unsafe_allow_html=True)
+    marks_note = curve_warning(sorted(buckets["product"].unique()) + ["TTF Natural Gas"], st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {}), valuation_date)
+    if marks_note:
+        st.warning(marks_note)
+    fig = go.Figure(go.Bar(x=totals.to_numpy(), y=list(totals.index), orientation="h", marker=dict(color=[GAIN if v >= 0 else LOSS for v in totals]), hovertemplate="%{y}: €%{x:,.0f}<extra></extra>"))
+    fig.update_layout(title="P&L of today's book in each episode, EUR", hovermode="closest", yaxis_title="", margin=dict(l=240))
+    chart(fig, 280)
+    pivot = detail.pivot_table(index="episode", columns="product", values="pnl_eur", aggfunc="sum", sort=False).round(0)
+    pivot["Total"] = pivot.sum(axis=1)
+    table(pivot.reset_index().rename(columns={"episode": "Episode"}))
+    stretches = [s for s in (worst_stretch(outcome.get("pnl"), n) for n in (5, 10)) if s]
+    if stretches:
+        st.subheader("Worst stretches in your own saved marks")
+        table(pd.DataFrame([{"Length": f"{s['days']} days", "P&L of today's book, EUR": round(s["pnl_eur"]), "From": s["start"], "To": s["end"]} for s in stretches]))
+        if saved_snapshots()["source"].eq(SYNTHETIC_HISTORY_SOURCE).any():
+            st.warning("Part of this history is synthetic demo data, so this table says nothing about real risk.")
+    with st.expander("What each episode applies, and the limits"):
+        for episode in CRISIS_EPISODES:
+            st.markdown(f"**{episode['name']}.** {episode['what']} Figures are rounded and come from public reports: {'; '.join(episode['sources'])}.")
+        st.markdown("Only the nearest-month gas move is from those reports. **These parts are assumptions:** far-dated months use the share you set, fading over about six months. "
+                    f"NBP moves with TTF. Power is implied through a gas plant at {DEFAULT_SPREAD_PARAMS['gas_efficiency'] * 100:.0f}% efficiency, not taken from 2022 power prices, and real power moved differently, especially in France.\n\n"
+                    "Moves are applied at once, with no hedging, margin calls or lost liquidity, all of which made 2022 harder than this shows. "
+                    "Same EUR/MWh on today's lower prices is far harsher than the same percentage, and gas is held above EUR 1/MWh.")
+
+
+def render_var_check(outcome: dict) -> None:
+    level = st.radio("Confidence level", [0.95, 0.99], index=1, horizontal=True, key="var_check_level", format_func=lambda v: f"{v * 100:.0f}%")
+    check = var_backtest(outcome.get("pnl"), float(level))
+    if not check["tests"]:
+        need_data_note(f"This needs more than {VAR_CHECK_MIN_HISTORY} days of saved curve moves, and {outcome.get('observations', 0)} are saved so far.")
+        return
+    if saved_snapshots()["source"].isin(("Demo marks", SYNTHETIC_HISTORY_SOURCE)).any():
+        st.warning("Part of this history uses demo or synthetic prices, so this result only shows how the check works. It says nothing about real risk.")
+    k1, k2, k3, k4 = st.columns(4)
+    kpi(k1, "Days tested", f"{check['tests']}")
+    kpi(k2, "Losses beyond VaR", f"{check['exceptions']}", f"{check['expected']:.1f} expected")
+    kpi(k3, "Kupiec p-value", f"{check['p_value']:.2f}", "Below 0.05 rejects VaR" if check["tests"] >= VAR_CHECK_MIN_TESTS else "Not judged on so few days")
+    kpi(k4, "Result", check["verdict"], f"Basel zone: {check['zone']}" if check["zone"] else "")
+    data = check["table"]
+    fig = go.Figure(go.Bar(x=data["date"], y=data["pnl_eur"], name="Daily P&L of today's book", marker=dict(color=GRAY)))
+    fig.add_trace(go.Scatter(x=data["date"], y=-data["var_eur"], mode="lines", name="VaR that day", line=dict(color=AMBER, width=2)))
+    hits = data.loc[data["exception"]]
+    fig.add_trace(go.Scatter(x=hits["date"], y=hits["pnl_eur"], mode="markers", name="Loss beyond VaR", marker=dict(color=LOSS, size=9, symbol="x")))
+    fig.update_layout(title="Daily P&L against the VaR known the day before, EUR")
+    chart(fig, 380)
+    if check["pairs"]:
+        st.caption(f"Losses beyond VaR came on consecutive days {check['pairs']} time{'s' if check['pairs'] > 1 else ''}. Clustering means VaR is slow to react when markets turn, even if the total count looks fine.")
+    with st.expander("How this check works"):
+        st.markdown(f"Each day's VaR uses only the {VAR_CHECK_WINDOW} days before it, with at least {VAR_CHECK_MIN_HISTORY}. That day's result is then compared with it. "
+                    "This applies today's book to past price moves, so it tests the method rather than your past trading.\n\n"
+                    "Kupiec's test asks whether the number of losses beyond VaR is plausible for the confidence level. It has little power on short samples, which is why fewer than "
+                    f"{VAR_CHECK_MIN_TESTS} days gets no verdict. The Basel zone counts the last 250 days at 99%: green up to 4, yellow 5 to 9, red 10 or more.")
+
+
+BRIEF_METRICS = ("EU storage fill", "Winter outlook, normal weather", "TTF nearest month", "French day-ahead base", "German day-ahead base", "Daily P&L", "1-day VaR, 95%")
+
+
+def _base_pair(zone: str) -> tuple[Optional[float], Optional[float], Optional[date]]:
+    base = daily_base_prices(zone_prices(zone))
+    if len(base) < 2:
+        return None, None, None
+    return float(base.iloc[-1]), float(base.iloc[-2]), base.index[-1].date()
+
+
+def brief_metrics() -> dict:
+    metrics: dict = {}
+    fill = _storage_daily(_live_dataset_frame("gie_agsi_history"))
+    if len(fill) >= 2:
+        metrics["EU storage fill"] = {"now": float(fill["fill"].iloc[-1]), "before": float(fill["fill"].iloc[-2]), "unit": "%", "as_of": fill["day"].iloc[-1].date()}
+    outlook = winter_outlook()
+    if outlook.get("ready") and outlook.get("basis") == "weather":
+        metrics["Winter outlook, normal weather"] = {"now": outlook["scenarios"][outlook["central"]]["end"], "before": None, "unit": "%", "as_of": outlook["start"]}
+    marks = marks_path(saved_snapshots(), "TTF Natural Gas")
+    if len(marks["days"]) >= 2:
+        last, previous = marks["days"][-1], marks["days"][-2]
+        months = sorted(m for m in marks["table"][last] if m > date(last.year, last.month, 1) and m in marks["table"][previous])
+        if months:
+            metrics["TTF nearest month"] = {"now": marks["table"][last][months[0]], "before": marks["table"][previous][months[0]], "unit": "EUR/MWh", "as_of": last}
+    for name, zone in (("French day-ahead base", "France"), ("German day-ahead base", "Germany-Luxembourg")):
+        now, before, day = _base_pair(zone)
+        if now is not None:
+            metrics[name] = {"now": now, "before": before, "unit": "EUR/MWh", "as_of": day}
+    lookups, buckets = saved_lookups(), executed_buckets()
+    days = sorted(lookups)
+    if len(days) >= 2 and not buckets.empty:
+        series = session_memo("pnl_series", (data_version("trades", "snapshots"), fx_rate("eur_per_gbp")), lambda: pnl_history(buckets, lookups, fx_rate("eur_per_gbp")))
+        if len(series) >= 1:
+            metrics["Daily P&L"] = {"now": float(series["pnl_eur"].iloc[-1]), "before": float(series["pnl_eur"].iloc[-2]) if len(series) >= 2 else None, "unit": "EUR", "as_of": days[-1]}
+        outcome = session_memo("var", (data_version("trades", "snapshots"), fx_rate("eur_per_gbp")), lambda: historical_var(buckets, saved_snapshots(), fx_rate("eur_per_gbp"), prepared=saved_moves()))
+        if outcome["observations"] >= 20:
+            metrics["1-day VaR, 95%"] = {"now": outcome["var"][0.95], "before": None, "unit": "EUR at risk", "as_of": days[-1]}
+    return metrics
+
+
+def _metric_text(value: Optional[float], unit: str) -> str:
+    if value is None:
+        return ""
+    return {"%": f"{value:.1f}%", "EUR": fmt_money(value), "EUR at risk": fmt_money(value, signed=False), "EUR/MWh": f"€{value:.2f}"}.get(unit, f"{value:,.2f}")
+
+
+def build_brief() -> dict:
+    """Everything the morning brief says, used by both the page and the PDF."""
+    metrics = brief_metrics()
+    store = desk_store()
+    rules = store.load_alerts() if store is not None else pd.DataFrame(columns=["metric", "condition", "level"])
+    changes = []
+    for name in BRIEF_METRICS:
+        reading = metrics.get(name)
+        if reading:
+            change = reading["now"] - reading["before"] if reading.get("before") is not None else None
+            changes.append({"Item": name, "Now": _metric_text(reading["now"], reading["unit"]),
+                            "Before": _metric_text(reading.get("before"), reading["unit"]),
+                            "Change": ("" if change is None else f"{change:+.1f} pts" if reading["unit"] == "%" else fmt_money(change) if reading["unit"] == "EUR" else f"{change:+.2f}"),
+                            "Date": f"{reading['as_of']:%d %b}"})
+    held = saved_reads()
+    earlier = held.loc[held["source"].eq("Recorded") & held["read_date"].lt(valuation_date.isoformat())] if not held.empty else held
+    reads = []
+    for market, read in market_reads().items():
+        previous = earlier.loc[earlier["market"].eq(market)] if not earlier.empty else earlier
+        before = previous["reading"].iloc[-1] if not previous.empty else ""
+        summary = read["summary"]
+        reads.append({"Market": market, "Read": summary["reading"], "Confidence": summary["confidence"], "Previous": before or "None saved", "Changed": bool(before) and before != summary["reading"]})
+    pnl_text, drivers = "", pd.DataFrame()
+    lookups, buckets = saved_lookups(), executed_buckets()
+    days = sorted(lookups)
+    if len(days) >= 2 and not buckets.empty:
+        step = pnl_explain(buckets, lookups[days[-2]], lookups[days[-1]], days[-2], days[-1])
+        if not step.empty:
+            drivers = pnl_drivers(step, step["currency"].map({"EUR": 1.0, "GBP": fx_rate("eur_per_gbp")}))
+            pnl_text = pnl_sentence(drivers)
+    estimates = []
+    for zone in ("France", "Germany-Luxembourg"):
+        if zone in _live_variants("entsoe_price"):
+            result = zone_estimate(zone)
+            if result["ready"]:
+                estimates.append({"Zone": zone, "Day": f"{result['day']:%a %d %b}", "Estimate": f"€{result['estimate']:.0f}", "Likely range": f"€{result['low']:.0f} to €{result['high']:.0f}", "Latest day": "Unusually large gap" if result["unusual"] else "Within usual error"})
+    outlook = winter_outlook()
+    outlook_text = ""
+    if outlook.get("ready") and outlook.get("basis") == "weather":
+        scenarios = outlook["scenarios"]
+        outlook_text = f"EU storage ends March at about {scenarios[1]['end']:.0f}% with normal weather, {scenarios[0]['end']:.0f}% in the coldest past winter and {scenarios[2]['end']:.0f}% in the mildest."
+    custom, metadata = st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {})
+    warnings_ = []
+    held_products = sorted(buckets["product"].unique()) if not buckets.empty else []
+    marks_note = curve_warning(held_products, custom, metadata, valuation_date)
+    if marks_note:
+        warnings_.append(marks_note)
+    if not metrics.get("EU storage fill"):
+        warnings_.append("There's no storage data yet. Select Update market data.")
+    return {"alerts": threshold_alerts(rules, metrics), "changes": changes, "reads": reads, "pnl_text": pnl_text, "drivers": drivers, "estimates": estimates,
+            "outlook": outlook_text, "warnings": warnings_}
+
+
+def brief_pdf(brief: dict) -> bytes:
+    blocks: list[tuple] = [("title", "Morning brief"), ("subtitle", f"Meridian, {valuation_date:%A %d %B %Y}. Screening analysis, not investment advice.")]
+    if brief["warnings"]:
+        blocks += [("note", w) for w in brief["warnings"]]
+    if brief["alerts"]:
+        blocks.append(("heading", "Thresholds crossed"))
+        blocks += [("text", f"{a['metric']}: {_metric_text(a['now'], a['unit'])}, {a['condition'].lower()} your level of {_metric_text(a['level'], a['unit'])}" + (". New today." if a["new"] else ".")) for a in brief["alerts"]]
+    if brief["changes"]:
+        blocks.append(("heading", "What changed"))
+        columns = ["Item", "Now", "Before", "Change", "Date"]
+        blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["changes"]], (0.40, 0.17, 0.17, 0.15, 0.11))))
+    if brief["reads"]:
+        blocks.append(("heading", "Market read"))
+        columns = ["Market", "Read", "Confidence", "Previous"]
+        blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["reads"]], (0.28, 0.28, 0.18, 0.26))))
+    if brief["pnl_text"]:
+        blocks += [("heading", "P&L"), ("text", brief["pnl_text"])]
+    if brief["estimates"]:
+        blocks.append(("heading", "Next-day power price estimate"))
+        columns = ["Zone", "Day", "Estimate", "Likely range", "Latest day"]
+        blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["estimates"]], (0.28, 0.16, 0.13, 0.19, 0.24))))
+    if brief["outlook"]:
+        blocks += [("heading", "Winter storage"), ("text", brief["outlook"])]
+    blocks.append(("note", "Reads, estimates and projections are simple models with the limits shown in the app. Check their track record before relying on them."))
+    return simple_pdf(blocks, "Meridian morning brief")
+
+
+def page_morning_brief() -> None:
+    title_block("Morning brief", f"{valuation_date:%A %d %B %Y}. What changed since the last update, on one page you can save as a PDF.")
+    brief = build_brief()
+    left, right = st.columns([1, 4], vertical_alignment="center")
+    with left:
+        update_button("brief_update")
+    with right:
+        st.download_button("Download as PDF", data=brief_pdf(brief), file_name=f"meridian_brief_{valuation_date.isoformat()}.pdf", mime="application/pdf", key="brief_pdf")
+    for note in brief["warnings"]:
+        st.warning(note)
+    for alert in brief["alerts"]:
+        st.error(f"{alert['metric']}: {_metric_text(alert['now'], alert['unit'])}, {alert['condition'].lower()} your level of {_metric_text(alert['level'], alert['unit'])}." + (" New today." if alert["new"] else ""), icon=":material/notifications_active:")
+    if brief["changes"]:
+        st.subheader("What changed")
+        table(pd.DataFrame(brief["changes"]))
+    if brief["reads"]:
+        st.subheader("Market read")
+        table(pd.DataFrame(brief["reads"]).assign(Changed=lambda f: f["Changed"].map({True: "Yes", False: ""})))
+    if brief["pnl_text"]:
+        st.subheader("P&L")
+        st.markdown(brief["pnl_text"])
+    if brief["estimates"]:
+        st.subheader("Next-day power price estimate")
+        table(pd.DataFrame(brief["estimates"]))
+    if brief["outlook"]:
+        st.subheader("Winter storage")
+        st.markdown(brief["outlook"])
+    st.subheader("Your thresholds")
+    store = desk_store()
+    if store is None:
+        st.caption("Thresholds need the saved desk database, which isn't available in this folder.")
+        return
+    rules = store.load_alerts()
+    edited = st.data_editor(rules, num_rows="dynamic", hide_index=True, key="alert_rules", width="stretch", column_config={
+        "metric": st.column_config.SelectboxColumn("Item", options=list(BRIEF_METRICS), required=True),
+        "condition": st.column_config.SelectboxColumn("Condition", options=["Above", "Below"], required=True),
+        "level": st.column_config.NumberColumn("Level", required=True)})
+    if st.button("Save thresholds", key="save_alerts"):
+        store.save_alerts(edited.dropna())
+        st.session_state["flash_message"] = "Thresholds saved."
+        st.rerun()
+    st.caption("A threshold shows at the top of this page and in the PDF whenever its condition holds. Levels use each item's own unit.")
+
+
 def page_market_fundamentals():
     title_block("Market fundamentals", "Storage, LNG, power, gas flows and weather, read together. These describe the market. They are not price forecasts.")
     data_items = st.session_state.get("live_data", {})
@@ -6963,7 +9195,9 @@ def page_market_fundamentals():
     else:
         st.info("Select Update market data in the sidebar to see what the data shows.")
 
-    fund_tabs = view_tabs(["Gas storage", "LNG", "Power", "Gas flows", "Weather", "Cross-market analysis"])
+    fund_tabs = view_tabs(["Gas storage", "Winter outlook", "LNG", "Power", "Gas flows", "Weather", "Cross-market analysis"])
+    if fund_tabs[1]:
+        render_winter_outlook()
     if fund_tabs[0]:
         st.subheader("EU gas storage")
         history_item = _live_dataset_frame("gie_agsi_history")
@@ -7014,7 +9248,7 @@ def page_market_fundamentals():
         else:
             st.info("Select Update market data in the sidebar to load storage.")
 
-    if fund_tabs[1]:
+    if fund_tabs[2]:
         data = _live_dataset_frame("gie_alsi")
         st.subheader("LNG terminals")
         if not data.empty:
@@ -7036,7 +9270,7 @@ def page_market_fundamentals():
         else:
             st.info("Select Update market data in the sidebar to load LNG data.")
 
-    if fund_tabs[2]:
+    if fund_tabs[3]:
         st.subheader("Power prices, load and generation")
         power_keys = [("entsoe_price", "Day-ahead price"), ("entsoe_load", "Actual load"), ("entsoe_generation", "Actual generation by type"), ("entsoe_flow", "Physical flow")]
         available = [(key, label) for key, label in power_keys if _live_variants(key) or not _live_dataset_frame(key).empty]
@@ -7073,7 +9307,7 @@ def page_market_fundamentals():
         else:
             need_data_note("Select Update market data in the sidebar to load prices, load and generation.")
 
-    if fund_tabs[3]:
+    if fund_tabs[4]:
         data = _live_dataset_frame("entsog_flow")
         st.subheader("Gas flows")
         if not data.empty:
@@ -7095,7 +9329,7 @@ def page_market_fundamentals():
         else:
             st.info("Fetch the ENTSOG point-direction catalogue, select an exact identifier, and fetch the chosen indicator in Live Data Integrations.")
 
-    if fund_tabs[4]:
+    if fund_tabs[5]:
         data = _live_dataset_frame("weather_daily")
         st.subheader("Weather")
         weather_for_normals = _live_dataset_frame("weather_daily")
@@ -7143,7 +9377,7 @@ def page_market_fundamentals():
         else:
             st.info("Select Update market data in the sidebar to load the forecast.")
 
-    if fund_tabs[5]:
+    if fund_tabs[6]:
         st.subheader("Residual load against day-ahead price")
         ready = residual_ready_zones()
         if ready:
@@ -7240,7 +9474,7 @@ def page_live_data_integrations():
             table(pd.DataFrame([{"Source": n, "Result": "Updated" if good else "Failed", "Detail": d} for n, good, d in results]))
     saved = resolved_credentials()
     with st.expander("Replace an access key", expanded=False):
-        st.caption("You only need this to use a different key. Your saved keys are already in use and are never sent to your browser, so these fields stay empty. A key pasted here lasts for this session. To change one permanently, set a Streamlit secret or environment variable.")
+        st.caption("You only need this to use a different key. Your saved keys come from the keys file beside the app and are never sent to your browser, so these fields stay empty. A key pasted here lasts for this session. To change one permanently, edit meridian_keys.toml.")
         c1, c2, c3 = st.columns(3)
         gie_api_key = c1.text_input("GIE key (AGSI+ and ALSI)", value="", type="password", key="live_gie_api_key", placeholder="Saved key in use" if saved["gie"] else "No key saved")
         entsoe_api_token = c2.text_input("ENTSO-E token", value="", type="password", key="live_entsoe_token", placeholder="Saved token in use" if saved["entsoe"] else "No token saved")
@@ -7621,6 +9855,7 @@ def page_model_validation():
 # =============================================================================
 PAGES = {
     "Market Overview": page_market_overview,
+    "Morning Brief": page_morning_brief,
     "Market Read": page_market_read,
     "Market Fundamentals": page_market_fundamentals,
     "Power Spot": page_power_spot,
@@ -7669,9 +9904,16 @@ def main() -> None:
     init_session()
     collect_update()
     valuation_date = date.today()
+    if not st.session_state.get("curve_folder_checked"):
+        st.session_state.curve_folder_checked = True
+        import_curve_folder()
     curves = build_curves()
     ensure_daily_snapshot()
     maybe_auto_update()
+    try:
+        record_market_reads()
+    except Exception as exc:
+        st.session_state.desk_store_error = f"Read record: {type(exc).__name__}: {exc}"
     # Apply queued navigation before the sidebar widgets exist.
     pending_nav_page = st.session_state.pop("pending_nav_page", None)
     if pending_nav_page:
