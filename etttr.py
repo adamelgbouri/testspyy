@@ -1783,7 +1783,18 @@ ZONE_WEATHER = {"France": "Paris / French power proxy", "Germany-Luxembourg": "B
                 "Spain": "Madrid / Iberian power proxy", "Great Britain": "London / NBP proxy"}
 GAS_WEATHER_LOCATIONS = ("Amsterdam / TTF proxy", "London / NBP proxy", "Paris / French power proxy",
                          "Berlin / German power proxy", "Brussels / Belgian power proxy")
+# Natural gas use by country in 2024, billion cubic metres, rounded. Used only as weights.
+GAS_DEMAND_WEIGHTS = {"Berlin / German power proxy": 78.0, "London / NBP proxy": 63.0, "Amsterdam / TTF proxy": 32.0,
+                      "Paris / French power proxy": 31.0, "Brussels / Belgian power proxy": 14.0}
+# EU storage serves EU demand, so the winter projection leaves out Britain.
+EU_STORAGE_LOCATIONS = tuple(name for name in GAS_WEATHER_LOCATIONS if name != "London / NBP proxy")
 STALE_DAYS = 10
+# Signals built from the same fact share one weight, so one fact can't look like several opinions.
+SIGNAL_THEMES = {"storage_level": "storage", "storage_pace": "storage", "winter_outlook": "storage", "lng": "supply", "summer_winter": "curve",
+                 "switching": "fuel", "fuel": "fuel", "weather": "weather", "momentum": "price", "negative": "price",
+                 "residual": "balance", "wind": "balance", "nuclear": "nuclear"}
+THEME_WEIGHT_CAP = 3.0
+NUCLEAR_MIN_SHARE = 0.15
 
 
 def _signal(key: str, name: str, weight: float, z: Optional[float] = None, value: str = "", why: str = "",
@@ -1795,30 +1806,58 @@ def _signal(key: str, name: str, weight: float, z: Optional[float] = None, value
             "value": value, "why": why, "flip": flip, "missing": missing}
 
 
+def _theme(signal: dict) -> str:
+    return SIGNAL_THEMES.get(signal["key"], signal["key"])
+
+
+def counted_weights(signals: Sequence[dict]) -> list[float]:
+    """Each signal's weight after capping its theme, using only the signals that are loaded."""
+    totals: dict = {}
+    for signal in signals:
+        if signal["available"]:
+            totals[_theme(signal)] = totals.get(_theme(signal), 0.0) + signal["weight"]
+    return [signal["weight"] * min(1.0, THEME_WEIGHT_CAP / totals[_theme(signal)]) if signal["available"] else 0.0 for signal in signals]
+
+
 def summarise_read(signals: Sequence[dict]) -> dict:
-    """Combine signals into a reading, with confidence from coverage and agreement."""
+    """Combine signals into a reading. Confidence needs enough evidence, agreement and more than one independent theme."""
+    counted = counted_weights(signals)
+    theme_totals: dict = {}
+    for signal in signals:
+        theme_totals[_theme(signal)] = theme_totals.get(_theme(signal), 0.0) + signal["weight"]
+    total_weight = sum(min(value, THEME_WEIGHT_CAP) for value in theme_totals.values()) or 1.0
+    live_weight = sum(counted)
     live = [s for s in signals if s["available"]]
-    total_weight = sum(s["weight"] for s in signals) or 1.0
-    live_weight = sum(s["weight"] for s in live)
     result = {"reading": "Not enough data", "score": 0.0, "confidence": "None", "coverage": live_weight / total_weight,
-              "agreement": 0.0, "supporting": [], "against": [], "live": len(live), "total": len(signals),
+              "agreement": 0.0, "supporting": [], "against": [], "live": len(live), "total": len(signals), "themes": 0,
               "missing": [s for s in signals if not s["available"]]}
     if len(live) < 2:
         return result
-    score = sum(s["weight"] * s["score"] for s in live) / live_weight
+    score = sum(weight * s["score"] for weight, s in zip(counted, signals)) / live_weight
     label = ("Bullish" if score >= 0.5 else "Leaning bullish" if score >= 0.15 else
              "Bearish" if score <= -0.5 else "Leaning bearish" if score <= -0.15 else "Balanced")
-    bullish = sum(s["weight"] for s in live if s["score"] >= 0.1)
-    bearish = sum(s["weight"] for s in live if s["score"] <= -0.1)
+    bullish = sum(weight for weight, s in zip(counted, signals) if s["score"] >= 0.1)
+    bearish = sum(weight for weight, s in zip(counted, signals) if s["score"] <= -0.1)
     agreement = max(bullish, bearish) / (bullish + bearish) if bullish + bearish else 0.0
     coverage = result["coverage"]
+    direction = 1.0 if score >= 0 else -1.0
+    net: dict = {}
+    for weight, signal in zip(counted, signals):
+        if signal["available"]:
+            held = net.setdefault(_theme(signal), [0.0, 0.0])
+            held[0] += weight * signal["score"]
+            held[1] += weight
+    themes = sum(1 for value, weight in net.values() if value / weight * direction >= 0.1)
     confidence = "High" if coverage >= 0.75 and agreement >= 0.75 else "Medium" if coverage >= 0.5 and agreement >= 0.6 else "Low"
+    # High confidence needs independent support: signals about one fact aren't a second opinion.
+    if confidence == "High" and themes < 2:
+        confidence = "Medium"
     # A balanced reading is never a confident call: either signals disagree or none is strong.
     if label == "Balanced":
         confidence = "Low" if bullish and bearish else "Medium"
-    direction = 1.0 if score >= 0 else -1.0
-    ranked = sorted(live, key=lambda s: -s["weight"] * abs(s["score"]))
-    result.update({"reading": label, "score": float(score), "confidence": confidence, "agreement": agreement,
+    order = sorted(zip(counted, signals), key=lambda pair: -pair[0] * abs(pair[1]["score"]))
+    ranked = [s for weight, s in order if s["available"]]
+    result.update({"reading": label, "score": float(score), "confidence": confidence, "agreement": agreement, "themes": themes,
                    "supporting": [s for s in ranked if s["score"] * direction >= 0.1],
                    "against": [s for s in ranked if s["score"] * direction <= -0.1]})
     return result
@@ -1840,9 +1879,11 @@ def _heating_signal(daily: pd.DataFrame, normals: pd.DataFrame, locations: Seque
     anomaly = anomaly.loc[anomaly["location"].isin(locations)] if not anomaly.empty else anomaly
     if anomaly.empty:
         return _signal("weather", name, weight, missing=missing)
-    forecast, normal = float(anomaly["forecast_hdd"].sum()), float(anomaly["normal_hdd"].sum())
+    weights = anomaly["location"].map(GAS_DEMAND_WEIGHTS).fillna(1.0).to_numpy(float) if len(locations) > 1 else np.ones(len(anomaly))
+    forecast = float(np.average(anomaly["forecast_hdd"], weights=weights))
+    normal = float(np.average(anomaly["normal_hdd"], weights=weights))
     days = int(anomaly["days"].max())
-    if normal < 3.0 * len(anomaly):
+    if normal < 3.0:
         return _signal("weather", name, weight, 0.0, f"Outside the heating season: only {normal:.0f} normal degree days ahead.",
                        "Temperature has little effect on heating demand at this time of year.", "This becomes relevant when heating demand returns.")
     gap = (forecast - normal) / normal
@@ -1960,6 +2001,41 @@ def _hourly_residual(load: pd.DataFrame, generation: pd.DataFrame) -> pd.DataFra
     return joined[["hour", "residual"]]
 
 
+def _nuclear_signal(generation: pd.DataFrame, tz: str, today: date) -> Optional[dict]:
+    """Nuclear output against recent weeks, in zones where nuclear is a large share. Otherwise no signal."""
+    if generation is None or generation.empty or not {"series", "value", "timestamp"}.issubset(generation.columns):
+        return None
+    labels = generation["series"].astype(str).str.casefold()
+    produced = generation.loc[~labels.str.contains("consumption")]
+    if produced.empty:
+        return None
+    frame = pd.DataFrame({"day": pd.to_datetime(produced["timestamp"], errors="coerce", utc=True).dt.tz_convert(tz).dt.date,
+                          "hour": pd.to_datetime(produced["timestamp"], errors="coerce", utc=True).dt.floor("h"),
+                          "series": produced["series"].astype(str), "mw": _number_series(produced["value"])}).dropna()
+    hourly = frame.groupby(["day", "hour", "series"], as_index=False)["mw"].mean()
+    is_nuclear = hourly["series"].str.casefold().str.contains("nuclear")
+    if not is_nuclear.any():
+        return None
+    recent_days = sorted(hourly["day"].unique())[-28:]
+    window = hourly.loc[hourly["day"].isin(recent_days)]
+    share = float(window.loc[window["series"].str.casefold().str.contains("nuclear"), "mw"].sum()) / max(float(window["mw"].sum()), 1.0)
+    if share < NUCLEAR_MIN_SHARE:
+        return None
+    name, weight = "Nuclear output against the past weeks", 2.5
+    daily = hourly.loc[is_nuclear].groupby(["day", "hour"], as_index=False)["mw"].sum().groupby("day")["mw"].mean()
+    if len(daily) < 14:
+        return _signal("nuclear", name, weight, missing="Fetch at least 14 days of actual generation.")
+    if (today - daily.index.max()).days > STALE_DAYS:
+        return _signal("nuclear", name, weight, missing="Actual generation is out of date. Fetch it again.")
+    recent, prior = daily.tail(7), daily.iloc[:-7].tail(21)
+    gap = float(recent.mean()) - float(prior.mean())
+    scale = max(float(prior.std()), float(prior.mean()) * 0.03, 1.0)
+    return _signal("nuclear", name, weight, -gap / scale,
+                   f"{recent.mean() / 1000:.1f} GW over the last 7 days, {gap / float(prior.mean()) * 100:+.1f}% against {prior.mean() / 1000:.1f} GW before that.",
+                   "Lower nuclear output means dearer plants or imports must fill the gap. This shows output so far, not planned outages ahead.",
+                   f"Reverses if output moves {'above' if gap < 0 else 'below'} {prior.mean() / 1000:.1f} GW.")
+
+
 def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generation: pd.DataFrame, daily: pd.DataFrame,
                   normals: pd.DataFrame, imported: dict, today: date) -> list[dict]:
     """Evidence for one power zone. Prices come from day-ahead data, never forward demo marks."""
@@ -2027,7 +2103,8 @@ def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generatio
                            f"{spot:.1f} EUR/MWh over the last week, against a {cost:.1f} EUR/MWh cost for a 50% efficient gas plant.",
                            "Prices far above gas plant cost tend to attract supply, and prices far below it leave little room to fall.",
                            f"Reverses if the price moves through {cost:.1f} EUR/MWh.")
-    return [residual, momentum, heating, negative, wind, fuel]
+    nuclear = _nuclear_signal(generation, tz, today)
+    return [residual] + ([nuclear] if nuclear else []) + [momentum, heating, negative, wind, fuel]
 
 
 # -----------------------------------------------------------------------------
@@ -2187,6 +2264,8 @@ def curve_warning(products: Sequence[str], custom: dict, metadata: dict, today: 
 # -----------------------------------------------------------------------------
 # Market Read track record: was the read right, compared with chance?
 # -----------------------------------------------------------------------------
+READ_METHOD_VERSION = 2
+READ_METHOD_DATE = date(2026, 11, 6)
 TRACK_HORIZONS = (1, 5, 20)
 TRACK_MIN_INDEPENDENT = 20
 CALL_THRESHOLD = 0.15
@@ -2421,15 +2500,21 @@ def daily_fill(history: pd.DataFrame) -> pd.Series:
     return series.asfreq("D").interpolate(limit=3)
 
 
-def archive_hdd(archive: pd.DataFrame, locations: Sequence[str] = GAS_WEATHER_LOCATIONS) -> pd.Series:
-    """Average heating degree days across the north-west European reference cities."""
+def _demand_weighted(frame: pd.DataFrame) -> pd.Series:
+    """Heating degree days by date, weighted by each country's gas use. A missing city drops out that day."""
+    weights = frame["location"].map(GAS_DEMAND_WEIGHTS).fillna(1.0)
+    return (frame["hdd"] * weights).groupby(frame["date"]).sum() / weights.groupby(frame["date"]).sum()
+
+
+def archive_hdd(archive: pd.DataFrame, locations: Sequence[str] = EU_STORAGE_LOCATIONS) -> pd.Series:
+    """Heating degree days across EU reference cities, weighted by each country's gas use."""
     if archive is None or archive.empty or not {"date", "location", "hdd"}.issubset(archive.columns):
         return pd.Series(dtype=float)
     part = archive.loc[archive["location"].isin(locations)]
     if part.empty:
         return pd.Series(dtype=float)
-    out = pd.DataFrame({"date": pd.to_datetime(part["date"], errors="coerce"), "hdd": pd.to_numeric(part["hdd"], errors="coerce")}).dropna()
-    return out.groupby("date")["hdd"].mean().sort_index()
+    out = pd.DataFrame({"date": pd.to_datetime(part["date"], errors="coerce"), "location": part["location"], "hdd": pd.to_numeric(part["hdd"], errors="coerce")}).dropna()
+    return _demand_weighted(out).sort_index()
 
 
 def _weather_terms(days: pd.DatetimeIndex, hdd: np.ndarray) -> np.ndarray:
@@ -2541,12 +2626,12 @@ def winter_band(fill: pd.Series, year: int) -> pd.DataFrame:
     return pd.DataFrame({"day": axis, "low": table.min(axis=1), "high": table.max(axis=1), "average": table.mean(axis=1)}).loc[usable].reset_index(drop=True)
 
 
-def forecast_hdd(daily: pd.DataFrame, locations: Sequence[str] = GAS_WEATHER_LOCATIONS) -> pd.Series:
+def forecast_hdd(daily: pd.DataFrame, locations: Sequence[str] = EU_STORAGE_LOCATIONS) -> pd.Series:
     if daily is None or daily.empty or not {"date", "location", "forecast_period", "heating_degree_day_proxy_18c"}.issubset(daily.columns):
         return pd.Series(dtype=float)
     part = daily.loc[daily["forecast_period"].eq("Forecast") & daily["location"].isin(locations)]
-    frame = pd.DataFrame({"date": pd.to_datetime(part["date"], errors="coerce"), "hdd": pd.to_numeric(part["heating_degree_day_proxy_18c"], errors="coerce")}).dropna()
-    return frame.groupby("date")["hdd"].mean().sort_index() if not frame.empty else pd.Series(dtype=float)
+    frame = pd.DataFrame({"date": pd.to_datetime(part["date"], errors="coerce"), "location": part["location"], "hdd": pd.to_numeric(part["heating_degree_day_proxy_18c"], errors="coerce")}).dropna()
+    return _demand_weighted(frame).sort_index() if not frame.empty else pd.Series(dtype=float)
 
 
 def project_winter(history: pd.DataFrame, archive: pd.DataFrame, daily_weather: pd.DataFrame, today: date) -> dict:
@@ -2674,6 +2759,7 @@ ESTIMATE_MIN_DAYS = 60
 ESTIMATE_TEST_DAYS = 90
 ESTIMATE_REFIT_EVERY = 5
 ESTIMATE_COLUMNS = ("lag1", "avg7", "lag7", "hdd", "wind", "solar", "weekend", "monday")
+FORECAST_COLUMNS = ("lag1", "avg7", "lag7", "load_gw", "wind_gw", "solar_gw", "weekend", "monday")
 
 
 def daily_base_prices(series: pd.DataFrame) -> pd.Series:
@@ -2711,17 +2797,63 @@ def estimate_features(base: pd.Series, weather: pd.DataFrame, last_day: pd.Times
     return frame
 
 
-def _fit_estimate(frame: pd.DataFrame) -> np.ndarray:
-    design = np.column_stack([np.ones(len(frame)), frame[list(ESTIMATE_COLUMNS)].to_numpy(float)])
+def entsoe_forecast_days(load_forecast: pd.DataFrame, renewable_forecast: pd.DataFrame, tz: str) -> pd.DataFrame:
+    """ENTSO-E's day-ahead forecasts by delivery day, in GW. A day needs at least 20 hours to count."""
+    columns = ["load_gw", "wind_gw", "solar_gw"]
+    needed = {"timestamp", "value"}
+    if load_forecast is None or load_forecast.empty or renewable_forecast is None or renewable_forecast.empty or not needed.issubset(load_forecast.columns) or not {"series", *needed}.issubset(renewable_forecast.columns):
+        return pd.DataFrame(columns=columns)
+
+    def daily(frame: pd.DataFrame) -> pd.Series:
+        hours = pd.to_datetime(frame["timestamp"], errors="coerce", utc=True).dt.floor("h")
+        parts = pd.DataFrame({"hour": hours, "series": frame["series"].astype(str) if "series" in frame.columns else "x", "mw": _number_series(frame["value"])}).dropna()
+        if parts.empty:
+            return pd.Series(dtype=float)
+        total = parts.groupby(["hour", "series"], as_index=False)["mw"].mean().groupby("hour")["mw"].sum()
+        days = pd.DatetimeIndex(total.index).tz_convert(tz).tz_localize(None).normalize()
+        grouped = total.groupby(days)
+        return (grouped.mean() / 1000.0).loc[grouped.count() >= 20]
+
+    labels = renewable_forecast["series"].astype(str).str.casefold()
+    wind, solar = daily(renewable_forecast.loc[labels.str.contains("wind")]), daily(renewable_forecast.loc[labels.str.contains("solar")])
+    table_ = pd.DataFrame({"load_gw": daily(load_forecast), "wind_gw": wind, "solar_gw": solar})
+    # A zone that publishes no solar or wind forecast at all has none to count.
+    for column, series in (("wind_gw", wind), ("solar_gw", solar)):
+        if series.empty:
+            table_[column] = 0.0
+    return table_
+
+
+def _fit_estimate(frame: pd.DataFrame, columns: Sequence[str] = ESTIMATE_COLUMNS) -> np.ndarray:
+    design = np.column_stack([np.ones(len(frame)), frame[list(columns)].to_numpy(float)])
     return np.linalg.lstsq(design, frame["base"].to_numpy(float), rcond=None)[0]
 
 
-def _apply_estimate(beta: np.ndarray, frame: pd.DataFrame) -> np.ndarray:
-    return np.column_stack([np.ones(len(frame)), frame[list(ESTIMATE_COLUMNS)].to_numpy(float)]) @ beta
+def _apply_estimate(beta: np.ndarray, frame: pd.DataFrame, columns: Sequence[str] = ESTIMATE_COLUMNS) -> np.ndarray:
+    return np.column_stack([np.ones(len(frame)), frame[list(columns)].to_numpy(float)]) @ beta
 
 
-def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, daily: pd.DataFrame) -> dict:
-    """Estimate the next unpublished delivery day, and test the method one day at a time."""
+def _walk_forward(known: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    """Estimate each past day from earlier days only, refitting regularly."""
+    rows, beta = [], None
+    first = max(ESTIMATE_MIN_DAYS, len(known) - ESTIMATE_TEST_DAYS)
+    for position in range(first, len(known)):
+        if beta is None or (position - first) % ESTIMATE_REFIT_EVERY == 0:
+            beta = _fit_estimate(known.iloc[max(0, position - ESTIMATE_TRAIN_DAYS):position], columns)
+        row = known.iloc[[position]]
+        rows.append({"day": row.index[0], "actual": float(row["base"].iloc[0]), "estimate": float(_apply_estimate(beta, row, columns)[0]),
+                     "last_week": float(row["lag7"].iloc[0]), "yesterday": float(row["lag1"].iloc[0])})
+    return pd.DataFrame(rows)
+
+
+def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, daily: pd.DataFrame,
+                      load_forecast: Optional[pd.DataFrame] = None, renewable_forecast: Optional[pd.DataFrame] = None) -> dict:
+    """Estimate the next unpublished delivery day, and test the methods one day at a time.
+
+    The weather method can run before the auction. ENTSO-E's wind and solar forecast is usually
+    published after it, so that method mainly checks published prices, and sets the estimate only
+    when the forecast for the target day already exists and it has tested at least as well.
+    """
     location = ZONE_WEATHER.get(zone)
     base = daily_base_prices(series)
     if not location or len(base) < ESTIMATE_MIN_DAYS + 20:
@@ -2731,33 +2863,54 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
         return {"ready": False, "reason": "This needs the wind and solar history. Select Update market data."}
     target = base.index[-1] + pd.Timedelta(days=1)
     frame = estimate_features(base, weather, target)
-    known = frame.iloc[:-1].dropna()
+    known = frame.iloc[:-1].dropna(subset=["base", *ESTIMATE_COLUMNS])
     ahead = frame.iloc[[-1]]
-    if ahead[list(ESTIMATE_COLUMNS)].isna().any(axis=None):
-        return {"ready": False, "reason": f"There's no weather forecast for {target:%d %b}. Select Update market data."}
+    weather_ready = not ahead[list(ESTIMATE_COLUMNS)].isna().any(axis=None)
     if len(known) < ESTIMATE_MIN_DAYS + 10:
         return {"ready": False, "reason": "Prices and weather overlap on too few days so far."}
-    rows, beta = [], None
-    for position in range(max(ESTIMATE_MIN_DAYS, len(known) - ESTIMATE_TEST_DAYS), len(known)):
-        if beta is None or (position - max(ESTIMATE_MIN_DAYS, len(known) - ESTIMATE_TEST_DAYS)) % ESTIMATE_REFIT_EVERY == 0:
-            beta = _fit_estimate(known.iloc[max(0, position - ESTIMATE_TRAIN_DAYS):position])
-        row = known.iloc[[position]]
-        rows.append({"day": row.index[0], "actual": float(row["base"].iloc[0]), "estimate": float(_apply_estimate(beta, row)[0]),
-                     "last_week": float(row["lag7"].iloc[0]), "yesterday": float(row["lag1"].iloc[0])})
-    test = pd.DataFrame(rows)
-    errors = test["actual"] - test["estimate"]
-    final = _fit_estimate(known.tail(ESTIMATE_TRAIN_DAYS))
-    value = float(_apply_estimate(final, ahead)[0])
-    latest = test.iloc[-1]
+    test = _walk_forward(known, ESTIMATE_COLUMNS)
+    final = _fit_estimate(known.tail(ESTIMATE_TRAIN_DAYS), ESTIMATE_COLUMNS)
+
+    tz = ENTSOE_ZONES[zone]["timezone"]
+    published = entsoe_forecast_days(load_forecast, renewable_forecast, tz)
+    forecast_frame = frame[["base", "lag1", "avg7", "lag7", "weekend", "monday"]].join(published.reindex(frame.index)) if not published.empty else None
+    forecast_known = forecast_frame.iloc[:-1].dropna() if forecast_frame is not None else pd.DataFrame()
+    forecast_test, forecast_final = pd.DataFrame(), None
+    if len(forecast_known) >= ESTIMATE_MIN_DAYS + 30:
+        forecast_test = _walk_forward(forecast_known, FORECAST_COLUMNS)
+        forecast_final = _fit_estimate(forecast_known.tail(ESTIMATE_TRAIN_DAYS), FORECAST_COLUMNS)
+    comparison = None
+    if not forecast_test.empty:
+        shared = test.merge(forecast_test[["day", "estimate"]].rename(columns={"estimate": "forecast_estimate"}), on="day")
+        if len(shared) >= 20:
+            comparison = {"days": len(shared), "weather": float((shared["actual"] - shared["estimate"]).abs().mean()),
+                          "forecasts": float((shared["actual"] - shared["forecast_estimate"]).abs().mean()),
+                          "last_week": float((shared["actual"] - shared["last_week"]).abs().mean()), "yesterday": float((shared["actual"] - shared["yesterday"]).abs().mean())}
+    target_has_forecast = forecast_final is not None and not forecast_frame.iloc[[-1]][list(FORECAST_COLUMNS)].isna().any(axis=None)
+    use_forecasts = target_has_forecast and comparison is not None and comparison["forecasts"] <= comparison["weather"]
+    if not use_forecasts and not weather_ready:
+        return {"ready": False, "reason": f"There's no weather forecast for {target:%d %b}. Select Update market data."}
+    chosen = forecast_test if use_forecasts else test
+    errors = chosen["actual"] - chosen["estimate"]
+    value = float(_apply_estimate(forecast_final, forecast_frame.iloc[[-1]], FORECAST_COLUMNS)[0]) if use_forecasts else float(_apply_estimate(final, ahead, ESTIMATE_COLUMNS)[0])
+    # Judge the latest published price with ENTSO-E's forecasts when they exist for that day.
+    checker = forecast_test if not forecast_test.empty and forecast_test["day"].iloc[-1] == base.index[-1] else test
+    latest = checker.iloc[-1]
     gap = float(latest["actual"] - latest["estimate"])
-    typical = float(errors.abs().quantile(0.9))
-    return {"ready": True, "reason": "", "zone": zone, "day": target.date(), "estimate": value,
-            "low": value + float(errors.quantile(0.1)), "high": value + float(errors.quantile(0.9)), "test": test, "n": len(test),
-            "error": float(errors.abs().mean()), "error_last_week": float((test["actual"] - test["last_week"]).abs().mean()),
-            "error_yesterday": float((test["actual"] - test["yesterday"]).abs().mean()),
-            "latest_day": latest["day"].date(), "latest_actual": float(latest["actual"]), "latest_estimate": float(latest["estimate"]),
-            "latest_gap": gap, "unusual": abs(gap) > typical, "wind_effect": float(final[ESTIMATE_COLUMNS.index("wind") + 1]),
-            "hdd_effect": float(final[ESTIMATE_COLUMNS.index("hdd") + 1]), "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1])}
+    check_errors = (checker["actual"] - checker["estimate"]).abs()
+    result = {"ready": True, "reason": "", "zone": zone, "day": target.date(), "estimate": value, "method": "ENTSO-E forecasts" if use_forecasts else "Weather",
+              "low": value + float(errors.quantile(0.1)), "high": value + float(errors.quantile(0.9)), "test": chosen, "n": len(chosen),
+              "error": float(errors.abs().mean()), "error_last_week": float((chosen["actual"] - chosen["last_week"]).abs().mean()),
+              "error_yesterday": float((chosen["actual"] - chosen["yesterday"]).abs().mean()),
+              "latest_day": latest["day"].date(), "latest_actual": float(latest["actual"]), "latest_estimate": float(latest["estimate"]),
+              "latest_gap": gap, "unusual": abs(gap) > float(check_errors.quantile(0.9)), "check_method": "ENTSO-E forecasts" if checker is forecast_test else "Weather",
+              "comparison": comparison, "target_has_forecast": target_has_forecast, "forecast_days": int(published.dropna().shape[0]),
+              "wind_effect": float(final[ESTIMATE_COLUMNS.index("wind") + 1]), "hdd_effect": float(final[ESTIMATE_COLUMNS.index("hdd") + 1]),
+              "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1]), "forecast_effects": None}
+    if forecast_final is not None:
+        result["forecast_effects"] = {"load": float(forecast_final[FORECAST_COLUMNS.index("load_gw") + 1]), "wind": float(forecast_final[FORECAST_COLUMNS.index("wind_gw") + 1]),
+                                      "solar": float(forecast_final[FORECAST_COLUMNS.index("solar_gw") + 1])}
+    return result
 
 
 def score_recorded_estimates(log: pd.DataFrame, base: pd.Series) -> dict:
@@ -3064,12 +3217,24 @@ class DeskStore:
                     confidence TEXT NOT NULL, price_through TEXT NOT NULL, signals TEXT NOT NULL,
                     PRIMARY KEY (read_date, market, source));
                 CREATE TABLE IF NOT EXISTS price_estimates (
-                    delivery_date TEXT NOT NULL, zone TEXT NOT NULL, estimate REAL NOT NULL, low REAL NOT NULL, high REAL NOT NULL, made_on TEXT NOT NULL,
+                    delivery_date TEXT NOT NULL, zone TEXT NOT NULL, estimate REAL NOT NULL, low REAL NOT NULL, high REAL NOT NULL, made_on TEXT NOT NULL, method TEXT NOT NULL DEFAULT 'Weather',
                     PRIMARY KEY (delivery_date, zone));
                 CREATE TABLE IF NOT EXISTS alert_rules (metric TEXT NOT NULL, condition TEXT NOT NULL, level REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS curve_files (
                     name TEXT PRIMARY KEY, sha TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, processed_at TEXT NOT NULL);
             """)
+        self._upgrade()
+
+    def _upgrade(self) -> None:
+        """Bring a database from an earlier version up to date. Replayed reads are rebuilt with the current method."""
+        with self._connect() as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(price_estimates)")}
+            if "method" not in columns:
+                conn.execute("ALTER TABLE price_estimates ADD COLUMN method TEXT NOT NULL DEFAULT 'Weather'")
+            row = conn.execute("SELECT value FROM settings WHERE key='read_method'").fetchone()
+            if row is None or float(row[0]) < READ_METHOD_VERSION:
+                conn.execute("DELETE FROM read_log WHERE source='Replayed'")
+                conn.execute("INSERT OR REPLACE INTO settings VALUES ('read_method',?)", (str(float(READ_METHOD_VERSION)),))
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=15)
@@ -3207,7 +3372,7 @@ class DeskStore:
     def save_price_estimates(self, rows: Sequence[tuple]) -> None:
         """The first estimate for a day stands, so the record can't be improved afterwards."""
         with self._connect() as conn:
-            conn.executemany("INSERT OR IGNORE INTO price_estimates VALUES (?,?,?,?,?,?)", rows)
+            conn.executemany("INSERT OR IGNORE INTO price_estimates (delivery_date, zone, estimate, low, high, made_on, method) VALUES (?,?,?,?,?,?,?)", rows)
 
     def load_price_estimates(self, zone: str) -> pd.DataFrame:
         with self._connect() as conn:
@@ -4380,6 +4545,12 @@ def fetch_entsoe_series(token: str, series_kind: str, zone_name: str,
         elif series_kind == "Actual generation by type":
             document_type, parser_kind = "A75", "generation"
             base_params = {"processType": "A16", "in_Domain": eic}
+        elif series_kind == "Day-ahead load forecast":
+            document_type, parser_kind = "A65", "load"
+            base_params = {"processType": "A01", "outBiddingZone_Domain": eic}
+        elif series_kind == "Day-ahead wind and solar forecast":
+            document_type, parser_kind = "A69", "generation"
+            base_params = {"processType": "A01", "in_Domain": eic}
         else:
             raise ValueError("Unsupported ENTSO-E series type.")
     # ENTSO-E expects UTC period boundaries in yyyyMMddHHmm format.
@@ -5434,6 +5605,11 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
                                                 ("entsoe_generation", "Actual generation", "Actual generation by type", KEEP_DAYS["generation"])):
         for zone in dict.fromkeys(list(UPDATE_DEFAULT_ZONES) + [z for z in _live_variants(store_key) if z in ENTSOE_ZONES]):
             entsoe_task("prices", store_key, label, series_kind, zone, keep, 30, today + timedelta(days=1))
+    for store_key, label, series_kind in (("entsoe_load_forecast", "Load forecast", "Day-ahead load forecast"),
+                                          ("entsoe_renewable_forecast", "Wind and solar forecast", "Day-ahead wind and solar forecast")):
+        for zone in price_zones:
+            if zone in ZONE_WEATHER:
+                entsoe_task("prices", store_key, label, series_kind, zone, KEEP_DAYS["prices"], PRICE_HISTORY_DAYS, today + timedelta(days=2))
     for variant, item in _live_variants("entsoe_flow").items():
         meta = item.get("metadata", {})
         if meta.get("source_zone") in ENTSOE_ZONES and meta.get("target_zone") in ENTSOE_ZONES:
@@ -7349,6 +7525,106 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
                 raise AssertionError("A PDF object is at the wrong position.")
         return f"Thresholds fire only when their condition holds and mark what's new. A long PDF has {count} pages with a valid file table, the euro sign and escaped brackets."
 
+    def check_signal_themes() -> str:
+        storage = [_signal("storage_level", "L", 3.0, 2.0), _signal("storage_pace", "P", 2.0, 2.0), _signal("winter_outlook", "W", 2.0, 2.0), _signal("lng", "G", 1.5)]
+        alone = summarise_read(storage)
+        assert_close(sum(counted_weights(storage)), 3.0)
+        assert_close(counted_weights(storage)[0], 3.0 * 3.0 / 7.0)
+        assert_close(alone["coverage"], 3.0 / 4.5)
+        if alone["confidence"] == "High" or alone["themes"] != 1:
+            raise AssertionError(f"Storage alone must not reach high confidence: {alone['confidence']}, {alone['themes']} themes.")
+        both = summarise_read(storage + [_signal("weather", "H", 2.5, 2.0)])
+        if both["confidence"] != "High" or both["themes"] != 2:
+            raise AssertionError(f"Two independent themes that agree should give high confidence: {both['confidence']}.")
+        split = summarise_read([_signal("storage_level", "L", 3.0, 2.0), _signal("storage_pace", "P", 2.0, 2.0), _signal("weather", "H", 3.0, -2.0)])
+        assert_close(split["score"], 0.0)
+        return "Three storage signals count as 3.0 of weight, not 7.0, and can't reach high confidence alone. A second theme that agrees can, and an opposing one of equal weight cancels them."
+
+    def check_nuclear_signal() -> str:
+        days = pd.date_range("2026-09-01", periods=40, freq="D", tz="UTC")
+        def frame(nuclear: float, recent: float, other: float = 10000.0) -> pd.DataFrame:
+            rows = []
+            for i, day in enumerate(days):
+                rows.append({"timestamp": day + pd.Timedelta(hours=12), "series": "Nuclear", "value": recent if i >= 33 else nuclear})
+                rows.append({"timestamp": day + pd.Timedelta(hours=12), "series": "Fossil Gas", "value": other})
+                rows.append({"timestamp": day + pd.Timedelta(hours=12), "series": "Nuclear (consumption)", "value": 99999.0})
+            return pd.DataFrame(rows)
+        today = date(2026, 10, 11)
+        fall = _nuclear_signal(frame(40000.0, 36000.0), "Europe/Paris", today)
+        if not fall["available"] or fall["score"] <= 0 or "36.0 GW" not in fall["value"] or "-10.0%" not in fall["value"]:
+            raise AssertionError(f"Falling output should be bullish: {fall}")
+        assert_close(fall["score"], 1.0 * min(4000.0 / max(0.0, 40000.0 * 0.03, 1.0) / 2.0, 1.0))
+        rise = _nuclear_signal(frame(40000.0, 44000.0), "Europe/Paris", today)
+        if rise["score"] >= 0:
+            raise AssertionError("Rising output should be bearish.")
+        if _nuclear_signal(frame(100.0, 100.0), "Europe/Berlin", today) is not None:
+            raise AssertionError("A zone with little nuclear should have no nuclear signal.")
+        if _nuclear_signal(frame(40000.0, 36000.0), "Europe/Paris", date(2027, 1, 1))["available"]:
+            raise AssertionError("Old output must not count as current evidence.")
+        return "Falling nuclear output is bullish and rising is bearish. Consumption rows are ignored, zones with little nuclear get no signal, and old data doesn't count."
+
+    def check_entsoe_forecast_method() -> str:
+        calls = []
+        def fake(url, params=None, **kwargs):
+            calls.append(dict(params))
+            return b'<Doc><TimeSeries><Period><timeInterval><start>2026-01-01T00:00Z</start><end>2026-01-01T01:00Z</end></timeInterval><resolution>PT60M</resolution><Point><position>1</position><quantity>5</quantity></Point></Period></TimeSeries></Doc>', "text/xml"
+        for kind, document, process, area in (("Day-ahead load forecast", "A65", "A01", "outBiddingZone_Domain"), ("Day-ahead wind and solar forecast", "A69", "A01", "in_Domain")):
+            calls.clear()
+            fetch_entsoe_series("t", kind, "France", date(2026, 1, 1), date(2026, 1, 2), _http_fn=fake)
+            sent = calls[0]
+            if sent["documentType"] != document or sent["processType"] != process or area not in sent:
+                raise AssertionError(f"Wrong request for {kind}: {sent}")
+        rng = np.random.default_rng(31)
+        days = pd.date_range("2025-08-01", periods=320, freq="D")
+        wind_gw, load_gw, solar_gw = rng.uniform(1, 15, len(days)), rng.uniform(40, 70, len(days)), rng.uniform(0, 6, len(days))
+        price = np.empty(len(days))
+        price[0] = 70.0
+        for i in range(1, len(days)):
+            price[i] = 0.3 * price[i - 1] + 1.5 * load_gw[i] - 2.5 * wind_gw[i] - 1.0 * solar_gw[i] - 10.0 * (days[i].dayofweek >= 5) + rng.normal(0, 1.0)
+        hourly = pd.DataFrame({"local": days.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(days)), unit="h"), "value": price.repeat(24), "hours": 1.0})
+        location = ZONE_WEATHER["France"]
+        weather = pd.DataFrame({"date": days, "location": location, "temperature_mean_c": rng.normal(10, 5, len(days)), "wind_speed_100m_mean_kmh": rng.uniform(5, 40, len(days)), "solar_radiation_mean_wm2": rng.uniform(20, 250, len(days))})
+        ahead = weather.tail(1).assign(date=days[-1] + pd.Timedelta(days=1))
+        stamps = (days.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(days)), unit="h")).tz_localize("Europe/Paris", ambiguous=True, nonexistent="shift_forward").tz_convert("UTC")
+        load_fc = pd.DataFrame({"timestamp": stamps, "value": (load_gw * 1000).repeat(24), "series": "Load"})
+        renew = pd.concat([pd.DataFrame({"timestamp": stamps, "value": (wind_gw * 500).repeat(24), "series": name}) for name in ("Wind Onshore", "Wind Offshore")] +
+                          [pd.DataFrame({"timestamp": stamps, "value": (solar_gw * 1000).repeat(24), "series": "Solar"})])
+        late = next_day_estimate("France", hourly, weather, ahead, load_fc, renew)
+        if late["method"] != "Weather" or late["target_has_forecast"] or late["check_method"] != "ENTSO-E forecasts":
+            raise AssertionError(f"Before forecasts exist, weather sets the estimate: {late['method']}, {late['check_method']}.")
+        if not late["comparison"] or late["comparison"]["forecasts"] >= late["comparison"]["weather"]:
+            raise AssertionError(f"On a rule built from forecasts, that method should win: {late['comparison']}")
+        assert_close(late["forecast_effects"]["wind"], -2.5, 0.2)
+        assert_close(late["forecast_effects"]["load"], 1.5, 0.2)
+        next_stamps = pd.date_range(days[-1] + pd.Timedelta(days=1), periods=24, freq="h", tz="Europe/Paris").tz_convert("UTC")
+        early_load = pd.concat([load_fc, pd.DataFrame({"timestamp": next_stamps, "value": 55000.0, "series": "Load"})])
+        early_renew = pd.concat([renew] + [pd.DataFrame({"timestamp": next_stamps, "value": 5000.0, "series": name}) for name in ("Wind Onshore", "Solar")])
+        early = next_day_estimate("France", hourly, weather, ahead, early_load, early_renew)
+        if early["method"] != "ENTSO-E forecasts":
+            raise AssertionError("When the forecast exists and tested better, it should set the estimate.")
+        worse = next_day_estimate("France", hourly, weather, ahead, load_fc.assign(value=rng.uniform(40000, 70000, len(load_fc))), renew.assign(value=rng.uniform(0, 9000, len(renew))))
+        if worse["comparison"]["forecasts"] < worse["comparison"]["weather"] and worse["method"] != "Weather":
+            raise AssertionError("Method choice is inconsistent.")
+        absent = next_day_estimate("France", hourly, weather, ahead)
+        if absent["method"] != "Weather" or absent["comparison"] is not None:
+            raise AssertionError("Without forecasts the weather method should run alone.")
+        changed = hourly.copy()
+        changed.loc[changed["local"] >= days[-1], "value"] = 900.0
+        again = next_day_estimate("France", changed, weather, ahead, load_fc, renew)
+        # The forecast test holds one fewer usable row only if the last day is dropped, so compare by date.
+        one = pd.DataFrame(late["test"]).set_index("day")["estimate"]
+        two = pd.DataFrame(again["test"]).set_index("day")["estimate"]
+        check_day = days[-3]
+        assert_close(float(one.loc[check_day]), float(two.loc[check_day]))
+        return "Requests use A65/A01 and A69/A01. Weather sets the estimate before ENTSO-E's forecast exists, then the forecast takes over only if it tested better. Effects are recovered and later prices change nothing earlier."
+
+    def check_demand_weights() -> str:
+        archive = pd.DataFrame({"date": ["2026-01-01"] * 3, "location": ["Berlin / German power proxy", "Paris / French power proxy", "London / NBP proxy"], "hdd": [20.0, 10.0, 99.0]})
+        assert_close(float(archive_hdd(archive).iloc[0]), (78.0 * 20.0 + 31.0 * 10.0) / 109.0)
+        one = pd.DataFrame({"date": ["2026-01-01"], "location": ["Paris / French power proxy"], "hdd": [10.0]})
+        assert_close(float(archive_hdd(one).iloc[0]), 10.0)
+        return "German gas use counts for more than French, Britain stays out of the EU storage model, and a missing city simply drops out."
+
     cases = [
         ("Product registry and market timezones", "Configuration", check_product_registry),
         ("MWh ↔ MMBtu conversions", "Units & conversions", check_energy_conversion),
@@ -7415,6 +7691,10 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Spot analytics by hand", "Power spot", check_spot_analytics_by_hand),
         ("Seasonal storage and degree-day normals", "Fundamentals analytics", check_storage_season_and_hdd),
         ("ECB and weather archive parsers", "Live API integration", check_ecb_and_archive_parsers),
+        ("Related signals share one weight", "Market Read", check_signal_themes),
+        ("Nuclear output signal", "Market Read", check_nuclear_signal),
+        ("Demand weights for heating", "Market Read", check_demand_weights),
+        ("ENTSO-E forecast method", "Next-day estimate", check_entsoe_forecast_method),
         ("Next-day estimate recovers known effects", "Next-day estimate", check_next_day_estimate),
         ("P&L drivers add up", "Daily P&L", check_pnl_drivers),
         ("Crisis replay by hand", "Risk", check_crisis_replay),
@@ -8304,7 +8584,8 @@ def _read_dial(name: str, read: dict) -> str:
     position = (summary["score"] + 1.0) / 2.0 * 100.0
     enough = summary["confidence"] != "None"
     lead = summary["supporting"][0]["name"] if summary["supporting"] else ""
-    line = f"Led by: {lead.lower()}." if enough and lead else "Load the missing data to form a reading." if not enough else "The evidence is evenly split."
+    lead_text = re.sub(r"\b(lng|ttf|eua|nbp)\b", lambda m: m[0].upper(), lead.lower()) if lead else ""
+    line = f"Led by: {lead_text}." if enough and lead else "Load the missing data to form a reading." if not enough else "The evidence is evenly split."
     knob = f'<div class="knob {_read_tone(summary)}" style="left:{position:.1f}%"></div>' if enough else ""
     confidence = f'{summary["confidence"]} confidence' if enough else f'{summary["live"]} of {summary["total"]} signals'
     return (f'<div class="dial"><div class="dial-top"><span class="dial-name">{html.escape(name)}</span><span class="pill">{html.escape(confidence)}</span></div>'
@@ -8371,9 +8652,10 @@ def page_market_read():
     with st.expander("How this reading works"):
         st.markdown("Each signal compares a current figure with its own history and becomes a score from -1 (bearish) to +1 (bullish). "
                     "The reading is the weighted average, with these fixed thresholds: 0.15 for leaning and 0.50 for a full call.\n\n"
-                    "Confidence combines how much of the evidence is loaded with how far the signals agree.")
-        rows = [{"Market": name, "Signal": s["name"], "Weight": s["weight"], "Score": round(s["score"], 2) if s["available"] else None, "Status": "Loaded" if s["available"] else "Waiting for data"}
-                for name, read in reads.items() for s in read["signals"]]
+                    "Signals built from the same fact, such as the three storage signals, share one capped weight, so one fact can't look like several opinions.\n\n"
+                    "Confidence combines how much of the evidence is loaded with how far the signals agree. High confidence also needs support from at least two independent themes.")
+        rows = [{"Market": name, "Signal": s["name"], "Weight": s["weight"], "Counted as": round(counted, 2), "Score": round(s["score"], 2) if s["available"] else None, "Status": "Loaded" if s["available"] else "Waiting for data"}
+                for name, read in reads.items() for s, counted in zip(read["signals"], counted_weights(read["signals"]))]
         table(pd.DataFrame(rows))
         st.caption("The weights are expert judgement. They aren't fitted to prices, and the Track record view shows how the reads have done, so this organises the evidence rather than forecasting prices. It isn't trading advice. Curve signals only use imported marks, never demo prices.")
 
@@ -8682,6 +8964,8 @@ def render_track_record() -> None:
         if not part.empty:
             st.subheader("Does higher confidence mean better calls")
             table(pd.DataFrame([{"Confidence": r["confidence"], "Reads": r["source"], **_track_row(r)} for r in part.sort_values(["source", "confidence"]).to_dict("records")]))
+    if not recorded.empty and recorded["read_date"].min() < READ_METHOD_DATE.isoformat():
+        st.caption(f"The read's method changed on {READ_METHOD_DATE:%d %b %Y}, when related signals began sharing a capped weight and French nuclear output was added. Recorded reads before that date used the earlier method.")
     with st.expander("How the scoring works"):
         st.markdown("**Recorded** reads were saved on the day, with all the evidence then available. They are the real test.\n\n"
                     "**Replayed** reads are rebuilt from past data using only what was known at the time. They leave out forecasts and curve signals, so they test only part of the method.\n\n"
@@ -8775,7 +9059,7 @@ def render_winter_outlook() -> None:
                         f"- Each extra point of fill changes the daily move by **{model['fill_effect']:+.4f} points**.\n"
                         f"- These explain **{model['r2'] * 100:.0f}%** of daily changes across {model['n']:,} days in {len(model['winters'])} winters. The last three winters count fully and older ones count half.\n"
                         f"- Storage has lately run **{outlook['bias']:+.3f} points a day** against the model. That gap is carried forward and halves every {BIAS_HALF_LIFE_DAYS:.0f} days.\n\n")
-        st.markdown("Heating demand is the simple average of five north-west European cities, which is a rough stand-in for the weather that drives EU demand. "
+        st.markdown("Heating demand averages reference cities in Germany, the Netherlands, France and Belgium, weighted by each country's gas use. It's still a rough stand-in, because it leaves out the rest of the EU, including Italy and Spain. "
                     "The projection doesn't know about supply outages, LNG arrivals, prices or policy, and the crisis winters of 2021-22 and 2022-23 sit in the sample. Treat it as a guide to the size of the weather risk, not as a forecast.")
 
 
@@ -8784,7 +9068,8 @@ def render_winter_outlook() -> None:
 # -----------------------------------------------------------------------------
 def zone_estimate(zone: str) -> dict:
     return session_memo(f"estimate|{zone}", data_version("live"),
-                        lambda: next_day_estimate(zone, zone_prices(zone), _live_dataset_frame("weather_power_history"), _live_dataset_frame("weather_daily")))
+                        lambda: next_day_estimate(zone, zone_prices(zone), _live_dataset_frame("weather_power_history"), _live_dataset_frame("weather_daily"),
+                                                  _live_dataset_frame(f"entsoe_load_forecast|{zone}"), _live_dataset_frame(f"entsoe_renewable_forecast|{zone}")))
 
 
 def record_price_estimates() -> None:
@@ -8793,7 +9078,7 @@ def record_price_estimates() -> None:
         if zone in ZONE_WEATHER:
             result = zone_estimate(zone)
             if result["ready"]:
-                rows.append((result["day"].isoformat(), zone, result["estimate"], result["low"], result["high"], valuation_date.isoformat()))
+                rows.append((result["day"].isoformat(), zone, result["estimate"], result["low"], result["high"], valuation_date.isoformat(), result["method"]))
     if rows:
         _save(lambda s: s.save_price_estimates(rows))
         bump("estimates")
@@ -8812,12 +9097,19 @@ def render_next_day(zones: Sequence[str]) -> None:
         return
     beat = result["error"] < min(result["error_last_week"], result["error_yesterday"])
     gap_word = "above" if result["latest_gap"] > 0 else "below"
+    basis = ("It uses ENTSO-E's published load, wind and solar forecasts for that day." if result["method"] != "Weather" else
+             "It uses the weather forecast, which has tested better here than ENTSO-E's forecasts." if result["target_has_forecast"] and result["comparison"] else
+             "It uses the weather forecast, because ENTSO-E's wind and solar forecast is usually published by 18:00 the day before delivery, after the auction.")
+    euros = lambda value: f"{'+' if value >= 0 else '-'}€{abs(value):.2f}"
+    against = (f"in line with the €{result['latest_estimate']:.0f} suggested by" if abs(result["latest_gap"]) < 0.5 else
+               f"€{abs(result['latest_gap']):.0f} {gap_word} the €{result['latest_estimate']:.0f} suggested by")
+    check_basis = "ENTSO-E's forecasts for that day" if result["check_method"] != "Weather" else "the weather"
     with st.container(key="hero"):
         st.markdown(
-            f'<div class="desk-note"><p>Base price for {result["day"]:%a %d %b} in {html.escape(zone)}: about <b>€{result["estimate"]:.0f}/MWh</b>, likely between €{result["low"]:.0f} and €{result["high"]:.0f}.</p>'
-            f'<p>The latest published day, {result["latest_day"]:%a %d %b}, came in at €{result["latest_actual"]:.0f}, €{abs(result["latest_gap"]):.0f} {gap_word} the estimate of €{result["latest_estimate"]:.0f}. '
+            f'<div class="desk-note"><p>Base price for {result["day"]:%a %d %b} in {html.escape(zone)}: about <b>€{result["estimate"]:.0f}/MWh</b>, likely between €{result["low"]:.0f} and €{result["high"]:.0f}. {basis}</p>'
+            f'<p>The latest published day, {result["latest_day"]:%a %d %b}, came in at €{result["latest_actual"]:.0f}, {against} {check_basis}. '
             f'{"That is an unusually large gap, so check for something the method can&#39;t see." if result["unusual"] else "That is within the usual range of error."}</p>'
-            f'<p class="soft">Over the last {result["n"]} days, it missed by €{result["error"]:.1f} on average, against €{result["error_last_week"]:.1f} for using the same weekday last week and €{result["error_yesterday"]:.1f} for using the previous day. '
+            f'<p class="soft">Over the last {result["n"]} days, this method missed by €{result["error"]:.1f} on average, against €{result["error_last_week"]:.1f} for using the same weekday last week and €{result["error_yesterday"]:.1f} for using the previous day. '
             f'{"" if beat else "It has not beaten both simple methods, so don&#39;t rely on it over them."}</p></div>', unsafe_allow_html=True)
     test = result["test"].tail(60)
     fig = go.Figure()
@@ -8827,6 +9119,14 @@ def render_next_day(zones: Sequence[str]) -> None:
                              error_y=dict(type="data", symmetric=False, array=[result["high"] - result["estimate"]], arrayminus=[result["estimate"] - result["low"]], color=AMBER, thickness=2)))
     fig.update_layout(title=f"{zone}: day-ahead base price, EUR/MWh")
     chart(fig, 380)
+    comparison = result["comparison"]
+    if comparison:
+        st.subheader("How the methods compare")
+        table(pd.DataFrame([{"Method": "ENTSO-E forecasts", "Average miss, EUR/MWh": round(comparison["forecasts"], 2)}, {"Method": "Weather in one city", "Average miss, EUR/MWh": round(comparison["weather"], 2)},
+                            {"Method": "Same weekday last week", "Average miss, EUR/MWh": round(comparison["last_week"], 2)}, {"Method": "Previous day", "Average miss, EUR/MWh": round(comparison["yesterday"], 2)}]))
+        st.caption(f"On the same {comparison['days']} days. The ENTSO-E method isn't fully comparable: its wind and solar forecasts are usually published after the auction, so it shows how good the forecast information is, not what you could have estimated beforehand.")
+    else:
+        st.caption(f"ENTSO-E's forecasts cover {result['forecast_days']} days so far, and a comparison needs at least {ESTIMATE_MIN_DAYS + 30}. Select Update market data to load them.")
     store = desk_store()
     log = store.load_price_estimates(zone) if store is not None else pd.DataFrame()
     live = score_recorded_estimates(log, daily_base_prices(zone_prices(zone)))
@@ -8835,12 +9135,17 @@ def render_next_day(zones: Sequence[str]) -> None:
     else:
         st.caption("Each estimate is also saved on the day, using the real forecast. They're scored here once the prices are published.")
     with st.expander("How this estimate works"):
-        st.markdown("It's a regression on the last 180 days. It uses the previous day's price, the last 7 days' average, the same weekday last week, the weekday pattern, and heating demand, wind and solar in one reference city.\n\n"
-                    f"- 10 km/h more wind changes the price by **€{result['wind_effect'] * 10:+.2f}**.\n"
-                    f"- One more heating degree day changes it by **€{result['hdd_effect']:+.2f}**.\n"
-                    f"- 10 W/m² more solar radiation changes it by **€{result['solar_effect'] * 10:+.2f}**.\n\n"
-                    "The test above uses the weather that actually happened, because past forecasts aren't available, so real errors will be larger. The saved estimates show those real errors over time.\n\n"
-                    "It knows nothing about plant outages, French nuclear availability, gas prices, public holidays or the auction itself. One city is a rough stand-in for a whole country's wind and solar.")
+        effects = result["forecast_effects"]
+        st.markdown("Each method is a regression on the last 180 days using the previous day's price, the last 7 days' average, the same weekday last week and the weekday pattern. They differ in the rest.\n\n"
+                    "**Weather method.** It adds heating demand, wind and solar in one reference city, and can run before the auction. "
+                    f"10 km/h more wind changes the price by **{euros(result['wind_effect'] * 10)}**, one more heating degree day by **{euros(result['hdd_effect'])}**, and 10 W/m² more solar radiation by **{euros(result['solar_effect'] * 10)}**. "
+                    "Its test uses the weather that actually happened, because past forecasts aren't available, so real errors will be larger.\n\n"
+                    "**ENTSO-E method.** It adds the system operators' day-ahead forecasts of load, wind and solar for the whole zone, and its test uses those forecasts rather than what happened. "
+                    + (f"1 GW more forecast load changes the price by **{euros(effects['load'])}**, 1 GW more wind by **{euros(effects['wind'])}**, and 1 GW more solar by **{euros(effects['solar'])}**. " if effects else "")
+                    + "The load forecast is due two hours before the auction deadline, but the wind and solar forecast is only due by 18:00 the day before delivery. "
+                    "So it usually can't set the estimate before the auction. Its main use is checking whether a published price looks high or low against those forecasts. It sets the estimate only when the forecast already exists and it has tested at least as well as the weather method.\n\n"
+                    f"ENTSO-E's forecasts cover **{result['forecast_days']} days** for this zone so far, and some operators may revise them after first publishing.\n\n"
+                    "Neither method knows about plant outages, gas prices, public holidays or the auction itself.")
 
 
 def render_pnl_drivers(step: pd.DataFrame, factor: pd.Series) -> pd.DataFrame:
