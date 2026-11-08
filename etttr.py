@@ -1312,7 +1312,7 @@ def spot_series(frame: pd.DataFrame, timezone_name: str) -> pd.DataFrame:
     out = frame.copy()
     out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce", utc=True)
     out["value"] = _number_series(out["value"])
-    out = out.dropna(subset=["timestamp", "value"]).sort_values("timestamp").drop_duplicates("timestamp")
+    out = out.dropna(subset=["timestamp", "value"])
     if out.empty:
         return pd.DataFrame(columns=columns)
     if "resolution" in out.columns:
@@ -1320,8 +1320,17 @@ def spot_series(frame: pd.DataFrame, timezone_name: str) -> pd.DataFrame:
         out["hours"] = out["resolution"].map(durations).astype(float)
     else:
         out["hours"] = float("nan")
+    # Where a slot appears twice, keep the finer price. The sort makes this the same choice every time.
+    out = out.sort_values(["timestamp", "hours"], kind="mergesort").drop_duplicates("timestamp")
     fallback = out["timestamp"].diff().dt.total_seconds().div(3600).median()
     out["hours"] = out["hours"].fillna(fallback if pd.notna(fallback) and fallback > 0 else 1.0)
+    # A day holding both 15- and 60-minute rows would count the same time twice, so keep the finest full set.
+    days = out["timestamp"].dt.floor("D")
+    finest = out.groupby(days)["hours"].transform("min")
+    if out["hours"].ne(finest).any():
+        is_finest = out["hours"].eq(finest)
+        covered = (out["hours"] * is_finest).groupby(days).transform("sum")
+        out = out.loc[is_finest | covered.lt(18.0)]
     out["local"] = out["timestamp"].dt.tz_convert(timezone_name)
     return out[columns].reset_index(drop=True)
 
@@ -2265,6 +2274,7 @@ def curve_warning(products: Sequence[str], custom: dict, metadata: dict, today: 
 # Market Read track record: was the read right, compared with chance?
 # -----------------------------------------------------------------------------
 READ_METHOD_VERSION = 2
+PRICE_SERIES_VERSION = 1
 READ_METHOD_DATE = date(2026, 11, 6)
 TRACK_HORIZONS = (1, 5, 20)
 TRACK_MIN_INDEPENDENT = 20
@@ -2545,6 +2555,9 @@ def fit_storage_model(fill: pd.Series, hdd: pd.Series, exclude: Optional[int] = 
     root = np.sqrt(weights)
     target = frame["change"].to_numpy()
     beta = np.linalg.lstsq(design * root[:, None], target * root, rcond=None)[0]
+    # Fuller storage can draw faster, but emptier storage must not draw faster still. That would feed on itself.
+    if beta[8] > 0:
+        beta = np.append(np.linalg.lstsq(weather * root[:, None], target * root, rcond=None)[0], 0.0)
     fitted = design @ beta
     spread = float(np.sum((target - target.mean()) ** 2))
     return {"beta": beta, "n": int(len(frame)), "winters": full, "hdd_effect": float(beta[6]), "weekend_effect": float(beta[7]), "fill_effect": float(beta[8]),
@@ -2679,6 +2692,7 @@ def project_winter(history: pd.DataFrame, archive: pd.DataFrame, daily_weather: 
         def path(weather: pd.Series) -> np.ndarray:
             return simulate_fill(model, start_fill, days, weather.to_numpy(), bias)
         ends = {w: float(path(s)[-1]) for w, s in weather_years.items()}
+        result["end_without_recent_gap"] = float(simulate_fill(model, start_fill, days, normal.to_numpy(), 0.0)[-1])
         result["scenarios"] = [
             {"name": "Cold", "note": f"Weather like {winter_label(coldest)}, the coldest of the {len(weather_years)} past winters", "path": path(weather_years[coldest])},
             {"name": "Normal", "note": f"Average weather of the {len(weather_years)} past winters", "path": path(normal)},
@@ -2710,6 +2724,8 @@ def project_winter(history: pd.DataFrame, archive: pd.DataFrame, daily_weather: 
         result["basis"] = "past winters"
     for scenario in result["scenarios"]:
         scenario["end"] = float(scenario["path"][-1])
+    past_levels = [level for level in (_fill_on(fill, _in_other_winter(start, year, winter)) for winter in range(year - 12, year)) if level is not None]
+    result["lowest_past_level"] = min(past_levels) if past_levels else None
     if not hdd.empty:
         test = backtest_outlook(fill, hdd, start, year)
         if not test.empty:
@@ -2766,9 +2782,11 @@ def daily_base_prices(series: pd.DataFrame) -> pd.Series:
     """Average day-ahead price by delivery day, leaving out days with few published prices."""
     if series is None or series.empty:
         return pd.Series(dtype=float)
-    grouped = series.assign(day=pd.to_datetime(series["local"].dt.date)).groupby("day")["value"]
-    counts = grouped.count()
-    return grouped.mean().loc[counts >= 0.8 * counts.median()].sort_index()
+    data = series.assign(day=pd.to_datetime(series["local"].dt.date), weighted=series["value"] * series["hours"])
+    grouped = data.groupby("day")
+    hours = grouped["hours"].sum()
+    # Judged by hours covered, so a change of resolution can't hide a whole period.
+    return (grouped["weighted"].sum() / hours).loc[hours >= 19.0].sort_index()
 
 
 def power_weather(history: pd.DataFrame, daily: pd.DataFrame, location: str) -> pd.DataFrame:
@@ -3235,6 +3253,12 @@ class DeskStore:
             if row is None or float(row[0]) < READ_METHOD_VERSION:
                 conn.execute("DELETE FROM read_log WHERE source='Replayed'")
                 conn.execute("INSERT OR REPLACE INTO settings VALUES ('read_method',?)", (str(float(READ_METHOD_VERSION)),))
+            # Earlier versions mixed the two German auctions, so those prices are fetched again.
+            row = conn.execute("SELECT value FROM settings WHERE key='price_series'").fetchone()
+            if row is None or float(row[0]) < PRICE_SERIES_VERSION:
+                conn.execute("DELETE FROM live_data WHERE key IN ('entsoe_price|Germany-Luxembourg', 'entsoe_price|Austria')")
+                conn.execute("DELETE FROM read_log WHERE source='Replayed' AND market='German power'")
+                conn.execute("INSERT OR REPLACE INTO settings VALUES ('price_series',?)", (str(float(PRICE_SERIES_VERSION)),))
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=15)
@@ -4426,7 +4450,19 @@ def parse_entsoe_xml(content: bytes, series_kind: str = "price") -> pd.DataFrame
     kind = series_kind.lower()
     wanted = ("price.amount", "quantity") if kind == "price" else ("quantity", "price.amount")
     frames = []
-    for ts in _direct_children(root, "TimeSeries"):
+    all_series = _direct_children(root, "TimeSeries")
+    if kind == "price":
+        # Germany-Luxembourg and Austria publish two auctions: the official SDAC price is sequence 1 and
+        # EXAA is sequence 2, with the same timestamps. Keep one auction, and treat unlabelled series as 1.
+        def auction(ts) -> int:
+            text = next((child.text for child in ts if _xml_local_name(child.tag).startswith("classificationSequence")), None)
+            try:
+                return int(str(text).strip())
+            except ValueError:
+                return 1
+        wanted_auction = min((auction(ts) for ts in all_series), default=1)
+        all_series = [ts for ts in all_series if auction(ts) == wanted_auction]
+    for ts in all_series:
         psr_node = _direct_children(ts, "MktPSRType")
         psr_code = (_child_text(psr_node[0], "psrType") if psr_node else "") or ""
         curve_type = _child_text(ts, "curveType") or ""
@@ -4896,6 +4932,10 @@ hr {{ border-color:{BORDER}; margin:1.2rem 0; }}
 .desk-note p {{ margin:0 0 0.7rem; font-size:inherit; line-height:inherit; }}
 .desk-note b {{ font-weight:600; font-family:{UI_FONT}; font-size:0.92em; white-space:nowrap; }}
 .desk-note .soft {{ color:{GRAY}; font-size:0.86em; }}
+.desk-note ul {{ margin:0 0 0.7rem; padding-left:1.1em; list-style:disc; }}
+.desk-note li {{ margin:0 0 0.28rem; padding:0; font-size:1.12rem; line-height:1.38; color:{TEXT}; }}
+.desk-note li::marker {{ color:{GRAY}; }}
+.desk-note .desk-label {{ margin:0.9rem 0 0.3rem; font-family:{UI_FONT}; font-size:0.86rem; font-weight:600; color:{GRAY}; }}
 .desk-note b.gain {{ color:{GAIN}; }} .desk-note b.loss {{ color:{LOSS}; }}
 
 /* Figures: raised tiles lit along the top edge */
@@ -7344,7 +7384,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         level = 88.0
         for i, day in enumerate(days):
             if day.month in WINTER_MONTHS:
-                step = 0.35 + hdd_effect * hdd[i] - 0.12 * (day.dayofweek >= 5) + 0.002 * (level - 60.0) + rng.normal(0, 0.03)
+                step = 0.35 + hdd_effect * hdd[i] - 0.12 * (day.dayofweek >= 5) - 0.002 * (level - 60.0) + rng.normal(0, 0.03)
             else:
                 step = 0.02 * (90.0 - level)
             level = float(np.clip(level + step, 2.0, 100.0))
@@ -7356,7 +7396,10 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         model = fit_storage_model(fill, hdd)
         assert_close(model["hdd_effect"], -0.04, 0.003)
         assert_close(model["weekend_effect"], -0.12, 0.01)
-        assert_close(model["fill_effect"], 0.002, 0.0015)
+        assert_close(model["fill_effect"], -0.002, 0.0015)
+        wrong_way = pd.Series(np.cumsum(hdd.reindex(fill.index).fillna(0).to_numpy() * -0.01) + (fill.index.year - 2016) * 8.0 + 70.0, index=fill.index)
+        if fit_storage_model(wrong_way, hdd)["fill_effect"] > 0:
+            raise AssertionError("Emptier storage must never draw faster.")
         if model["r2"] < 0.8:
             raise AssertionError(f"The model should explain a clean rule: {model['r2']}")
         start = pd.Timestamp(2020, 11, 1)
@@ -7625,6 +7668,29 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         assert_close(float(archive_hdd(one).iloc[0]), 10.0)
         return "German gas use counts for more than French, Britain stays out of the EU storage model, and a missing city simply drops out."
 
+    def check_two_auctions() -> str:
+        series = lambda position, price: (f"<TimeSeries>{position}<curveType>A03</curveType><Period><timeInterval><start>2026-11-05T23:00Z</start><end>2026-11-06T23:00Z</end></timeInterval>"
+                                          f"<resolution>PT60M</resolution><Point><position>1</position><price.amount>{price}</price.amount></Point></Period></TimeSeries>")
+        label = "<classificationSequence_AttributeInstanceComponent.position>{}</classificationSequence_AttributeInstanceComponent.position>"
+        for order in ((1, 2), (2, 1)):
+            xml = "<Doc>" + "".join(series(label.format(n), 100.0 if n == 1 else 500.0) for n in order) + "</Doc>"
+            frame = parse_entsoe_xml(xml.encode(), "price")
+            if len(frame) != 24 or set(frame["value"]) != {100.0}:
+                raise AssertionError(f"Only the SDAC auction should be kept: {set(frame['value'])}.")
+        single = parse_entsoe_xml(("<Doc>" + series("", 70.0) + "</Doc>").encode(), "price")
+        if set(single["value"]) != {70.0}:
+            raise AssertionError("A zone with no auction label should be kept.")
+        day = pd.date_range("2026-11-06", periods=96, freq="15min", tz="UTC")
+        mixed = pd.concat([pd.DataFrame({"timestamp": day, "value": 70.0, "resolution": "PT15M"}), pd.DataFrame({"timestamp": day[::4], "value": 700.0, "resolution": "PT60M"})])
+        cleaned = spot_series(mixed.sample(frac=1.0, random_state=3), "UTC")
+        assert_close(float(spot_kpis(cleaned)["base"]), 70.0)
+        assert_close(float(cleaned["hours"].sum()), 24.0)
+        hourly_then_quarter = pd.concat([pd.DataFrame({"timestamp": pd.date_range("2026-10-01", periods=24 * 5, freq="h", tz="UTC"), "value": 50.0, "resolution": "PT60M"}),
+                                         pd.DataFrame({"timestamp": pd.date_range("2026-10-06", periods=96 * 5, freq="15min", tz="UTC"), "value": 80.0, "resolution": "PT15M"})])
+        if len(daily_base_prices(spot_series(hourly_then_quarter, "UTC"))) != 10:
+            raise AssertionError("A change from hourly to 15-minute prices must keep both periods.")
+        return "Only the official SDAC auction is kept, in any order. Unlabelled zones are kept, overlapping resolutions don't count twice, and a change of resolution loses no days."
+
     cases = [
         ("Product registry and market timezones", "Configuration", check_product_registry),
         ("MWh ↔ MMBtu conversions", "Units & conversions", check_energy_conversion),
@@ -7691,6 +7757,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Spot analytics by hand", "Power spot", check_spot_analytics_by_hand),
         ("Seasonal storage and degree-day normals", "Fundamentals analytics", check_storage_season_and_hdd),
         ("ECB and weather archive parsers", "Live API integration", check_ecb_and_archive_parsers),
+        ("Only the official day-ahead auction is used", "Live data parser", check_two_auctions),
         ("Related signals share one weight", "Market Read", check_signal_themes),
         ("Nuclear output signal", "Market Read", check_nuclear_signal),
         ("Demand weights for heating", "Market Read", check_demand_weights),
@@ -7780,38 +7847,45 @@ def contract_picker(prefix: str, product: str) -> tuple[date, date, str, str]:
     return start, end, instrument, label
 
 
-def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float], reads_line: str = "") -> str:
-    """The morning note, written from whatever is actually loaded. Missing data stays unsaid."""
-    parts = []
+def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float], reads: Sequence[tuple] = (), outlook: str = "") -> str:
+    """The morning note as short bullets, written from whatever is actually loaded. Missing data stays unsaid."""
+    today_items = []
     total = metrics["eur_total"]
     if metrics["executed"]:
         trades = "trade" if metrics["executed"] == 1 else "trades"
-        sentence = f'Your book is marked at <b class="{tone_of(total)}">{fmt_money(total)}</b> across {metrics["executed"]} executed {trades}'
+        item = f'Book: <b class="{tone_of(total)}">{fmt_money(total)}</b> across {metrics["executed"]} executed {trades}'
         if pnl_today is not None:
-            sentence += f', <b class="{tone_of(pnl_today)}">{fmt_money(pnl_today)}</b> on the day'
-        parts.append(f"<p>{sentence}.</p>")
+            item += f', <b class="{tone_of(pnl_today)}">{fmt_money(pnl_today)}</b> on the day'
+        held = executed_buckets()
+        if not held.empty and curve_warning(sorted(held["product"].unique()), st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {}), valuation_date):
+            item += ", valued on demo or old prices"
+        today_items.append(item)
     else:
-        parts.append("<p>Your book has no executed trades yet.</p>")
-    market = []
+        today_items.append("Book: no executed trades yet")
+    has_market = False
     storage = snapshot.get("storage", {})
     if storage.get("fill_pct") is not None:
-        text = f'EU gas storage is <b>{storage["fill_pct"]:.1f}%</b> full'
+        item = f'EU gas storage: <b>{storage["fill_pct"]:.1f}%</b> full'
         change = storage.get("change_7_reports_twh")
         if change is not None:
-            text += f', {"down" if change < 0 else "up"} {abs(change):.1f} TWh in a week'
-        market.append(text)
+            item += f', {"down" if change < 0 else "up"} {abs(change):.1f} TWh in a week'
+        today_items.append(item)
+        has_market = True
     for zone, label in (("France", "French"), ("Germany-Luxembourg", "German")):
         series = zone_prices(zone)
         if not series.empty:
             today_local = datetime.now(ZoneInfo(ENTSOE_ZONES[zone]["timezone"])).date()
             current = series.loc[series["local"].dt.date.eq(today_local)]
             if not current.empty:
-                market.append(f'{label} day-ahead averages <b>{spot_kpis(current)["base"]:.1f} €/MWh</b> today')
-    if market:
-        parts.append("<p>" + "; ".join(market) + ".</p>")
-    if reads_line:
-        parts.append(f'<p class="soft">{reads_line}</p>')
-    if not market:
+                today_items.append(f'{label} day-ahead: <b>{spot_kpis(current)["base"]:.1f} €/MWh</b> average today')
+                has_market = True
+    parts = ["<ul>" + "".join(f"<li>{item}</li>" for item in today_items) + "</ul>"]
+    read_items = [f"{html.escape(market)}: {html.escape(reading.lower())}" for market, reading in reads]
+    if outlook:
+        read_items.append(outlook)
+    if read_items:
+        parts.append('<p class="desk-label">Market read</p><ul>' + "".join(f"<li>{item}</li>" for item in read_items) + "</ul>")
+    if not has_market:
         parts.append('<p class="soft">Market data will appear here once it has been updated.</p>')
     if metrics["unmarked"]:
         word = "trade needs" if metrics["unmarked"] == 1 else "trades need"
@@ -7823,7 +7897,7 @@ def _outlook_line() -> str:
     outlook = winter_outlook()
     if not outlook.get("ready") or outlook.get("basis") != "weather":
         return ""
-    return f" With normal weather, EU storage ends March at about {outlook['scenarios'][outlook['central']]['end']:.0f}%."
+    return f"EU storage at the end of March: about <b>{outlook['scenarios'][outlook['central']]['end']:.0f}%</b> with normal weather"
 
 
 def page_market_overview():
@@ -7847,14 +7921,14 @@ def page_market_overview():
     hero = st.container(key="hero")
     note_col, chart_col = hero.columns([1, 1.05], gap="large")
     with note_col:
-        reads = [f"{name} {read['summary']['reading'].lower()}" for name, read in market_reads().items() if read["summary"]["confidence"] != "None"]
-        st.markdown(desk_note_html(metrics, snapshot, pnl_today, (f"Market read: {', '.join(reads)}." if reads else "") + _outlook_line()), unsafe_allow_html=True)
+        reads = [(name, read["summary"]["reading"]) for name, read in market_reads().items() if read["summary"]["confidence"] != "None"]
+        st.markdown(desk_note_html(metrics, snapshot, pnl_today, reads, _outlook_line()), unsafe_allow_html=True)
         update_button("overview_refresh")
     with chart_col:
         names = ["TTF Natural Gas", "French Power Base", "German Power Base"]
         frame = pd.concat([curves[n].assign(delivery_month=lambda f: pd.to_datetime(f["delivery_month"])) for n in names], ignore_index=True)
         frame = frame.loc[frame["delivery_month"].lt(pd.Timestamp(_add_months(valuation_date, 25)))]
-        fig = px.line(frame, x="delivery_month", y="price", color="product", title="Forward curves, EUR/MWh",
+        fig = px.line(frame, x="delivery_month", y="price", color="product", title="Forward curves, EUR/MWh" + (" (demo prices)" if any(p not in st.session_state.get("custom_curves", {}) for p in frame["product"].unique()) else ""),
                       labels={"delivery_month": "", "price": "", "product": ""})
         chart(fig, 290)
 
@@ -9029,6 +9103,9 @@ def render_winter_outlook() -> None:
     with st.container(key="hero"):
         paragraph = f'<p class="soft">{html.escape(third)}</p>' if third else ""
         st.markdown(f'<div class="desk-note"><p>{first} {second}</p>{paragraph}</div>', unsafe_allow_html=True)
+    lowest = outlook.get("lowest_past_level")
+    if lowest is not None and outlook["start_fill"] < lowest:
+        st.warning(f"Storage is at {outlook['start_fill']:.1f}%, below every past winter in the data at this date (lowest {lowest:.1f}%). The method is working outside its experience, and it can't see withdrawals slowing because of high prices or demand cuts. Treat the March levels as a warning sign, not a precise figure.")
     c1, c2, c3, c4 = st.columns(4)
     kpi(c1, f"Now, {outlook['start']:%d %b}", f"{outlook['start_fill']:.1f}%", "Latest published gas day")
     for column, scenario, color in zip((c2, c3, c4), scenarios, OUTLOOK_COLORS):
@@ -9056,9 +9133,9 @@ def render_winter_outlook() -> None:
             st.markdown(f"Each winter day's storage change is estimated from the month, heating demand, weekends and how full storage is. The result is then run forward one day at a time.\n\n"
                         f"- Each extra heating degree day changes storage by **{model['hdd_effect']:+.3f} points** that day.\n"
                         f"- A weekend day changes it by **{model['weekend_effect']:+.3f} points**.\n"
-                        f"- Each extra point of fill changes the daily move by **{model['fill_effect']:+.4f} points**.\n"
-                        f"- These explain **{model['r2'] * 100:.0f}%** of daily changes across {model['n']:,} days in {len(model['winters'])} winters. The last three winters count fully and older ones count half.\n"
-                        f"- Storage has lately run **{outlook['bias']:+.3f} points a day** against the model. That gap is carried forward and halves every {BIAS_HALF_LIFE_DAYS:.0f} days.\n\n")
+                        + (f"- Each extra point of fill changes the daily move by **{model['fill_effect']:+.4f} points**, so withdrawals slow as storage empties.\n" if model["fill_effect"] < 0 else "- The data shows no sign of withdrawals slowing as storage empties, so that effect is left out. In reality they do slow at low levels, so the coldest case may be too low.\n") +
+                                                f"- These explain **{model['r2'] * 100:.0f}%** of daily changes across {model['n']:,} days in {len(model['winters'])} winters. The last three winters count fully and older ones count half.\n"
+                        f"- Storage has lately run **{outlook['bias']:+.3f} points a day** against the model. That gap is carried forward and halves every {BIAS_HALF_LIFE_DAYS:.0f} days. Without it, normal weather would end March at **{outlook['end_without_recent_gap']:.0f}%**.\n\n")
         st.markdown("Heating demand averages reference cities in Germany, the Netherlands, France and Belgium, weighted by each country's gas use. It's still a rough stand-in, because it leaves out the rest of the EU, including Italy and Spain. "
                     "The projection doesn't know about supply outages, LNG arrivals, prices or policy, and the crisis winters of 2021-22 and 2022-23 sit in the sample. Treat it as a guide to the size of the weather risk, not as a forecast.")
 
