@@ -1309,6 +1309,9 @@ def spot_series(frame: pd.DataFrame, timezone_name: str) -> pd.DataFrame:
     columns = ["timestamp", "local", "value", "hours"]
     if frame is None or frame.empty or not {"timestamp", "value"}.issubset(frame.columns):
         return pd.DataFrame(columns=columns)
+    # A slice of a series this function already cleaned needs no second pass.
+    if frame.attrs.get("spot_clean") == timezone_name and {"local", "hours"}.issubset(frame.columns):
+        return frame[columns]
     out = frame.copy()
     out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce", utc=True)
     out["value"] = _number_series(out["value"])
@@ -1332,7 +1335,9 @@ def spot_series(frame: pd.DataFrame, timezone_name: str) -> pd.DataFrame:
         covered = (out["hours"] * is_finest).groupby(days).transform("sum")
         out = out.loc[is_finest | covered.lt(18.0)]
     out["local"] = out["timestamp"].dt.tz_convert(timezone_name)
-    return out[columns].reset_index(drop=True)
+    out = out[columns].reset_index(drop=True)
+    out.attrs["spot_clean"] = timezone_name
+    return out
 
 
 def spot_kpis(series: pd.DataFrame) -> dict:
@@ -2053,7 +2058,8 @@ def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generatio
     momentum = _signal("momentum", "Day-ahead price against the past weeks", 2.0, missing="Fetch at least 14 days of day-ahead prices.")
     negative = _signal("negative", "Negative-price hours", 1.5, missing="Fetch at least 14 days of day-ahead prices.")
     if not series.empty:
-        by_day = series.assign(day=series["local"].dt.date).groupby("day", as_index=False)["value"].mean()
+        series_day = series["local"].dt.date
+        by_day = series.assign(day=series_day).groupby("day", as_index=False)["value"].mean()
         age = (today - by_day["day"].max()).days
         if age > STALE_DAYS:
             momentum["missing"] = negative["missing"] = f"Day-ahead prices are {age} days old. Fetch them again."
@@ -2064,8 +2070,8 @@ def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generatio
                                f"{recent.mean():.1f} EUR/MWh over the last 7 days, against {prior.mean():.1f} before that.",
                                "Shows the direction prices are already moving in, not why.",
                                f"Reverses if the 7-day average moves {'below' if gap >= 0 else 'above'} {prior.mean():.1f} EUR/MWh.")
-            cut = series["local"].dt.date >= by_day["day"].iloc[-7]
-            earlier = series["local"].dt.date >= by_day["day"].iloc[max(len(by_day) - 28, 0)]
+            cut = series_day >= by_day["day"].iloc[-7]
+            earlier = series_day >= by_day["day"].iloc[max(len(by_day) - 28, 0)]
             share = lambda part: float(part.loc[part["value"] < 0, "hours"].sum() / part["hours"].sum() * 100.0) if not part.empty else 0.0
             recent_share, prior_share = share(series.loc[cut]), share(series.loc[earlier & ~cut])
             hours = float(series.loc[cut & series["value"].lt(0), "hours"].sum())
@@ -2253,23 +2259,6 @@ def fresh_curves(custom: dict, metadata: dict, today: date, max_age: int = 10) -
     return fresh
 
 
-def curve_warning(products: Sequence[str], custom: dict, metadata: dict, today: date) -> str:
-    """One sentence naming the prices a result relies on that aren't current market marks."""
-    demo, stale = [], []
-    for product in products:
-        status = curve_state(product, custom, metadata, today)
-        if status["state"] == "Demo":
-            demo.append(product)
-        elif status["state"] != "Current":
-            stale.append(f"{product} ({status['age']} days old)" if status["age"] is not None else product)
-    parts = []
-    if demo:
-        parts.append(f"{', '.join(demo)} {'uses' if len(demo) == 1 else 'use'} demo prices")
-    if stale:
-        parts.append(f"{', '.join(stale)} {'has' if len(stale) == 1 else 'have'} old marks")
-    return ("; ".join(parts) + ". Treat these results as an illustration until you add current marks in Forward Curves.") if parts else ""
-
-
 # -----------------------------------------------------------------------------
 # Market Read track record: was the read right, compared with chance?
 # -----------------------------------------------------------------------------
@@ -2283,7 +2272,7 @@ SIGNAL_THRESHOLD = 0.10
 REPLAY_LOOKBACK_DAYS = 40
 MARKET_ZONES = {"French power": "France", "German power": "Germany-Luxembourg", "Dutch power": "Netherlands",
                 "Belgian power": "Belgium", "Spanish power": "Spain", "British power": "Great Britain"}
-REAL_MARK_EXCLUSIONS = ("Demo marks", SYNTHETIC_HISTORY_SOURCE)
+REAL_MARK_EXCLUSIONS = ("Demo marks", "Part real marks", SYNTHETIC_HISTORY_SOURCE)
 
 
 def read_row(read_date: date, market: str, signals: Sequence[dict], summary: dict, price_through: date, source: str) -> dict:
@@ -2429,15 +2418,25 @@ def replay_power_reads(market: str, zone: str, prices: pd.DataFrame, load: pd.Da
     if prices is None or prices.empty or "timestamp" not in prices.columns:
         return []
     tz = ENTSOE_ZONES[zone]["timezone"]
-    stamps = pd.to_datetime(prices["timestamp"], errors="coerce", utc=True)
-    local_days = stamps.dt.tz_convert(tz).dt.date
-    days = sorted(set(local_days.dropna()))
+    # Clean and parse everything once; each day then only slices it.
+    prices = spot_series(prices, tz)
+    if prices.empty:
+        return []
+    stamps = prices["timestamp"]
+    days = sorted(set(prices["local"].dt.date))
     if len(days) < 30:
         return []
     frames = []
-    for frame in (load, generation):
+    for index, frame in enumerate((load, generation)):
         held = frame is not None and not frame.empty and "timestamp" in frame.columns
-        frames.append((frame, pd.to_datetime(frame["timestamp"], errors="coerce", utc=True)) if held else (None, None))
+        if not held:
+            frames.append((None, None))
+            continue
+        frame = frame.assign(timestamp=pd.to_datetime(frame["timestamp"], errors="coerce", utc=True), value=_number_series(frame["value"])).dropna(subset=["timestamp", "value"])
+        if index == 1 and "series" in frame.columns:
+            # Hourly means per series give the same signals as raw quarter-hours, at a fraction of the rows.
+            frame = frame.assign(timestamp=frame["timestamp"].dt.floor("h")).groupby(["timestamp", "series"], as_index=False)["value"].mean()
+        frames.append((frame, frame["timestamp"]))
     rows = []
     for day in days[28:-1]:
         if day.weekday() >= 5 or (day.isoformat(), market) in skip or day >= today:
@@ -2853,15 +2852,19 @@ def _apply_estimate(beta: np.ndarray, frame: pd.DataFrame, columns: Sequence[str
 
 def _walk_forward(known: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
     """Estimate each past day from earlier days only, refitting regularly."""
-    rows, beta = [], None
     first = max(ESTIMATE_MIN_DAYS, len(known) - ESTIMATE_TEST_DAYS)
-    for position in range(first, len(known)):
-        if beta is None or (position - first) % ESTIMATE_REFIT_EVERY == 0:
-            beta = _fit_estimate(known.iloc[max(0, position - ESTIMATE_TRAIN_DAYS):position], columns)
-        row = known.iloc[[position]]
-        rows.append({"day": row.index[0], "actual": float(row["base"].iloc[0]), "estimate": float(_apply_estimate(beta, row, columns)[0]),
-                     "last_week": float(row["lag7"].iloc[0]), "yesterday": float(row["lag1"].iloc[0])})
-    return pd.DataFrame(rows)
+    features = np.column_stack([np.ones(len(known)), known[list(columns)].to_numpy(float)])
+    target = known["base"].to_numpy(float)
+    estimates = np.empty(max(len(known) - first, 0))
+    # Refit every few days on earlier days only, then apply that fit to the next block in one step.
+    for block_start in range(first, len(known), ESTIMATE_REFIT_EVERY):
+        train = slice(max(0, block_start - ESTIMATE_TRAIN_DAYS), block_start)
+        beta = np.linalg.lstsq(features[train], target[train], rcond=None)[0]
+        block = slice(block_start, min(block_start + ESTIMATE_REFIT_EVERY, len(known)))
+        estimates[block.start - first:block.stop - first] = features[block] @ beta
+    test = known.iloc[first:]
+    return pd.DataFrame({"day": test.index, "actual": target[first:], "estimate": estimates,
+                         "last_week": test["lag7"].to_numpy(float), "yesterday": test["lag1"].to_numpy(float)})
 
 
 def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, daily: pd.DataFrame,
@@ -3200,6 +3203,156 @@ def simple_pdf(blocks: Sequence[tuple], title: str = "") -> bytes:
     return bytes(output)
 
 
+# -----------------------------------------------------------------------------
+# Free real prices for marks, and where every price came from
+# -----------------------------------------------------------------------------
+SOURCE_IMPORTED = "Imported marks"
+SOURCE_DAY_AHEAD = "Day-ahead average, ENTSO-E"
+SOURCE_PART_DEMO = "Day-ahead so far, demo for the rest"
+SOURCE_PART_IMPORTED = "Day-ahead so far, imported for the rest"
+SOURCE_AUCTION = "EUA auction price, EEX"
+SOURCE_DEMO = "Demo"
+REAL_PRICE_SOURCES = {SOURCE_IMPORTED, SOURCE_DAY_AHEAD, SOURCE_PART_IMPORTED, SOURCE_AUCTION}
+PART_REAL_MARKS = "Part real marks"
+DEMO_HISTORY_SOURCES = ("Demo marks", PART_REAL_MARKS, SYNTHETIC_HISTORY_SOURCE)
+REALISED_COMPLETE_SHARE = 0.98
+REALISED_HISTORY_MONTHS = 13
+AUCTION_MAX_AGE_DAYS = 10
+POWER_PRODUCT_ZONES = {"French Power Base": "France", "French Power Peak": "France",
+                       "German Power Base": "Germany-Luxembourg", "German Power Peak": "Germany-Luxembourg"}
+EUA_AUCTION_URL = "https://public.eex-group.com/eex/eua-auction-report/emission-spot-primary-market-auction-report-{year}-data.xlsx"
+
+
+def realised_months(series: pd.DataFrame, profile: str, timezone_name: str, today: date, months_back: int = REALISED_HISTORY_MONTHS) -> dict:
+    """{month: (average price, share of the month's delivery hours covered)} from published day-ahead prices.
+
+    A financial power contract settles on the day-ahead average, so every published hour is a real price.
+    """
+    if series is None or series.empty:
+        return {}
+    local = series["local"]
+    if str(profile).upper() == "PEAK":
+        keep = (local.dt.dayofweek < 5) & (local.dt.hour >= 8) & (local.dt.hour < 20)
+        series, local = series.loc[keep], local.loc[keep]
+    first = _add_months(date(today.year, today.month, 1), -int(months_back))
+    index = (local.dt.year * 12 + local.dt.month - 1).to_numpy()
+    lowest, highest = first.year * 12 + first.month - 1, today.year * 12 + today.month - 1
+    keep = (index >= lowest) & (index <= highest)
+    hours = series["hours"].to_numpy(float)[keep]
+    weighted = series["value"].to_numpy(float)[keep] * hours
+    sums = pd.DataFrame({"m": index[keep], "w": weighted, "h": hours}).groupby("m")[["w", "h"]].sum()
+    result = {}
+    for code, (total, covered) in zip(sums.index, sums.to_numpy()):
+        month = date(int(code) // 12, int(code) % 12 + 1, 1)
+        possible = delivery_hours(month, _add_months(month, 1), profile, timezone_name)
+        if covered > 0 and possible > 0:
+            result[month] = (float(total) / float(covered), min(float(covered) / possible, 1.0))
+    return result
+
+
+def compose_curve(product: str, base: pd.DataFrame, base_source: str, realised: dict, today: date,
+                  auction: Optional[tuple] = None) -> tuple[pd.DataFrame, dict]:
+    """The curve used for valuation, with each month's source. Real prices replace demo ones wherever they exist."""
+    spec = CURVE_PRODUCTS[product]
+    lookup = _curve_lookup(validate_curve(base))
+    sources = {month: base_source for month in lookup}
+    current = date(today.year, today.month, 1)
+    if product == "EUA Carbon" and base_source == SOURCE_DEMO and auction is not None:
+        # The futures curve is close to flat, so the latest auction price stands in for every month.
+        price = float(auction[0])
+        lookup = {month: price for month in sorted(set(lookup) | {current})}
+        sources = {month: SOURCE_AUCTION for month in lookup}
+    for month, (price, share) in sorted(realised.items()):
+        if month < current:
+            if share >= REALISED_COMPLETE_SHARE:
+                lookup[month], sources[month] = price, SOURCE_DAY_AHEAD
+        elif month == current:
+            if share >= REALISED_COMPLETE_SHARE:
+                lookup[month], sources[month] = price, SOURCE_DAY_AHEAD
+                continue
+            rest = lookup.get(month)
+            rest_source = sources.get(month)
+            if rest is None:
+                following = _add_months(month, 1)
+                rest, rest_source = lookup.get(following), sources.get(following)
+            if rest is not None:
+                lookup[month] = share * price + (1.0 - share) * float(rest)
+                sources[month] = SOURCE_PART_IMPORTED if rest_source in REAL_PRICE_SOURCES else SOURCE_PART_DEMO
+    months = sorted(lookup)
+    curve = pd.DataFrame({"delivery_month": months, "product": product, "price": [lookup[m] for m in months],
+                          "currency": spec["currency"], "unit": spec["unit"]})
+    return validate_curve(curve), sources
+
+
+def price_state(labels: Sequence[str]) -> str:
+    """Real when every price is real, Demo when none is, otherwise Part real."""
+    labels = list(labels)
+    if not labels:
+        return "None"
+    real = sum(1 for label in labels if label in REAL_PRICE_SOURCES)
+    partial = sum(1 for label in labels if label == SOURCE_PART_DEMO)
+    if real == len(labels):
+        return "Real"
+    if real == 0 and partial == 0:
+        return "Demo"
+    return "Part real"
+
+
+def trade_price_state(product: str, start: object, end: object, profile: str, sources: dict) -> str:
+    """Whether a trade's mark uses real prices, demo prices or both, month by month over its delivery."""
+    try:
+        spec = CURVE_PRODUCTS[product]
+        segments = _month_segments(_to_date(start), _to_date(end), str(profile or spec.get("profile", "BASE")).upper(), spec["timezone"])
+    except Exception:
+        return "None"
+    held = sources.get(product, {})
+    return price_state([held.get(month, "Missing") for month, _ in segments if month in held])
+
+
+def parse_eua_auctions(content: bytes) -> pd.DataFrame:
+    """Auction date and clearing price from EEX's yearly EUA auction report. Aviation (EUAA) auctions are left out."""
+    raw = pd.read_excel(io.BytesIO(content), header=None, dtype=str)
+    header_row = None
+    for index in range(min(len(raw), 30)):
+        cells = [str(v).strip().casefold() for v in raw.iloc[index].tolist()]
+        if "date" in cells and any("auction price" in c for c in cells):
+            header_row = index
+            break
+    if header_row is None:
+        raise ValueError("The auction report's layout wasn't recognised: no Date and Auction Price columns.")
+    frame = raw.iloc[header_row + 1:].copy()
+    frame.columns = [str(v).strip() for v in raw.iloc[header_row].tolist()]
+    price_col = next(c for c in frame.columns if "auction price" in c.casefold())
+    contract_col = next((c for c in frame.columns if c.casefold() in ("contract", "product")), None)
+    out = pd.DataFrame({"date": pd.to_datetime(frame["Date"], errors="coerce", dayfirst=True), "price": _number_series(frame[price_col])})
+    if contract_col:
+        contract = frame[contract_col].astype(str).str.strip().str.upper()
+        out = out.loc[~contract.str.startswith("EUAA").to_numpy()]
+    out = out.dropna()
+    out = out.loc[out["price"].between(1.0, 500.0)]
+    if out.empty:
+        raise ValueError("The auction report holds no usable prices.")
+    return out.groupby(out["date"].dt.date, as_index=False)["price"].mean().rename(columns={"date": "date"}).sort_values("date").reset_index(drop=True)
+
+
+def fetch_eua_auctions(today: Optional[date] = None, _http_fn=None) -> pd.DataFrame:
+    """EEX's public EUA primary auction results for this year, and last year's in January."""
+    today = today or date.today()
+    get = _http_fn or _http_get_bytes
+    frames, errors = [], []
+    for year in ([today.year, today.year - 1] if today.month == 1 else [today.year]):
+        try:
+            content, _ = get(EUA_AUCTION_URL.format(year=year))
+            frames.append(parse_eua_auctions(content))
+        except ImportError as exc:
+            raise RuntimeError("Reading the EEX auction report needs the openpyxl package: pip install openpyxl") from exc
+        except Exception as exc:
+            errors.append(f"{year}: {exc}")
+    if not frames:
+        raise RuntimeError("; ".join(errors) or "No auction report found.")
+    return pd.concat(frames, ignore_index=True).drop_duplicates("date").sort_values("date").reset_index(drop=True)
+
+
 # =============================================================================
 # SECTION 3 · SAVED DATA (SQLite)
 # Everything the desk needs tomorrow lives in one local database file.
@@ -3511,12 +3664,17 @@ def fx_rate(key: str) -> float:
     return float(st.session_state.get("settings", {}).get(key, DEFAULT_SETTINGS[key]))
 
 
-def set_fx_rate(key: str, value: float) -> None:
-    st.session_state.setdefault("settings", {})[key] = float(value)
+def set_fx_rate(key: str, value: float, ecb: bool = False) -> None:
+    """Save a rate. A rate typed in by hand marks the FX source as yours rather than the ECB's."""
+    settings = st.session_state.setdefault("settings", {})
+    settings[key] = float(value)
     _save(lambda s: s.set_setting(key, float(value)))
+    if not ecb and key in ("eur_per_gbp", "eur_per_usd"):
+        settings["fx_ecb_epoch"] = -1.0
+        _save(lambda s: s.set_setting("fx_ecb_epoch", -1.0))
 
 
-DEFAULT_SETTINGS = {"eur_per_gbp": 1.17, "eur_per_usd": 0.92, "auto_update": 1.0}
+DEFAULT_SETTINGS = {"eur_per_gbp": 1.17, "eur_per_usd": 0.92, "auto_update": 1.0, "fx_ecb_epoch": 0.0}
 
 
 # =============================================================================
@@ -3527,6 +3685,9 @@ DEFAULT_SETTINGS = {"eur_per_gbp": 1.17, "eur_per_usd": 0.92, "auto_update": 1.0
 HTTP_TIMEOUT_SECONDS = 25
 MAX_API_RESPONSE_BYTES = 20 * 1024 * 1024
 KEYS_FILE_NAME = "meridian_keys.toml"
+ENTSOE_WINDOW_DAYS = 360
+ENTSOE_GENERATION_WINDOW_DAYS = 31
+ENTSOE_FALLBACK_WINDOW_DAYS = 30
 RETRY_HTTP_CODES = {429, 500, 502, 503, 504}
 RETRY_WAIT_SECONDS = 1.5
 ENTSOE_MAX_DAYS = 1096
@@ -4550,7 +4711,7 @@ def fetch_entsoe_series(token: str, series_kind: str, zone_name: str,
                         _http_fn=None, progress=None) -> pd.DataFrame:
     """Fetch ENTSO-E day-ahead prices, actual load, generation or cross-border flow.
 
-    Long periods are split into 30-day requests and joined, so up to three years can be
+    Long periods are split into requests of up to 360 days and joined, so up to three years can be
     requested at once. A window with no published data is skipped rather than failing the rest.
     """
     if not token.strip():
@@ -4592,14 +4753,18 @@ def fetch_entsoe_series(token: str, series_kind: str, zone_name: str,
     # ENTSO-E expects UTC period boundaries in yyyyMMddHHmm format.
     zone = ZoneInfo(ENTSOE_ZONES.get(zone_name, {}).get("timezone", "Europe/Paris"))
     request_http = _http_fn or _http_get_bytes
-    windows = []
-    cursor = start_date
-    while cursor < end_date_exclusive:
-        following = min(cursor + timedelta(days=30), end_date_exclusive)
-        windows.append((cursor, following))
-        cursor = following
-    frames, no_data = [], ""
-    for index, (window_start, window_end) in enumerate(windows):
+    # ENTSO-E serves up to a year per request. Generation holds many series, so it uses shorter windows.
+    span = ENTSOE_GENERATION_WINDOW_DAYS if parser_kind == "generation" and document_type == "A75" else ENTSOE_WINDOW_DAYS
+
+    def split(first: date, last: date, days: int) -> list[tuple[date, date]]:
+        parts, cursor = [], first
+        while cursor < last:
+            following = min(cursor + timedelta(days=days), last)
+            parts.append((cursor, following))
+            cursor = following
+        return parts
+
+    def request(window_start: date, window_end: date):
         params = dict(base_params)
         params.update({
             "documentType": document_type,
@@ -4609,16 +4774,32 @@ def fetch_entsoe_series(token: str, series_kind: str, zone_name: str,
         })
         try:
             body, _ = request_http(ENTSOE_BASE, params=params, headers={"Accept": "application/xml, application/zip, */*"})
-            frames.append(parse_entsoe_xml(body, parser_kind))
+            return parse_entsoe_xml(body, parser_kind), ""
         except ProviderHTTPError as exc:
             message = _entsoe_error_message(exc)
             if "no matching data" not in message.casefold():
                 raise RuntimeError(message) from None
-            no_data = message
+            return None, message
         except RuntimeError as exc:
             if "no matching data" not in str(exc).casefold():
                 raise
-            no_data = str(exc)
+            return None, str(exc)
+
+    windows = split(start_date, end_date_exclusive, span)
+    frames, no_data = [], ""
+    for index, (window_start, window_end) in enumerate(windows):
+        try:
+            results = [request(window_start, window_end)]
+        except RuntimeError:
+            # If a long window is refused, ask again in month-sized pieces before giving up.
+            if (window_end - window_start).days <= ENTSOE_FALLBACK_WINDOW_DAYS:
+                raise
+            results = [request(a, b) for a, b in split(window_start, window_end, ENTSOE_FALLBACK_WINDOW_DAYS)]
+        for frame, message in results:
+            if frame is not None:
+                frames.append(frame)
+            elif message:
+                no_data = message
         if progress is not None:
             progress((index + 1) / len(windows))
     if not frames:
@@ -4932,6 +5113,15 @@ hr {{ border-color:{BORDER}; margin:1.2rem 0; }}
 .desk-note p {{ margin:0 0 0.7rem; font-size:inherit; line-height:inherit; }}
 .desk-note b {{ font-weight:600; font-family:{UI_FONT}; font-size:0.92em; white-space:nowrap; }}
 .desk-note .soft {{ color:{GRAY}; font-size:0.86em; }}
+.src-row {{ display:flex; flex-wrap:wrap; align-items:center; gap:0.4rem 0.45rem; margin:0.85rem 0 0.1rem; }}
+.src-title {{ font-family:{UI_FONT}; font-size:0.78rem; font-weight:600; color:{GRAY}; margin-right:0.25rem; }}
+.src {{ display:inline-flex; align-items:baseline; gap:0.35rem; padding:0.2rem 0.6rem; border-radius:999px; font-family:{UI_FONT}; font-size:0.78rem; color:{TEXT};
+        border:1px solid rgba(169,190,194,0.25); background:rgba(255,255,255,0.03); }}
+.src b {{ font-weight:700; font-size:0.72rem; }}
+.src.real b, .src.user b {{ color:{GAIN}; }} .src.real {{ border-color:rgba(70,200,150,0.45); }}
+.src.part b, .src.old b {{ color:{AMBER}; }} .src.part, .src.old {{ border-color:rgba(242,184,75,0.45); }}
+.src.demo b {{ color:{AMBER}; }} .src.demo {{ border-color:rgba(242,184,75,0.65); background:rgba(242,184,75,0.08); }}
+.src.missing b, .src.info b {{ color:{GRAY}; }}
 .desk-note ul {{ margin:0 0 0.7rem; padding-left:1.1em; list-style:disc; }}
 .desk-note li {{ margin:0 0 0.28rem; padding:0; font-size:1.12rem; line-height:1.38; color:{TEXT}; }}
 .desk-note li::marker {{ color:{GRAY}; }}
@@ -5239,19 +5429,6 @@ def kpi(col, label: str, value: str, sub: str = "", accent: str = "", tone: str 
                  f'<div class="v {tone}">{html.escape(value)}</div>{note}{bar}</div>', unsafe_allow_html=True)
 
 
-def curve_status_pill() -> str:
-    user_curves = st.session_state.get("custom_curves", {})
-    metadata = st.session_state.get("curve_metadata", {})
-    stale = sum(1 for p in user_curves if curve_state(p, user_curves, metadata, date.today())["state"] != "Current")
-    if stale:
-        return f'<span class="pill warn"><i></i>{stale} imported curve{"s" if stale > 1 else ""} out of date</span>'
-    if user_curves and len(user_curves) >= len(CURVE_PRODUCTS):
-        return '<span class="pill good"><i></i>Your imported marks</span>'
-    if user_curves:
-        return f'<span class="pill warn"><i></i>{len(user_curves)} of {len(CURVE_PRODUCTS)} curves imported</span>'
-    return '<span class="pill warn"><i></i>Demo marks, not market prices</span>'
-
-
 def render_header(title: str, subtitle: str) -> None:
     label = st.session_state.get("nav_page", DEFAULT_NAV_ITEM)
     icon = label.split("/", 1)[1].split(":", 1)[0] if label.startswith(":material/") else "bolt"
@@ -5259,7 +5436,9 @@ def render_header(title: str, subtitle: str) -> None:
         left, right = st.columns([5, 2], vertical_alignment="center")
         left.markdown(f'<div class="head-row"><div class="head-icon"><span aria-hidden="true">{html.escape(icon)}</span></div>'
                       f'<div><h1 class="page-title">{html.escape(title)}</h1><p class="page-sub">{html.escape(subtitle)}</p></div></div>', unsafe_allow_html=True)
-        right.markdown(f'<div style="text-align:right">{curve_status_pill()}</div>', unsafe_allow_html=True)
+        sources = page_sources_html(current_page_name())
+        if sources:
+            st.markdown(sources, unsafe_allow_html=True)
 
 
 def page_accent_css(label: str) -> str:
@@ -5397,6 +5576,8 @@ def init_session() -> None:
     st.session_state.curve_metadata = metadata
     st.session_state.live_data = live
     st.session_state.settings = settings
+    if float(settings.get("fx_ecb_epoch", 0.0)) > 0 and "fx_updated_at" not in st.session_state:
+        st.session_state.fx_updated_at = datetime.fromtimestamp(float(settings["fx_ecb_epoch"]), timezone.utc)
     if saved_trades is None:
         commit_trades(build_sample_trades())
     else:
@@ -5406,10 +5587,8 @@ def init_session() -> None:
 
 
 def build_curves() -> dict[str, pd.DataFrame]:
-    custom = st.session_state.get("custom_curves", {})
-    return {product: custom[product] if product in custom else make_sample_curve(product, valuation_date, months=DEMO_CURVE_MONTHS)
-            for product in CURVE_PRODUCTS}
-
+    """Imported marks, then free real prices, then demo prices for whatever is left. See composed_curves."""
+    return composed_curves()[0]
 
 def ensure_daily_snapshot() -> None:
     """Record today's marks the first time the desk opens each day. History builds by itself."""
@@ -5421,7 +5600,7 @@ def ensure_daily_snapshot() -> None:
         marked = curve_mark_date(metadata.get(product)) if product in custom else None
         if marked is not None and marked < valuation_date:
             continue
-        source = str(st.session_state.get("curve_metadata", {}).get(product, {}).get("source_label", "Demo marks")) if product in st.session_state.get("custom_curves", {}) else "Demo marks"
+        source = snapshot_source(product)
         _save(lambda s, c=curve, src=source: s.save_snapshot(valuation_date, c, src, replace=False))
     st.session_state.snapshot_day = valuation_date
     bump("snapshots")
@@ -5524,6 +5703,8 @@ def missing_keys_text() -> str:
 # =============================================================================
 UPDATE_DEFAULT_ZONES = ("France", "Germany-Luxembourg")
 PRICE_HISTORY_DAYS = 365
+# The estimate trains on 180 days and tests on 90, so older forecasts would never be used.
+FORECAST_HISTORY_DAYS = ESTIMATE_TRAIN_DAYS + ESTIMATE_TEST_DAYS + 14
 STALE_HOURS = {"prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0}
 KEEP_DAYS = {"prices": 400, "load": 90, "generation": 90, "lng": 400}
 MAX_UPDATE_WORKERS = 4
@@ -5649,7 +5830,7 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
                                           ("entsoe_renewable_forecast", "Wind and solar forecast", "Day-ahead wind and solar forecast")):
         for zone in price_zones:
             if zone in ZONE_WEATHER:
-                entsoe_task("prices", store_key, label, series_kind, zone, KEEP_DAYS["prices"], PRICE_HISTORY_DAYS, today + timedelta(days=2))
+                entsoe_task("prices", store_key, label, series_kind, zone, FORECAST_HISTORY_DAYS, FORECAST_HISTORY_DAYS, today + timedelta(days=2))
     for variant, item in _live_variants("entsoe_flow").items():
         meta = item.get("metadata", {})
         if meta.get("source_zone") in ENTSOE_ZONES and meta.get("target_zone") in ENTSOE_ZONES:
@@ -5712,13 +5893,22 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             _stored_live_item("weather_power_history", "Open-Meteo wind and solar history", frame, {"days": 430})
             return f"{frame['location'].nunique()} of {len(power_zones)} locations"
         tasks.append(UpdateTask("Wind and solar history", lambda: fetch_power_weather([ZONE_WEATHER[z] for z in power_zones]), apply_power_weather))
+    held_auctions = _live_dataset_frame("eex_eua_auctions")
+    auction_age = (today - pd.Timestamp(held_auctions["date"].iloc[-1]).date()).days if not held_auctions.empty and "date" in held_auctions.columns else None
+    if force or auction_age is None or (auction_age >= 1 and _needs_update("eex_eua_auctions", "prices", False)):
+        def apply_auctions(frame: pd.DataFrame) -> str:
+            _stored_live_item("eex_eua_auctions", "EEX EUA primary auction prices", frame, {"source": "EEX public auction report"})
+            last = frame.iloc[-1]
+            return f"{pd.Timestamp(last['date']):%d %b}: €{float(last['price']):.2f}/t"
+        tasks.append(UpdateTask("EUA auction prices", lambda: fetch_eua_auctions(today), apply_auctions))
     fx_age = st.session_state.get("fx_updated_at")
     if force or fx_age is None or (datetime.now(timezone.utc) - fx_age).total_seconds() / 3600.0 >= STALE_HOURS["fx"]:
         def apply_fx(outcome: tuple) -> str:
             (gbp_per_eur, _), (usd_per_eur, _) = outcome
-            set_fx_rate("eur_per_gbp", 1.0 / gbp_per_eur)
-            set_fx_rate("eur_per_usd", 1.0 / usd_per_eur)
+            set_fx_rate("eur_per_gbp", 1.0 / gbp_per_eur, ecb=True)
+            set_fx_rate("eur_per_usd", 1.0 / usd_per_eur, ecb=True)
             st.session_state.fx_updated_at = datetime.now(timezone.utc)
+            set_fx_rate("fx_ecb_epoch", st.session_state.fx_updated_at.timestamp(), ecb=True)
             for widget in ("risk_gbp", "risk_usd", "spread_gbp", "spread_usd", "pnl_fx", "data_fx"):
                 st.session_state.pop(widget, None)
             return f"EUR/GBP {gbp_per_eur:.4f}, EUR/USD {usd_per_eur:.4f}"
@@ -6002,6 +6192,285 @@ def winter_outlook() -> dict:
     return session_memo("winter_outlook", (data_version("live"), valuation_date),
                         lambda: project_winter(_live_dataset_frame("gie_agsi_history"), _live_dataset_frame("weather_archive"),
                                                _live_dataset_frame("weather_daily"), valuation_date))
+
+
+# =============================================================================
+# SECTION 6D · REAL OR DEMO: WHERE EACH PRICE ON A PAGE COMES FROM
+# =============================================================================
+def eua_auction_price() -> Optional[tuple]:
+    frame = _live_dataset_frame("eex_eua_auctions")
+    if frame.empty or not {"date", "price"}.issubset(frame.columns):
+        return None
+    last = frame.iloc[-1]
+    day = pd.Timestamp(last["date"]).date()
+    return (float(last["price"]), day) if (valuation_date - day).days <= AUCTION_MAX_AGE_DAYS else None
+
+
+def book_months() -> dict:
+    """{product: delivery months held}, so past months are only added where a trade needs them."""
+    trades = st.session_state.get("trades")
+    held: dict = {}
+    if trades is None or trades.empty:
+        return held
+    for row in trades.to_dict("records"):
+        if str(row.get("status", "")).upper() in ("CANCELLED", "EXPIRED") or row.get("product") not in CURVE_PRODUCTS:
+            continue
+        try:
+            spec = CURVE_PRODUCTS[row["product"]]
+            segments = _month_segments(_to_date(row["delivery_start"]), _to_date(row["delivery_end"]), str(row.get("profile") or "BASE").upper(), spec["timezone"])
+        except Exception:
+            continue
+        held.setdefault(row["product"], set()).update(month for month, _ in segments)
+    return held
+
+
+def composed_curves() -> tuple[dict, dict]:
+    """Every curve with real prices put in wherever a free source has them, and each month's source."""
+    def build() -> tuple[dict, dict]:
+        custom = st.session_state.get("custom_curves", {})
+        needed = book_months()
+        current = date(valuation_date.year, valuation_date.month, 1)
+        auction = eua_auction_price()
+        curves_, sources = {}, {}
+        for product in CURVE_PRODUCTS:
+            base = custom[product] if product in custom else make_sample_curve(product, valuation_date, months=DEMO_CURVE_MONTHS)
+            realised = {}
+            zone = POWER_PRODUCT_ZONES.get(product)
+            if zone:
+                spec = PRODUCTS[product]
+                realised = realised_months(zone_prices(zone), spec["profile"], spec["timezone"], valuation_date)
+                # Past months only where the book delivers in them, so forward views still start this month.
+                realised = {m: v for m, v in realised.items() if m >= current or m in needed.get(product, set())}
+            try:
+                curves_[product], sources[product] = compose_curve(product, base, SOURCE_IMPORTED if product in custom else SOURCE_DEMO, realised, valuation_date, auction)
+            except Exception:
+                curves_[product] = validate_curve(base)
+                sources[product] = {m: SOURCE_IMPORTED if product in custom else SOURCE_DEMO for m in curves_[product]["delivery_month"]}
+        return curves_, sources
+    return session_memo("composed_curves", (data_version("live", "curves", "trades"), valuation_date), build)
+
+
+def curve_sources() -> dict:
+    return composed_curves()[1]
+
+
+def product_price_state(product: str) -> str:
+    state = price_state(curve_sources().get(product, {}).values())
+    if state == "Real" and product in st.session_state.get("custom_curves", {}):
+        status = curve_state(product, st.session_state["custom_curves"], st.session_state.get("curve_metadata", {}), valuation_date)
+        if status["state"] != "Current":
+            return "Old"
+    return state
+
+
+def snapshot_source(product: str) -> str:
+    """How a day's saved marks are labelled, so history built on demo prices is never mistaken for real."""
+    state = product_price_state(product)
+    if product in st.session_state.get("custom_curves", {}) and state in ("Real", "Old"):
+        return curve_source_label(product)
+    return {"Real": "Free real prices", "Part real": PART_REAL_MARKS}.get(state, "Demo marks")
+
+
+SHORT_NAMES = {"TTF Natural Gas": "TTF", "NBP Natural Gas": "NBP", "German Power Base": "German base", "German Power Peak": "German peak",
+               "French Power Base": "French base", "French Power Peak": "French peak", "EUA Carbon": "EUA", "API2 Coal": "API2 coal"}
+
+
+def _names(products: Sequence[str]) -> str:
+    names = [SHORT_NAMES.get(p, p) for p in products]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def price_warning(products: Sequence[str]) -> str:
+    """One sentence naming the curves a result relies on that aren't fully real and current."""
+    states = {p: product_price_state(p) for p in dict.fromkeys(products)}
+    demo = [p for p, s in states.items() if s == "Demo"]
+    part = [p for p, s in states.items() if s == "Part real"]
+    old = [p for p, s in states.items() if s == "Old"]
+    parts = []
+    if demo:
+        parts.append(f"{_names(demo)} {'uses' if len(demo) == 1 else 'use'} demo prices")
+    if part:
+        parts.append(f"{_names(part)} {'uses' if len(part) == 1 else 'use'} real day-ahead prices for delivered days but demo prices for later months")
+    if old:
+        parts.append(f"{_names(old)} {'has' if len(old) == 1 else 'have'} out-of-date imported marks")
+    return ("; ".join(parts) + ". Results that depend on these are illustrations, not market values.") if parts else ""
+
+
+def book_products() -> list[str]:
+    trades = st.session_state.get("trades")
+    if trades is None or trades.empty:
+        return []
+    active = trades.loc[~trades["status"].astype(str).str.upper().isin(["CANCELLED", "EXPIRED"])]
+    return sorted(active["product"].dropna().astype(str).unique())
+
+
+# ---- inputs a page can declare: each returns (state, text) pairs ------------------
+def _latest(frame: pd.DataFrame, columns: Sequence[str]) -> Optional[date]:
+    column = _find_column(frame, columns) if not frame.empty else None
+    if not column:
+        return None
+    stamps = pd.to_datetime(frame[column], errors="coerce", utc=True).dropna()
+    return stamps.max().date() if not stamps.empty else None
+
+
+def src_spot() -> list:
+    zones = [z for z in _live_variants("entsoe_price") if z in ENTSOE_ZONES]
+    if not zones:
+        return [("missing", "ENTSO-E day-ahead prices")]
+    last = max(zone_prices(z)["local"].max() for z in zones if not zone_prices(z).empty) if any(not zone_prices(z).empty for z in zones) else None
+    return [("real", f"ENTSO-E day-ahead prices{f' to {last:%d %b}' if last is not None else ''}")]
+
+
+def src_power_system() -> list:
+    loaded = bool(_live_variants("entsoe_load")) or bool(_live_variants("entsoe_generation"))
+    return [("real", "ENTSO-E load and generation")] if loaded else [("missing", "ENTSO-E load and generation")]
+
+
+def src_forecasts() -> list:
+    return [("real", "ENTSO-E load, wind and solar forecasts")] if _live_variants("entsoe_load_forecast") else [("missing", "ENTSO-E forecasts")]
+
+
+def src_storage() -> list:
+    last = _latest(_live_dataset_frame("gie_agsi_history"), ("gasDayStart", "observation_date", "gas_day"))
+    return [("real", f"GIE storage to {last:%d %b}")] if last else [("missing", "GIE storage")]
+
+
+def src_lng() -> list:
+    last = _latest(_live_dataset_frame("gie_alsi"), ("gasDayStart", "observation_date", "gas_day"))
+    return [("real", f"GIE LNG to {last:%d %b}")] if last else [("missing", "GIE LNG")]
+
+
+def src_weather() -> list:
+    return [("real", "Open-Meteo weather")] if not _live_dataset_frame("weather_daily").empty else [("missing", "Open-Meteo weather")]
+
+
+def src_flows() -> list:
+    return [("real", "ENTSO-E and ENTSOG flows")] if _live_variants("entsoe_flow") or _live_variants("entsog") else []
+
+
+def src_fx() -> list:
+    stamp = float(st.session_state.get("settings", {}).get("fx_ecb_epoch", 0.0))
+    if stamp > 0:
+        return [("real", f"ECB FX rates of {datetime.fromtimestamp(stamp, timezone.utc):%d %b}")]
+    if stamp < 0:
+        return [("user", "FX rates set by you")]
+    return [("demo", "Default FX rates")]
+
+
+def src_book() -> list:
+    trades = st.session_state.get("trades")
+    if trades is None or trades.empty:
+        return [("missing", "Trades")]
+    demo = trades["counterparty"].astype(str).str.contains("(Demo)", regex=False)
+    count = lambda n, word: f"{n} {word}{'s' if n != 1 else ''}"
+    if demo.all():
+        return [("demo", f"{count(len(trades), 'sample trade')}, not yours")]
+    if demo.any():
+        return [("user", f"{count(int((~demo).sum()), 'trade')} of yours"), ("demo", count(int(demo.sum()), "sample trade"))]
+    return [("user", f"{count(len(trades), 'trade')} of yours")]
+
+
+def src_curves(products: Sequence[str]) -> list:
+    groups: dict = {}
+    for product in dict.fromkeys(products):
+        groups.setdefault(product_price_state(product), []).append(product)
+    out = []
+    real = groups.get("Real", [])
+    if real:
+        labels = {label for p in real for label in curve_sources()[p].values()}
+        how = "auction price" if labels == {SOURCE_AUCTION} else "imported marks" if labels <= {SOURCE_IMPORTED} else "real marks"
+        out.append(("real", f"{_names(real)} {how}"))
+    if groups.get("Part real"):
+        out.append(("part", f"{_names(groups['Part real'])}: day-ahead for delivered days, demo after"))
+    if groups.get("Old"):
+        out.append(("old", f"{_names(groups['Old'])} imported marks"))
+    if groups.get("Demo"):
+        out.append(("demo", f"{_names(groups['Demo'])} forward prices"))
+    return out
+
+
+def src_book_curves() -> list:
+    return src_curves(book_products()) if book_products() else []
+
+
+def src_history() -> list:
+    history = saved_snapshots()
+    held = book_products()
+    if history.empty or not held:
+        return [("missing", "Saved price history")]
+    part = history.loc[history["product"].isin(held)]
+    by_day = part.groupby("snapshot_date")["source"].agg(lambda s: "demo" if s.isin(("Demo marks", SYNTHETIC_HISTORY_SOURCE)).any() else "part" if s.eq(PART_REAL_MARKS).any() else "real")
+    counts = by_day.value_counts()
+    out = []
+    for state, text in (("real", "real"), ("part", "part real"), ("demo", "demo")):
+        if counts.get(state, 0):
+            out.append((state, f"{int(counts[state])} day{'s' if counts[state] > 1 else ''} of {text} price history"))
+    return out
+
+
+def src_read_curves() -> list:
+    fresh = fresh_curves(st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {}), valuation_date)
+    if fresh:
+        return [("real", f"{_names(sorted(fresh))} imported marks")]
+    return [("info", "Curve signals off: they only use real forward marks")]
+
+
+ALL_PRICED = tuple(CURVE_PRODUCTS)
+PAGE_SOURCES = {
+    "Market Overview": lambda: src_book() + src_curves(list(dict.fromkeys(book_products() + ["TTF Natural Gas", "French Power Base", "German Power Base"]))) + src_spot() + src_storage() + src_weather(),
+    "Morning Brief": lambda: src_spot() + src_storage() + src_weather() + src_book() + src_book_curves() + src_history(),
+    "Market Read": lambda: src_storage() + src_lng() + src_weather() + src_spot() + src_power_system() + src_read_curves(),
+    "Market Fundamentals": lambda: src_storage() + src_lng() + src_weather() + src_spot() + src_power_system() + src_flows(),
+    "Power Spot": lambda: src_spot() + src_weather() + src_forecasts(),
+    "Spreads & Margins": lambda: src_curves([p for p in CURVE_PRODUCTS if p != "NBP Natural Gas"]) + src_fx(),
+    "Forward Curves": lambda: src_curves(ALL_PRICED),
+    "OTC Quote Builder": lambda: src_curves(list(PRODUCTS)),
+    "Trading Book & MtM": lambda: src_book() + src_book_curves() + src_fx(),
+    "Daily P&L": lambda: src_book() + src_history() + src_fx(),
+    "Risk & Exposure": lambda: src_book() + src_curves(list(dict.fromkeys(book_products() + ["TTF Natural Gas", "EUA Carbon"]))) + src_history() + src_fx(),
+    "Hedge Advisor": lambda: src_book() + src_book_curves() + src_history(),
+    "Physical Operations": lambda: src_book(),
+    "Live Data Integrations": lambda: src_spot() + src_power_system() + src_storage() + src_lng() + src_weather() + src_fx(),
+    "Data & Assumptions": lambda: src_curves(ALL_PRICED) + src_fx(),
+    "Model Validation": lambda: [("info", "Built-in test data, not market prices")],
+}
+SOURCE_LABELS = {"real": "Real", "part": "Part real", "demo": "Demo", "old": "Old", "missing": "Not loaded", "user": "Yours", "info": "Note"}
+
+
+def page_sources_html(page: str) -> str:
+    settings = st.session_state.get("settings", {})
+    key = (data_version("live", "curves", "trades", "snapshots"), valuation_date, settings.get("fx_ecb_epoch"))
+    return session_memo(f"sources|{page}", key, lambda: _page_sources_html(page))
+
+
+def _page_sources_html(page: str) -> str:
+    builder = PAGE_SOURCES.get(page)
+    if builder is None:
+        return ""
+    try:
+        items = builder()
+    except Exception:
+        return ""
+    order = {"real": 0, "user": 1, "part": 2, "old": 3, "demo": 4, "missing": 5, "info": 6}
+    chips = "".join(f'<span class="src {state}"><b>{SOURCE_LABELS[state]}</b>{html.escape(text)}</span>'
+                    for state, text in sorted(items, key=lambda item: order.get(item[0], 9)))
+    return f'<div class="src-row"><span class="src-title">Data on this page</span>{chips}</div>'
+
+
+def current_page_name() -> str:
+    label = st.session_state.get("nav_page", DEFAULT_NAV_ITEM)
+    return label.split("  ", 1)[1].strip() if "  " in label else label
+
+
+def prices_used_lines(products: Sequence[str]) -> list[tuple[str, str]]:
+    """(product, how it's priced) for the brief and its PDF."""
+    lines = []
+    for product in dict.fromkeys(products):
+        state = product_price_state(product)
+        detail = {"Real": "real prices", "Part real": "real day-ahead for delivered days, demo prices for later months",
+                  "Old": "real but out-of-date imported marks", "Demo": "demo prices"}.get(state, state)
+        lines.append((product, detail))
+    return lines
 # =============================================================================
 # SECTION 7 · MODEL CHECKS
 # =============================================================================
@@ -6677,14 +7146,25 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
 
     def check_long_fetch_is_chunked() -> str:
         windows = []
-        def fake_http(url, params=None, headers=None):
-            windows.append(params["periodStart"])
-            return (f'<Publication_MarketDocument xmlns="urn:x"><TimeSeries><Period><timeInterval><start>{params["periodStart"][:4]}-{params["periodStart"][4:6]}-{params["periodStart"][6:8]}T{params["periodStart"][8:10]}:00Z</start></timeInterval>'
+        def fake_http(url, params=None, headers=None, refuse_long=False):
+            start, end = (datetime.strptime(params[k], "%Y%m%d%H%M") for k in ("periodStart", "periodEnd"))
+            windows.append((end - start).days)
+            if refuse_long and (end - start).days > 40:
+                raise RuntimeError("Too long a period")
+            return (f'<Publication_MarketDocument xmlns="urn:x"><TimeSeries><Period><timeInterval><start>{start:%Y-%m-%dT%H:%MZ}</start><end>{start + timedelta(hours=1):%Y-%m-%dT%H:%MZ}</end></timeInterval>'
                     f'<resolution>PT60M</resolution><Point><position>1</position><price.amount>{len(windows)}</price.amount></Point></Period></TimeSeries></Publication_MarketDocument>').encode(), "text/xml"
-        frame = fetch_entsoe_series("test", "Day-ahead price", "France", date(2026, 1, 1), date(2026, 4, 1), _http_fn=fake_http)
-        if len(windows) != 3 or len(frame) != 3:
-            raise AssertionError(f"Expected three 30-day requests, got {len(windows)}.")
-        return "A 90-day request is split into three windows and joined into one series."
+        frame = fetch_entsoe_series("test", "Day-ahead price", "France", date(2025, 1, 1), date(2027, 1, 1), _http_fn=fake_http)
+        if len(windows) != 3 or max(windows) > 361 or len(frame) != 3:
+            raise AssertionError(f"Two years should take three requests of up to 360 days, got {windows}.")
+        windows.clear()
+        fetch_entsoe_series("test", "Actual generation by type", "France", date(2026, 1, 1), date(2026, 4, 1), _http_fn=fake_http)
+        if len(windows) != 3 or max(windows) > 32:
+            raise AssertionError(f"Generation should use month-sized requests, got {windows}.")
+        windows.clear()
+        frame = fetch_entsoe_series("test", "Day-ahead price", "France", date(2026, 1, 1), date(2026, 4, 1), _http_fn=lambda u, params=None, headers=None: fake_http(u, params, headers, refuse_long=True))
+        if windows[0] < 80 or len(windows) != 4 or max(windows[1:]) > 31 or len(frame) != 3:
+            raise AssertionError(f"A refused long request should be retried in 30-day pieces, got {windows}.")
+        return "Two years take three requests of up to 360 days, generation uses month-sized requests, and a refused long request is retried in 30-day pieces."
 
     def check_tenors_and_month_end() -> str:
         if contract_window("Q1-27") != (date(2027, 1, 1), date(2027, 4, 1)):
@@ -7296,9 +7776,6 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             raise AssertionError("Curve status is wrong.")
         if set(fresh_curves(custom, {**meta, "EUA Carbon": {"curve_date": "2026-10-01"}}, today)) != {"TTF Natural Gas"}:
             raise AssertionError("Old marks must not count as today's evidence.")
-        note = curve_warning(["TTF Natural Gas", "EUA Carbon", "API2 Coal"], custom, meta, today)
-        if "API2 Coal uses demo" not in note or "EUA Carbon (9 days old)" not in note or "TTF" in note:
-            raise AssertionError(f"Warning names the wrong curves: {note}")
         month = date(2026, 12, 1)
         rows = pd.DataFrame({"snapshot_date": ["2026-11-03", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-05"], "product": ["TTF Natural Gas", "EUA Carbon", "EUA Carbon", "TTF Natural Gas", "EUA Carbon"],
                              "delivery_month": [month.isoformat()] * 5, "price": [30.0, 70.0, 71.0, 33.0, 72.0], "source": "x"})
@@ -7308,7 +7785,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         history = pnl_history(book_buckets(trade), lookups, 1.17)
         assert_close(float(history["pnl_eur"].iloc[0]), 0.0)
         assert_close(float(history["pnl_eur"].iloc[1]), 3.0 * 744.0)
-        return "Curve status and warnings are right, and a product missing for a day keeps its last marks: 0 P&L that day, then the full 3.00 move on 744 MWh."
+        return "Curve status is right, and a product missing for a day keeps its last marks: 0 P&L that day, then the full 3.00 move on 744 MWh."
 
     def check_track_scoring() -> str:
         low, high = wilson_interval(50, 100)
@@ -7402,7 +7879,6 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             raise AssertionError("Emptier storage must never draw faster.")
         if model["r2"] < 0.8:
             raise AssertionError(f"The model should explain a clean rule: {model['r2']}")
-        start = pd.Timestamp(2020, 11, 1)
         days = pd.date_range("2020-11-02", "2021-03-31", freq="D")
         one = simulate_fill(model, 80.0, days, hdd.reindex(days).to_numpy())
         two = simulate_fill(model, 80.0, days, hdd.reindex(days).to_numpy() + 1.0)
@@ -7691,6 +8167,69 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             raise AssertionError("A change from hourly to 15-minute prices must keep both periods.")
         return "Only the official SDAC auction is kept, in any order. Unlabelled zones are kept, overlapping resolutions don't count twice, and a change of resolution loses no days."
 
+
+    def check_real_marks() -> str:
+        day = pd.date_range("2026-10-01", "2026-11-11", freq="15min", tz="Europe/Paris", inclusive="left")
+        prices = pd.DataFrame({"local": day, "value": np.where((day.hour >= 8) & (day.hour < 20) & (day.dayofweek < 5), 120.0, 60.0), "hours": 0.25})
+        today = date(2026, 11, 10)
+        base = realised_months(prices, "BASE", "Europe/Paris", today)
+        peak = realised_months(prices, "PEAK", "Europe/Paris", today)
+        assert_close(base[date(2026, 10, 1)][1], 1.0)
+        weekdays = int(np.busday_count(date(2026, 10, 1), date(2026, 11, 1)))
+        assert_close(base[date(2026, 10, 1)][0], (120.0 * weekdays * 12 + 60.0 * (745 - weekdays * 12)) / 745.0, 1e-6)
+        assert_close(peak[date(2026, 10, 1)][0], 120.0)
+        assert_close(base[date(2026, 11, 1)][1], 240.0 / 720.0)
+        demo = make_sample_curve("French Power Base", today, 12)
+        curve, sources = compose_curve("French Power Base", demo, SOURCE_DEMO, base, today)
+        lookup = _curve_lookup(curve)
+        next_demo = _curve_lookup(validate_curve(demo))[date(2026, 12, 1)]
+        share, realised = base[date(2026, 11, 1)][1], base[date(2026, 11, 1)][0]
+        assert_close(lookup[date(2026, 11, 1)], share * realised + (1 - share) * next_demo)
+        if sources[date(2026, 10, 1)] != SOURCE_DAY_AHEAD or sources[date(2026, 11, 1)] != SOURCE_PART_DEMO or sources[date(2026, 12, 1)] != SOURCE_DEMO:
+            raise AssertionError(f"Wrong month sources: {sources}")
+        if price_state(sources.values()) != "Part real" or price_state([SOURCE_DEMO]) != "Demo" or price_state([SOURCE_DAY_AHEAD, SOURCE_IMPORTED]) != "Real":
+            raise AssertionError("Price state summary is wrong.")
+        if trade_price_state("French Power Base", "2026-10-01", "2026-11-01", "BASE", {"French Power Base": sources}) != "Real":
+            raise AssertionError("A trade that delivered in October should be marked on real prices.")
+        if trade_price_state("French Power Base", "2026-10-01", "2027-01-01", "BASE", {"French Power Base": sources}) != "Part real":
+            raise AssertionError("A trade spanning delivered and future months is part real.")
+        imported = demo.assign(price=100.0)
+        _, mixed = compose_curve("French Power Base", imported, SOURCE_IMPORTED, base, today)
+        if mixed[date(2026, 11, 1)] != SOURCE_PART_IMPORTED or price_state(mixed.values()) != "Real":
+            raise AssertionError("Day-ahead plus imported marks are fully real.")
+        eua, eua_sources = compose_curve("EUA Carbon", make_sample_curve("EUA Carbon", today, 12), SOURCE_DEMO, {}, today, (81.5, date(2026, 11, 9)))
+        if set(eua["price"]) != {81.5} or set(eua_sources.values()) != {SOURCE_AUCTION} or date(2026, 11, 1) not in eua_sources:
+            raise AssertionError("The auction price should replace demo EUA marks.")
+        _, kept = compose_curve("EUA Carbon", make_sample_curve("EUA Carbon", today, 12).assign(price=70.0), SOURCE_IMPORTED, {}, today, (81.5, date(2026, 11, 9)))
+        if set(kept.values()) != {SOURCE_IMPORTED}:
+            raise AssertionError("Imported EUA marks must not be replaced by the auction price.")
+        trades = normalise_trades(pd.DataFrame([{"trade_id": "R", "trade_date": "2026-09-20", "product": "French Power Base", "instrument": "SWAP", "settlement_type": "FINANCIAL",
+                                                 "side": "BUY_FIXED", "delivery_start": "2026-10-01", "delivery_end": "2026-11-01", "profile": "BASE", "quantity_mw": 1.0,
+                                                 "trade_price": 80.0, "currency": "EUR", "status": "EXECUTED", "counterparty": "X"}]))
+        marked = mark_trades_resilient(trades, {**{p: make_sample_curve(p, today, 12) for p in CURVE_PRODUCTS}, "French Power Base": curve})
+        assert_close(float(marked["mtm"].iloc[0]), (base[date(2026, 10, 1)][0] - 80.0) * 745.0, 1e-3)
+        return "October settles on its day-ahead average, November blends delivered days with demo prices, an October trade values on real prices, and the EUA auction replaces only demo marks."
+
+    def check_eua_auction_file() -> str:
+        if __import__("importlib.util").util.find_spec("openpyxl") is None:
+            return "Skipped: openpyxl isn't installed, so the auction report can't be read here."
+        rows = [["EEX EUA Primary Auction"], [], ["Date", "Auction Name", "Contract", "Status", "Auction Price €/tCO2", "Auction Volume tCO2"],
+                ["03/11/2026", "EU, 4th period", "EUA", "Ok", "79,10", "3000000"], ["04/11/2026", "EU, 4th period", "EUAA", "Ok", "70.00", "500000"],
+                ["05/11/2026", "DE, 4th period", "EUA", "Ok", "80.40", "2000000"], ["05/11/2026", "EU, 4th period", "EUA", "Ok", "80.60", "2000000"]]
+        buffer = io.BytesIO()
+        pd.DataFrame(rows).to_excel(buffer, header=False, index=False)
+        frame = parse_eua_auctions(buffer.getvalue())
+        if frame["date"].tolist() != [date(2026, 11, 3), date(2026, 11, 5)]:
+            raise AssertionError(f"Wrong auction days: {frame}")
+        assert_close(float(frame["price"].iloc[0]), 79.10)
+        assert_close(float(frame["price"].iloc[1]), 80.50)
+        try:
+            buffer = io.BytesIO()
+            pd.DataFrame([["nothing"]]).to_excel(buffer, header=False, index=False)
+            parse_eua_auctions(buffer.getvalue())
+        except ValueError:
+            return "Header rows are found, aviation auctions are left out, French decimals are read and same-day auctions are averaged. An unknown layout is refused."
+        raise AssertionError("An unknown layout should be refused.")
     cases = [
         ("Product registry and market timezones", "Configuration", check_product_registry),
         ("MWh ↔ MMBtu conversions", "Units & conversions", check_energy_conversion),
@@ -7758,6 +8297,8 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Seasonal storage and degree-day normals", "Fundamentals analytics", check_storage_season_and_hdd),
         ("ECB and weather archive parsers", "Live API integration", check_ecb_and_archive_parsers),
         ("Only the official day-ahead auction is used", "Live data parser", check_two_auctions),
+        ("Real day-ahead and auction prices replace demo marks", "Market data", check_real_marks),
+        ("EUA auction report", "Live data parser", check_eua_auction_file),
         ("Related signals share one weight", "Market Read", check_signal_themes),
         ("Nuclear output signal", "Market Read", check_nuclear_signal),
         ("Demand weights for heating", "Market Read", check_demand_weights),
@@ -7807,19 +8348,22 @@ def fx_controls(prefix: str) -> tuple[float, float]:
         try:
             gbp_per_eur, day = fetch_ecb_rate("GBP")
             usd_per_eur, _ = fetch_ecb_rate("USD")
-            set_fx_rate("eur_per_gbp", 1.0 / gbp_per_eur)
-            set_fx_rate("eur_per_usd", 1.0 / usd_per_eur)
+            set_fx_rate("eur_per_gbp", 1.0 / gbp_per_eur, ecb=True)
+            set_fx_rate("eur_per_usd", 1.0 / usd_per_eur, ecb=True)
+            set_fx_rate("fx_ecb_epoch", datetime.now(timezone.utc).timestamp(), ecb=True)
+            st.session_state.fx_updated_at = datetime.now(timezone.utc)
             for suffix in ("gbp", "usd"):
                 st.session_state.pop(f"{prefix}_{suffix}", None)
             st.session_state["flash_message"] = f"Using ECB reference rates from {day}."
             st.rerun()
         except Exception as exc:
             st.error(f"Could not get ECB rates: {exc}")
-    if abs(gbp - fx_rate("eur_per_gbp")) > 1e-9:
+    # The boxes show four decimals, so only a change beyond that rounding is a rate typed in by hand.
+    if abs(gbp - fx_rate("eur_per_gbp")) > 0.00005:
         set_fx_rate("eur_per_gbp", gbp)
-    if abs(usd - fx_rate("eur_per_usd")) > 1e-9:
+    if abs(usd - fx_rate("eur_per_usd")) > 0.00005:
         set_fx_rate("eur_per_usd", usd)
-    return gbp, usd
+    return fx_rate("eur_per_gbp"), fx_rate("eur_per_usd")
 
 
 def contract_picker(prefix: str, product: str) -> tuple[date, date, str, str]:
@@ -7857,8 +8401,13 @@ def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float], re
         if pnl_today is not None:
             item += f', <b class="{tone_of(pnl_today)}">{fmt_money(pnl_today)}</b> on the day'
         held = executed_buckets()
-        if not held.empty and curve_warning(sorted(held["product"].unique()), st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {}), valuation_date):
-            item += ", valued on demo or old prices"
+        state = {product_price_state(p) for p in held["product"].unique()} if not held.empty else set()
+        if state & {"Demo", "Old"}:
+            item += ", valued partly or fully on demo prices" if "Real" in state or "Part real" in state else ", valued on demo prices"
+        elif "Part real" in state:
+            item += ", valued on real day-ahead for delivered days and demo prices after"
+        if src_book()[0][0] == "demo":
+            item += ". These are the sample trades, not yours"
         today_items.append(item)
     else:
         today_items.append("Book: no executed trades yet")
@@ -7927,8 +8476,8 @@ def page_market_overview():
     with chart_col:
         names = ["TTF Natural Gas", "French Power Base", "German Power Base"]
         frame = pd.concat([curves[n].assign(delivery_month=lambda f: pd.to_datetime(f["delivery_month"])) for n in names], ignore_index=True)
-        frame = frame.loc[frame["delivery_month"].lt(pd.Timestamp(_add_months(valuation_date, 25)))]
-        fig = px.line(frame, x="delivery_month", y="price", color="product", title="Forward curves, EUR/MWh" + (" (demo prices)" if any(p not in st.session_state.get("custom_curves", {}) for p in frame["product"].unique()) else ""),
+        frame = frame.loc[frame["delivery_month"].lt(pd.Timestamp(_add_months(valuation_date, 25))) & frame["delivery_month"].ge(pd.Timestamp(valuation_date.replace(day=1)))]
+        fig = px.line(frame, x="delivery_month", y="price", color="product", title="Forward curves, EUR/MWh" + (lambda st_: " (demo prices)" if st_ == {"Demo"} else " (partly demo prices)" if "Demo" in st_ or "Part real" in st_ else " (real prices)")({product_price_state(p) for p in names}),
                       labels={"delivery_month": "", "price": "", "product": ""})
         chart(fig, 290)
 
@@ -8012,7 +8561,10 @@ def page_power_spot():
         for failure in failures:
             st.error(failure)
     loaded = {z: zone_prices(z) for z in _live_variants("entsoe_price") if z in ENTSOE_ZONES}
-    active = {z: s for z, s in loaded.items() if z in selected and not s.empty}
+    # The period chooses what is shown, not only what is fetched: the update holds a year of prices.
+    first_day = date.today() - timedelta(days=int(horizon))
+    active = {z: s.loc[s["local"].dt.date > first_day] for z, s in loaded.items() if z in selected and not s.empty}
+    active = {z: s for z, s in active.items() if not s.empty}
     if not active:
         need_data_note("Choose your zones and select Fetch prices to load day-ahead data from ENTSO-E.")
         return
@@ -8022,7 +8574,7 @@ def page_power_spot():
         k = spot_kpis(series)
         rows.append({"Zone": zone, "Base avg": k["base"], "Peak avg": k["peak"], "Peak minus base": k["peak_minus_base"], "Low": k["low"], "High": k["high"],
                      "Negative hours": k["negative_hours"], "Hourly volatility": k["volatility"], "Hours": k["hours"]})
-    st.caption(f"EUR/MWh. Peak is weekdays 08:00 to 20:00 local time. Averages are weighted by time, so 15-minute and hourly data compare fairly. Data through {max(s['local'].max() for s in active.values()):%d %b %Y}.")
+    st.caption(f"EUR/MWh. Peak is weekdays 08:00 to 20:00 local time. Averages are weighted by time, so 15-minute and hourly data compare fairly. Showing {min(s['local'].min() for s in active.values()):%d %b %Y} to {max(s['local'].max() for s in active.values()):%d %b %Y}. A zone with less history covers a shorter span.")
     table(pd.DataFrame(rows))
 
     tabs = view_tabs(["Prices", "Daily shape", "Heatmap", "Duration curve", "Zone spread", "Wind and solar capture", "Next-day estimate"])
@@ -8113,9 +8665,9 @@ def page_power_spot():
 
 def page_spreads():
     title_block("Spreads and margins", "What a gas or coal plant earns on the forward curve, and the location, shape and hub spreads around it.")
-    missing_imports = [p for p in ("EUA Carbon", "API2 Coal") if p not in st.session_state.get("custom_curves", {})]
-    if missing_imports:
-        st.caption(f"{' and '.join(missing_imports)} use demo marks until you import real curves in Forward Curves.")
+    note = price_warning([p for p in CURVE_PRODUCTS if p != "NBP Natural Gas"])
+    if note:
+        st.warning(note)
     tab_margin, tab_other, tab_history = view_tabs(["Clean spark and dark", "Location, shape and hub", "History"])
     if tab_margin:
         c1, c2 = st.columns(2)
@@ -8197,7 +8749,8 @@ def page_forward_curves():
     spec = CURVE_PRODUCTS[selected]
     curve = validate_curve(curves[selected])
     curve["delivery_month"] = pd.to_datetime(curve["delivery_month"])
-    first = curve.iloc[0]
+    after_current = curve.loc[curve["delivery_month"] > pd.Timestamp(valuation_date.replace(day=1))]
+    first = after_current.iloc[0] if not after_current.empty else curve.iloc[0]
     c1, c2, c3, c4 = st.columns(4)
     kpi(c1, f"Front month, {first['delivery_month']:%b %Y}", f"{float(first['price']):,.2f}", spec["unit"])
     kpi(c2, "Curve average", f"{curve['price'].mean():,.2f}", spec["unit"])
@@ -8216,12 +8769,18 @@ def page_forward_curves():
     fig.update_layout(title=f"{selected}, {spec['unit']}", yaxis_title="")
     chart(fig, 400)
 
+    sources_here = curve_sources().get(selected, {})
+    state = product_price_state(selected)
+    counts = pd.Series(list(sources_here.values())).value_counts()
+    mix = "; ".join(f"{n} month{'s' if n > 1 else ''} {label.lower() if label != 'Demo' else 'demo prices'}" for label, n in counts.items())
     if selected in st.session_state.get("custom_curves", {}):
         meta = st.session_state.get("curve_metadata", {}).get(selected, {})
         marked = curve_mark_date(meta)
-        st.caption(f"Source: {curve_source_label(selected)}. Marks dated {marked:%d %b %Y}. Check your data licence." if marked else f"Source: {curve_source_label(selected)}. Check your data licence.")
-    else:
-        st.warning("These are demo prices, not market quotes. Add real marks below before relying on any valuation that uses this curve.")
+        st.caption(f"Imported marks{f' dated {marked:%d %b %Y}' if marked else ''}. Check your data licence. Months: {mix}.")
+    if state in ("Demo", "Part real", "Old"):
+        st.warning(f"This curve isn't fully real. Months: {mix}. Add real marks in the views below to replace the demo prices.")
+    elif selected not in st.session_state.get("custom_curves", {}):
+        st.caption(f"Real prices from free sources. Months: {mix}.")
     if spec["commodity"] == "Power":
         zone = "France" if spec["zone"] == "France" else "Germany-Luxembourg"
         series = zone_prices(zone)
@@ -8235,7 +8794,8 @@ def page_forward_curves():
         if previous:
             earlier_lookup = dict(zip(pd.to_datetime(earlier["delivery_month"]).dt.date, earlier["price"]))
             display_curve["change"] = [p - earlier_lookup[m] if m in earlier_lookup else float("nan") for m, p in zip(display_curve["delivery_month"], display_curve["price"])]
-        table(display_curve[[c for c in display_curve.columns if c in ("delivery_month", "price", "change", "unit")]], height=320)
+        display_curve["source"] = [sources_here.get(m, "") for m in display_curve["delivery_month"]]
+        table(display_curve[[c for c in display_curve.columns if c in ("delivery_month", "price", "change", "unit", "source")]], height=320)
         st.download_button("Download this curve as CSV", data=display_curve.to_csv(index=False).encode("utf-8"),
                            file_name=f"{selected.lower().replace(' ', '_')}_forward_curve.csv", mime="text/csv")
     if tab_status:
@@ -8394,7 +8954,15 @@ def page_trading_book_mtm():
                     st.warning("Some active trades have no price yet. The Mark error column says why, and they are left out of the totals.")
                 st.markdown('<div style="height:0.6rem"></div>', unsafe_allow_html=True)
                 columns = ["trade_id", "counterparty", "product", "instrument", "settlement_type", "side", "delivery_start", "delivery_end", "profile", "quantity_mw", "quantity_mwh", "trade_price", "market_price", "currency", "mtm", "status", "mark_error"]
-                table(view[[c for c in columns if c in view.columns]])
+                view = view.assign(prices=[trade_price_state(p, a, b, f, curve_sources()) if str(s).upper() == "EXECUTED" else "" for p, a, b, f, s in
+                                           zip(view["product"], view["delivery_start"], view["delivery_end"], view["profile"], view["status"])]) if not view.empty else view
+                table(view[["prices"] + [c for c in columns if c in view.columns]])
+                if not view.empty and "mtm" in view.columns:
+                    eur = view.loc[view["prices"].ne("") & view["currency"].eq("EUR")]
+                    split = eur.groupby("prices")["mtm"].sum()
+                    if len(split):
+                        st.caption("EUR MtM by price source: " + ", ".join(f"{fmt_money(float(split[k]))} on {k.lower()} prices" for k in ("Real", "Part real", "Demo") if k in split.index)
+                                   + ". Only the real part is a market value.")
         if tab_positions:
             month_positions = position_summary_by_delivery(marked.loc[marked["status"].eq("EXECUTED")].copy() if not marked.empty else marked, curves)
             if month_positions.empty:
@@ -8544,7 +9112,7 @@ def page_daily_pnl():
 
 def seed_demo_history() -> None:
     """Fill past days with labelled synthetic marks for products still using demo curves."""
-    products = [p for p in CURVE_PRODUCTS if p not in st.session_state.get("custom_curves", {})]
+    products = [p for p in CURVE_PRODUCTS if product_price_state(p) != "Real"]
     rows = synthetic_curve_history(valuation_date, products)
     _save(lambda s: s.add_snapshot_rows(rows, replace=False))
     bump("snapshots")
@@ -8643,7 +9211,7 @@ def _build_market_reads() -> dict:
     loaded = set(_live_variants("entsoe_price"))
     for label, zone in MARKET_ZONES.items():
         if zone in ("France", "Germany-Luxembourg") or zone in loaded:
-            reads[label] = power_signals(zone, _live_dataset_frame(f"entsoe_price|{zone}"), _live_dataset_frame(f"entsoe_load|{zone}"),
+            reads[label] = power_signals(zone, zone_prices(zone), _live_dataset_frame(f"entsoe_load|{zone}"),
                                          _live_dataset_frame(f"entsoe_generation|{zone}"), daily, normals, imported, today)
     return {name: {"signals": signals, "summary": summarise_read(signals)} for name, signals in reads.items()}
 
@@ -8777,7 +9345,7 @@ def page_hedge_advisor():
         return
     if not history.empty and history["source"].eq(SYNTHETIC_HISTORY_SOURCE).any():
         st.warning("Part of this history is synthetic demo data, so these hedges only show how the advisor works. Don't act on them.")
-    marks_note = curve_warning(products, st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {}), valuation_date)
+    marks_note = price_warning(products)
     if marks_note:
         st.warning(marks_note)
     if plan["uncovered"]:
@@ -9151,8 +9719,14 @@ def zone_estimate(zone: str) -> dict:
 
 def record_price_estimates() -> None:
     rows = []
+    store = desk_store()
     for zone in _live_variants("entsoe_price"):
         if zone in ZONE_WEATHER:
+            base = daily_base_prices(zone_prices(zone))
+            target = (base.index[-1] + pd.Timedelta(days=1)).date().isoformat() if len(base) else None
+            held = store.load_price_estimates(zone) if store is not None else pd.DataFrame()
+            if target is None or (not held.empty and held["delivery_date"].eq(target).any()):
+                continue   # the first estimate for a day stands, so there's nothing to compute
             result = zone_estimate(zone)
             if result["ready"]:
                 rows.append((result["day"].isoformat(), zone, result["estimate"], result["low"], result["high"], valuation_date.isoformat(), result["method"]))
@@ -9236,7 +9810,9 @@ def render_driver_table(drivers: pd.DataFrame) -> None:
     if drivers.empty:
         return
     st.subheader("What drove it, by delivery month")
-    shown = drivers.assign(delivery_month=drivers["delivery_month"].map(month_contract_label)).rename(columns={
+    sources = curve_sources()
+    drivers = drivers.assign(prices=[{SOURCE_DEMO: "Demo"}.get(sources.get(p, {}).get(m, ""), sources.get(p, {}).get(m, "")) for p, m in zip(drivers["product"], drivers["delivery_month"])])
+    shown = drivers.assign(delivery_month=drivers["delivery_month"].map(month_contract_label)).rename(columns={"prices": "Prices now",
         "product": "Product", "delivery_month": "Month", "net_mwh": "Net MWh", "previous_mark": "Mark before", "current_mark": "Mark now", "mark_change": "Change",
         "price_move": "Price move, EUR", "new_trades": "New trades, EUR", "first_marks": "First marks, EUR", "total": "Total, EUR"})
     table(shown.round({"Net MWh": 0, "Mark before": 2, "Mark now": 2, "Change": 2, "Price move, EUR": 0, "New trades, EUR": 0, "First marks, EUR": 0, "Total, EUR": 0}))
@@ -9254,7 +9830,7 @@ def render_crisis_replay(buckets: pd.DataFrame, eur_per_gbp: float, outcome: dic
     multiple = f", or {abs(totals.min()) / var99:.0f} times the 99% one-day VaR" if var99 and totals.min() < 0 else ""
     with st.container(key="hero"):
         st.markdown(f'<div class="desk-note"><p>The worst of these for today\'s book is <b>{html.escape(worst_name)}</b>: <span style="white-space:nowrap">{fmt_money(float(totals.min()))}</span>{multiple}.</p></div>', unsafe_allow_html=True)
-    marks_note = curve_warning(sorted(buckets["product"].unique()) + ["TTF Natural Gas"], st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {}), valuation_date)
+    marks_note = price_warning(sorted(buckets["product"].unique()) + ["TTF Natural Gas"])
     if marks_note:
         st.warning(marks_note)
     fig = go.Figure(go.Bar(x=totals.to_numpy(), y=list(totals.index), orientation="h", marker=dict(color=[GAIN if v >= 0 else LOSS for v in totals]), hovertemplate="%{y}: €%{x:,.0f}<extra></extra>"))
@@ -9284,7 +9860,7 @@ def render_var_check(outcome: dict) -> None:
     if not check["tests"]:
         need_data_note(f"This needs more than {VAR_CHECK_MIN_HISTORY} days of saved curve moves, and {outcome.get('observations', 0)} are saved so far.")
         return
-    if saved_snapshots()["source"].isin(("Demo marks", SYNTHETIC_HISTORY_SOURCE)).any():
+    if saved_snapshots()["source"].isin(DEMO_HISTORY_SOURCES).any():
         st.warning("Part of this history uses demo or synthetic prices, so this result only shows how the check works. It says nothing about real risk.")
     k1, k2, k3, k4 = st.columns(4)
     kpi(k1, "Days tested", f"{check['tests']}")
@@ -9394,15 +9970,15 @@ def build_brief() -> dict:
     if outlook.get("ready") and outlook.get("basis") == "weather":
         scenarios = outlook["scenarios"]
         outlook_text = f"EU storage ends March at about {scenarios[1]['end']:.0f}% with normal weather, {scenarios[0]['end']:.0f}% in the coldest past winter and {scenarios[2]['end']:.0f}% in the mildest."
-    custom, metadata = st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {})
     warnings_ = []
     held_products = sorted(buckets["product"].unique()) if not buckets.empty else []
-    marks_note = curve_warning(held_products, custom, metadata, valuation_date)
+    marks_note = price_warning(held_products)
     if marks_note:
         warnings_.append(marks_note)
     if not metrics.get("EU storage fill"):
         warnings_.append("There's no storage data yet. Select Update market data.")
-    return {"alerts": threshold_alerts(rules, metrics), "changes": changes, "reads": reads, "pnl_text": pnl_text, "drivers": drivers, "estimates": estimates,
+    priced = list(dict.fromkeys(held_products + ["TTF Natural Gas", "French Power Base", "German Power Base"]))
+    return {"prices_used": prices_used_lines(priced), "book_note": src_book(), "alerts": threshold_alerts(rules, metrics), "changes": changes, "reads": reads, "pnl_text": pnl_text, "drivers": drivers, "estimates": estimates,
             "outlook": outlook_text, "warnings": warnings_}
 
 
@@ -9429,7 +10005,10 @@ def brief_pdf(brief: dict) -> bytes:
         blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["estimates"]], (0.28, 0.16, 0.13, 0.19, 0.24))))
     if brief["outlook"]:
         blocks += [("heading", "Winter storage"), ("text", brief["outlook"])]
-    blocks.append(("note", "Reads, estimates and projections are simple models with the limits shown in the app. Check their track record before relying on them."))
+    blocks.append(("heading", "Prices used"))
+    blocks += [("text", f"{product}: {detail}.") for product, detail in brief["prices_used"]]
+    blocks += [("text", f"Book: {text}.") for state, text in brief["book_note"] if state == "demo"]
+    blocks.append(("note", "Day-ahead, storage, weather and FX figures come from ENTSO-E, GIE, Open-Meteo and the ECB. Reads, estimates and projections are simple models with the limits shown in the app. Check their track record before relying on them."))
     return simple_pdf(blocks, "Meridian morning brief")
 
 
@@ -9460,6 +10039,8 @@ def page_morning_brief() -> None:
     if brief["outlook"]:
         st.subheader("Winter storage")
         st.markdown(brief["outlook"])
+    st.subheader("Prices used")
+    table(pd.DataFrame(brief["prices_used"], columns=["Product", "Priced with"]))
     st.subheader("Your thresholds")
     store = desk_store()
     if store is None:
@@ -10140,7 +10721,7 @@ def page_data_assumptions():
         product_curve = curves[product_name]
         imported = product_name in st.session_state.get("custom_curves", {})
         dates = pd.to_datetime(product_curve.get("delivery_month", pd.Series(dtype="datetime64[ns]")), errors="coerce")
-        rows.append({"Product": product_name, "Source": curve_source_label(product_name), "Monthly marks": int(len(product_curve)),
+        rows.append({"Product": product_name, "Prices": product_price_state(product_name), "Source": ", ".join(sorted(set(curve_sources().get(product_name, {}).values()))), "Monthly marks": int(len(product_curve)),
                      "First delivery": dates.min().date() if len(dates.dropna()) else None, "Last delivery": dates.max().date() if len(dates.dropna()) else None,
                      "Imported (UTC)": st.session_state.get("curve_metadata", {}).get(product_name, {}).get("imported_at_utc", "") if imported else ""})
     table(pd.DataFrame(rows))
