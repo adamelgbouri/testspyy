@@ -5083,7 +5083,7 @@ def fetch_zone_weather(zone: str, start: Optional[date] = None, end: Optional[da
 # delayed, and TradingView's terms don't allow automated access. Personal use, at the user's choice.
 TRADINGVIEW_CURVES = {"TTF Natural Gas": {"exchange": "NYMEX", "root": "TTF", "name": "NYMEX Dutch TTF month futures"}}
 TRADINGVIEW_MONTH_CODES = "FGHJKMNQUVXZ"
-TRADINGVIEW_INSTALL = "pip install --upgrade --no-cache-dir git+https://github.com/rongardF/tvdatafeed.git"
+TRADINGVIEW_INSTALL = "pip install tradingview-datafeed"   # or the maintained fork: pip install git+https://github.com/rongardF/tvdatafeed.git
 TRADINGVIEW_HISTORY_BARS = 60          # first fetch: about three months of daily closes, so P&L and risk start with real history
 TRADINGVIEW_UPDATE_BARS = 7
 TRADINGVIEW_MAX_MONTHS = 48
@@ -5981,7 +5981,7 @@ PRICE_HISTORY_DAYS = 365
 # ENTSO-E's forecasts only need to span the tested days and enough earlier days to fit them.
 FORECAST_HISTORY_DAYS = 300
 ZONE_WEATHER_HISTORY_DAYS = 430
-STALE_HOURS = {"prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0}
+STALE_HOURS = {"tradingview": 1.0, "prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0}
 KEEP_DAYS = {"prices": 400, "load": 90, "generation": 90, "lng": 400}
 MAX_UPDATE_WORKERS = 4
 
@@ -6058,11 +6058,33 @@ def _needs_update(key: str, kind: str, force: bool) -> bool:
     return force or age is None or age >= STALE_HOURS[kind]
 
 
+def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[UpdateTask]:
+    """The TTF curve from TradingView, the default source for TTF marks. Refreshed hourly as prices are delayed anyway."""
+    today = today or date.today()
+    if not tradingview_available():
+        def missing() -> None:
+            raise RuntimeError(f"TTF is on demo prices because tradingview-datafeed isn't installed. Run: {TRADINGVIEW_INSTALL}, then restart the app.")
+        return [UpdateTask("TTF curve from TradingView", missing, lambda _: "")]
+    if not _needs_update("tradingview_curves", "tradingview", force):
+        return []
+    keys = resolved_credentials()
+    bars = TRADINGVIEW_HISTORY_BARS if _held_frame("tradingview_curves") is None else TRADINGVIEW_UPDATE_BARS
+    login = (keys["tradingview_user"], keys["tradingview_password"])
+    tasks = []
+    for tv_product in TRADINGVIEW_CURVES:
+        def fetch_tv(product=tv_product) -> pd.DataFrame:
+            return fetch_tradingview_curve(product, today, bars, *login)
+        def apply_tv(raw: pd.DataFrame, product=tv_product) -> str:
+            return apply_tradingview_curve(product, raw)
+        tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv))
+    return tasks
+
+
 def plan_update(force: bool = True, today: Optional[date] = None) -> list[UpdateTask]:
     """Decide what to request. force ignores recent fetches, except for slow-moving normals."""
     today = today or date.today()
     keys = resolved_credentials()
-    tasks: list[UpdateTask] = []
+    tasks: list[UpdateTask] = tradingview_tasks(force, today)   # first, so the TTF marks come in first
 
     def keyed(kind: str, fetch: Callable[[], object]) -> Callable[[], object]:
         """A source with no key reports what to do, rather than a provider's error."""
@@ -6211,16 +6233,6 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             _stored_live_item("weather_power_history", "Open-Meteo wind and solar history", frame, {"days": 430})
             return f"{frame['location'].nunique()} of {len(power_zones)} locations"
         tasks.append(UpdateTask("Wind and solar history", lambda: fetch_power_weather([ZONE_WEATHER[z] for z in power_zones]), apply_power_weather))
-    if tradingview_available() and _needs_update("tradingview_curves", "prices", force):
-        first_time = _held_frame("tradingview_curves") is None
-        bars = TRADINGVIEW_HISTORY_BARS if first_time else TRADINGVIEW_UPDATE_BARS
-        login = (keys["tradingview_user"], keys["tradingview_password"])
-        for tv_product in TRADINGVIEW_CURVES:
-            def fetch_tv(product=tv_product) -> pd.DataFrame:
-                return fetch_tradingview_curve(product, today, bars, *login)
-            def apply_tv(raw: pd.DataFrame, product=tv_product) -> str:
-                return apply_tradingview_curve(product, raw)
-            tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv))
     held_auctions = _live_dataset_frame("eex_eua_auctions")
     auction_age = (today - pd.Timestamp(held_auctions["date"].iloc[-1]).date()).days if not held_auctions.empty and "date" in held_auctions.columns else None
     if force or auction_age is None or (auction_age >= 1 and _needs_update("eex_eua_auctions", "prices", False)):
@@ -9273,11 +9285,23 @@ def page_forward_curves():
     counts = pd.Series(list(sources_here.values())).value_counts()
     mix = "; ".join(f"{n} month{'s' if n > 1 else ''} {label.lower() if label != 'Demo' else 'demo prices'}" for label, n in counts.items())
     if selected in TRADINGVIEW_CURVES:
-        if tradingview_available():
-            st.caption(f"Fetched from TradingView ({TRADINGVIEW_CURVES[selected]['name']}) with each market data update, through tvdatafeed. "
-                       "Prices are delayed, the library is unofficial and can stop working when TradingView changes, and TradingView's terms don't allow automated access, so keep this to personal use.")
-        else:
-            st.caption(f"To fetch this curve from TradingView with each update, install tvdatafeed: `{TRADINGVIEW_INSTALL}`")
+        meta = st.session_state.get("curve_metadata", {}).get(selected, {})
+        from_tv = meta.get("source_type") == "TradingView" and selected in st.session_state.get("custom_curves", {})
+        status, action = st.columns([4, 1])
+        with status:
+            if not tradingview_available():
+                st.warning(f"TTF is on demo prices: the TradingView library isn't installed. Run `{TRADINGVIEW_INSTALL}` and restart the app.")
+            elif from_tv:
+                st.success(f"Marks from TradingView ({TRADINGVIEW_CURVES[selected]['name']}), dated {curve_mark_date(meta):%d %b %Y}, {fetched_text(meta.get('imported_at_utc')).lower()}. "
+                           "Refreshed every hour when the app updates.")
+            else:
+                st.info("The TTF curve comes from TradingView by default. It's fetched when the app opens and with each update.")
+        with action:
+            running = bool(st.session_state.get("update_job"))
+            if tradingview_available() and st.button("Fetch TTF now", key="tv_fetch_now", disabled=running, width="stretch"):
+                if start_update(tasks=tradingview_tasks(True)):
+                    st.rerun()
+        st.caption("Through tvdatafeed: prices are delayed, the library is unofficial and can stop working when TradingView changes, and TradingView's terms don't allow automated access, so keep this to personal use.")
     if selected in st.session_state.get("custom_curves", {}):
         meta = st.session_state.get("curve_metadata", {}).get(selected, {})
         marked = curve_mark_date(meta)
