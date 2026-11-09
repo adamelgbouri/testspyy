@@ -2769,12 +2769,66 @@ def outlook_signal(outlook: Optional[dict]) -> Optional[dict]:
 # -----------------------------------------------------------------------------
 # Next-day power price estimate
 # -----------------------------------------------------------------------------
-ESTIMATE_TRAIN_DAYS = 180
+ESTIMATE_TRAIN_DAYS = 365
+ESTIMATE_HALF_LIFE_DAYS = 120          # recent days count more: a day 120 days back weighs half as much
 ESTIMATE_MIN_DAYS = 60
-ESTIMATE_TEST_DAYS = 90
+ESTIMATE_TEST_DAYS = 180
 ESTIMATE_REFIT_EVERY = 5
-ESTIMATE_COLUMNS = ("lag1", "avg7", "lag7", "hdd", "wind", "solar", "weekend", "monday")
-FORECAST_COLUMNS = ("lag1", "avg7", "lag7", "load_gw", "wind_gw", "solar_gw", "weekend", "monday")
+ESTIMATE_RANGE = (0.1, 0.9)            # an 80% range
+ESTIMATE_RANGE_HALF_LIFE_DAYS = 10     # how fast the range follows recent accuracy
+ESTIMATE_RANGE_MIN_ERRORS = 30
+CALENDAR_COLUMNS = ("same", "work", "lag1", "avg7", "lag7", "saturday", "sunday", "after_off")
+WEATHER_COLUMNS = ("hdd", "wind", "solar", "hdd_before", "wind_before", "solar_before")
+ESTIMATE_COLUMNS = CALENDAR_COLUMNS + WEATHER_COLUMNS
+FORECAST_COLUMNS = CALENDAR_COLUMNS + ("load_gw", "wind_gw", "solar_gw")
+# Points spread across each zone, latitude and longitude. Wind in one city says little about a whole
+# country's wind output: on real German prices and forecasts, a dozen points cut the average miss by about a sixth.
+ZONE_WEATHER_POINTS = {
+    "France": ((50.6, 2.8), (49.4, 0.6), (48.86, 2.35), (49.0, 4.2), (48.6, 6.2), (48.1, -2.8), (47.3, 5.0),
+               (46.6, -0.3), (45.76, 4.84), (45.8, 2.6), (43.9, 1.4), (43.6, 4.1)),
+    "Germany-Luxembourg": ((54.4, 9.1), (53.8, 11.6), (53.1, 7.9), (52.8, 10.4), (52.5, 13.4), (51.9, 7.6), (51.7, 11.8),
+                           (51.3, 14.2), (50.6, 9.6), (50.0, 7.0), (49.7, 11.3), (48.5, 9.6), (48.3, 12.2)),
+}
+
+
+def _easter(year: int) -> date:
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    g = (b - (b + 8) // 25 + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    l_ = (32 + 2 * e + 2 * (c // 4) - h - c % 4) % 7
+    m = (a + 11 * h + 22 * l_) // 451
+    return date(year, (h + l_ - 7 * m + 114) // 31, (h + l_ - 7 * m + 114) % 31 + 1)
+
+
+def public_holidays(zone: str, year: int) -> set:
+    """National public holidays that move power demand, by zone. Regional holidays are left out."""
+    e = _easter(year)
+    day = lambda m, d: date(year, m, d)
+    monday = lambda m, nth: [day(m, 1) + timedelta(days=i) for i in range(31) if (day(m, 1) + timedelta(days=i)).month == m and (day(m, 1) + timedelta(days=i)).weekday() == 0][nth]
+    if zone == "France":
+        return {day(1, 1), e + timedelta(1), day(5, 1), day(5, 8), e + timedelta(39), e + timedelta(50), day(7, 14), day(8, 15), day(11, 1), day(11, 11), day(12, 25)}
+    if zone == "Germany-Luxembourg":
+        return {day(1, 1), e - timedelta(2), e + timedelta(1), day(5, 1), e + timedelta(39), e + timedelta(50), day(10, 3), day(12, 25), day(12, 26)}
+    if zone == "Netherlands":
+        kings = day(4, 27) if day(4, 27).weekday() != 6 else day(4, 26)
+        return {day(1, 1), e + timedelta(1), kings, e + timedelta(39), e + timedelta(50), day(12, 25), day(12, 26)}
+    if zone == "Belgium":
+        return {day(1, 1), e + timedelta(1), day(5, 1), e + timedelta(39), e + timedelta(50), day(7, 21), day(8, 15), day(11, 1), day(11, 11), day(12, 25)}
+    if zone == "Spain":
+        return {day(1, 1), day(1, 6), e - timedelta(2), day(5, 1), day(8, 15), day(10, 12), day(11, 1), day(12, 6), day(12, 8), day(12, 25)}
+    if zone == "Great Britain":
+        new_year = day(1, 1) + timedelta(days={5: 2, 6: 1}.get(day(1, 1).weekday(), 0))
+        christmas = {5: (day(12, 27), day(12, 28)), 6: (day(12, 27), day(12, 26))}.get(day(12, 25).weekday(), (day(12, 25), day(12, 26) + timedelta(days=2 if day(12, 26).weekday() == 5 else 0)))
+        return {new_year, e - timedelta(2), e + timedelta(1), monday(5, 0), monday(5, -1), monday(8, -1), *christmas}
+    return set()
+
+
+def day_classes(days: pd.DatetimeIndex, zone: str) -> np.ndarray:
+    """0 for a working day, 1 for a Saturday, 2 for a Sunday or public holiday."""
+    holidays = set().union(*(public_holidays(zone, y) for y in range(days.year.min(), days.year.max() + 1))) if len(days) else set()
+    off = np.fromiter((d in holidays for d in days.date), bool, len(days)) | (days.dayofweek == 6)
+    return np.where(off, 2, np.where(days.dayofweek == 5, 1, 0))
 
 
 def daily_base_prices(series: pd.DataFrame) -> pd.Series:
@@ -2803,14 +2857,39 @@ def power_weather(history: pd.DataFrame, daily: pd.DataFrame, location: str) -> 
     return pd.DataFrame({"hdd": (18.0 - joined["temperature"]).clip(lower=0), "wind": joined["wind"], "solar": joined["solar"]})
 
 
-def estimate_features(base: pd.Series, weather: pd.DataFrame, last_day: pd.Timestamp) -> pd.DataFrame:
-    """One row per delivery day. Prices come only from earlier days, as at auction time."""
+def zone_weather(history: pd.DataFrame, forecast: pd.DataFrame, zone: str) -> pd.DataFrame:
+    """Heating demand, wind and solar by day, averaged over the zone's points. Forecast days replace the archive."""
+    frames = [f.loc[f["zone"].eq(zone), ["date", "hdd", "wind", "solar"]] for f in (history, forecast)
+              if f is not None and not f.empty and {"zone", "date", "hdd", "wind", "solar"}.issubset(f.columns)]
+    if not frames:
+        return pd.DataFrame(columns=["hdd", "wind", "solar"])
+    joined = pd.concat(frames, ignore_index=True).assign(date=lambda f: pd.to_datetime(f["date"], errors="coerce")).dropna(subset=["date"])
+    return joined.drop_duplicates("date", keep="last").set_index("date").sort_index().astype(float)
+
+
+def estimate_features(base: pd.Series, weather: pd.DataFrame, last_day: pd.Timestamp, zone: str = "") -> pd.DataFrame:
+    """One row per delivery day. Prices come only from earlier days, as at auction time.
+
+    same is the latest earlier day of the same kind (working day, Saturday, Sunday or holiday), and work the
+    latest earlier working day, so a Monday starts from Friday rather than from a quiet Sunday.
+    """
     days = pd.date_range(base.index.min(), last_day, freq="D")
     prices = base.reindex(days)
-    frame = pd.DataFrame({"base": prices, "lag1": prices.shift(1), "avg7": prices.shift(1).rolling(7, min_periods=5).mean(), "lag7": prices.shift(7)}, index=days)
-    frame = frame.join(weather.reindex(days))
-    frame["weekend"] = (days.dayofweek >= 5).astype(float)
-    frame["monday"] = (days.dayofweek == 0).astype(float)
+    values, classes = prices.to_numpy(float), day_classes(days, zone)
+    same, work, latest = np.full(len(days), np.nan), np.full(len(days), np.nan), [np.nan, np.nan, np.nan]
+    for i, kind in enumerate(classes):
+        same[i], work[i] = latest[kind], latest[0]
+        if not np.isnan(values[i]):
+            latest[kind] = values[i]
+    frame = pd.DataFrame({"base": prices, "same": same, "work": work, "lag1": prices.shift(1),
+                          "avg7": prices.shift(1).rolling(7, min_periods=5).mean(), "lag7": prices.shift(7)}, index=days)
+    frame["saturday"], frame["sunday"] = (classes == 1).astype(float), (classes == 2).astype(float)
+    frame["after_off"] = ((classes == 0) & (np.r_[0, classes[:-1]] == 2)).astype(float)
+    weather = weather.reindex(days) if weather is not None and not weather.empty else pd.DataFrame(index=days)
+    for column in ("hdd", "wind", "solar"):
+        frame[column] = weather[column] if column in weather.columns else np.nan
+        # The day before's weather explains part of the day before's price, which the fit starts from.
+        frame[f"{column}_before"] = frame[column].shift(1)
     return frame
 
 
@@ -2841,93 +2920,149 @@ def entsoe_forecast_days(load_forecast: pd.DataFrame, renewable_forecast: pd.Dat
     return table_
 
 
-def _fit_estimate(frame: pd.DataFrame, columns: Sequence[str] = ESTIMATE_COLUMNS) -> np.ndarray:
-    design = np.column_stack([np.ones(len(frame)), frame[list(columns)].to_numpy(float)])
-    return np.linalg.lstsq(design, frame["base"].to_numpy(float), rcond=None)[0]
+def _weighted_beta(features: np.ndarray, target: np.ndarray, ages: np.ndarray) -> np.ndarray:
+    """Least squares where a day ESTIMATE_HALF_LIFE_DAYS older counts half as much."""
+    root = np.sqrt(0.5 ** (ages / ESTIMATE_HALF_LIFE_DAYS))
+    return np.linalg.lstsq(features * root[:, None], target * root, rcond=None)[0]
+
+
+def _design(frame: pd.DataFrame, columns: Sequence[str]) -> np.ndarray:
+    return np.column_stack([np.ones(len(frame)), frame[list(columns)].to_numpy(float)])
+
+
+def _fit_estimate(frame: pd.DataFrame, columns: Sequence[str] = ESTIMATE_COLUMNS, as_of: Optional[pd.Timestamp] = None) -> np.ndarray:
+    as_of = as_of if as_of is not None else frame.index.max() + pd.Timedelta(days=1)
+    kept = frame.loc[frame.index >= as_of - pd.Timedelta(days=ESTIMATE_TRAIN_DAYS)]
+    return _weighted_beta(_design(kept, columns), kept["base"].to_numpy(float), (as_of - kept.index).days.to_numpy(float))
 
 
 def _apply_estimate(beta: np.ndarray, frame: pd.DataFrame, columns: Sequence[str] = ESTIMATE_COLUMNS) -> np.ndarray:
-    return np.column_stack([np.ones(len(frame)), frame[list(columns)].to_numpy(float)]) @ beta
+    return _design(frame, columns) @ beta
 
 
 def _walk_forward(known: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
     """Estimate each past day from earlier days only, refitting regularly."""
     first = max(ESTIMATE_MIN_DAYS, len(known) - ESTIMATE_TEST_DAYS)
-    features = np.column_stack([np.ones(len(known)), known[list(columns)].to_numpy(float)])
-    target = known["base"].to_numpy(float)
+    features, target = _design(known, columns), known["base"].to_numpy(float)
+    day_number = ((known.index - known.index[0]).days).to_numpy(float)
     estimates = np.empty(max(len(known) - first, 0))
     # Refit every few days on earlier days only, then apply that fit to the next block in one step.
     for block_start in range(first, len(known), ESTIMATE_REFIT_EVERY):
-        train = slice(max(0, block_start - ESTIMATE_TRAIN_DAYS), block_start)
-        beta = np.linalg.lstsq(features[train], target[train], rcond=None)[0]
+        train = np.flatnonzero((day_number < day_number[block_start]) & (day_number >= day_number[block_start] - ESTIMATE_TRAIN_DAYS))
+        beta = _weighted_beta(features[train], target[train], day_number[block_start] - day_number[train])
         block = slice(block_start, min(block_start + ESTIMATE_REFIT_EVERY, len(known)))
         estimates[block.start - first:block.stop - first] = features[block] @ beta
     test = known.iloc[first:]
-    return pd.DataFrame({"day": test.index, "actual": target[first:], "estimate": estimates,
+    return pd.DataFrame({"day": test.index, "actual": target[first:], "estimate": estimates, "same_type": test["same"].to_numpy(float),
                          "last_week": test["lag7"].to_numpy(float), "yesterday": test["lag1"].to_numpy(float)})
 
 
+def estimate_range(errors: np.ndarray) -> dict:
+    """An 80% range for the next day from past misses, widened or narrowed by how accurate recent days were.
+
+    Misses are divided by the recent typical miss before taking quantiles, so a calm spell gives a narrower
+    range and a volatile one a wider range. held is the share of tested days whose price landed inside the
+    range built only from earlier days.
+    """
+    errors = np.asarray(errors, float)
+    scale = pd.Series(np.abs(errors)).ewm(halflife=ESTIMATE_RANGE_HALF_LIFE_DAYS, min_periods=5).mean()
+    before = scale.shift(1).to_numpy()
+    scaled = errors / before
+    usable = ~np.isnan(scaled)
+    low_q, high_q = ESTIMATE_RANGE
+    if usable.sum() < ESTIMATE_RANGE_MIN_ERRORS:
+        return {"low": float(np.quantile(errors, low_q)), "high": float(np.quantile(errors, high_q)), "held": None, "held_days": 0, "adaptive": False}
+    now = float(scale.iloc[-1])
+    hits = []
+    for i in np.flatnonzero(usable):
+        past = scaled[:i][usable[:i]]
+        if len(past) >= ESTIMATE_RANGE_MIN_ERRORS:
+            low, high = np.quantile(past, [low_q, high_q]) * before[i]
+            hits.append(low <= errors[i] <= high)
+    low, high = np.quantile(scaled[usable], [low_q, high_q]) * now
+    return {"low": float(low), "high": float(high), "held": float(np.mean(hits)) if hits else None, "held_days": len(hits), "adaptive": True}
+
+
+def _weather_for_estimate(zone: str, history: pd.DataFrame, daily: pd.DataFrame, grid_history: Optional[pd.DataFrame], grid_forecast: Optional[pd.DataFrame],
+                          target: pd.Timestamp) -> tuple[pd.DataFrame, str]:
+    """Weather across the zone's points when held, otherwise the one reference city."""
+    location = ZONE_WEATHER.get(zone)
+    options = []
+    if zone in ZONE_WEATHER_POINTS:
+        options.append((zone_weather(grid_history, grid_forecast, zone), f"{len(ZONE_WEATHER_POINTS[zone])} points across the zone"))
+    if location:
+        options.append((power_weather(history, daily, location), location.split(" / ")[0]))
+    enough = [(w, name) for w, name in options if not w.empty and w["wind"].notna().sum() >= ESTIMATE_MIN_DAYS]
+    ready = [(w, name) for w, name in enough if target in w.index and not w.loc[[target], ["hdd", "wind", "solar"]].isna().any(axis=None)]
+    return (ready or enough or [(pd.DataFrame(columns=["hdd", "wind", "solar"]), "")])[0]
+
+
 def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, daily: pd.DataFrame,
-                      load_forecast: Optional[pd.DataFrame] = None, renewable_forecast: Optional[pd.DataFrame] = None) -> dict:
+                      load_forecast: Optional[pd.DataFrame] = None, renewable_forecast: Optional[pd.DataFrame] = None,
+                      grid_history: Optional[pd.DataFrame] = None, grid_forecast: Optional[pd.DataFrame] = None) -> dict:
     """Estimate the next unpublished delivery day, and test the methods one day at a time.
 
     The weather method can run before the auction. ENTSO-E's wind and solar forecast is usually
     published after it, so that method mainly checks published prices, and sets the estimate only
     when the forecast for the target day already exists and it has tested at least as well.
     """
-    location = ZONE_WEATHER.get(zone)
     base = daily_base_prices(series)
-    if not location or len(base) < ESTIMATE_MIN_DAYS + 20:
+    if zone not in ZONE_WEATHER or len(base) < ESTIMATE_MIN_DAYS + 20:
         return {"ready": False, "reason": f"This needs at least {ESTIMATE_MIN_DAYS + 20} days of day-ahead prices. Select Update market data."}
-    weather = power_weather(history, daily, location)
-    if weather.empty or weather["wind"].notna().sum() < ESTIMATE_MIN_DAYS:
-        return {"ready": False, "reason": "This needs the wind and solar history. Select Update market data."}
     target = base.index[-1] + pd.Timedelta(days=1)
-    frame = estimate_features(base, weather, target)
+    weather, basis = _weather_for_estimate(zone, history, daily, grid_history, grid_forecast, target)
+    if weather.empty:
+        return {"ready": False, "reason": "This needs the wind and solar history. Select Update market data."}
+    frame = estimate_features(base, weather, target, zone)
     known = frame.iloc[:-1].dropna(subset=["base", *ESTIMATE_COLUMNS])
     ahead = frame.iloc[[-1]]
     weather_ready = not ahead[list(ESTIMATE_COLUMNS)].isna().any(axis=None)
     if len(known) < ESTIMATE_MIN_DAYS + 10:
         return {"ready": False, "reason": "Prices and weather overlap on too few days so far."}
     test = _walk_forward(known, ESTIMATE_COLUMNS)
-    final = _fit_estimate(known.tail(ESTIMATE_TRAIN_DAYS), ESTIMATE_COLUMNS)
+    final = _fit_estimate(known, ESTIMATE_COLUMNS, target)
 
     tz = ENTSOE_ZONES[zone]["timezone"]
     published = entsoe_forecast_days(load_forecast, renewable_forecast, tz)
-    forecast_frame = frame[["base", "lag1", "avg7", "lag7", "weekend", "monday"]].join(published.reindex(frame.index)) if not published.empty else None
+    forecast_frame = frame[["base", *CALENDAR_COLUMNS]].join(published.reindex(frame.index)) if not published.empty else None
     forecast_known = forecast_frame.iloc[:-1].dropna() if forecast_frame is not None else pd.DataFrame()
     forecast_test, forecast_final = pd.DataFrame(), None
     if len(forecast_known) >= ESTIMATE_MIN_DAYS + 30:
         forecast_test = _walk_forward(forecast_known, FORECAST_COLUMNS)
-        forecast_final = _fit_estimate(forecast_known.tail(ESTIMATE_TRAIN_DAYS), FORECAST_COLUMNS)
+        forecast_final = _fit_estimate(forecast_known, FORECAST_COLUMNS, target)
     comparison = None
     if not forecast_test.empty:
         shared = test.merge(forecast_test[["day", "estimate"]].rename(columns={"estimate": "forecast_estimate"}), on="day")
         if len(shared) >= 20:
-            comparison = {"days": len(shared), "weather": float((shared["actual"] - shared["estimate"]).abs().mean()),
-                          "forecasts": float((shared["actual"] - shared["forecast_estimate"]).abs().mean()),
-                          "last_week": float((shared["actual"] - shared["last_week"]).abs().mean()), "yesterday": float((shared["actual"] - shared["yesterday"]).abs().mean())}
+            miss = lambda column: float((shared["actual"] - shared[column]).abs().mean())
+            comparison = {"days": len(shared), "weather": miss("estimate"), "forecasts": miss("forecast_estimate"),
+                          "same_type": miss("same_type"), "last_week": miss("last_week"), "yesterday": miss("yesterday")}
     target_has_forecast = forecast_final is not None and not forecast_frame.iloc[[-1]][list(FORECAST_COLUMNS)].isna().any(axis=None)
     use_forecasts = target_has_forecast and comparison is not None and comparison["forecasts"] <= comparison["weather"]
     if not use_forecasts and not weather_ready:
         return {"ready": False, "reason": f"There's no weather forecast for {target:%d %b}. Select Update market data."}
     chosen = forecast_test if use_forecasts else test
-    errors = chosen["actual"] - chosen["estimate"]
+    errors = (chosen["actual"] - chosen["estimate"]).to_numpy(float)
     value = float(_apply_estimate(forecast_final, forecast_frame.iloc[[-1]], FORECAST_COLUMNS)[0]) if use_forecasts else float(_apply_estimate(final, ahead, ESTIMATE_COLUMNS)[0])
+    spread = estimate_range(errors)
     # Judge the latest published price with ENTSO-E's forecasts when they exist for that day.
     checker = forecast_test if not forecast_test.empty and forecast_test["day"].iloc[-1] == base.index[-1] else test
     latest = checker.iloc[-1]
     gap = float(latest["actual"] - latest["estimate"])
     check_errors = (checker["actual"] - checker["estimate"]).abs()
+    miss = lambda column: float((chosen["actual"] - chosen[column]).abs().mean())
     result = {"ready": True, "reason": "", "zone": zone, "day": target.date(), "estimate": value, "method": "ENTSO-E forecasts" if use_forecasts else "Weather",
-              "low": value + float(errors.quantile(0.1)), "high": value + float(errors.quantile(0.9)), "test": chosen, "n": len(chosen),
-              "error": float(errors.abs().mean()), "error_last_week": float((chosen["actual"] - chosen["last_week"]).abs().mean()),
-              "error_yesterday": float((chosen["actual"] - chosen["yesterday"]).abs().mean()),
+              "weather_basis": basis, "low": value + spread["low"], "high": value + spread["high"], "held": spread["held"], "held_days": spread["held_days"],
+              "adaptive_range": spread["adaptive"], "test": chosen, "n": len(chosen), "error": float(np.abs(errors).mean()),
+              "error_same_type": miss("same_type"), "error_last_week": miss("last_week"), "error_yesterday": miss("yesterday"),
+              "recent_error": float(np.abs(errors[-30:]).mean()),
               "latest_day": latest["day"].date(), "latest_actual": float(latest["actual"]), "latest_estimate": float(latest["estimate"]),
               "latest_gap": gap, "unusual": abs(gap) > float(check_errors.quantile(0.9)), "check_method": "ENTSO-E forecasts" if checker is forecast_test else "Weather",
               "comparison": comparison, "target_has_forecast": target_has_forecast, "forecast_days": int(published.dropna().shape[0]),
               "wind_effect": float(final[ESTIMATE_COLUMNS.index("wind") + 1]), "hdd_effect": float(final[ESTIMATE_COLUMNS.index("hdd") + 1]),
               "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1]), "forecast_effects": None}
+    best_simple = min(result["error_same_type"], result["error_last_week"], result["error_yesterday"])
+    result["skill"] = 1.0 - result["error"] / best_simple if best_simple > 0 else 0.0
     if forecast_final is not None:
         result["forecast_effects"] = {"load": float(forecast_final[FORECAST_COLUMNS.index("load_gw") + 1]), "wind": float(forecast_final[FORECAST_COLUMNS.index("wind_gw") + 1]),
                                       "solar": float(forecast_final[FORECAST_COLUMNS.index("solar_gw") + 1])}
@@ -2936,16 +3071,23 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
 
 def score_recorded_estimates(log: pd.DataFrame, base: pd.Series) -> dict:
     """Estimates saved on the day, using real forecasts, against the prices that followed."""
+    empty = {"n": 0, "error": None, "error_last_week": None, "held": None, "held_n": 0}
     if log is None or log.empty or base is None or base.empty:
-        return {"n": 0, "error": None, "error_last_week": None}
+        return empty
     days = pd.to_datetime(log["delivery_date"])
     actual = base.reindex(days).to_numpy(float)
     last_week = base.reindex(days - pd.Timedelta(days=7)).to_numpy(float)
     estimate = log["estimate"].to_numpy(float)
     both = ~np.isnan(actual) & ~np.isnan(last_week)
     if not both.any():
-        return {"n": 0, "error": None, "error_last_week": None}
-    return {"n": int(both.sum()), "error": float(np.abs(actual[both] - estimate[both]).mean()), "error_last_week": float(np.abs(actual[both] - last_week[both]).mean())}
+        return empty
+    out = {"n": int(both.sum()), "error": float(np.abs(actual[both] - estimate[both]).mean()), "error_last_week": float(np.abs(actual[both] - last_week[both]).mean()), "held": None, "held_n": 0}
+    if {"low", "high"}.issubset(log.columns):
+        low, high = pd.to_numeric(log["low"], errors="coerce").to_numpy(float), pd.to_numeric(log["high"], errors="coerce").to_numpy(float)
+        ranged = ~np.isnan(actual) & ~np.isnan(low) & ~np.isnan(high)
+        if ranged.any():
+            out["held"], out["held_n"] = float(np.mean((actual[ranged] >= low[ranged]) & (actual[ranged] <= high[ranged]))), int(ranged.sum())
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -4890,6 +5032,53 @@ def fetch_power_weather(location_names: Sequence[str], days: int = 430, _json_ge
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(), failures
 
 
+def fetch_zone_weather(zone: str, start: Optional[date] = None, end: Optional[date] = None, forecast: bool = False,
+                       api_key: str = "", commercial_endpoint: bool = False, _json_get_fn=None) -> pd.DataFrame:
+    """Daily heating demand, wind at 100 m and solar radiation averaged over a zone's points, in one request.
+
+    The archive gives past days. The forecast gives the last week and the next three days, which also
+    covers the days the archive hasn't published yet.
+    """
+    points = ZONE_WEATHER_POINTS[zone]
+    timezone_name = ENTSOE_ZONES[zone]["timezone"]
+    params = {"latitude": ",".join(f"{lat:.2f}" for lat, _ in points), "longitude": ",".join(f"{lon:.2f}" for _, lon in points),
+              "hourly": "temperature_2m,wind_speed_100m,shortwave_radiation", "timezone": timezone_name}
+    if forecast:
+        url = OPEN_METEO_CUSTOMER_BASE if commercial_endpoint else OPEN_METEO_FORECAST_BASE
+        params.update({"past_days": 7, "forecast_days": 3})
+        if api_key.strip():
+            params["apikey"] = api_key.strip()
+    else:
+        url = OPEN_METEO_ARCHIVE_BASE
+        params.update({"start_date": start.isoformat(), "end_date": end.isoformat()})
+    payload = (_json_get_fn or _json_get)(url, params=params)
+    answers = payload if isinstance(payload, list) else [payload]
+    per_point = []
+    for answer in answers:
+        hourly = answer.get("hourly", {}) if isinstance(answer, dict) else {}
+        if not hourly.get("time"):
+            continue
+        frame = pd.DataFrame({"date": [str(t)[:10] for t in hourly["time"]],
+                              "temperature": pd.to_numeric(pd.Series(hourly.get("temperature_2m", [])), errors="coerce"),
+                              "wind": pd.to_numeric(pd.Series(hourly.get("wind_speed_100m", [])), errors="coerce"),
+                              "solar": pd.to_numeric(pd.Series(hourly.get("shortwave_radiation", [])), errors="coerce")})
+        # A day counts only with most of its hours, so a partly published day can't pass as a calm one.
+        counts = frame.groupby("date")[["temperature", "wind", "solar"]].count().min(axis=1)
+        daily = frame.groupby("date")[["temperature", "wind", "solar"]].mean().loc[lambda f: counts.reindex(f.index) >= 20]
+        per_point.append(daily.assign(hdd=(18.0 - daily["temperature"]).clip(lower=0)))
+    if not per_point:
+        raise RuntimeError("Open-Meteo returned no weather for this zone.")
+    joined = pd.concat(per_point)
+    grouped = joined.groupby(level=0)
+    means = grouped[["temperature", "hdd", "wind", "solar"]].mean().loc[grouped.size() >= max(1, len(points) // 2)]
+    if means.empty:
+        complete = sum(not part.empty for part in per_point)
+        raise RuntimeError(f"Open-Meteo gave complete days for {complete} of {len(points)} points, too few to stand for the zone.")
+    out = means.reset_index().rename(columns={"index": "date"})
+    out["date"] = pd.to_datetime(out["date"])
+    return out.assign(zone=zone, points=len(per_point))[["zone", "date", "temperature", "hdd", "wind", "solar", "points"]]
+
+
 def fetch_temperature_normals(location_names: Sequence[str], years: int = 10, _json_get_fn=None) -> tuple[pd.DataFrame, list[str]]:
     """Calendar-day temperature and degree-day normals from Open-Meteo's historical archive."""
     _, normals, failures = fetch_weather_archive(location_names, years, _json_get_fn)
@@ -5703,8 +5892,9 @@ def missing_keys_text() -> str:
 # =============================================================================
 UPDATE_DEFAULT_ZONES = ("France", "Germany-Luxembourg")
 PRICE_HISTORY_DAYS = 365
-# The estimate trains on 180 days and tests on 90, so older forecasts would never be used.
-FORECAST_HISTORY_DAYS = ESTIMATE_TRAIN_DAYS + ESTIMATE_TEST_DAYS + 14
+# ENTSO-E's forecasts only need to span the tested days and enough earlier days to fit them.
+FORECAST_HISTORY_DAYS = 300
+ZONE_WEATHER_HISTORY_DAYS = 430
 STALE_HOURS = {"prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0}
 KEEP_DAYS = {"prices": 400, "load": 90, "generation": 90, "lng": 400}
 MAX_UPDATE_WORKERS = 4
@@ -5885,6 +6075,48 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             return f"{normals['location'].nunique()} of {len(WEATHER_LOCATIONS)} locations"
         tasks.append(UpdateTask("Weather history", lambda: fetch_weather_archive(list(WEATHER_LOCATIONS)), apply_archive))
     power_zones = [z for z in dict.fromkeys(list(UPDATE_DEFAULT_ZONES) + list(_live_variants("entsoe_price"))) if z in ZONE_WEATHER]
+    grid_zones = [z for z in power_zones if z in ZONE_WEATHER_POINTS]
+    if grid_zones and _needs_update("zone_weather_history", "power_weather", False):
+        held_grid = _held_frame("zone_weather_history")
+        archive_end = today - timedelta(days=5)
+        def fetch_grid_history() -> tuple[pd.DataFrame, list[str]]:
+            frames, failures = [], []
+            for zone in grid_zones:
+                held_zone = held_grid.loc[held_grid["zone"].eq(zone)] if held_grid is not None and "zone" in held_grid.columns else None
+                start = incremental_start(held_zone if held_zone is not None and not held_zone.empty else None, "date", ZONE_WEATHER_HISTORY_DAYS, 3, today)
+                if start > archive_end:
+                    continue
+                try:
+                    frames.append(fetch_zone_weather(zone, start, archive_end))
+                except Exception as exc:
+                    failures.append(f"{zone}: {exc}")
+            return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), failures
+        def apply_grid_history(outcome: tuple) -> str:
+            frame, failures = outcome
+            if frame.empty and failures:
+                raise RuntimeError("; ".join(failures))
+            merged = store_observations("zone_weather_history", "Open-Meteo weather across each zone", frame, {"zones": grid_zones}, ("date", "zone"), "date", ZONE_WEATHER_HISTORY_DAYS + 20) if not frame.empty else held_grid
+            return f"{len(frame):,} new days, {0 if merged is None else len(merged):,} held" + (f". Failed: {'; '.join(failures)}" if failures else "")
+        tasks.append(UpdateTask("Weather across each power zone", fetch_grid_history, apply_grid_history))
+    if grid_zones and _needs_update("zone_weather_forecast", "weather", force):
+        open_meteo_key = keys["open_meteo"]
+        def fetch_grid_forecast() -> tuple[pd.DataFrame, list[str]]:
+            frames, failures = [], []
+            for zone in grid_zones:
+                try:
+                    frames.append(fetch_zone_weather(zone, forecast=True, api_key=open_meteo_key, commercial_endpoint=bool(open_meteo_key)))
+                except Exception as exc:
+                    failures.append(f"{zone}: {exc}")
+            return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), failures
+        def apply_grid_forecast(outcome: tuple) -> str:
+            frame, failures = outcome
+            if frame.empty:
+                raise RuntimeError("; ".join(failures) or "No zone returned a forecast.")
+            _stored_live_item("zone_weather_forecast", "Open-Meteo forecast across each zone", frame, {"zones": grid_zones})
+            return f"{frame['zone'].nunique()} of {len(grid_zones)} zones"
+        tasks.append(UpdateTask("Weather forecast across each power zone", fetch_grid_forecast, apply_grid_forecast))
+    # Zones with points across them use those; the single reference city is kept for the others.
+    power_zones = [z for z in power_zones if z not in ZONE_WEATHER_POINTS]
     if power_zones and _needs_update("weather_power_history", "power_weather", False):
         def apply_power_weather(outcome: tuple) -> str:
             frame, failures = outcome
@@ -8137,6 +8369,100 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         assert_close(float(one.loc[check_day]), float(two.loc[check_day]))
         return "Requests use A65/A01 and A69/A01. Weather sets the estimate before ENTSO-E's forecast exists, then the forecast takes over only if it tested better. Effects are recovered and later prices change nothing earlier."
 
+    def check_estimate_calendar() -> str:
+        if _easter(2026) != date(2026, 4, 5) or _easter(2027) != date(2027, 3, 28):
+            raise AssertionError("Easter date is wrong.")
+        fr, de, gb = public_holidays("France", 2026), public_holidays("Germany-Luxembourg", 2026), public_holidays("Great Britain", 2027)
+        if not {date(2026, 5, 14), date(2026, 5, 25), date(2026, 7, 14), date(2026, 11, 11)} <= fr or date(2026, 4, 3) in fr:
+            raise AssertionError("French holidays are wrong.")
+        if not {date(2026, 4, 3), date(2026, 10, 3), date(2026, 12, 26)} <= de or date(2026, 7, 14) in de:
+            raise AssertionError("German holidays are wrong.")
+        if not {date(2027, 12, 27), date(2027, 12, 28), date(2027, 5, 3), date(2027, 5, 31), date(2027, 8, 30)} <= gb:
+            raise AssertionError("British bank holidays and Christmas substitutes are wrong.")
+        days = pd.date_range("2026-05-01", "2026-05-18")   # Fri 1 May and Thu 14 May are French holidays
+        kinds = day_classes(days, "France")
+        if kinds[0] != 2 or kinds[1] != 1 or kinds[2] != 2 or kinds[3] != 0 or kinds[13] != 2:
+            raise AssertionError(f"Day kinds are wrong: {kinds[:14]}")
+        base = pd.Series(np.arange(len(days), dtype=float) + 100.0, index=days)
+        frame = estimate_features(base, pd.DataFrame(), days[-1] + pd.Timedelta(days=1), "France")
+        monday = frame.loc["2026-05-11"]   # Friday 8 May is a holiday too, so the last working day is Thursday 7 May
+        if monday["work"] != base["2026-05-07"] or monday["same"] != base["2026-05-07"] or monday["lag1"] != base["2026-05-10"] or monday["after_off"] != 1.0:
+            raise AssertionError("A working day after a weekend must start from the last working day.")
+        sunday = frame.loc["2026-05-17"]
+        if sunday["same"] != base["2026-05-14"]:
+            raise AssertionError("A Sunday must start from the last Sunday or holiday.")
+        return "Easter, French, German and British holidays match the calendar. A Monday after a long weekend starts from the last working day, and a Sunday from the last holiday."
+
+    def check_zone_weather_fetch() -> str:
+        calls = []
+        def answer(day_values, hours=24):
+            times = [f"{d}T{h:02d}:00" for d in day_values for h in range(hours)]
+            return times
+        def fake(url, params=None):
+            calls.append((url, dict(params)))
+            n = len(params["latitude"].split(","))
+            out = []
+            for i in range(n):
+                times = answer(["2026-01-01", "2026-01-02"]) + answer(["2026-01-03"], 10)   # the last day is only partly published
+                out.append({"hourly": {"time": times, "temperature_2m": [8.0 + i] * len(times), "wind_speed_100m": [10.0 * (i + 1)] * len(times), "shortwave_radiation": [50.0] * len(times)}})
+            return out
+        frame = fetch_zone_weather("Germany-Luxembourg", date(2026, 1, 1), date(2026, 1, 3), _json_get_fn=fake)
+        url, params = calls[-1]
+        points = len(ZONE_WEATHER_POINTS["Germany-Luxembourg"])
+        if url != OPEN_METEO_ARCHIVE_BASE or len(params["latitude"].split(",")) != points or len(calls) != 1:
+            raise AssertionError("All points must go in one archive request.")
+        if list(frame["date"].dt.date) != [date(2026, 1, 1), date(2026, 1, 2)]:
+            raise AssertionError("A partly published day must be left out.")
+        assert_close(float(frame["wind"].iloc[0]), 10.0 * (points + 1) / 2)
+        assert_close(float(frame["hdd"].iloc[0]), float(np.mean([max(18.0 - (8.0 + i), 0.0) for i in range(points)])))
+        try:
+            fetch_zone_weather("France", forecast=True, _json_get_fn=lambda u, params=None: fake(u, params)[0])
+            raise AssertionError("One point can't stand for a whole zone.")
+        except RuntimeError as exc:
+            if "too few" not in str(exc):
+                raise
+        url, params = calls[-1]
+        if url != OPEN_METEO_FORECAST_BASE or params.get("past_days") != 7 or params.get("forecast_days") != 3:
+            raise AssertionError("The forecast request is wrong.")
+        return f"{points} German points go in one request, partial days are dropped, wind and heating demand are averaged across points, and an answer for too few points is refused."
+
+    def check_estimate_range() -> str:
+        rng = np.random.default_rng(5)
+        steady = rng.normal(0, 10, 400)
+        out = estimate_range(steady)
+        if out["held"] is None or not 0.72 <= out["held"] <= 0.88:
+            raise AssertionError(f"On steady misses the range should hold about 80% of days: {out['held']}")
+        assert_close(out["high"] - out["low"], 2 * 1.2816 * 10, 6.0)
+        jumpy = np.r_[rng.normal(0, 5, 200), rng.normal(0, 25, 40)]
+        wide = estimate_range(jumpy)
+        if not wide["high"] - wide["low"] > 2.5 * (estimate_range(jumpy[:200])["high"] - estimate_range(jumpy[:200])["low"]):
+            raise AssertionError("After misses grow, the range must widen.")
+        few = estimate_range(rng.normal(0, 10, 20))
+        if few["held"] is not None or few["adaptive"]:
+            raise AssertionError("With few tested days the range can't claim a hit rate.")
+        return f"On steady misses the range held {out['held'] * 100:.0f}% of days for an 80% aim, it widens when misses grow, and with few tested days it claims no hit rate."
+
+    def check_estimate_uses_zone_points() -> str:
+        rng = np.random.default_rng(8)
+        days = pd.date_range("2025-09-01", periods=330, freq="D")
+        zone_wind, city_wind = rng.uniform(5, 40, len(days)), rng.uniform(5, 40, len(days))
+        price = 120 - 2.0 * zone_wind - 15.0 * (days.dayofweek >= 5) + rng.normal(0, 2, len(days))
+        hourly = pd.DataFrame({"local": days.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(days)), unit="h"), "value": price.repeat(24), "hours": 1.0})
+        city = pd.DataFrame({"date": days, "location": ZONE_WEATHER["France"], "temperature_mean_c": 12.0, "wind_speed_100m_mean_kmh": city_wind, "solar_radiation_mean_wm2": 100.0})
+        grid = pd.DataFrame({"zone": "France", "date": days, "hdd": 6.0, "wind": zone_wind, "solar": 100.0})
+        ahead = grid.tail(1).assign(date=days[-1] + pd.Timedelta(days=1), wind=30.0)
+        with_grid = next_day_estimate("France", hourly, city, city.tail(1).assign(date=days[-1] + pd.Timedelta(days=1)), grid_history=grid, grid_forecast=ahead)
+        city_only = next_day_estimate("France", hourly, city, city.tail(1).assign(date=days[-1] + pd.Timedelta(days=1)))
+        if "points" not in with_grid["weather_basis"] or city_only["weather_basis"] != "Paris":
+            raise AssertionError(f"Wrong weather source: {with_grid['weather_basis']}, {city_only['weather_basis']}")
+        if not with_grid["error"] < 0.5 * city_only["error"]:
+            raise AssertionError("When prices follow zone-wide wind, the zone points should test far better than one city.")
+        assert_close(with_grid["wind_effect"], -2.0, 0.25)
+        no_ahead = next_day_estimate("France", hourly, city, city.tail(1).assign(date=days[-1] + pd.Timedelta(days=1)), grid_history=grid)
+        if no_ahead["weather_basis"] != "Paris":
+            raise AssertionError("Without a zone forecast for the day, the city forecast should be used.")
+        return f"Zone points are used when they have a forecast for the day (miss €{with_grid['error']:.1f} against €{city_only['error']:.1f} for one city), otherwise the city."
+
     def check_demand_weights() -> str:
         archive = pd.DataFrame({"date": ["2026-01-01"] * 3, "location": ["Berlin / German power proxy", "Paris / French power proxy", "London / NBP proxy"], "hdd": [20.0, 10.0, 99.0]})
         assert_close(float(archive_hdd(archive).iloc[0]), (78.0 * 20.0 + 31.0 * 10.0) / 109.0)
@@ -8304,6 +8630,10 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Demand weights for heating", "Market Read", check_demand_weights),
         ("ENTSO-E forecast method", "Next-day estimate", check_entsoe_forecast_method),
         ("Next-day estimate recovers known effects", "Next-day estimate", check_next_day_estimate),
+        ("Holidays and kinds of day", "Next-day estimate", check_estimate_calendar),
+        ("Weather across a zone in one request", "Live API integration", check_zone_weather_fetch),
+        ("The 80% range holds about 80%", "Next-day estimate", check_estimate_range),
+        ("Zone weather points beat one city", "Next-day estimate", check_estimate_uses_zone_points),
         ("P&L drivers add up", "Daily P&L", check_pnl_drivers),
         ("Crisis replay by hand", "Risk", check_crisis_replay),
         ("VaR check and Kupiec test", "Risk", check_var_backtest),
@@ -9714,7 +10044,8 @@ def render_winter_outlook() -> None:
 def zone_estimate(zone: str) -> dict:
     return session_memo(f"estimate|{zone}", data_version("live"),
                         lambda: next_day_estimate(zone, zone_prices(zone), _live_dataset_frame("weather_power_history"), _live_dataset_frame("weather_daily"),
-                                                  _live_dataset_frame(f"entsoe_load_forecast|{zone}"), _live_dataset_frame(f"entsoe_renewable_forecast|{zone}")))
+                                                  _live_dataset_frame(f"entsoe_load_forecast|{zone}"), _live_dataset_frame(f"entsoe_renewable_forecast|{zone}"),
+                                                  _live_dataset_frame("zone_weather_history"), _live_dataset_frame("zone_weather_forecast")))
 
 
 def record_price_estimates() -> None:
@@ -9746,57 +10077,78 @@ def render_next_day(zones: Sequence[str]) -> None:
         need_data_note(result["reason"])
         update_button("estimate_update")
         return
-    beat = result["error"] < min(result["error_last_week"], result["error_yesterday"])
+    beat = result["skill"] > 0
     gap_word = "above" if result["latest_gap"] > 0 else "below"
+    weather_words = f"the weather forecast at {result['weather_basis']}" if "points" in result["weather_basis"] else f"the weather forecast for {result['weather_basis'] or 'one city'}"
     basis = ("It uses ENTSO-E's published load, wind and solar forecasts for that day." if result["method"] != "Weather" else
-             "It uses the weather forecast, which has tested better here than ENTSO-E's forecasts." if result["target_has_forecast"] and result["comparison"] else
-             "It uses the weather forecast, because ENTSO-E's wind and solar forecast is usually published by 18:00 the day before delivery, after the auction.")
+             f"It uses {weather_words}, which has tested better here than ENTSO-E's forecasts." if result["target_has_forecast"] and result["comparison"] else
+             f"It uses {weather_words}, because ENTSO-E's wind and solar forecast is usually published by 18:00 the day before delivery, after the auction.")
     euros = lambda value: f"{'+' if value >= 0 else '-'}€{abs(value):.2f}"
-    against = (f"in line with the €{result['latest_estimate']:.0f} suggested by" if abs(result["latest_gap"]) < 0.5 else
-               f"€{abs(result['latest_gap']):.0f} {gap_word} the €{result['latest_estimate']:.0f} suggested by")
+    shown_gap = round(result["latest_actual"]) - round(result["latest_estimate"])   # agrees with the rounded prices shown
+    against = (f"in line with the €{result['latest_estimate']:.0f} suggested by" if shown_gap == 0 else
+               f"€{abs(shown_gap):.0f} {gap_word} the €{result['latest_estimate']:.0f} suggested by")
     check_basis = "ENTSO-E's forecasts for that day" if result["check_method"] != "Weather" else "the weather"
+    held = (f" The range is built the same way each day and held the price on <b>{result['held'] * 100:.0f}%</b> of {result['held_days']} tested days, against the 80% it aims for."
+            if result["held"] is not None else " There are too few tested days yet to say how often the range holds.")
+    trend = (" Recent days have been harder than usual, so the range is wider." if result["recent_error"] > 1.25 * result["error"] else
+             " Recent days have been calmer than usual, so the range is narrower." if result["recent_error"] < 0.8 * result["error"] else "")
     with st.container(key="hero"):
         st.markdown(
-            f'<div class="desk-note"><p>Base price for {result["day"]:%a %d %b} in {html.escape(zone)}: about <b>€{result["estimate"]:.0f}/MWh</b>, likely between €{result["low"]:.0f} and €{result["high"]:.0f}. {basis}</p>'
+            f'<div class="desk-note"><p>Base price for {result["day"]:%a %d %b} in {html.escape(zone)}: about <b>€{result["estimate"]:.0f}/MWh</b>, '
+            f'with an 80% chance of landing between <b>€{result["low"]:.0f} and €{result["high"]:.0f}</b>. {html.escape(basis)}</p>'
             f'<p>The latest published day, {result["latest_day"]:%a %d %b}, came in at €{result["latest_actual"]:.0f}, {against} {check_basis}. '
             f'{"That is an unusually large gap, so check for something the method can&#39;t see." if result["unusual"] else "That is within the usual range of error."}</p>'
-            f'<p class="soft">Over the last {result["n"]} days, this method missed by €{result["error"]:.1f} on average, against €{result["error_last_week"]:.1f} for using the same weekday last week and €{result["error_yesterday"]:.1f} for using the previous day. '
-            f'{"" if beat else "It has not beaten both simple methods, so don&#39;t rely on it over them."}</p></div>', unsafe_allow_html=True)
-    test = result["test"].tail(60)
+            f'<p class="soft">Over the last {result["n"]} days, each estimated only from earlier days, it missed by €{result["error"]:.1f} on average, '
+            f'{abs(result["skill"]) * 100:.0f}% {"less" if beat else "more"} than the best simple method (€{min(result["error_same_type"], result["error_last_week"], result["error_yesterday"]):.1f}).{held}{trend} '
+            f'{"" if beat else "It has not beaten the simple methods, so don&#39;t rely on it over them."}</p></div>', unsafe_allow_html=True)
+    test = result["test"].tail(90)
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=test["day"], y=test["actual"], mode="lines", name="Published price", line=dict(color=TEXT, width=2)))
     fig.add_trace(go.Scatter(x=test["day"], y=test["estimate"], mode="lines", name="Estimate made the day before", line=dict(color=AMBER, width=2, dash="dash")))
-    fig.add_trace(go.Scatter(x=[pd.Timestamp(result["day"])], y=[result["estimate"]], mode="markers", name="Next day, with likely range", marker=dict(color=AMBER, size=11, symbol="diamond"),
+    fig.add_trace(go.Scatter(x=[pd.Timestamp(result["day"])], y=[result["estimate"]], mode="markers", name="Next day, with 80% range", marker=dict(color=AMBER, size=11, symbol="diamond"),
                              error_y=dict(type="data", symmetric=False, array=[result["high"] - result["estimate"]], arrayminus=[result["estimate"] - result["low"]], color=AMBER, thickness=2)))
     fig.update_layout(title=f"{zone}: day-ahead base price, EUR/MWh")
     chart(fig, 380)
     comparison = result["comparison"]
+    st.subheader("How the methods compare")
+    rows = [{"Method": f"Weather at {result['weather_basis']}" if "points" in result["weather_basis"] else f"Weather in {result['weather_basis'] or 'one city'}", "Average miss, EUR/MWh": round(comparison["weather"] if comparison else result["error"], 2)}]
     if comparison:
-        st.subheader("How the methods compare")
-        table(pd.DataFrame([{"Method": "ENTSO-E forecasts", "Average miss, EUR/MWh": round(comparison["forecasts"], 2)}, {"Method": "Weather in one city", "Average miss, EUR/MWh": round(comparison["weather"], 2)},
-                            {"Method": "Same weekday last week", "Average miss, EUR/MWh": round(comparison["last_week"], 2)}, {"Method": "Previous day", "Average miss, EUR/MWh": round(comparison["yesterday"], 2)}]))
+        rows.insert(0, {"Method": "ENTSO-E forecasts", "Average miss, EUR/MWh": round(comparison["forecasts"], 2)})
+    source = comparison or {"same_type": result["error_same_type"], "last_week": result["error_last_week"], "yesterday": result["error_yesterday"]}
+    rows += [{"Method": "Last day of the same kind", "Average miss, EUR/MWh": round(source["same_type"], 2)},
+             {"Method": "Same weekday last week", "Average miss, EUR/MWh": round(source["last_week"], 2)}, {"Method": "Previous day", "Average miss, EUR/MWh": round(source["yesterday"], 2)}]
+    table(pd.DataFrame(rows))
+    if comparison:
         st.caption(f"On the same {comparison['days']} days. The ENTSO-E method isn't fully comparable: its wind and solar forecasts are usually published after the auction, so it shows how good the forecast information is, not what you could have estimated beforehand.")
     else:
-        st.caption(f"ENTSO-E's forecasts cover {result['forecast_days']} days so far, and a comparison needs at least {ESTIMATE_MIN_DAYS + 30}. Select Update market data to load them.")
+        st.caption(f"Over {result['n']} days. A day of the same kind means a working day, a Saturday, or a Sunday or public holiday. ENTSO-E's forecasts cover {result['forecast_days']} days so far, and comparing with them needs at least {ESTIMATE_MIN_DAYS + 30}.")
     store = desk_store()
     log = store.load_price_estimates(zone) if store is not None else pd.DataFrame()
     live = score_recorded_estimates(log, daily_base_prices(zone_prices(zone)))
     if live["n"]:
-        st.caption(f"Estimates saved on the day with real forecasts: {live['n']} scored so far, missing by €{live['error']:.1f} on average, against €{live['error_last_week']:.1f} for the same weekday last week.")
+        st.caption(f"Estimates saved on the day, before prices were known: {live['n']} scored so far, missing by €{live['error']:.1f} on average, against €{live['error_last_week']:.1f} for the same weekday last week."
+                   + (f" Their ranges held the price on {live['held'] * 100:.0f}% of {live['held_n']} days." if live["held"] is not None else "") + " This is the truest test, as nothing here could see the outcome.")
     else:
-        st.caption("Each estimate is also saved on the day, using the real forecast. They're scored here once the prices are published.")
+        st.caption("Each estimate is also saved on the day, before the price is known. They're scored here once the prices are published, which is the truest test of the method.")
     with st.expander("How this estimate works"):
         effects = result["forecast_effects"]
-        st.markdown("Each method is a regression on the last 180 days using the previous day's price, the last 7 days' average, the same weekday last week and the weekday pattern. They differ in the rest.\n\n"
-                    "**Weather method.** It adds heating demand, wind and solar in one reference city, and can run before the auction. "
-                    f"10 km/h more wind changes the price by **{euros(result['wind_effect'] * 10)}**, one more heating degree day by **{euros(result['hdd_effect'])}**, and 10 W/m² more solar radiation by **{euros(result['solar_effect'] * 10)}**. "
-                    "Its test uses the weather that actually happened, because past forecasts aren't available, so real errors will be larger.\n\n"
+        grid = "points" in result["weather_basis"]
+        st.markdown("Each method is a regression on up to a year of days, where recent days count more: a day four months back counts half as much as yesterday. "
+                    "It starts from the last day of the same kind (a working day, a Saturday, or a Sunday or public holiday), the last working day, the previous day, the last 7 days' average and the same weekday last week, "
+                    "so a Monday starts from Friday's price, not Sunday's, and national public holidays are priced like Sundays.\n\n"
+                    + (f"**Weather method.** It adds heating demand, wind at 100 m and solar radiation averaged over {len(ZONE_WEATHER_POINTS.get(zone, ()))} points spread across the zone, for the day and the day before. "
+                       "On real German prices and pre-auction weather forecasts, a dozen points instead of one city cut the average miss by about a sixth. " if grid else
+                       f"**Weather method.** It adds heating demand, wind and solar in {result['weather_basis'] or 'one reference city'}, for the day and the day before. ")
+                    + f"10 km/h more wind changes the price by **{euros(result['wind_effect'] * 10)}**, one more heating degree day by **{euros(result['hdd_effect'])}**, and 10 W/m² more solar radiation by **{euros(result['solar_effect'] * 10)}**. "
+                    "Its test uses the weather that actually happened, because past forecasts aren't stored, so real errors run a little larger. The saved estimates above don't have that advantage.\n\n"
+                    "**The range.** It comes from this method's own misses on the tested days, scaled by how large recent misses were, so it widens when the market turns volatile and narrows when it calms. "
+                    "It aims to hold the price on 8 days in 10. After a sudden jump in volatility it takes a week or two to catch up.\n\n"
                     "**ENTSO-E method.** It adds the system operators' day-ahead forecasts of load, wind and solar for the whole zone, and its test uses those forecasts rather than what happened. "
                     + (f"1 GW more forecast load changes the price by **{euros(effects['load'])}**, 1 GW more wind by **{euros(effects['wind'])}**, and 1 GW more solar by **{euros(effects['solar'])}**. " if effects else "")
                     + "The load forecast is due two hours before the auction deadline, but the wind and solar forecast is only due by 18:00 the day before delivery. "
                     "So it usually can't set the estimate before the auction. Its main use is checking whether a published price looks high or low against those forecasts. It sets the estimate only when the forecast already exists and it has tested at least as well as the weather method.\n\n"
                     f"ENTSO-E's forecasts cover **{result['forecast_days']} days** for this zone so far, and some operators may revise them after first publishing.\n\n"
-                    "Neither method knows about plant outages, gas prices, public holidays or the auction itself.")
+                    "Neither method knows about gas or carbon prices, plant outages, interconnector limits or the auction itself. A sharp move in gas between one day and the next is the most common reason for a large miss.")
 
 
 def render_pnl_drivers(step: pd.DataFrame, factor: pd.Series) -> pd.DataFrame:
@@ -9964,7 +10316,7 @@ def build_brief() -> dict:
         if zone in _live_variants("entsoe_price"):
             result = zone_estimate(zone)
             if result["ready"]:
-                estimates.append({"Zone": zone, "Day": f"{result['day']:%a %d %b}", "Estimate": f"€{result['estimate']:.0f}", "Likely range": f"€{result['low']:.0f} to €{result['high']:.0f}", "Latest day": "Unusually large gap" if result["unusual"] else "Within usual error"})
+                estimates.append({"Zone": zone, "Day": f"{result['day']:%a %d %b}", "Estimate": f"€{result['estimate']:.0f}", "80% range": f"€{result['low']:.0f} to €{result['high']:.0f}", "Latest day": "Unusually large gap" if result["unusual"] else "Within usual error"})
     outlook = winter_outlook()
     outlook_text = ""
     if outlook.get("ready") and outlook.get("basis") == "weather":
@@ -10001,7 +10353,7 @@ def brief_pdf(brief: dict) -> bytes:
         blocks += [("heading", "P&L"), ("text", brief["pnl_text"])]
     if brief["estimates"]:
         blocks.append(("heading", "Next-day power price estimate"))
-        columns = ["Zone", "Day", "Estimate", "Likely range", "Latest day"]
+        columns = ["Zone", "Day", "Estimate", "80% range", "Latest day"]
         blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["estimates"]], (0.28, 0.16, 0.13, 0.19, 0.24))))
     if brief["outlook"]:
         blocks += [("heading", "Winter storage"), ("text", brief["outlook"])]
