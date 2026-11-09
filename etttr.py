@@ -5079,6 +5079,91 @@ def fetch_zone_weather(zone: str, start: Optional[date] = None, end: Optional[da
     return out.assign(zone=zone, points=len(per_point))[["zone", "date", "temperature", "hdd", "wind", "solar", "points"]]
 
 
+# TradingView through tvdatafeed, an unofficial library: it can break when TradingView changes, prices are
+# delayed, and TradingView's terms don't allow automated access. Personal use, at the user's choice.
+TRADINGVIEW_CURVES = {"TTF Natural Gas": {"exchange": "NYMEX", "root": "TTF", "name": "NYMEX Dutch TTF month futures"}}
+TRADINGVIEW_MONTH_CODES = "FGHJKMNQUVXZ"
+TRADINGVIEW_INSTALL = "pip install --upgrade --no-cache-dir git+https://github.com/rongardF/tvdatafeed.git"
+TRADINGVIEW_HISTORY_BARS = 60          # first fetch: about three months of daily closes, so P&L and risk start with real history
+TRADINGVIEW_UPDATE_BARS = 7
+TRADINGVIEW_MAX_MONTHS = 48
+TRADINGVIEW_CARRY_DAYS = 5             # a contract with no trade that day keeps its last close for up to this many days
+
+
+def tradingview_available() -> bool:
+    import importlib.util
+    import sys
+    if sys.modules.get("tvDatafeed") is not None:
+        return True
+    try:
+        return importlib.util.find_spec("tvDatafeed") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def tradingview_symbol(root: str, month: date) -> str:
+    return f"{root}{TRADINGVIEW_MONTH_CODES[month.month - 1]}{month.year}"
+
+
+def fetch_tradingview_curve(product: str, today: date, n_bars: int, username: str = "", password: str = "", _client=None) -> pd.DataFrame:
+    """Daily closes of each month contract, one row per day and delivery month, ready for parse_curve_table.
+
+    A contract is used only on days before its delivery month starts. A day where fewer than half the
+    contracts have a price, such as a holiday, is left out.
+    """
+    spec = TRADINGVIEW_CURVES[product]
+    if _client is None:
+        try:
+            from tvDatafeed import TvDatafeed, Interval
+        except ImportError:
+            raise RuntimeError(f"tvdatafeed isn't installed. Run: {TRADINGVIEW_INSTALL}") from None
+        import logging
+        logging.getLogger("tvDatafeed").setLevel(logging.CRITICAL)   # its own messages are replaced by the summary below
+        client, interval = TvDatafeed(username or None, password or None), Interval.in_daily
+    else:
+        client, interval = _client, "1D"
+    # With history, start from contracts that were the front month at the start of that history.
+    first = _add_months(date(today.year, today.month, 1), 1 - (math.ceil(n_bars / 21) if n_bars > TRADINGVIEW_UPDATE_BARS else 0))
+    closes, misses, failures = {}, 0, 0
+    for step in range(TRADINGVIEW_MAX_MONTHS + 4):
+        month = _add_months(first, step)
+        try:
+            bars = client.get_hist(symbol=tradingview_symbol(spec["root"], month), exchange=spec["exchange"], interval=interval, n_bars=int(n_bars))
+        except Exception:
+            bars, failures = None, failures + 1
+            if failures >= 3 and not closes:
+                raise RuntimeError("Can't reach TradingView. Check the connection and try again later.") from None
+        if bars is None or len(bars) == 0 or "close" not in getattr(bars, "columns", []):
+            if month > today:
+                misses += 1
+                if misses >= 3 and closes:
+                    break   # past the last listed contract
+            continue
+        misses = 0
+        days = [min(pd.Timestamp(stamp).date(), today) for stamp in bars.index]
+        prices = pd.to_numeric(bars["close"], errors="coerce").to_numpy(float)
+        kept = {d: p for d, p in zip(days, prices) if d < month and np.isfinite(p) and p > 0}
+        if kept:
+            closes[month] = pd.Series(kept)
+    if not closes:
+        raise RuntimeError("TradingView returned no TTF prices. Check the connection, or add a TradingView login to the keys file.")
+    table = pd.DataFrame(closes).sort_index()
+    table.index = pd.to_datetime(table.index)
+    for month in table.columns:   # carry a quiet contract's last close, only while it was listed
+        listed = table[month].first_valid_index()
+        filled = table[month].ffill(limit=TRADINGVIEW_CARRY_DAYS)
+        table[month] = filled.where(table.index >= listed)
+    for day in table.index:
+        table.loc[day, [m for m in table.columns if pd.Timestamp(m) <= day]] = np.nan
+    live = table.notna().sum(axis=1)
+    listed_then = pd.Series([sum(1 for m in table.columns if pd.Timestamp(m) > d) for d in table.index], index=table.index)
+    table = table.loc[live >= 0.5 * listed_then.clip(lower=1)]
+    rows = table.stack().dropna().rename("price").reset_index()   # pandas 3 keeps empty cells when stacking
+    rows.columns = ["curve_date", "contract", "price"]
+    return pd.DataFrame({"product": product, "contract": [pd.Timestamp(m).date() for m in rows["contract"]],
+                         "curve_date": [pd.Timestamp(d).date() for d in rows["curve_date"]], "price": rows["price"].to_numpy(float)})
+
+
 def fetch_temperature_normals(location_names: Sequence[str], years: int = 10, _json_get_fn=None) -> tuple[pd.DataFrame, list[str]]:
     """Calendar-day temperature and degree-day normals from Open-Meteo's historical archive."""
     _, normals, failures = fetch_weather_archive(location_names, years, _json_get_fn)
@@ -5877,7 +5962,8 @@ def resolved_credentials() -> dict[str, str]:
     from_file = keys_from_file()
     def pick(name: str, secret: str) -> str:
         return overrides.get(name) or _secret_or_env(secret, secret) or from_file.get(secret, "")
-    return {"gie": pick("gie", "GIE_API_KEY"), "entsoe": pick("entsoe", "ENTSOE_API_TOKEN"), "open_meteo": pick("open_meteo", "OPEN_METEO_API_KEY")}
+    return {"gie": pick("gie", "GIE_API_KEY"), "entsoe": pick("entsoe", "ENTSOE_API_TOKEN"), "open_meteo": pick("open_meteo", "OPEN_METEO_API_KEY"),
+            "tradingview_user": pick("tradingview_user", "TRADINGVIEW_USERNAME"), "tradingview_password": pick("tradingview_password", "TRADINGVIEW_PASSWORD")}
 
 
 def missing_keys_text() -> str:
@@ -6125,6 +6211,16 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             _stored_live_item("weather_power_history", "Open-Meteo wind and solar history", frame, {"days": 430})
             return f"{frame['location'].nunique()} of {len(power_zones)} locations"
         tasks.append(UpdateTask("Wind and solar history", lambda: fetch_power_weather([ZONE_WEATHER[z] for z in power_zones]), apply_power_weather))
+    if tradingview_available() and _needs_update("tradingview_curves", "prices", force):
+        first_time = _held_frame("tradingview_curves") is None
+        bars = TRADINGVIEW_HISTORY_BARS if first_time else TRADINGVIEW_UPDATE_BARS
+        login = (keys["tradingview_user"], keys["tradingview_password"])
+        for tv_product in TRADINGVIEW_CURVES:
+            def fetch_tv(product=tv_product) -> pd.DataFrame:
+                return fetch_tradingview_curve(product, today, bars, *login)
+            def apply_tv(raw: pd.DataFrame, product=tv_product) -> str:
+                return apply_tradingview_curve(product, raw)
+            tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv))
     held_auctions = _live_dataset_frame("eex_eua_auctions")
     auction_age = (today - pd.Timestamp(held_auctions["date"].iloc[-1]).date()).days if not held_auctions.empty and "date" in held_auctions.columns else None
     if force or auction_age is None or (auction_age >= 1 and _needs_update("eex_eua_auctions", "prices", False)):
@@ -6348,6 +6444,29 @@ def import_curve_folder() -> list[dict]:
         if imported:
             st.session_state["flash_message"] = f"Imported {imported} curve file(s)."
     return results
+
+
+def apply_tradingview_curve(product: str, raw: pd.DataFrame) -> str:
+    """Save each day's TradingView curve as that day's marks, and price with the latest one."""
+    store = desk_store()
+    custom, metadata = st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {})
+    today = date.today()
+    shapes = {p: custom.get(p, make_sample_curve(p, today, DEMO_CURVE_MONTHS)) for p in CURVE_PRODUCTS}
+    latest = {p: (curve_mark_date(metadata.get(p)), custom[p]) for p in custom if curve_mark_date(metadata.get(p))}
+    parsed = parse_curve_table(raw, "tradingview", today, shapes, latest, today)
+    source = f"TradingView, {TRADINGVIEW_CURVES[product]['name']}, delayed"
+    if store is not None:
+        for item in parsed:
+            store.save_snapshot(item["day"], item["curve"], source, replace=True)
+    newest = parsed[-1]
+    held = curve_mark_date(metadata.get(product)) if product in custom else None
+    if held is None or newest["day"] >= held:
+        commit_custom_curve(product, newest["curve"], {"source_label": source, "source_type": "TradingView", "imported_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")},
+                            curve_date=newest["day"])
+    bump("snapshots")
+    _stored_live_item("tradingview_curves", "TradingView forward curves", raw.loc[raw["curve_date"].eq(newest["day"])], {"product": product, "days": len(parsed)})
+    front = newest["curve"].iloc[0]
+    return f"{len(newest['curve'])} months dated {newest['day']:%d %b}, front {pd.Timestamp(front['delivery_month']):%b %y} at {front['price']:.2f}" + (f", plus {len(parsed) - 1} earlier days" if len(parsed) > 1 else "")
 
 
 def saved_reads() -> pd.DataFrame:
@@ -8463,6 +8582,55 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             raise AssertionError("Without a zone forecast for the day, the city forecast should be used.")
         return f"Zone points are used when they have a forecast for the day (miss €{with_grid['error']:.1f} against €{city_only['error']:.1f} for one city), otherwise the city."
 
+    def check_tradingview_curve() -> str:
+        today = date(2026, 11, 9)
+        screen = {date(2026, 12, 1): 87.010, date(2027, 1, 1): 85.384, date(2027, 2, 1): 84.784, date(2027, 3, 1): 81.755, date(2027, 4, 1): 70.556}
+        calls = []
+        class FakeClient:
+            def get_hist(self, symbol, exchange, interval, n_bars):
+                calls.append((symbol, exchange, n_bars))
+                code, year = symbol[3], int(symbol[4:])
+                month = date(year, TRADINGVIEW_MONTH_CODES.index(code) + 1, 1)
+                if month > date(2027, 4, 1):
+                    return None   # not listed
+                days = pd.bdate_range(end=pd.Timestamp(today), periods=n_bars)
+                last = screen.get(month, 90.0)
+                closes = last + 0.1 * np.arange(len(days))[::-1]
+                frame = pd.DataFrame({"symbol": symbol, "close": closes}, index=days + pd.Timedelta(hours=1))
+                if month == date(2027, 3, 1):
+                    frame = frame.drop(frame.index[-3])   # no trade one day
+                if month == date(2026, 12, 1):
+                    frame = frame.drop(frame.index[-6])   # one more gap
+                return frame
+        raw = fetch_tradingview_curve("TTF Natural Gas", today, 7, _client=FakeClient())
+        if calls[0][:2] != ("TTFZ2026", "NYMEX") or calls[1][0] != "TTFF2027":
+            raise AssertionError(f"Wrong symbols: {calls[:2]}")
+        if len(calls) != 8:
+            raise AssertionError(f"It should stop after three months that aren't listed: {len(calls)} requests.")
+        latest = raw.loc[raw["curve_date"].eq(today)].set_index("contract")["price"]
+        for month, price in screen.items():
+            assert_close(float(latest[month]), price)
+        parsed = parse_curve_table(raw, "tradingview", today, {}, {}, today)
+        if len(parsed) != 7 or parsed[-1]["day"] != today or len(parsed[-1]["curve"]) != 5:
+            raise AssertionError("Each day should become one monthly curve.")
+        gap_day = pd.bdate_range(end=pd.Timestamp(today), periods=7)[-3].date()
+        carried = raw.loc[raw["curve_date"].eq(gap_day)].set_index("contract")["price"]
+        assert_close(float(carried[date(2027, 3, 1)]), screen[date(2027, 3, 1)] + 0.3)   # previous day's close carried
+        history = fetch_tradingview_curve("TTF Natural Gas", today, 60, _client=FakeClient())
+        october = history.loc[history["curve_date"].eq(date(2026, 10, 20))]
+        if date(2026, 11, 1) not in set(october["contract"]) or date(2026, 11, 1) in set(history.loc[history["curve_date"] >= date(2026, 11, 1), "contract"]):
+            raise AssertionError("A contract counts only before its delivery month starts.")
+        class Down:
+            def get_hist(self, **kwargs):
+                raise ConnectionError("offline")
+        try:
+            fetch_tradingview_curve("TTF Natural Gas", today, 7, _client=Down())
+            raise AssertionError("An unreachable TradingView should be reported.")
+        except RuntimeError as exc:
+            if "reach" not in str(exc):
+                raise
+        return "Symbols are NYMEX TTFZ2026, TTFF2027 and on. Your screenshot's closes come through as today's marks, a day with no trade keeps the last close, expired months drop out, and an outage stops after three tries."
+
     def check_demand_weights() -> str:
         archive = pd.DataFrame({"date": ["2026-01-01"] * 3, "location": ["Berlin / German power proxy", "Paris / French power proxy", "London / NBP proxy"], "hdd": [20.0, 10.0, 99.0]})
         assert_close(float(archive_hdd(archive).iloc[0]), (78.0 * 20.0 + 31.0 * 10.0) / 109.0)
@@ -8630,6 +8798,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Demand weights for heating", "Market Read", check_demand_weights),
         ("ENTSO-E forecast method", "Next-day estimate", check_entsoe_forecast_method),
         ("Next-day estimate recovers known effects", "Next-day estimate", check_next_day_estimate),
+        ("TradingView curve through tvdatafeed", "Live API integration", check_tradingview_curve),
         ("Holidays and kinds of day", "Next-day estimate", check_estimate_calendar),
         ("Weather across a zone in one request", "Live API integration", check_zone_weather_fetch),
         ("The 80% range holds about 80%", "Next-day estimate", check_estimate_range),
@@ -9103,6 +9272,12 @@ def page_forward_curves():
     state = product_price_state(selected)
     counts = pd.Series(list(sources_here.values())).value_counts()
     mix = "; ".join(f"{n} month{'s' if n > 1 else ''} {label.lower() if label != 'Demo' else 'demo prices'}" for label, n in counts.items())
+    if selected in TRADINGVIEW_CURVES:
+        if tradingview_available():
+            st.caption(f"Fetched from TradingView ({TRADINGVIEW_CURVES[selected]['name']}) with each market data update, through tvdatafeed. "
+                       "Prices are delayed, the library is unofficial and can stop working when TradingView changes, and TradingView's terms don't allow automated access, so keep this to personal use.")
+        else:
+            st.caption(f"To fetch this curve from TradingView with each update, install tvdatafeed: `{TRADINGVIEW_INSTALL}`")
     if selected in st.session_state.get("custom_curves", {}):
         meta = st.session_state.get("curve_metadata", {}).get(selected, {})
         marked = curve_mark_date(meta)
