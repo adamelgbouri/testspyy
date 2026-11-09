@@ -2781,6 +2781,8 @@ CALENDAR_COLUMNS = ("same", "work", "lag1", "avg7", "lag7", "saturday", "sunday"
 WEATHER_COLUMNS = ("hdd", "wind", "solar", "hdd_before", "wind_before", "solar_before")
 ESTIMATE_COLUMNS = CALENDAR_COLUMNS + WEATHER_COLUMNS
 FORECAST_COLUMNS = CALENDAR_COLUMNS + ("load_gw", "wind_gw", "solar_gw")
+GAS_COLUMNS = ("gas", "gas_before")
+GAS_MIN_GAIN = 0.02                    # gas is used only when it cuts the tested average miss by at least 2%, so noise can't win by luck
 # Points spread across each zone, latitude and longitude. Wind in one city says little about a whole
 # country's wind output: on real German prices and forecasts, a dozen points cut the average miss by about a sixth.
 ZONE_WEATHER_POINTS = {
@@ -2893,6 +2895,22 @@ def estimate_features(base: pd.Series, weather: pd.DataFrame, last_day: pd.Times
     return frame
 
 
+def gas_at_auction(gas: Optional[pd.DataFrame], days: pd.DatetimeIndex) -> pd.DataFrame:
+    """Front-month TTF as known at each delivery day's auction: the last close two days or more before delivery,
+    since the auction runs at noon the day before. gas_before is the same for the previous delivery day."""
+    if gas is None or gas.empty or not {"date", "close"}.issubset(gas.columns):
+        return pd.DataFrame({"gas": np.nan, "gas_before": np.nan}, index=days)
+    closes = gas.assign(date=pd.to_datetime(gas["date"]).dt.tz_localize(None).dt.normalize()).dropna(subset=["close"]).sort_values("date")
+    closes = closes.drop_duplicates("date", keep="last")[["date", "close"]]
+    asked = pd.DataFrame({"cutoff": days - pd.Timedelta(days=2)}).sort_values("cutoff")
+    matched = pd.merge_asof(asked, closes, left_on="cutoff", right_on="date", direction="backward")
+    known = pd.Series(matched["close"].to_numpy(float), index=days)
+    # A close more than a week before isn't what the market knew at the auction.
+    stale = (asked["cutoff"].to_numpy() - matched["date"].to_numpy()) > np.timedelta64(7, "D")
+    known[stale] = np.nan
+    return pd.DataFrame({"gas": known, "gas_before": known.shift(1)}, index=days)
+
+
 def entsoe_forecast_days(load_forecast: pd.DataFrame, renewable_forecast: pd.DataFrame, tz: str) -> pd.DataFrame:
     """ENTSO-E's day-ahead forecasts by delivery day, in GW. A day needs at least 20 hours to count."""
     columns = ["load_gw", "wind_gw", "solar_gw"]
@@ -2999,7 +3017,8 @@ def _weather_for_estimate(zone: str, history: pd.DataFrame, daily: pd.DataFrame,
 
 def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, daily: pd.DataFrame,
                       load_forecast: Optional[pd.DataFrame] = None, renewable_forecast: Optional[pd.DataFrame] = None,
-                      grid_history: Optional[pd.DataFrame] = None, grid_forecast: Optional[pd.DataFrame] = None) -> dict:
+                      grid_history: Optional[pd.DataFrame] = None, grid_forecast: Optional[pd.DataFrame] = None,
+                      gas: Optional[pd.DataFrame] = None) -> dict:
     """Estimate the next unpublished delivery day, and test the methods one day at a time.
 
     The weather method can run before the auction. ENTSO-E's wind and solar forecast is usually
@@ -3021,6 +3040,23 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
         return {"ready": False, "reason": "Prices and weather overlap on too few days so far."}
     test = _walk_forward(known, ESTIMATE_COLUMNS)
     final = _fit_estimate(known, ESTIMATE_COLUMNS, target)
+    # Gas: tested on the same days with and without it, and used only when it clearly helps.
+    weather_columns, gas_check = ESTIMATE_COLUMNS, None
+    frame = frame.join(gas_at_auction(gas, frame.index))
+    gas_known = frame.iloc[:-1].dropna(subset=["base", *ESTIMATE_COLUMNS, *GAS_COLUMNS])
+    if len(gas_known) >= ESTIMATE_MIN_DAYS + 30:
+        gas_test = _walk_forward(gas_known, ESTIMATE_COLUMNS + GAS_COLUMNS)
+        shared = test.merge(gas_test[["day", "estimate"]].rename(columns={"estimate": "with_gas"}), on="day")
+        if len(shared) >= 30:
+            without, with_gas = float((shared["actual"] - shared["estimate"]).abs().mean()), float((shared["actual"] - shared["with_gas"]).abs().mean())
+            ahead_gas = not frame.iloc[[-1]][list(GAS_COLUMNS)].isna().any(axis=None)
+            gas_check = {"days": len(shared), "without": without, "with": with_gas, "used": ahead_gas and with_gas <= (1.0 - GAS_MIN_GAIN) * without,
+                         "ready": ahead_gas, "effect": None}
+            if gas_check["used"]:
+                weather_columns, test = ESTIMATE_COLUMNS + GAS_COLUMNS, gas_test
+                final = _fit_estimate(gas_known, weather_columns, target)
+                gas_check["effect"] = float(final[weather_columns.index("gas") + 1])
+    ahead = frame.iloc[[-1]]
 
     tz = ENTSOE_ZONES[zone]["timezone"]
     published = entsoe_forecast_days(load_forecast, renewable_forecast, tz)
@@ -3043,7 +3079,7 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
         return {"ready": False, "reason": f"There's no weather forecast for {target:%d %b}. Select Update market data."}
     chosen = forecast_test if use_forecasts else test
     errors = (chosen["actual"] - chosen["estimate"]).to_numpy(float)
-    value = float(_apply_estimate(forecast_final, forecast_frame.iloc[[-1]], FORECAST_COLUMNS)[0]) if use_forecasts else float(_apply_estimate(final, ahead, ESTIMATE_COLUMNS)[0])
+    value = float(_apply_estimate(forecast_final, forecast_frame.iloc[[-1]], FORECAST_COLUMNS)[0]) if use_forecasts else float(_apply_estimate(final, ahead, weather_columns)[0])
     spread = estimate_range(errors)
     # Judge the latest published price with ENTSO-E's forecasts when they exist for that day.
     checker = forecast_test if not forecast_test.empty and forecast_test["day"].iloc[-1] == base.index[-1] else test
@@ -3060,7 +3096,7 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
               "latest_gap": gap, "unusual": abs(gap) > float(check_errors.quantile(0.9)), "check_method": "ENTSO-E forecasts" if checker is forecast_test else "Weather",
               "comparison": comparison, "target_has_forecast": target_has_forecast, "forecast_days": int(published.dropna().shape[0]),
               "wind_effect": float(final[ESTIMATE_COLUMNS.index("wind") + 1]), "hdd_effect": float(final[ESTIMATE_COLUMNS.index("hdd") + 1]),
-              "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1]), "forecast_effects": None}
+              "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1]), "forecast_effects": None, "gas": gas_check}
     best_simple = min(result["error_same_type"], result["error_last_week"], result["error_yesterday"])
     result["skill"] = 1.0 - result["error"] / best_simple if best_simple > 0 else 0.0
     if forecast_final is not None:
@@ -3412,6 +3448,8 @@ def compose_curve(product: str, base: pd.DataFrame, base_source: str, realised: 
             if share >= REALISED_COMPLETE_SHARE:
                 lookup[month], sources[month] = price, SOURCE_DAY_AHEAD
                 continue
+            if sources.get(month) in REAL_PRICE_SOURCES:
+                continue   # a market quote for this month already prices in the days delivered so far
             rest = lookup.get(month)
             rest_source = sources.get(month)
             if rest is None:
@@ -5081,13 +5119,24 @@ def fetch_zone_weather(zone: str, start: Optional[date] = None, end: Optional[da
 
 # TradingView through tvdatafeed, an unofficial library: it can break when TradingView changes, prices are
 # delayed, and TradingView's terms don't allow automated access. Personal use, at the user's choice.
-TRADINGVIEW_CURVES = {"TTF Natural Gas": {"exchange": "NYMEX", "root": "TTF", "name": "NYMEX Dutch TTF month futures"}}
+# listing: "monthly" probes every month; "eua" probes the months ICE lists for EUA futures.
+# in_delivery: power futures settle on the month's day-ahead average and trade through that month; gas expires before it.
+# scale turns the quoted unit into the app's unit (NBP is quoted in pence per therm, the app uses GBP/MWh).
+TRADINGVIEW_CURVES = {
+    "TTF Natural Gas": {"exchange": "NYMEX", "root": "TTF", "name": "NYMEX Dutch TTF month futures", "months": 48},
+    "NBP Natural Gas": {"exchange": "NYMEX", "root": "UKG", "name": "NYMEX UK NBP month futures, converted from pence per therm", "months": 36, "scale": 34.1214 / 100.0},
+    "German Power Base": {"exchange": "NYMEX", "root": "DEB", "name": "NYMEX German power baseload month futures", "months": 36, "in_delivery": True},
+    "German Power Peak": {"exchange": "NYMEX", "root": "DEP", "name": "NYMEX German power peakload month futures", "months": 36, "in_delivery": True},
+    "French Power Base": {"exchange": "ICEENDEX", "root": "FNB", "name": "ICE Endex French power base futures", "months": 36, "in_delivery": True},
+    "French Power Peak": {"exchange": "ICEENDEX", "root": "FNA", "name": "ICE Endex French power peak futures", "months": 36, "in_delivery": True},
+    "EUA Carbon": {"exchange": "ICEENDEX", "root": "ECF", "name": "ICE Endex EUA futures, months between expiries interpolated", "months": 74, "in_delivery": True, "listing": "eua"},
+}
 TRADINGVIEW_MONTH_CODES = "FGHJKMNQUVXZ"
 TRADINGVIEW_INSTALL = "pip install tradingview-datafeed"   # or the maintained fork: pip install git+https://github.com/rongardF/tvdatafeed.git
 TRADINGVIEW_HISTORY_BARS = 60          # first fetch: about three months of daily closes, so P&L and risk start with real history
 TRADINGVIEW_UPDATE_BARS = 7
-TRADINGVIEW_MAX_MONTHS = 48
 TRADINGVIEW_CARRY_DAYS = 5             # a contract with no trade that day keeps its last close for up to this many days
+_TRADINGVIEW_LOGIN: dict = {}
 
 
 def tradingview_available() -> bool:
@@ -5105,28 +5154,52 @@ def tradingview_symbol(root: str, month: date) -> str:
     return f"{root}{TRADINGVIEW_MONTH_CODES[month.month - 1]}{month.year}"
 
 
+def _tradingview_client(username: str, password: str):
+    """A client per fetch, sharing one sign-in: a client isn't safe across threads, and signing in for each product looks like abuse."""
+    import logging
+    import threading
+    from tvDatafeed import TvDatafeed, Interval
+    logging.getLogger("tvDatafeed").setLevel(logging.CRITICAL)   # its own messages are replaced by the summaries here
+    lock = _TRADINGVIEW_LOGIN.setdefault("lock", threading.Lock())
+    with lock:
+        key = (username or "", hashlib.sha256((password or "").encode()).hexdigest())
+        if _TRADINGVIEW_LOGIN.get("key") != key:
+            _TRADINGVIEW_LOGIN.update(key=key, token=TvDatafeed(username or None, password or None).token)
+        client = TvDatafeed()
+        client.token = _TRADINGVIEW_LOGIN["token"]
+    return client, Interval.in_daily
+
+
+def _tradingview_months(spec: dict, first: date, today: date) -> list[date]:
+    """The contract months to ask for, nearest first."""
+    months = [_add_months(first, step) for step in range(spec["months"] + 4)]
+    if spec.get("listing") != "eua":
+        return months
+    soon = _add_months(date(today.year, today.month, 1), 3)
+    two_years = _add_months(date(today.year, today.month, 1), 26)
+    return [m for m in months if m < soon or (m < two_years and m.month in (3, 6, 8, 9, 12)) or m.month == 12]
+
+
 def fetch_tradingview_curve(product: str, today: date, n_bars: int, username: str = "", password: str = "", _client=None) -> pd.DataFrame:
     """Daily closes of each month contract, one row per day and delivery month, ready for parse_curve_table.
 
-    A contract is used only on days before its delivery month starts. A day where fewer than half the
-    contracts have a price, such as a holiday, is left out.
+    A gas contract is used only before its delivery month starts; a power or carbon contract until that month
+    ends. A day where fewer than half the contracts have a price, such as a holiday, is left out.
     """
     spec = TRADINGVIEW_CURVES[product]
     if _client is None:
         try:
-            from tvDatafeed import TvDatafeed, Interval
+            client, interval = _tradingview_client(username, password)
         except ImportError:
-            raise RuntimeError(f"tvdatafeed isn't installed. Run: {TRADINGVIEW_INSTALL}") from None
-        import logging
-        logging.getLogger("tvDatafeed").setLevel(logging.CRITICAL)   # its own messages are replaced by the summary below
-        client, interval = TvDatafeed(username or None, password or None), Interval.in_daily
+            raise RuntimeError(f"tradingview-datafeed isn't installed. Run: {TRADINGVIEW_INSTALL}") from None
     else:
         client, interval = _client, "1D"
+    in_delivery = bool(spec.get("in_delivery"))
+    history = math.ceil(n_bars / 21) if n_bars > TRADINGVIEW_UPDATE_BARS else 0
     # With history, start from contracts that were the front month at the start of that history.
-    first = _add_months(date(today.year, today.month, 1), 1 - (math.ceil(n_bars / 21) if n_bars > TRADINGVIEW_UPDATE_BARS else 0))
+    first = _add_months(date(today.year, today.month, 1), (0 if in_delivery else 1) - history)
     closes, misses, failures = {}, 0, 0
-    for step in range(TRADINGVIEW_MAX_MONTHS + 4):
-        month = _add_months(first, step)
+    for month in _tradingview_months(spec, first, today):
         try:
             bars = client.get_hist(symbol=tradingview_symbol(spec["root"], month), exchange=spec["exchange"], interval=interval, n_bars=int(n_bars))
         except Exception:
@@ -5140,28 +5213,65 @@ def fetch_tradingview_curve(product: str, today: date, n_bars: int, username: st
                     break   # past the last listed contract
             continue
         misses = 0
+        ends = _add_months(month, 1) if in_delivery else month
         days = [min(pd.Timestamp(stamp).date(), today) for stamp in bars.index]
-        prices = pd.to_numeric(bars["close"], errors="coerce").to_numpy(float)
-        kept = {d: p for d, p in zip(days, prices) if d < month and np.isfinite(p) and p > 0}
+        prices = pd.to_numeric(bars["close"], errors="coerce").to_numpy(float) * float(spec.get("scale", 1.0))
+        kept = {d: p for d, p in zip(days, prices) if d < ends and np.isfinite(p) and p > 0}
         if kept:
             closes[month] = pd.Series(kept)
     if not closes:
-        raise RuntimeError("TradingView returned no TTF prices. Check the connection, or add a TradingView login to the keys file.")
+        raise RuntimeError(f"TradingView returned no prices for {spec['exchange']}:{spec['root']}. Check the connection, or add a TradingView login to the keys file.")
     table = pd.DataFrame(closes).sort_index()
     table.index = pd.to_datetime(table.index)
+    ends = {m: pd.Timestamp(_add_months(m, 1) if in_delivery else m) for m in table.columns}
     for month in table.columns:   # carry a quiet contract's last close, only while it was listed
         listed = table[month].first_valid_index()
         filled = table[month].ffill(limit=TRADINGVIEW_CARRY_DAYS)
-        table[month] = filled.where(table.index >= listed)
-    for day in table.index:
-        table.loc[day, [m for m in table.columns if pd.Timestamp(m) <= day]] = np.nan
+        table[month] = filled.where((table.index >= listed) & (table.index < ends[month]))
     live = table.notna().sum(axis=1)
-    listed_then = pd.Series([sum(1 for m in table.columns if pd.Timestamp(m) > d) for d in table.index], index=table.index)
+    listed_then = pd.Series([sum(1 for m in table.columns if ends[m] > d) for d in table.index], index=table.index)
     table = table.loc[live >= 0.5 * listed_then.clip(lower=1)]
+    if spec.get("listing") == "eua":
+        # Fill the months between expiries in a straight line, flat before the first one listed that day.
+        months = pd.date_range(min(table.columns), max(table.columns), freq="MS")
+        wide = table.copy()
+        wide.columns = pd.to_datetime(wide.columns)
+        wide = wide.reindex(columns=months)
+        position = np.array([m.year * 12 + m.month for m in months], float)
+        filled = []
+        for day, row in wide.iterrows():
+            known = row.notna().to_numpy()
+            current = (day.year * 12 + day.month)
+            values = np.interp(position, position[known], row.to_numpy(float)[known]) if known.any() else np.full(len(months), np.nan)
+            values[position < current] = np.nan   # no month already over
+            filled.append(values)
+        table = pd.DataFrame(filled, index=wide.index, columns=[m.date() for m in months])
     rows = table.stack().dropna().rename("price").reset_index()   # pandas 3 keeps empty cells when stacking
     rows.columns = ["curve_date", "contract", "price"]
     return pd.DataFrame({"product": product, "contract": [pd.Timestamp(m).date() for m in rows["contract"]],
                          "curve_date": [pd.Timestamp(d).date() for d in rows["curve_date"]], "price": rows["price"].to_numpy(float)})
+
+
+TRADINGVIEW_FRONT_HISTORY_BARS = 520   # about two years of front-month TTF, for testing gas in the next-day estimate
+
+
+def fetch_tradingview_front(product: str, n_bars: int, username: str = "", password: str = "", _client=None) -> pd.DataFrame:
+    """Daily closes of the continuous front-month contract (TradingView's 1!), in the app's unit."""
+    spec = TRADINGVIEW_CURVES[product]
+    if _client is None:
+        try:
+            client, interval = _tradingview_client(username, password)
+        except ImportError:
+            raise RuntimeError(f"tradingview-datafeed isn't installed. Run: {TRADINGVIEW_INSTALL}") from None
+    else:
+        client, interval = _client, "1D"
+    bars = client.get_hist(symbol=spec["root"], exchange=spec["exchange"], interval=interval, n_bars=int(n_bars), fut_contract=1)
+    if bars is None or len(bars) == 0 or "close" not in getattr(bars, "columns", []):
+        raise RuntimeError(f"TradingView returned no front-month prices for {spec['exchange']}:{spec['root']}1!.")
+    days = [pd.Timestamp(stamp).normalize() for stamp in bars.index]
+    close = pd.to_numeric(bars["close"], errors="coerce").to_numpy(float) * float(spec.get("scale", 1.0))
+    out = pd.DataFrame({"date": days, "product": product, "close": close}).dropna()
+    return out.loc[out["close"] > 0].drop_duplicates("date", keep="last").reset_index(drop=True)
 
 
 def fetch_temperature_normals(location_names: Sequence[str], years: int = 10, _json_get_fn=None) -> tuple[pd.DataFrame, list[str]]:
@@ -6059,12 +6169,12 @@ def _needs_update(key: str, kind: str, force: bool) -> bool:
 
 
 def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[UpdateTask]:
-    """The TTF curve from TradingView, the default source for TTF marks. Refreshed hourly as prices are delayed anyway."""
+    """Forward curves from TradingView, the default source of marks for every product it lists. Refreshed hourly."""
     today = today or date.today()
     if not tradingview_available():
         def missing() -> None:
-            raise RuntimeError(f"TTF is on demo prices because tradingview-datafeed isn't installed. Run: {TRADINGVIEW_INSTALL}, then restart the app.")
-        return [UpdateTask("TTF curve from TradingView", missing, lambda _: "")]
+            raise RuntimeError(f"Forward curves are on demo prices because tradingview-datafeed isn't installed. Run: {TRADINGVIEW_INSTALL}, then restart the app.")
+        return [UpdateTask("Forward curves from TradingView", missing, lambda _: "")]
     if not _needs_update("tradingview_curves", "tradingview", force):
         return []
     keys = resolved_credentials()
@@ -6077,6 +6187,14 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[
         def apply_tv(raw: pd.DataFrame, product=tv_product) -> str:
             return apply_tradingview_curve(product, raw)
         tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv))
+    held_front = _held_frame("tradingview_gas_front")
+    front_bars = TRADINGVIEW_FRONT_HISTORY_BARS if held_front is None or len(held_front) < 200 else 10
+    def fetch_front() -> pd.DataFrame:
+        return fetch_tradingview_front("TTF Natural Gas", front_bars, *login)
+    def apply_front(frame: pd.DataFrame) -> str:
+        merged = store_observations("tradingview_gas_front", "TradingView TTF front month", frame, {"symbol": "NYMEX:TTF1!"}, ("date", "product"), "date", 800)
+        return f"{len(frame)} days fetched, {len(merged)} held, last close {frame['close'].iloc[-1]:.2f} on {pd.Timestamp(frame['date'].iloc[-1]):%d %b}"
+    tasks.append(UpdateTask("TTF front-month history from TradingView", fetch_front, apply_front))
     return tasks
 
 
@@ -8500,6 +8618,80 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         assert_close(float(one.loc[check_day]), float(two.loc[check_day]))
         return "Requests use A65/A01 and A69/A01. Weather sets the estimate before ENTSO-E's forecast exists, then the forecast takes over only if it tested better. Effects are recovered and later prices change nothing earlier."
 
+    def check_tradingview_products() -> str:
+        today = date(2026, 11, 9)
+        listed = {("DEB", 2026, 11): 242.83, ("DEB", 2026, 12): 198.75, ("DEB", 2027, 1): 211.08, ("UKG", 2026, 12): 240.66, ("UKG", 2027, 1): 242.15,
+                  ("ECF", 2026, 11): 86.89, ("ECF", 2026, 12): 87.13, ("ECF", 2027, 1): 86.87, ("ECF", 2027, 3): 87.85, ("ECF", 2027, 6): 88.22}
+        asked = []
+        class Fake:
+            def get_hist(self, symbol, exchange, interval, n_bars):
+                asked.append(symbol)
+                key = (symbol[:3], int(symbol[4:]), TRADINGVIEW_MONTH_CODES.index(symbol[3]) + 1)
+                if key not in listed:
+                    return None
+                days = pd.bdate_range(end=pd.Timestamp(today), periods=n_bars)
+                return pd.DataFrame({"close": listed[key]}, index=days)
+        power = fetch_tradingview_curve("German Power Base", today, 7, _client=Fake())
+        latest = power.loc[power["curve_date"].eq(today)].set_index("contract")["price"]
+        if asked[0] != "DEBX2026" or date(2026, 11, 1) not in latest.index:
+            raise AssertionError("A power contract trades through its delivery month, so November must be kept.")
+        nbp = fetch_tradingview_curve("NBP Natural Gas", today, 7, _client=Fake())
+        assert_close(float(nbp.loc[nbp["curve_date"].eq(today) & nbp["contract"].eq(date(2026, 12, 1)), "price"].iloc[0]), 240.66 * 0.341214, 0.01)
+        asked.clear()
+        eua = fetch_tradingview_curve("EUA Carbon", today, 7, _client=Fake())
+        if any(code in a for a in asked[:12] for code in ("ECFG2027", "ECFJ2027", "ECFK2027")):
+            raise AssertionError(f"EUA months ICE doesn't list shouldn't be asked for: {asked[:12]}")
+        curve = eua.loc[eua["curve_date"].eq(today)].set_index("contract")["price"]
+        assert_close(float(curve[date(2027, 2, 1)]), (86.87 + 87.85) / 2, 0.01)
+        assert_close(float(curve[date(2027, 4, 1)]), 87.85 + (88.22 - 87.85) / 3, 0.01)
+        if date(2026, 10, 1) in curve.index or float(curve[date(2026, 11, 1)]) != 86.89:
+            raise AssertionError("EUA months must start with the current month's contract.")
+        base = validate_curve(pd.DataFrame({"delivery_month": [date(2026, 11, 1), date(2026, 12, 1)], "product": "German Power Base", "price": [242.83, 198.75], "currency": "EUR", "unit": "EUR/MWh"}))
+        composed, sources = compose_curve("German Power Base", base, SOURCE_IMPORTED, {date(2026, 11, 1): (150.0, 0.3)}, today)
+        if float(composed.loc[composed["delivery_month"].eq(date(2026, 11, 1)), "price"].iloc[0]) != 242.83 or sources[date(2026, 11, 1)] != SOURCE_IMPORTED:
+            raise AssertionError("A market quote for the current month already includes the days delivered, so it must stand as it is.")
+        return "German power keeps the month in delivery, NBP converts 240.66 p/therm to £82.12/MWh, EUA asks only for listed months and fills the gaps in a line, and a current-month quote isn't blended again."
+
+    def check_estimate_gas() -> str:
+        days = pd.date_range("2026-01-05", periods=10, freq="D")
+        closes = pd.DataFrame({"date": pd.to_datetime(["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09"]), "close": [30.0, 31.0, 32.0, 33.0, 34.0, 35.0]})
+        known = gas_at_auction(closes, days)
+        # Delivery Thu 8 Jan: the auction is Wed 7 at noon, so Tue 6's close is the last one known.
+        # Delivery Mon 12 Jan: two days before is Sat 10, so Fri 9's close. Delivery Mon 5 Jan: Fri 2's.
+        if known.loc["2026-01-08", "gas"] != 32.0 or known.loc["2026-01-12", "gas"] != 35.0 or known.loc["2026-01-08", "gas_before"] != 31.0:
+            raise AssertionError(f"Gas known at the auction is wrong: {known['gas'].tolist()}")
+        if known.loc["2026-01-05", "gas"] != 30.0:
+            raise AssertionError("A Monday's estimate must use the previous Friday's close.")
+        rng = np.random.default_rng(12)
+        span = pd.date_range("2025-08-01", periods=330, freq="D")
+        gas_path = 40 + np.cumsum(rng.normal(0, 1.5, len(span)))
+        gas_frame = pd.DataFrame({"date": span, "close": gas_path})
+        known_gas = gas_at_auction(gas_frame, span)["gas"].to_numpy()
+        wind = rng.uniform(5, 40, len(span))
+        def run(price):
+            hourly = pd.DataFrame({"local": span.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(span)), unit="h"), "value": np.repeat(price, 24), "hours": 1.0})
+            grid = pd.DataFrame({"zone": "France", "date": span, "hdd": 6.0, "wind": wind, "solar": 100.0})
+            ahead = grid.tail(1).assign(date=span[-1] + pd.Timedelta(days=1))
+            return next_day_estimate("France", hourly, pd.DataFrame(), pd.DataFrame(), grid_history=grid, grid_forecast=ahead, gas=gas_frame)
+        follows = np.nan_to_num(2.2 * known_gas, nan=88.0) + 30 - 1.5 * wind + rng.normal(0, 3, len(span))
+        with_gas = run(follows)
+        if not with_gas["gas"] or not with_gas["gas"]["used"]:
+            raise AssertionError(f"When power follows gas, gas should be used: {with_gas['gas']}")
+        assert_close(with_gas["gas"]["effect"], 2.2, 0.5)
+        noise = 120 - 1.5 * wind + rng.normal(0, 3, len(span))
+        without = run(noise)
+        if without["gas"] is None or without["gas"]["used"]:
+            raise AssertionError(f"When power ignores gas, gas shouldn't be used: {without['gas']}")
+        class Front:
+            def get_hist(self, symbol, exchange, interval, n_bars, fut_contract=None):
+                if (symbol, exchange, fut_contract) != ("UKG", "NYMEX", 1):
+                    raise AssertionError("The front month is asked for as a continuous contract.")
+                return pd.DataFrame({"close": [200.0, 210.0]}, index=pd.to_datetime(["2026-11-05 01:00", "2026-11-06 01:00"]))
+        front = fetch_tradingview_front("NBP Natural Gas", 2, _client=Front())
+        assert_close(float(front["close"].iloc[-1]), 210.0 * 0.341214, 0.01)
+        return (f"Gas uses the last close two days before delivery. When power follows gas it's used (miss €{with_gas['gas']['with']:.1f} against €{with_gas['gas']['without']:.1f}, "
+                f"effect {with_gas['gas']['effect']:.2f} for 2.2 set), and when it doesn't, it's left out.")
+
     def check_estimate_calendar() -> str:
         if _easter(2026) != date(2026, 4, 5) or _easter(2027) != date(2027, 3, 28):
             raise AssertionError("Easter date is wrong.")
@@ -8811,6 +9003,8 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("ENTSO-E forecast method", "Next-day estimate", check_entsoe_forecast_method),
         ("Next-day estimate recovers known effects", "Next-day estimate", check_next_day_estimate),
         ("TradingView curve through tvdatafeed", "Live API integration", check_tradingview_curve),
+        ("Power, NBP and EUA from TradingView", "Live API integration", check_tradingview_products),
+        ("Gas in the next-day estimate", "Next-day estimate", check_estimate_gas),
         ("Holidays and kinds of day", "Next-day estimate", check_estimate_calendar),
         ("Weather across a zone in one request", "Live API integration", check_zone_weather_fetch),
         ("The 80% range holds about 80%", "Next-day estimate", check_estimate_range),
@@ -9290,15 +9484,15 @@ def page_forward_curves():
         status, action = st.columns([4, 1])
         with status:
             if not tradingview_available():
-                st.warning(f"TTF is on demo prices: the TradingView library isn't installed. Run `{TRADINGVIEW_INSTALL}` and restart the app.")
+                st.warning(f"This curve is on demo prices: the TradingView library isn't installed. Run `{TRADINGVIEW_INSTALL}` and restart the app.")
             elif from_tv:
                 st.success(f"Marks from TradingView ({TRADINGVIEW_CURVES[selected]['name']}), dated {curve_mark_date(meta):%d %b %Y}, {fetched_text(meta.get('imported_at_utc')).lower()}. "
                            "Refreshed every hour when the app updates.")
             else:
-                st.info("The TTF curve comes from TradingView by default. It's fetched when the app opens and with each update.")
+                st.info(f"This curve comes from TradingView ({TRADINGVIEW_CURVES[selected]['name']}) by default. It's fetched when the app opens and with each update.")
         with action:
             running = bool(st.session_state.get("update_job"))
-            if tradingview_available() and st.button("Fetch TTF now", key="tv_fetch_now", disabled=running, width="stretch"):
+            if tradingview_available() and st.button("Fetch curves now", key="tv_fetch_now", help="Fetches every curve TradingView lists, not only this one.", disabled=running, width="stretch"):
                 if start_update(tasks=tradingview_tasks(True)):
                     st.rerun()
         st.caption("Through tvdatafeed: prices are delayed, the library is unofficial and can stop working when TradingView changes, and TradingView's terms don't allow automated access, so keep this to personal use.")
@@ -10244,7 +10438,8 @@ def zone_estimate(zone: str) -> dict:
     return session_memo(f"estimate|{zone}", data_version("live"),
                         lambda: next_day_estimate(zone, zone_prices(zone), _live_dataset_frame("weather_power_history"), _live_dataset_frame("weather_daily"),
                                                   _live_dataset_frame(f"entsoe_load_forecast|{zone}"), _live_dataset_frame(f"entsoe_renewable_forecast|{zone}"),
-                                                  _live_dataset_frame("zone_weather_history"), _live_dataset_frame("zone_weather_forecast")))
+                                                  _live_dataset_frame("zone_weather_history"), _live_dataset_frame("zone_weather_forecast"),
+                                                  _live_dataset_frame("tradingview_gas_front")))
 
 
 def record_price_estimates() -> None:
@@ -10279,6 +10474,9 @@ def render_next_day(zones: Sequence[str]) -> None:
     beat = result["skill"] > 0
     gap_word = "above" if result["latest_gap"] > 0 else "below"
     weather_words = f"the weather forecast at {result['weather_basis']}" if "points" in result["weather_basis"] else f"the weather forecast for {result['weather_basis'] or 'one city'}"
+    gas = result.get("gas")
+    if gas and gas["used"]:
+        weather_words += " and the TTF front-month price"
     basis = ("It uses ENTSO-E's published load, wind and solar forecasts for that day." if result["method"] != "Weather" else
              f"It uses {weather_words}, which has tested better here than ENTSO-E's forecasts." if result["target_has_forecast"] and result["comparison"] else
              f"It uses {weather_words}, because ENTSO-E's wind and solar forecast is usually published by 18:00 the day before delivery, after the auction.")
@@ -10313,10 +10511,21 @@ def render_next_day(zones: Sequence[str]) -> None:
     rows = [{"Method": f"Weather at {result['weather_basis']}" if "points" in result["weather_basis"] else f"Weather in {result['weather_basis'] or 'one city'}", "Average miss, EUR/MWh": round(comparison["weather"] if comparison else result["error"], 2)}]
     if comparison:
         rows.insert(0, {"Method": "ENTSO-E forecasts", "Average miss, EUR/MWh": round(comparison["forecasts"], 2)})
+    if gas:
+        rows.append({"Method": ("Weather and gas, in use" if gas["used"] else "Weather and gas, not in use"), "Average miss, EUR/MWh": round(gas["with"], 2)})
+        rows.append({"Method": "Weather without gas", "Average miss, EUR/MWh": round(gas["without"], 2)})
     source = comparison or {"same_type": result["error_same_type"], "last_week": result["error_last_week"], "yesterday": result["error_yesterday"]}
     rows += [{"Method": "Last day of the same kind", "Average miss, EUR/MWh": round(source["same_type"], 2)},
              {"Method": "Same weekday last week", "Average miss, EUR/MWh": round(source["last_week"], 2)}, {"Method": "Previous day", "Average miss, EUR/MWh": round(source["yesterday"], 2)}]
     table(pd.DataFrame(rows))
+    if gas:
+        gain = 1.0 - gas["with"] / gas["without"] if gas["without"] > 0 else 0.0
+        st.caption(f"Gas tested on the same {gas['days']} days: front-month TTF as known at each auction "
+                   + (f"cut the average miss by {gain * 100:.0f}%, so it's in use." if gas["used"] else
+                      "has no gas price for this auction yet, so it's left out today." if not gas["ready"] else
+                      f"changed the average miss by {-gain * 100:+.0f}%, short of the {GAS_MIN_GAIN * 100:.0f}% it needs to be used."))
+    elif result["zone"]:
+        st.caption("Gas isn't tested yet: it needs the TTF front-month history from TradingView, fetched with each update.")
     if comparison:
         st.caption(f"On the same {comparison['days']} days. The ENTSO-E method isn't fully comparable: its wind and solar forecasts are usually published after the auction, so it shows how good the forecast information is, not what you could have estimated beforehand.")
     else:
@@ -10347,7 +10556,10 @@ def render_next_day(zones: Sequence[str]) -> None:
                     + "The load forecast is due two hours before the auction deadline, but the wind and solar forecast is only due by 18:00 the day before delivery. "
                     "So it usually can't set the estimate before the auction. Its main use is checking whether a published price looks high or low against those forecasts. It sets the estimate only when the forecast already exists and it has tested at least as well as the weather method.\n\n"
                     f"ENTSO-E's forecasts cover **{result['forecast_days']} days** for this zone so far, and some operators may revise them after first publishing.\n\n"
-                    "Neither method knows about gas or carbon prices, plant outages, interconnector limits or the auction itself. A sharp move in gas between one day and the next is the most common reason for a large miss.")
+                    "**Gas.** The weather method is also tested with the front-month TTF price as known at each auction (the last close two days before delivery) and the day before's. "
+                    + (f"It's in use: €1/MWh more on gas changes the power estimate by **{euros(gas['effect'])}**. " if gas and gas["used"] and gas["effect"] is not None else
+                       f"It's used only when it cuts the tested average miss by at least {GAS_MIN_GAIN * 100:.0f}%. ")
+                    + "Neither method knows about carbon prices, plant outages, interconnector limits or the auction itself.")
 
 
 def render_pnl_drivers(step: pd.DataFrame, factor: pd.Series) -> pd.DataFrame:
