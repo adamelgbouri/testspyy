@@ -2900,18 +2900,56 @@ def power_weather(history: pd.DataFrame, daily: pd.DataFrame, location: str) -> 
                          "cdd": (joined["temperature"] - COOLING_BASE_C).clip(lower=0)})
 
 
-def zone_weather(history: pd.DataFrame, forecast: pd.DataFrame, zone: str) -> pd.DataFrame:
-    """Heating demand, wind, solar and cooling demand by day, averaged over the zone's points. Forecast days replace the archive."""
+def zone_weather(history: pd.DataFrame, forecast: pd.DataFrame, zone: str, vintage: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Heating demand, wind, solar and cooling demand by day, averaged over the zone's points.
+
+    Forecast days replace the archive. For past days, a forecast kept from the day before replaces what
+    happened, so the estimate is fitted and tested on what was known at the auction. Those days are marked kept.
+    """
     needed = ["date", "hdd", "wind", "solar"]
-    frames = [f.loc[f["zone"].eq(zone), needed + (["temperature"] if "temperature" in f.columns else [])] for f in (history, forecast)
-              if f is not None and not f.empty and {"zone", *needed}.issubset(f.columns)]
+    usable = lambda f: f is not None and not f.empty and {"zone", *needed}.issubset(f.columns)
+    frames = [f.loc[f["zone"].eq(zone), needed + (["temperature"] if "temperature" in f.columns else [])] for f in (history, forecast) if usable(f)]
     if not frames:
         return pd.DataFrame(columns=["hdd", "wind", "solar"])
-    joined = pd.concat(frames, ignore_index=True).assign(date=lambda f: pd.to_datetime(f["date"], errors="coerce")).dropna(subset=["date"])
-    joined = joined.drop_duplicates("date", keep="last").set_index("date").sort_index().astype(float)
+    tidy = lambda f: f.assign(date=pd.to_datetime(f["date"], errors="coerce")).dropna(subset=["date"]).drop_duplicates("date", keep="last").set_index("date").sort_index().astype(float)
+    joined = tidy(pd.concat(frames, ignore_index=True)).assign(kept=0.0)
+    if usable(vintage):
+        saved = tidy(vintage.loc[vintage["zone"].eq(zone), [c for c in joined.columns if c in vintage.columns] + ["date"]]).assign(kept=1.0)
+        saved = saved.loc[saved.index.isin(joined.index)]
+        joined.loc[saved.index, saved.columns] = saved
     if "temperature" in joined.columns:
         joined["cdd"] = (joined.pop("temperature") - COOLING_BASE_C).clip(lower=0)
     return joined
+
+
+WEATHER_VINTAGE_DAYS = 800
+
+
+def keep_weather_vintage(held: Optional[pd.DataFrame], forecast: pd.DataFrame, now_utc: datetime) -> Optional[pd.DataFrame]:
+    """Keep tomorrow's forecast as it stands today, by zone, so later tests can use what was known at the auction.
+
+    A forecast fetched before noon local time, when the auction closes, is never replaced by a later one.
+    """
+    if forecast is None or forecast.empty:
+        return None
+    rows = []
+    for zone, part in forecast.groupby("zone"):
+        local = now_utc.astimezone(ZoneInfo(ENTSOE_ZONES[zone]["timezone"]))
+        tomorrow = part.loc[pd.to_datetime(part["date"]).dt.date.eq(local.date() + timedelta(days=1))]
+        if not tomorrow.empty:
+            rows.append(tomorrow.assign(made_at=now_utc.isoformat(timespec="seconds"), before_auction=local.hour < 12))
+    if not rows:
+        return held
+    new = pd.concat(rows, ignore_index=True)
+    new["date"] = pd.to_datetime(new["date"])
+    if held is None or held.empty:
+        return new
+    held = held.assign(date=pd.to_datetime(held["date"]))
+    locked = held.loc[held["before_auction"].astype(bool)].merge(new.loc[~new["before_auction"], ["zone", "date"]], on=["zone", "date"])
+    new = new.merge(locked[["zone", "date"]].assign(_locked=True), on=["zone", "date"], how="left")
+    new = new.loc[new["_locked"].isna()].drop(columns="_locked")
+    merged = pd.concat([held, new], ignore_index=True).drop_duplicates(["zone", "date"], keep="last").sort_values(["zone", "date"])
+    return merged.loc[merged["date"] >= merged["date"].max() - pd.Timedelta(days=WEATHER_VINTAGE_DAYS)].reset_index(drop=True)
 
 
 def estimate_features(base: pd.Series, weather: pd.DataFrame, last_day: pd.Timestamp, zone: str = "") -> pd.DataFrame:
@@ -3047,12 +3085,12 @@ def estimate_range(errors: np.ndarray) -> dict:
 
 
 def _weather_for_estimate(zone: str, history: pd.DataFrame, daily: pd.DataFrame, grid_history: Optional[pd.DataFrame], grid_forecast: Optional[pd.DataFrame],
-                          target: pd.Timestamp) -> tuple[pd.DataFrame, str]:
+                          target: pd.Timestamp, vintage: Optional[pd.DataFrame] = None) -> tuple[pd.DataFrame, str]:
     """Weather across the zone's points when held, otherwise the one reference city."""
     location = ZONE_WEATHER.get(zone)
     options = []
     if zone in ZONE_WEATHER_POINTS:
-        options.append((zone_weather(grid_history, grid_forecast, zone), f"{len(ZONE_WEATHER_POINTS[zone])} points across the zone"))
+        options.append((zone_weather(grid_history, grid_forecast, zone, vintage), f"{len(ZONE_WEATHER_POINTS[zone])} points across the zone"))
     if location:
         options.append((power_weather(history, daily, location), location.split(" / ")[0]))
     enough = [(w, name) for w, name in options if not w.empty and w["wind"].notna().sum() >= ESTIMATE_MIN_DAYS]
@@ -3063,7 +3101,7 @@ def _weather_for_estimate(zone: str, history: pd.DataFrame, daily: pd.DataFrame,
 def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, daily: pd.DataFrame,
                       load_forecast: Optional[pd.DataFrame] = None, renewable_forecast: Optional[pd.DataFrame] = None,
                       grid_history: Optional[pd.DataFrame] = None, grid_forecast: Optional[pd.DataFrame] = None,
-                      gas: Optional[pd.DataFrame] = None) -> dict:
+                      gas: Optional[pd.DataFrame] = None, weather_vintage: Optional[pd.DataFrame] = None) -> dict:
     """Estimate the next unpublished delivery day, and test the methods one day at a time.
 
     The weather method can run before the auction. ENTSO-E's wind and solar forecast is usually
@@ -3074,7 +3112,7 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
     if zone not in ZONE_WEATHER or len(base) < ESTIMATE_MIN_DAYS + 20:
         return {"ready": False, "reason": f"This needs at least {ESTIMATE_MIN_DAYS + 20} days of day-ahead prices. Select Update market data."}
     target = base.index[-1] + pd.Timedelta(days=1)
-    weather, basis = _weather_for_estimate(zone, history, daily, grid_history, grid_forecast, target)
+    weather, basis = _weather_for_estimate(zone, history, daily, grid_history, grid_forecast, target, weather_vintage)
     if weather.empty:
         return {"ready": False, "reason": "This needs the wind and solar history. Select Update market data."}
     frame = estimate_features(base, weather, target, zone)
@@ -3148,7 +3186,8 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
               "latest_gap": gap, "unusual": abs(gap) > float(check_errors.quantile(0.9)), "check_method": "ENTSO-E forecasts" if checker is forecast_test else "Weather",
               "comparison": comparison, "target_has_forecast": target_has_forecast, "forecast_days": int(published.dropna().shape[0]),
               "wind_effect": float(final[ESTIMATE_COLUMNS.index("wind") + 1]), "hdd_effect": float(final[ESTIMATE_COLUMNS.index("hdd") + 1]),
-              "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1]), "forecast_effects": None, "gas": gas_check, "extras": extras}
+              "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1]), "forecast_effects": None, "gas": gas_check, "extras": extras,
+              "kept_forecast_days": int(weather["kept"].reindex(pd.DatetimeIndex(chosen["day"])).fillna(0).sum()) if "kept" in weather.columns and not use_forecasts else 0}
     best_simple = min(result["error_same_type"], result["error_last_week"], result["error_yesterday"])
     result["skill"] = 1.0 - result["error"] / best_simple if best_simple > 0 else 0.0
     if forecast_final is not None:
@@ -3596,6 +3635,34 @@ def default_db_path() -> Path:
     return Path(__file__).resolve().with_name("meridian_desk.db")
 
 
+BACKUP_FOLDER_NAME = "meridian_backups"
+BACKUPS_KEPT = 7
+
+
+def backup_database(path, today: Optional[date] = None, folder=None) -> str:
+    """Copy the database once a day into a folder beside it, keeping the last seven. Returns the copy made, or ""."""
+    today = today or date.today()
+    source = Path(path)
+    if not source.is_file() or source.stat().st_size == 0:
+        return ""
+    folder = Path(folder) if folder else source.with_name(BACKUP_FOLDER_NAME)
+    target = folder / f"{source.stem}-{today.isoformat()}{source.suffix}"
+    if target.exists():
+        return ""
+    folder.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(".partial")
+    # SQLite's own copy gives a consistent file even if something is being saved at that moment.
+    with sqlite3.connect(source, timeout=15) as live, sqlite3.connect(partial) as copy:
+        live.backup(copy)
+    copy.close()
+    live.close()
+    partial.replace(target)
+    protect_file(target)
+    for old in sorted(folder.glob(f"{source.stem}-*{source.suffix}"))[:-BACKUPS_KEPT]:
+        old.unlink(missing_ok=True)
+    return str(target)
+
+
 class DeskStore:
     """Small persistence layer. Holds no credentials and is safe to back up as one file."""
 
@@ -3830,6 +3897,10 @@ def desk_store() -> Optional[DeskStore]:
             # Trades, prices and keys are private: only this user account may read the files.
             protect_file(st.session_state.desk_store.path)
             protect_file(keys_file_path())
+            try:
+                backup_database(st.session_state.desk_store.path)
+            except Exception:
+                pass   # a failed backup must never stop the desk; the next session tries again
         except Exception as exc:
             st.session_state.desk_store = None
             st.session_state.desk_store_error = f"{type(exc).__name__}: {exc}"
@@ -5286,6 +5357,7 @@ TRADINGVIEW_MONTH_CODES = "FGHJKMNQUVXZ"
 TRADINGVIEW_INSTALL = "pip install tradingview-datafeed"   # or the maintained fork: pip install git+https://github.com/rongardF/tvdatafeed.git
 TRADINGVIEW_HISTORY_BARS = 60          # first fetch: about three months of daily closes, so P&L and risk start with real history
 TRADINGVIEW_UPDATE_BARS = 7
+TRADINGVIEW_NEAR_MONTHS = 12           # refreshed every hour; the months beyond are refreshed once a day
 TRADINGVIEW_CARRY_DAYS = 5             # a contract with no trade that day keeps its last close for up to this many days
 _TRADINGVIEW_LOGIN: dict = {}
 
@@ -5321,9 +5393,9 @@ def _tradingview_client(username: str, password: str):
     return client, Interval.in_daily
 
 
-def _tradingview_months(spec: dict, first: date, today: date) -> list[date]:
+def _tradingview_months(spec: dict, first: date, today: date, near_only: bool = False) -> list[date]:
     """The contract months to ask for, nearest first."""
-    months = [_add_months(first, step) for step in range(spec["months"] + 4)]
+    months = [_add_months(first, step) for step in range(TRADINGVIEW_NEAR_MONTHS if near_only else spec["months"] + 4)]
     if spec.get("listing") != "eua":
         return months
     soon = _add_months(date(today.year, today.month, 1), 3)
@@ -5331,7 +5403,7 @@ def _tradingview_months(spec: dict, first: date, today: date) -> list[date]:
     return [m for m in months if m < soon or (m < two_years and m.month in (3, 6, 8, 9, 12)) or m.month == 12]
 
 
-def fetch_tradingview_curve(product: str, today: date, n_bars: int, username: str = "", password: str = "", _client=None) -> pd.DataFrame:
+def fetch_tradingview_curve(product: str, today: date, n_bars: int, username: str = "", password: str = "", _client=None, near_only: bool = False) -> pd.DataFrame:
     """Daily closes of each month contract, one row per day and delivery month, ready for parse_curve_table.
 
     A gas contract is used only before its delivery month starts; a power or carbon contract until that month
@@ -5350,7 +5422,7 @@ def fetch_tradingview_curve(product: str, today: date, n_bars: int, username: st
     # With history, start from contracts that were the front month at the start of that history.
     first = _add_months(date(today.year, today.month, 1), (0 if in_delivery else 1) - history)
     closes, misses, failures = {}, 0, 0
-    for month in _tradingview_months(spec, first, today):
+    for month in _tradingview_months(spec, first, today, near_only):
         try:
             bars = client.get_hist(symbol=tradingview_symbol(spec["root"], month), exchange=spec["exchange"], interval=interval, n_bars=int(n_bars))
         except Exception:
@@ -6335,14 +6407,19 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[
     if not _needs_update("tradingview_curves", "tradingview", force):
         return []
     keys = resolved_credentials()
-    bars = TRADINGVIEW_HISTORY_BARS if _held_frame("tradingview_curves") is None else TRADINGVIEW_UPDATE_BARS
     login = (keys["tradingview_user"], keys["tradingview_password"])
+    metadata = st.session_state.get("curve_metadata", {})
     tasks = []
     for tv_product in TRADINGVIEW_CURVES:
-        def fetch_tv(product=tv_product) -> pd.DataFrame:
-            return fetch_tradingview_curve(product, today, bars, *login)
-        def apply_tv(raw: pd.DataFrame, product=tv_product) -> str:
-            return apply_tradingview_curve(product, raw)
+        held = metadata.get(tv_product, {}) if tv_product in st.session_state.get("custom_curves", {}) else {}
+        from_tv = held.get("source_type") == "TradingView"
+        bars = TRADINGVIEW_UPDATE_BARS if from_tv else TRADINGVIEW_HISTORY_BARS
+        # The whole curve once a day; after that, only the near months, which is where prices move within the day.
+        near_only = from_tv and held.get("full_fetch_day") == today.isoformat()
+        def fetch_tv(product=tv_product, bars=bars, near_only=near_only) -> pd.DataFrame:
+            return fetch_tradingview_curve(product, today, bars, *login, near_only=near_only)
+        def apply_tv(raw: pd.DataFrame, product=tv_product, near_only=near_only) -> str:
+            return apply_tradingview_curve(product, raw, near_only)
         tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv, lane="tradingview"))
     held_front = _held_frame("tradingview_gas_front")
     front_bars = TRADINGVIEW_FRONT_HISTORY_BARS if held_front is None or len(held_front) < 200 else 10
@@ -6496,6 +6573,9 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             if frame.empty:
                 raise RuntimeError("; ".join(failures) or "No zone returned a forecast.")
             _stored_live_item("zone_weather_forecast", "Open-Meteo forecast across each zone", frame, {"zones": grid_zones})
+            kept = keep_weather_vintage(_held_frame("zone_weather_vintage"), frame, datetime.now(timezone.utc))
+            if kept is not None:
+                _stored_live_item("zone_weather_vintage", "Weather forecasts as they stood the day before", kept, {"zones": grid_zones})
             return f"{frame['zone'].nunique()} of {len(grid_zones)} zones"
         tasks.append(UpdateTask("Weather forecast across each power zone", fetch_grid_forecast, apply_grid_forecast))
     # Zones with points across them use those; the single reference city is kept for the others.
@@ -6644,6 +6724,27 @@ def _update_panel() -> None:
         st.caption(f"{len(bad_files)} curve file(s) couldn't be imported. See Forward Curves.")
 
 
+def update_report() -> str:
+    """A plain-text record of the last update for checking a live run: versions, each source's outcome and how fresh each dataset is.
+    It holds no keys: messages are cleaned before they are stored."""
+    import platform
+    results = st.session_state.get("update_results") or []
+    finished = st.session_state.get("update_finished_at")
+    lines = [f"Meridian update report, {finished:%Y-%m-%d %H:%M} UTC" if finished else "Meridian update report (no update has run in this session)",
+             f"Python {platform.python_version()}, pandas {pd.__version__}, Streamlit {st.__version__}, TradingView library {'installed' if tradingview_available() else 'not installed'}",
+             f"Keys present: {', '.join(name for name, value in resolved_credentials().items() if value) or 'none'}", "", "Sources"]
+    lines += [f"  {'OK    ' if good else 'FAILED'} {name}: {detail}" for name, good, detail in results] or ["  none"]
+    lines += ["", "Datasets held"]
+    for key, item in sorted(st.session_state.get("live_data", {}).items()):
+        frame = item.get("data") if isinstance(item, dict) else None
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            lines.append(f"  {key}: {len(frame):,} rows, latest {_latest_observation_date(frame) or 'n/a'}, fetched {str(item.get('fetched_at_utc', 'n/a'))[:16]}")
+    marks = st.session_state.get("curve_metadata", {})
+    lines += ["", "Forward curves"] + [f"  {product}: {marks[product].get('source_label', 'imported')}, dated {marks[product].get('curve_date', 'n/a')}" if product in marks else f"  {product}: demo prices"
+                                      for product in CURVE_PRODUCTS]
+    return "\n".join(lines)
+
+
 def render_update_panel() -> None:
     running = bool(st.session_state.get("update_job"))
     st.fragment(_update_panel, run_every="1.5s" if running else None)()
@@ -6739,8 +6840,9 @@ def import_curve_folder() -> list[dict]:
     return results
 
 
-def apply_tradingview_curve(product: str, raw: pd.DataFrame) -> str:
-    """Save each day's TradingView curve as that day's marks, and price with the latest one."""
+def apply_tradingview_curve(product: str, raw: pd.DataFrame, near_only: bool = False) -> str:
+    """Save each day's TradingView curve as that day's marks, and price with the latest one.
+    A near-months refresh replaces those months and keeps the rest of today's curve."""
     store = desk_store()
     custom, metadata = st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {})
     today = date.today()
@@ -6752,14 +6854,22 @@ def apply_tradingview_curve(product: str, raw: pd.DataFrame) -> str:
         for item in parsed:
             store.save_snapshot(item["day"], item["curve"], source, replace=True)
     newest = parsed[-1]
-    held = curve_mark_date(metadata.get(product)) if product in custom else None
+    held_meta = metadata.get(product, {}) if product in custom else {}
+    held = curve_mark_date(held_meta) if held_meta else None
+    curve, full_day = newest["curve"], today.isoformat()
+    if near_only and product in custom:
+        fresh = set(curve["delivery_month"])
+        rest = validate_curve(custom[product])
+        rest = rest.loc[~rest["delivery_month"].isin(fresh) & (rest["delivery_month"] > min(fresh))]
+        curve, full_day = validate_curve(pd.concat([curve, rest], ignore_index=True)), held_meta.get("full_fetch_day", "")
     if held is None or newest["day"] >= held:
-        commit_custom_curve(product, newest["curve"], {"source_label": source, "source_type": "TradingView", "imported_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")},
-                            curve_date=newest["day"])
+        commit_custom_curve(product, curve, {"source_label": source, "source_type": "TradingView", "full_fetch_day": full_day,
+                                             "imported_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}, curve_date=newest["day"])
     bump("snapshots")
     _stored_live_item("tradingview_curves", "TradingView forward curves", raw.loc[raw["curve_date"].eq(newest["day"])], {"product": product, "days": len(parsed)})
-    front = newest["curve"].iloc[0]
-    return f"{len(newest['curve'])} months dated {newest['day']:%d %b}, front {pd.Timestamp(front['delivery_month']):%b %y} at {front['price']:.2f}" + (f", plus {len(parsed) - 1} earlier days" if len(parsed) > 1 else "")
+    front = curve.iloc[0]
+    return (f"{len(newest['curve'])} near months refreshed, {len(curve)} held" if near_only else f"{len(curve)} months") + \
+        f" dated {newest['day']:%d %b}, front {pd.Timestamp(front['delivery_month']):%b %y} at {front['price']:.2f}" + (f", plus {len(parsed) - 1} earlier days" if len(parsed) > 1 and not near_only else "")
 
 
 def saved_reads() -> pd.DataFrame:
@@ -8938,6 +9048,52 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         return (f"Load forecast and cooling are used when prices follow them (miss €{extras['load']['without']:.1f} to €{extras['cooling']['with']:.1f}), "
                 "stay out when they don't help, and a missing load forecast for the day doesn't stop the estimate.")
 
+    def check_backups_and_kept_forecasts() -> str:
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "desk.db")
+            with sqlite3.connect(path) as conn:
+                conn.execute("create table t (x)")
+                conn.execute("insert into t values (42)")
+            conn.close()
+            first = backup_database(path, date(2026, 11, 1))
+            if not first or backup_database(path, date(2026, 11, 1)):
+                raise AssertionError("One backup a day, no more.")
+            for day in range(2, 12):
+                backup_database(path, date(2026, 11, day))
+            kept = sorted(os.listdir(os.path.join(folder, BACKUP_FOLDER_NAME)))
+            if len(kept) != BACKUPS_KEPT or kept[-1] != "desk-2026-11-11.db" or kept[0] != "desk-2026-11-05.db":
+                raise AssertionError(f"The last seven backups should be kept: {kept}")
+            copy = sqlite3.connect(os.path.join(folder, BACKUP_FOLDER_NAME, kept[-1]))
+            value = copy.execute("select x from t").fetchone()[0]
+            copy.close()
+            if value != 42:
+                raise AssertionError("A backup must hold the data.")
+        morning = datetime(2026, 11, 9, 9, 0, tzinfo=timezone.utc)      # 10:00 in Paris, before the auction
+        row = lambda wind, day="2026-11-10": pd.DataFrame({"zone": "France", "date": pd.to_datetime([day]), "temperature": 9.0, "hdd": 9.0, "wind": wind, "solar": 80.0, "points": 12})
+        held = keep_weather_vintage(None, row(20.0), morning)
+        held = keep_weather_vintage(held, row(35.0), morning.replace(hour=15))   # an afternoon forecast must not replace the morning one
+        if len(held) != 1 or float(held["wind"].iloc[0]) != 20.0:
+            raise AssertionError("The forecast known before the auction must be kept.")
+        held = keep_weather_vintage(held, row(22.0), morning.replace(hour=10))   # a later morning one may
+        if float(held["wind"].iloc[0]) != 22.0:
+            raise AssertionError("A newer forecast from before the auction should replace an older one.")
+        if keep_weather_vintage(held, row(30.0, "2026-11-12"), morning) is not held and len(keep_weather_vintage(held, row(30.0, "2026-11-12"), morning)) != 1:
+            raise AssertionError("Only tomorrow's forecast is kept.")
+        history = pd.DataFrame({"zone": "France", "date": pd.to_datetime(["2026-11-09", "2026-11-10"]), "temperature": 9.0, "hdd": 9.0, "wind": [10.0, 40.0], "solar": 80.0})
+        used = zone_weather(history, None, "France", held)
+        if float(used.loc["2026-11-10", "wind"]) != 22.0 or used["kept"].tolist() != [0.0, 1.0] or float(zone_weather(history, None, "France").loc["2026-11-10", "wind"]) != 40.0:
+            raise AssertionError("A kept forecast should replace what happened for that day, and only that day.")
+        asked = []
+        class Count:
+            def get_hist(self, symbol, exchange, interval, n_bars):
+                asked.append(symbol)
+                return pd.DataFrame({"close": 80.0}, index=pd.bdate_range(end="2026-11-09", periods=n_bars))
+        near = fetch_tradingview_curve("TTF Natural Gas", date(2026, 11, 9), 7, _client=Count(), near_only=True)
+        if len(asked) != TRADINGVIEW_NEAR_MONTHS or near["contract"].nunique() != TRADINGVIEW_NEAR_MONTHS:
+            raise AssertionError(f"An hourly refresh should ask for the near months only: {len(asked)}")
+        return (f"One backup a day and the last {BACKUPS_KEPT} kept. A forecast fetched before the auction is kept and used for that day's test, and a later one can't replace it. "
+                f"An hourly TradingView refresh asks for {TRADINGVIEW_NEAR_MONTHS} contracts instead of the whole curve.")
+
     def check_estimate_calendar() -> str:
         if _easter(2026) != date(2026, 4, 5) or _easter(2027) != date(2027, 3, 28):
             raise AssertionError("Easter date is wrong.")
@@ -9253,6 +9409,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Gas in the next-day estimate", "Next-day estimate", check_estimate_gas),
         ("Downloads refuse unsafe addresses and content", "Security", check_safe_downloads),
         ("Load forecast and cooling in the estimate", "Next-day estimate", check_estimate_extra_inputs),
+        ("Backups, kept forecasts and near-month refresh", "Data handling", check_backups_and_kept_forecasts),
         ("Holidays and kinds of day", "Next-day estimate", check_estimate_calendar),
         ("Weather across a zone in one request", "Live API integration", check_zone_weather_fetch),
         ("The 80% range holds about 80%", "Next-day estimate", check_estimate_range),
@@ -10687,7 +10844,7 @@ def zone_estimate(zone: str) -> dict:
                         lambda: next_day_estimate(zone, zone_prices(zone), _live_dataset_frame("weather_power_history"), _live_dataset_frame("weather_daily"),
                                                   _live_dataset_frame(f"entsoe_load_forecast|{zone}"), _live_dataset_frame(f"entsoe_renewable_forecast|{zone}"),
                                                   _live_dataset_frame("zone_weather_history"), _live_dataset_frame("zone_weather_forecast"),
-                                                  _live_dataset_frame("tradingview_gas_front")))
+                                                  _live_dataset_frame("tradingview_gas_front"), _live_dataset_frame("zone_weather_vintage")))
 
 
 def record_price_estimates() -> None:
@@ -10803,7 +10960,8 @@ def render_next_day(zones: Sequence[str]) -> None:
                        "On real German prices and pre-auction weather forecasts, a dozen points instead of one city cut the average miss by about a sixth. " if grid else
                        f"**Weather method.** It adds heating demand, wind and solar in {result['weather_basis'] or 'one reference city'}, for the day and the day before. ")
                     + f"10 km/h more wind changes the price by **{euros(result['wind_effect'] * 10)}**, one more heating degree day by **{euros(result['hdd_effect'])}**, and 10 W/m² more solar radiation by **{euros(result['solar_effect'] * 10)}**. "
-                    "Its test uses the weather that actually happened, because past forecasts aren't stored, so real errors run a little larger. The saved estimates above don't have that advantage.\n\n"
+                    f"The app now keeps each day's forecast as it stood before the auction, and tests with it where it has one: **{result.get('kept_forecast_days', 0)} of the {result['n']} tested days** so far. "
+                    "The other days use the weather that actually happened, which flatters the test a little. That share shrinks every day the app is updated before noon.\n\n"
                     "**The range.** It comes from this method's own misses on the tested days, scaled by how large recent misses were, so it widens when the market turns volatile and narrows when it calms. "
                     "It aims to hold the price on 8 days in 10. After a sudden jump in volatility it takes a week or two to catch up.\n\n"
                     "**ENTSO-E method.** It adds the system operators' day-ahead forecasts of load, wind and solar for the whole zone, and its test uses those forecasts rather than what happened. "
@@ -11454,6 +11612,11 @@ def page_live_data_integrations():
         results = st.session_state.get("update_results") or []
         if results:
             table(pd.DataFrame([{"Source": n, "Result": "Updated" if good else "Failed", "Detail": d} for n, good, d in results]))
+            with st.expander("Update report, to check or share a live run"):
+                st.caption("Each source's outcome, how fresh each dataset is, and the library versions. It contains no keys. Copy it with the button at the top right of the box.")
+                report = update_report()
+                st.code(report, language=None)
+                st.download_button("Download the report", report, file_name="meridian_update_report.txt", key="update_report_download")
     saved = resolved_credentials()
     with st.expander("Replace an access key", expanded=False):
         st.caption("You only need this to use a different key. Your saved keys come from the keys file beside the app and are never sent to your browser, so these fields stay empty. A key pasted here lasts for this session. To change one permanently, edit meridian_keys.toml.")
