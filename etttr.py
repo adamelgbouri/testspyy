@@ -620,6 +620,8 @@ def validate_curve(curve: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Curve is missing required columns: {sorted(missing)}")
     if curve.empty:
+        if curve.attrs.get("not_loaded"):
+            return curve.copy()   # a product with no live price yet: valid, and simply has no marks
         raise ValueError("Curve contains no rows.")
     out = curve.copy()
     parsed = pd.to_datetime(out["delivery_month"], errors="coerce")
@@ -3084,6 +3086,58 @@ def estimate_range(errors: np.ndarray) -> dict:
     return {"low": float(low), "high": float(high), "held": float(np.mean(hits)) if hits else None, "held_days": len(hits), "adaptive": True}
 
 
+PROBABILITY_LEVELS = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
+
+
+def _pinball(levels: np.ndarray, predicted: np.ndarray, actual: float) -> float:
+    """The standard score for a set of quantiles: lower is better, and it rewards being both sharp and right."""
+    gap = actual - predicted
+    return float(np.where(gap >= 0, levels * gap, (levels - 1.0) * gap).mean())
+
+
+def estimate_distribution(errors: np.ndarray, simple_errors: Optional[np.ndarray] = None) -> Optional[dict]:
+    """The whole spread of likely misses for the next day, not only an 80% range.
+
+    Built like estimate_range: past misses divided by the recent typical miss, then scaled back by today's.
+    On real German prices this scored better and was better calibrated than quantile regression.
+    Each tested day is scored against quantiles built only from earlier days. simple_errors are the misses
+    of the simple method, scored the same way as the yardstick.
+    """
+    levels = np.array(PROBABILITY_LEVELS)
+
+    def build(values: np.ndarray) -> Optional[dict]:
+        values = np.asarray(values, float)
+        scale = pd.Series(np.abs(values)).ewm(halflife=ESTIMATE_RANGE_HALF_LIFE_DAYS, min_periods=5).mean()
+        before = scale.shift(1).to_numpy()
+        scaled = values / before
+        usable = ~np.isnan(scaled)
+        if usable.sum() < ESTIMATE_RANGE_MIN_ERRORS:
+            return None
+        scores, below = [], []
+        for i in np.flatnonzero(usable):
+            past = scaled[:i][usable[:i]]
+            if len(past) >= ESTIMATE_RANGE_MIN_ERRORS:
+                predicted = np.quantile(past, levels) * before[i]
+                scores.append(_pinball(levels, predicted, values[i]))
+                below.append(values[i] <= predicted)
+        if not scores:
+            return None
+        return {"offsets": np.sort(scaled[usable]) * float(scale.iloc[-1]), "score": float(np.mean(scores)), "days": len(scores),
+                "below": np.mean(below, axis=0)}
+
+    own = build(errors)
+    if own is None:
+        return None
+    simple = build(simple_errors) if simple_errors is not None else None
+    return {"offsets": own["offsets"], "levels": levels, "quantiles": np.quantile(own["offsets"], levels), "score": own["score"], "days": own["days"],
+            "below": own["below"], "simple_score": simple["score"] if simple else None}
+
+
+def chance_above(distribution: dict, estimate: float, level: float) -> float:
+    """Share of the likely outcomes above a price level."""
+    return float(np.mean(estimate + distribution["offsets"] > level))
+
+
 def _weather_for_estimate(zone: str, history: pd.DataFrame, daily: pd.DataFrame, grid_history: Optional[pd.DataFrame], grid_forecast: Optional[pd.DataFrame],
                           target: pd.Timestamp, vintage: Optional[pd.DataFrame] = None) -> tuple[pd.DataFrame, str]:
     """Weather across the zone's points when held, otherwise the one reference city."""
@@ -3171,6 +3225,7 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
     errors = (chosen["actual"] - chosen["estimate"]).to_numpy(float)
     value = float(_apply_estimate(forecast_final, forecast_frame.iloc[[-1]], FORECAST_COLUMNS)[0]) if use_forecasts else float(_apply_estimate(final, ahead, weather_columns)[0])
     spread = estimate_range(errors)
+    distribution = estimate_distribution(errors, (chosen["actual"] - chosen["same_type"]).to_numpy(float))
     # Judge the latest published price with ENTSO-E's forecasts when they exist for that day.
     checker = forecast_test if not forecast_test.empty and forecast_test["day"].iloc[-1] == base.index[-1] else test
     latest = checker.iloc[-1]
@@ -3186,7 +3241,7 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
               "latest_gap": gap, "unusual": abs(gap) > float(check_errors.quantile(0.9)), "check_method": "ENTSO-E forecasts" if checker is forecast_test else "Weather",
               "comparison": comparison, "target_has_forecast": target_has_forecast, "forecast_days": int(published.dropna().shape[0]),
               "wind_effect": float(final[ESTIMATE_COLUMNS.index("wind") + 1]), "hdd_effect": float(final[ESTIMATE_COLUMNS.index("hdd") + 1]),
-              "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1]), "forecast_effects": None, "gas": gas_check, "extras": extras,
+              "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1]), "forecast_effects": None, "gas": gas_check, "extras": extras, "distribution": distribution,
               "kept_forecast_days": int(weather["kept"].reindex(pd.DatetimeIndex(chosen["day"])).fillna(0).sum()) if "kept" in weather.columns and not use_forecasts else 0}
     best_simple = min(result["error_same_type"], result["error_last_week"], result["error_yesterday"])
     result["skill"] = 1.0 - result["error"] / best_simple if best_simple > 0 else 0.0
@@ -3625,6 +3680,236 @@ def fetch_eua_auctions(today: Optional[date] = None, _http_fn=None) -> pd.DataFr
 
 
 # =============================================================================
+# SECTION 2F · ASSET VALUATION: GAS STORAGE AND A GAS-FIRED PLANT
+# =============================================================================
+TRADING_DAYS = 252
+VOL_FALLBACK = {"Gas": (0.60, 0.25), "Power": (0.70, 0.25), "Carbon": (0.35, 0.30), "Coal": (0.35, 0.20)}   # near and far, per year
+VOL_MIN_DAYS = 20
+VOL_DECAY_PER_YEAR = 1.5          # how fast the extra volatility of near months fades with time to delivery
+STORAGE_GRID = 41                 # inventory levels: steps of 2.5% of the working volume
+STORAGE_PATHS = 300
+STORAGE_DEFAULTS = {"volume_mwh": 1_000_000.0, "inject_mwh_day": 6_500.0, "withdraw_mwh_day": 13_000.0, "start_share": 0.0, "end_share": 0.0,
+                    "inject_cost": 0.5, "withdraw_cost": 0.3, "rate": 0.03}
+PLANT_DEFAULTS = {"capacity_mw": 400.0, "efficiency": 0.55, "emission_factor": 0.202, "variable_cost": 3.0, "rate": 0.03}
+
+
+def contract_returns(history: pd.DataFrame, product: str) -> pd.DataFrame:
+    """Daily log returns of each contract, with its distance from delivery in months. Same contract only, never across a roll."""
+    empty = pd.DataFrame(columns=["day", "tenor", "ret"])
+    if history is None or history.empty:
+        return empty
+    data = history.loc[history["product"].eq(product), ["snapshot_date", "delivery_month", "price"]].copy()
+    if data.empty:
+        return empty
+    data["day"], data["month"] = pd.to_datetime(data["snapshot_date"]), pd.to_datetime(data["delivery_month"])
+    data = data.loc[data["price"] > 0].sort_values(["month", "day"])
+    grouped = data.groupby("month")
+    data["ret"] = np.log(data["price"]) - np.log(grouped["price"].shift(1))
+    data["gap"] = (data["day"] - grouped["day"].shift(1)).dt.days
+    data = data.loc[data["gap"].between(1, 5)]
+    data["tenor"] = (data["month"].dt.year - data["day"].dt.year) * 12 + data["month"].dt.month - data["day"].dt.month
+    return data.loc[data["tenor"] >= 0, ["day", "tenor", "ret"]].reset_index(drop=True)
+
+
+def curve_volatility(history: pd.DataFrame, product: str) -> dict:
+    """Yearly volatility of near months (up to 3 ahead) and far months (10 or more ahead) from saved daily curves.
+
+    With fewer than VOL_MIN_DAYS of real history it falls back to typical values and says so.
+    """
+    near_default, far_default = VOL_FALLBACK[CURVE_PRODUCTS[product]["commodity"]]
+    returns = contract_returns(history, product)
+    # Each contract's own moves are pooled. Averaging contracts first would hide part of the movement.
+    near, far = returns.loc[returns["tenor"].between(1, 3)], returns.loc[returns["tenor"] >= 10]
+    near_days, far_days = int(near["day"].nunique()), int(far["day"].nunique())
+    if near_days < VOL_MIN_DAYS:
+        return {"near": near_default, "far": far_default, "days": near_days, "estimated": False}
+    near_vol = float(near["ret"].std(ddof=1) * math.sqrt(TRADING_DAYS))
+    far_vol = float(far["ret"].std(ddof=1) * math.sqrt(TRADING_DAYS)) if far_days >= VOL_MIN_DAYS else min(far_default, near_vol)
+    return {"near": near_vol, "far": min(far_vol, near_vol), "days": near_days, "estimated": True}
+
+
+def curve_correlation(history: pd.DataFrame, first: str, second: str, fallback: float) -> tuple[float, int]:
+    """Correlation of the two products' near-month daily returns, and the days it rests on."""
+    series = []
+    for product in (first, second):
+        returns = contract_returns(history, product)
+        series.append(returns.loc[returns["tenor"].between(1, 3)].groupby("day")["ret"].mean())
+    joined = pd.concat(series, axis=1, keys=["a", "b"]).dropna()
+    if len(joined) < VOL_MIN_DAYS or joined["a"].std() == 0 or joined["b"].std() == 0:
+        return fallback, int(len(joined))
+    return float(np.clip(joined["a"].corr(joined["b"]), -0.95, 0.95)), int(len(joined))
+
+
+def vol_at(near: float, far: float, years: float) -> float:
+    """Volatility of a contract delivering in this many years: near months move more than far ones."""
+    return far + (near - far) * math.exp(-VOL_DECAY_PER_YEAR * max(years, 0.0))
+
+
+# ---- Gas storage --------------------------------------------------------------------
+def _storage_setup(volume: float, inject_day: float, withdraw_day: float, inject_cost: float, withdraw_cost: float, days: np.ndarray) -> tuple:
+    levels = np.linspace(0.0, volume, STORAGE_GRID)
+    change = levels[None, :] - levels[:, None]                      # from level i to level j, positive is injection
+    cost = np.where(change > 0, inject_cost * change, withdraw_cost * -change)
+    tolerance = 1e-9 * max(volume, 1.0)
+    allowed = [(change <= inject_day * d + tolerance) & (-change <= withdraw_day * d + tolerance) for d in days]
+    return levels, change, cost, allowed
+
+
+def _storage_values(prices: np.ndarray, discount: np.ndarray, change: np.ndarray, cost: np.ndarray, allowed: list, end_index: int) -> tuple:
+    """Best value from every inventory level for each price path, and each month's best next level.
+
+    prices has one row per path and one column per month. Buying costs the month's price, selling earns it.
+    """
+    paths, months = prices.shape
+    value = np.full((paths, STORAGE_GRID), -np.inf)
+    value[:, end_index] = 0.0
+    policy = np.zeros((months, paths, STORAGE_GRID), dtype=np.int16)
+    for m in range(months - 1, -1, -1):
+        cash = discount[m] * (-change[None, :, :] * prices[:, m, None, None] - cost[None, :, :])
+        total = np.where(allowed[m][None, :, :], cash + value[:, None, :], -np.inf)
+        policy[m] = total.argmax(axis=2)
+        value = total.max(axis=2)
+    return value, policy
+
+
+def storage_intrinsic(prices: Sequence[float], days: Sequence[int], years: Sequence[float], params: Optional[dict] = None) -> dict:
+    """The value locked in today by trading the forward curve: buy the cheap months, sell the dear ones, within the site's limits.
+
+    It needs no view on volatility: every trade in the plan can be done today at the curve's prices.
+    """
+    p = {**STORAGE_DEFAULTS, **(params or {})}
+    prices, days, years = np.asarray(prices, float), np.asarray(days, float), np.asarray(years, float)
+    if len(prices) < 2 or p["volume_mwh"] <= 0 or p["inject_mwh_day"] <= 0 or p["withdraw_mwh_day"] <= 0:
+        raise ValueError("Storage needs at least two months of prices, and a volume and rates above zero.")
+    levels, change, cost, allowed = _storage_setup(p["volume_mwh"], p["inject_mwh_day"], p["withdraw_mwh_day"], p["inject_cost"], p["withdraw_cost"], days)
+    start, end = (int(round(float(np.clip(p[k], 0, 1)) * (STORAGE_GRID - 1))) for k in ("start_share", "end_share"))
+    discount = np.exp(-p["rate"] * years)
+    value, policy = _storage_values(prices[None, :], discount, change, cost, allowed, end)
+    if not np.isfinite(value[0, start]):
+        raise ValueError("The end inventory can't be reached from the start within the injection and withdrawal rates.")
+    rows, level = [], start
+    for m in range(len(prices)):
+        nxt = int(policy[m, 0, level])
+        moved = float(change[level, nxt])
+        rows.append({"month": m, "price": float(prices[m]), "inject_mwh": max(moved, 0.0), "withdraw_mwh": abs(min(moved, 0.0)), "inventory_mwh": float(levels[nxt]),
+                     "cash": float(discount[m] * (-moved * prices[m] - cost[level, nxt]))})
+        level = nxt
+    return {"value": float(value[0, start]), "plan": pd.DataFrame(rows), "start_index": start, "end_index": end}
+
+
+def storage_rolling(prices: Sequence[float], days: Sequence[int], years: Sequence[float], near_vol: float, far_vol: float,
+                    params: Optional[dict] = None, paths: int = STORAGE_PATHS, seed: int = 7) -> dict:
+    """Value with re-optimising (rolling intrinsic): the plan is hedged today, then redone each month on that month's curve.
+
+    Whenever the new curve offers a better plan than the one already hedged, the difference is locked in by
+    re-hedging, so each month adds a gain that is never negative. The curve is simulated with two moves: one
+    shifting every month alike, and one that hits near months hardest and fades with time to delivery, which is
+    what moves the summer-winter spread. Forward prices have no drift. The result is a floor for the full option
+    value: a holder who also acts on views about future volatility could earn more.
+    """
+    p = {**STORAGE_DEFAULTS, **(params or {})}
+    prices, days, years = np.asarray(prices, float), np.asarray(days, float), np.asarray(years, float)
+    intrinsic = storage_intrinsic(prices, days, years, p)
+    levels, change, cost, allowed = _storage_setup(p["volume_mwh"], p["inject_mwh_day"], p["withdraw_mwh_day"], p["inject_cost"], p["withdraw_cost"], days)
+    discount = np.exp(-p["rate"] * years)
+    months, rows = len(prices), np.arange(paths)
+    rng = np.random.default_rng(seed)
+    curve = np.tile(prices, (paths, 1))
+    long_vol, short_vol = far_vol, math.sqrt(max(near_vol ** 2 - far_vol ** 2, 0.0))
+
+    def follow(policy: np.ndarray, start: np.ndarray) -> np.ndarray:
+        """The inventory level after each remaining month when the plan is followed from start."""
+        plan, level = np.empty((paths, policy.shape[0]), dtype=int), start
+        for m in range(policy.shape[0]):
+            level = policy[m][rows, level].astype(int)
+            plan[:, m] = level
+        return plan
+
+    def worth(start: np.ndarray, plan: np.ndarray, first_month: int) -> np.ndarray:
+        """What a plan is worth on the present curve."""
+        before = np.column_stack([start, plan[:, :-1]])
+        return ((-change[before, plan] * curve[:, first_month:] - cost[before, plan]) * discount[None, first_month:]).sum(axis=1)
+
+    level = np.full(paths, intrinsic["start_index"])
+    _, policy = _storage_values(curve, discount, change, cost, allowed, intrinsic["end_index"])
+    plan = follow(policy, level)
+    gains = np.zeros(paths)
+    for t in range(1, months):
+        level, plan = plan[:, 0], plan[:, 1:]                      # last month's trade is done; the rest of the plan stays hedged
+        step = float(years[t] - years[t - 1])
+        fade = short_vol * np.exp(-VOL_DECAY_PER_YEAR * np.clip(years[t:] - years[t], 0.0, None))
+        shocks = long_vol * math.sqrt(step) * rng.standard_normal((paths, 1)) + fade[None, :] * math.sqrt(step) * rng.standard_normal((paths, 1))
+        curve[:, t:] *= np.exp(shocks - 0.5 * (long_vol ** 2 + fade[None, :] ** 2) * step)
+        value, policy = _storage_values(curve[:, t:], discount[t:], change, cost, allowed[t:], intrinsic["end_index"])
+        better = value[rows, level] - worth(level, plan, t)
+        gains += np.maximum(better, 0.0)
+        plan = np.where((better > 1e-9)[:, None], follow(policy, level), plan)
+    extrinsic, error = float(gains.mean()), float(gains.std(ddof=1) / math.sqrt(paths)) if paths > 1 else 0.0
+    return {"intrinsic": intrinsic["value"], "rolling": intrinsic["value"] + extrinsic, "error": error, "extrinsic": extrinsic, "plan": intrinsic["plan"],
+            "low": intrinsic["value"] + float(np.quantile(gains, 0.05)), "high": intrinsic["value"] + float(np.quantile(gains, 0.95)), "paths": paths}
+
+
+# ---- Gas-fired plant as a strip of spread options ---------------------------------------
+def _normal_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def kirk_spread_option(first: float, second: float, strike: float, vol_first: float, vol_second: float, correlation: float, years: float, rate: float = 0.0) -> float:
+    """Value today of the right to receive first minus second minus strike, if positive (Kirk's approximation).
+
+    With a zero strike it is Margrabe's exact formula. With no time or no volatility it is the spread itself, if positive.
+    """
+    discount = math.exp(-rate * max(years, 0.0))
+    if first <= 0 or second + strike <= 0:
+        return discount * max(first - second - strike, 0.0)
+    share = second / (second + strike)
+    vol = math.sqrt(max(vol_first ** 2 - 2.0 * correlation * vol_first * vol_second * share + (vol_second * share) ** 2, 0.0))
+    spread_vol = vol * math.sqrt(max(years, 0.0))
+    if spread_vol < 1e-9:
+        return discount * max(first - second - strike, 0.0)
+    d1 = math.log(first / (second + strike)) / spread_vol + 0.5 * spread_vol
+    return discount * (first * _normal_cdf(d1) - (second + strike) * _normal_cdf(d1 - spread_vol))
+
+
+def plant_option_strip(months: pd.DataFrame, vols: dict, correlations: dict, params: Optional[dict] = None) -> pd.DataFrame:
+    """A gas-fired plant valued month by month as the right, not the duty, to run.
+
+    months needs power, gas and carbon prices in EUR, hours, and years to the start of delivery.
+    Running earns power minus gas / efficiency minus carbon x emission factor / efficiency minus the variable cost.
+    Each month is treated as one decision on the month's average prices. A real plant decides hour by hour,
+    so its flexibility is worth more than this.
+    """
+    p = {**PLANT_DEFAULTS, **(params or {})}
+    if not 0 < p["efficiency"] <= 1:
+        raise ValueError("Efficiency must be between 0 and 1.")
+    rows = []
+    for row in months.itertuples(index=False):
+        gas_cost, carbon_cost = row.gas / p["efficiency"], row.carbon * p["emission_factor"] / p["efficiency"]
+        fuel = gas_cost + carbon_cost
+        years = max(float(row.years), 0.0)
+        power_vol, gas_vol = vol_at(*vols["power"], years), vol_at(*vols["gas"], years)
+        carbon_vol = vol_at(*vols["carbon"], years)
+        w_gas, w_carbon = gas_cost / fuel, carbon_cost / fuel
+        fuel_vol = math.sqrt(max((w_gas * gas_vol) ** 2 + (w_carbon * carbon_vol) ** 2 + 2 * w_gas * w_carbon * correlations["gas_carbon"] * gas_vol * carbon_vol, 1e-12))
+        power_fuel = float(np.clip((w_gas * gas_vol * correlations["power_gas"] + w_carbon * carbon_vol * correlations["power_carbon"]) / fuel_vol, -0.95, 0.95))
+
+        def value(power: float, gas: float, carbon: float) -> float:
+            fuel_ = gas / p["efficiency"] + carbon * p["emission_factor"] / p["efficiency"]
+            return kirk_spread_option(power, fuel_, p["variable_cost"], power_vol, fuel_vol, power_fuel, years, p["rate"])
+
+        option = value(row.power, row.gas, row.carbon)
+        bump = lambda f, x: (f(x * 1.001) - f(x * 0.999)) / (x * 0.002)
+        volume = p["capacity_mw"] * row.hours
+        margin = row.power - fuel - p["variable_cost"]
+        rows.append({"month": row.month, "power": row.power, "fuel_cost": fuel, "margin": margin, "intrinsic": math.exp(-p["rate"] * years) * max(margin, 0.0), "option": option,
+                     "volume_mwh": volume, "value": option * volume, "intrinsic_value": math.exp(-p["rate"] * years) * max(margin, 0.0) * volume,
+                     "hedge_power_mwh": -bump(lambda x: value(x, row.gas, row.carbon), row.power) * volume,
+                     "hedge_gas_mwh": -bump(lambda x: value(row.power, x, row.carbon), row.gas) * volume,
+                     "hedge_carbon_t": -bump(lambda x: value(row.power, row.gas, x), row.carbon) * volume})
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
 # SECTION 3 · SAVED DATA (SQLite)
 # Everything the desk needs tomorrow lives in one local database file.
 # =============================================================================
@@ -3980,7 +4265,8 @@ def set_fx_rate(key: str, value: float, ecb: bool = False) -> None:
         _save(lambda s: s.set_setting("fx_ecb_epoch", -1.0))
 
 
-DEFAULT_SETTINGS = {"eur_per_gbp": 1.17, "eur_per_usd": 0.92, "auto_update": 1.0, "fx_ecb_epoch": 0.0}
+DEFAULT_SETTINGS = {"eur_per_gbp": 1.17, "eur_per_usd": 0.92, "auto_update": 1.0, "fx_ecb_epoch": 0.0,
+                    "allow_demo": 1.0 if os.getenv("MERIDIAN_ALLOW_DEMO", "").strip() == "1" else 0.0}   # live prices only unless chosen otherwise
 
 
 # =============================================================================
@@ -5351,6 +5637,7 @@ TRADINGVIEW_CURVES = {
     "German Power Peak": {"exchange": "NYMEX", "root": "DEP", "name": "NYMEX German power peakload month futures", "months": 36, "in_delivery": True},
     "French Power Base": {"exchange": "ICEENDEX", "root": "FNB", "name": "ICE Endex French power base futures", "months": 36, "in_delivery": True},
     "French Power Peak": {"exchange": "ICEENDEX", "root": "FNA", "name": "ICE Endex French power peak futures", "months": 36, "in_delivery": True},
+    "API2 Coal": {"exchange": "ICEEUR", "root": "ATW", "name": "ICE API2 Rotterdam coal futures", "months": 36, "in_delivery": True},
     "EUA Carbon": {"exchange": "ICEENDEX", "root": "ECF", "name": "ICE Endex EUA futures, months between expiries interpolated", "months": 74, "in_delivery": True, "listing": "eua"},
 }
 TRADINGVIEW_MONTH_CODES = "FGHJKMNQUVXZ"
@@ -6098,7 +6385,7 @@ def need_data_note(message: str) -> None:
 NAV_SECTIONS = {
     "Market": [":material/dashboard:  Market Overview", ":material/wb_twilight:  Morning Brief", ":material/psychology:  Market Read", ":material/public:  Market Fundamentals",
                ":material/bolt:  Power Spot", ":material/compare_arrows:  Spreads & Margins"],
-    "Pricing": [":material/show_chart:  Forward Curves", ":material/request_quote:  OTC Quote Builder"],
+    "Pricing": [":material/show_chart:  Forward Curves", ":material/request_quote:  OTC Quote Builder", ":material/factory:  Asset Valuation"],
     "Book and risk": [":material/menu_book:  Trading Book & MtM", ":material/calendar_today:  Daily P&L",
                       ":material/shield:  Risk & Exposure", ":material/verified_user:  Hedge Advisor", ":material/local_shipping:  Physical Operations"],
     "Data and controls": [":material/cable:  Live Data Integrations", ":material/tune:  Data & Assumptions",
@@ -6116,7 +6403,8 @@ WORKFLOW_NEXT = {
     "Power Spot": "Spreads & Margins",
     "Spreads & Margins": "Forward Curves",
     "Forward Curves": "OTC Quote Builder",
-    "OTC Quote Builder": "Trading Book & MtM",
+    "OTC Quote Builder": "Asset Valuation",
+    "Asset Valuation": "Trading Book & MtM",
     "Trading Book & MtM": "Daily P&L",
     "Daily P&L": "Risk & Exposure",
     "Risk & Exposure": "Hedge Advisor",
@@ -6231,8 +6519,10 @@ def saved_snapshots() -> pd.DataFrame:
         store = desk_store()
         if store is None:
             return pd.DataFrame(columns=["snapshot_date", "product", "delivery_month", "price", "source"])
-        return store.load_snapshots()
-    return session_memo("snapshots", data_version("snapshots"), load)
+        frame = store.load_snapshots()
+        # Live only: demo and simulated days are left out of P&L and risk history.
+        return frame if demo_allowed() else frame.loc[~frame["source"].isin(DEMO_HISTORY_SOURCES)].reset_index(drop=True)
+    return session_memo("snapshots", (data_version("snapshots"), demo_allowed()), load)
 
 
 def saved_lookups() -> dict:
@@ -6763,6 +7053,13 @@ def render_update_panel() -> None:
                             help="Fetches stale data in the background each time you open the app.")
     if automatic != bool(fx_rate("auto_update")):
         set_fx_rate("auto_update", 1.0 if automatic else 0.0)
+    demo = st.checkbox("Fill gaps with demo prices", value=demo_allowed(), key="allow_demo_toggle",
+                       help="Off: only live prices are used, and anything without one shows as not loaded. On: missing prices and history are filled with labelled demo values.")
+    if demo != demo_allowed():
+        set_fx_rate("allow_demo", 1.0 if demo else 0.0)
+        bump("curves")
+        bump("snapshots")
+        st.rerun()
 
 
 def update_button(key: str, label: str = "Update market data") -> None:
@@ -7000,6 +7297,11 @@ def book_months() -> dict:
     return held
 
 
+def demo_allowed() -> bool:
+    """Live prices only, unless the user chooses to fill gaps with demo prices."""
+    return bool(fx_rate("allow_demo"))
+
+
 def composed_curves() -> tuple[dict, dict]:
     """Every curve with real prices put in wherever a free source has them, and each month's source."""
     def build() -> tuple[dict, dict]:
@@ -7022,8 +7324,15 @@ def composed_curves() -> tuple[dict, dict]:
             except Exception:
                 curves_[product] = validate_curve(base)
                 sources[product] = {m: SOURCE_IMPORTED if product in custom else SOURCE_DEMO for m in curves_[product]["delivery_month"]}
+        if not demo_allowed():
+            # Live only: a month without a real price has no price, rather than an invented one.
+            for product, curve in curves_.items():
+                real = {m for m, source in sources[product].items() if source in REAL_PRICE_SOURCES}
+                curves_[product] = curve.loc[curve["delivery_month"].isin(real)].reset_index(drop=True)
+                curves_[product].attrs["not_loaded"] = True
+                sources[product] = {m: sources[product][m] for m in real}
         return curves_, sources
-    return session_memo("composed_curves", (data_version("live", "curves", "trades"), valuation_date), build)
+    return session_memo("composed_curves", (data_version("live", "curves", "trades"), valuation_date, demo_allowed()), build)
 
 
 def curve_sources() -> dict:
@@ -7201,6 +7510,7 @@ PAGE_SOURCES = {
     "Spreads & Margins": lambda: src_curves([p for p in CURVE_PRODUCTS if p != "NBP Natural Gas"]) + src_fx(),
     "Forward Curves": lambda: src_curves(ALL_PRICED),
     "OTC Quote Builder": lambda: src_curves(list(PRODUCTS)),
+    "Asset Valuation": lambda: src_curves(["TTF Natural Gas", "German Power Base", "French Power Base", "EUA Carbon"]),
     "Trading Book & MtM": lambda: src_book() + src_book_curves() + src_fx(),
     "Daily P&L": lambda: src_book() + src_history() + src_fx(),
     "Risk & Exposure": lambda: src_book() + src_curves(list(dict.fromkeys(book_products() + ["TTF Natural Gas", "EUA Carbon"]))) + src_history() + src_fx(),
@@ -9116,6 +9426,105 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         return (f"One backup a day and the last {BACKUPS_KEPT} kept. A forecast fetched before the auction is kept and used for that day's test, and a later one can't replace it. "
                 f"An hourly TradingView refresh asks for {TRADINGVIEW_NEAR_MONTHS} contracts instead of the whole curve.")
 
+    def check_storage_valuation() -> str:
+        days, years = np.full(12, 30.0), np.arange(12) / 12.0
+        free = {"volume_mwh": 1000.0, "inject_mwh_day": 1000.0, "withdraw_mwh_day": 1000.0, "inject_cost": 0.0, "withdraw_cost": 0.0, "rate": 0.0}
+        flat = storage_intrinsic(np.full(12, 50.0), days, years, free)
+        assert_close(flat["value"], 0.0, 1e-6)
+        step = np.r_[np.full(6, 30.0), np.full(6, 50.0)]
+        full = storage_intrinsic(step, days, years, free)
+        assert_close(full["value"], 1000.0 * 20.0, 1e-6)                      # fill at 30, empty at 50
+        assert_close(storage_intrinsic(step, days, years, {**free, "inject_cost": 1.5, "withdraw_cost": 0.5})["value"], 1000.0 * 18.0, 1e-6)
+        slow = storage_intrinsic(np.array([30.0, 50.0]), np.array([30.0, 30.0]), np.array([0.0, 1 / 12]), {**free, "inject_mwh_day": 1000.0 / 60.0})
+        assert_close(slow["value"], 500.0 * 20.0, 1e-6)                       # a month of injection only half fills it
+        plan = full["plan"]
+        if plan["inventory_mwh"].max() > 1000.0 + 1e-6 or plan["inventory_mwh"].min() < -1e-6 or plan["inventory_mwh"].iloc[-1] != 0.0:
+            raise AssertionError("Inventory must stay within the site and end where asked.")
+        assert_close(float(plan["cash"].sum()), full["value"], 1e-6)
+        assert_close(float(plan["inject_mwh"].sum()), float(plan["withdraw_mwh"].sum()), 1e-6)
+        seasonal = 60.0 + 12.0 * np.cos(np.arange(12) / 12.0 * 2 * np.pi)
+        site = {"volume_mwh": 1000.0, "inject_mwh_day": 10.0, "withdraw_mwh_day": 20.0, "inject_cost": 0.5, "withdraw_cost": 0.3, "rate": 0.03}
+        calm = storage_rolling(seasonal, days, years, 0.0, 0.0, site, paths=50)
+        assert_close(calm["rolling"], calm["intrinsic"], 1e-6)                # with no price moves, re-optimising adds nothing
+        lively = storage_rolling(seasonal, days, years, 0.6, 0.2, site, paths=400)
+        livelier = storage_rolling(seasonal, days, years, 1.0, 0.2, site, paths=400)
+        if lively["extrinsic"] <= 0 or livelier["rolling"] <= lively["rolling"]:
+            raise AssertionError(f"Flexibility should be worth more when near months move more: {lively['rolling']:.0f}, {livelier['rolling']:.0f}")
+        try:
+            storage_intrinsic(step, days, years, {**free, "end_share": 1.0, "inject_mwh_day": 0.1})
+            raise AssertionError("An end inventory that can't be reached must be refused.")
+        except ValueError:
+            pass
+        return (f"A flat curve is worth nothing, a 20 spread on 1,000 MWh is worth 20,000 less costs, rate limits bind, and inventory stays in bounds. "
+                f"Re-optimising adds nothing with still prices and {lively['extrinsic'] / lively['intrinsic'] * 100:.0f}% at 60% near-month volatility.")
+
+    def check_plant_option() -> str:
+        margrabe_vol = math.sqrt(0.5 ** 2 + 0.4 ** 2 - 2 * 0.6 * 0.5 * 0.4)
+        d1 = (math.log(100.0 / 90.0) + 0.5 * margrabe_vol ** 2 * 0.75) / (margrabe_vol * math.sqrt(0.75))
+        exact = 100.0 * _normal_cdf(d1) - 90.0 * _normal_cdf(d1 - margrabe_vol * math.sqrt(0.75))
+        assert_close(kirk_spread_option(100.0, 90.0, 0.0, 0.5, 0.4, 0.6, 0.75), exact, 1e-9)
+        assert_close(kirk_spread_option(100.0, 90.0, 4.0, 0.0, 0.0, 0.6, 0.75), 6.0, 1e-9)
+        assert_close(kirk_spread_option(80.0, 90.0, 4.0, 0.5, 0.4, 0.6, 0.0), 0.0, 1e-9)
+        rng = np.random.default_rng(3)
+        z1 = rng.standard_normal(400_000)
+        z2 = 0.6 * z1 + math.sqrt(1 - 0.36) * rng.standard_normal(400_000)
+        power = 100.0 * np.exp(-0.5 * 0.25 * 0.75 + 0.5 * math.sqrt(0.75) * z1)
+        fuel = 90.0 * np.exp(-0.5 * 0.16 * 0.75 + 0.4 * math.sqrt(0.75) * z2)
+        simulated = float(np.maximum(power - fuel - 4.0, 0.0).mean())
+        kirk = kirk_spread_option(100.0, 90.0, 4.0, 0.5, 0.4, 0.6, 0.75)
+        assert_close(kirk, simulated, 0.02 * simulated)
+        if not kirk_spread_option(100.0, 90.0, 4.0, 0.8, 0.4, 0.6, 0.75) > kirk > 6.0:
+            raise AssertionError("The option must be worth more than the margin today, and more with more volatility.")
+        months = pd.DataFrame({"month": pd.to_datetime(["2027-01-01", "2027-07-01", "2027-08-01"]), "power": [200.0, 60.0, 110.0], "gas": [40.0, 40.0, 40.0],
+                               "carbon": [80.0, 80.0, 80.0], "hours": [744.0, 744.0, 744.0], "years": [0.15, 0.65, 0.73]})
+        vols = {"power": (0.7, 0.3), "gas": (0.6, 0.25), "carbon": (0.35, 0.3)}
+        strip = plant_option_strip(months, vols, {"power_gas": 0.6, "power_carbon": 0.3, "gas_carbon": 0.2}, {"capacity_mw": 100.0, "efficiency": 0.5, "emission_factor": 0.2, "variable_cost": 3.0, "rate": 0.0})
+        assert_close(float(strip["fuel_cost"].iloc[0]), 40.0 / 0.5 + 80.0 * 0.2 / 0.5)
+        deep, out, near = strip.iloc[0], strip.iloc[1], strip.iloc[2]
+        if not (deep["option"] >= deep["intrinsic"] and deep["hedge_power_mwh"] < -0.9 * deep["volume_mwh"]):
+            raise AssertionError("A month deep in the money should be hedged almost in full.")
+        if not (out["intrinsic"] == 0.0 and 0.0 < out["option"] < 12.0 and out["hedge_power_mwh"] > -0.4 * out["volume_mwh"]):
+            raise AssertionError("A month out of the money has no margin today but some option value, and a small hedge.")
+        if not (near["hedge_gas_mwh"] > 0 and near["hedge_carbon_t"] > 0 and near["option"] > near["intrinsic"]):
+            raise AssertionError("The hedge sells power and buys gas and carbon.")
+        rng = np.random.default_rng(9)
+        days_ = pd.bdate_range("2026-06-01", periods=90)
+        rows = []
+        for k in range(1, 18):
+            month = pd.Timestamp("2026-06-01") + pd.DateOffset(months=k)    # contracts one to three months ahead on every day
+            path = 50.0 * np.exp(np.cumsum(rng.normal(0, 0.5 / math.sqrt(252), len(days_))))
+            rows += [{"snapshot_date": d.date().isoformat(), "product": "TTF Natural Gas", "delivery_month": month.date().isoformat(), "price": p_} for d, p_ in zip(days_, path)]
+        history = pd.DataFrame(rows)
+        measured = curve_volatility(history, "TTF Natural Gas")
+        if not measured["estimated"] or not 0.38 <= measured["near"] <= 0.62:
+            raise AssertionError(f"A 50% volatility should be measured as about 50%: {measured}")
+        if curve_volatility(history.loc[history["snapshot_date"] <= days_[10].date().isoformat()], "TTF Natural Gas")["estimated"]:
+            raise AssertionError("With too little history the typical values must be used, and said to be.")
+        return (f"Kirk's formula matches Margrabe's exactly at zero strike and a 400,000-path simulation within 2% (€{kirk:.2f} against €{simulated:.2f}). "
+                f"Zero volatility gives the margin, hedges sell power and buy gas and carbon, and a 50% volatility is measured as {measured['near'] * 100:.0f}%.")
+
+    def check_estimate_chances() -> str:
+        rng = np.random.default_rng(31)
+        misses = rng.normal(0, 10, 500)
+        spread = estimate_distribution(misses, rng.normal(0, 25, 500))
+        if np.abs(spread["below"] - np.array(PROBABILITY_LEVELS)).max() > 0.05:
+            raise AssertionError(f"Each line should have the price below it about as often as it says: {np.round(spread['below'], 2)}")
+        if not spread["score"] < spread["simple_score"]:
+            raise AssertionError("A method with smaller misses must score better.")
+        assert_close(chance_above(spread, 100.0, 100.0), 0.5, 0.06)
+        if not chance_above(spread, 100.0, 60.0) > 0.99 > 0.01 > chance_above(spread, 100.0, 140.0):
+            raise AssertionError("Chances far from the estimate must be near certain or near zero.")
+        assert_close(_pinball(np.array([0.5]), np.array([10.0]), 14.0), 2.0)
+        assert_close(_pinball(np.array([0.9]), np.array([10.0]), 4.0), 0.6)
+        if estimate_distribution(misses[:20]) is not None:
+            raise AssertionError("With few tested days no chances can be given.")
+        jumpy = np.r_[rng.normal(0, 5, 300), rng.normal(0, 25, 40)]
+        wide, calm = estimate_distribution(jumpy), estimate_distribution(jumpy[:300])
+        if not (wide["quantiles"][-1] - wide["quantiles"][0]) > 2.5 * (calm["quantiles"][-1] - calm["quantiles"][0]):
+            raise AssertionError("The spread must widen when recent misses grow.")
+        return (f"Each line has the price below it about as often as it says (largest gap {np.abs(spread['below'] - np.array(PROBABILITY_LEVELS)).max() * 100:.0f} points), "
+                "smaller misses score better, the spread widens after large misses, and too little history gives no chances.")
+
     def check_estimate_calendar() -> str:
         if _easter(2026) != date(2026, 4, 5) or _easter(2027) != date(2027, 3, 28):
             raise AssertionError("Easter date is wrong.")
@@ -9440,6 +9849,9 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Downloads refuse unsafe addresses and content", "Security", check_safe_downloads),
         ("Load forecast and cooling in the estimate", "Next-day estimate", check_estimate_extra_inputs),
         ("Backups, kept forecasts and near-month refresh", "Data handling", check_backups_and_kept_forecasts),
+        ("Gas storage valuation", "Asset valuation", check_storage_valuation),
+        ("Plant spread option", "Asset valuation", check_plant_option),
+        ("Chances for the next day", "Next-day estimate", check_estimate_chances),
         ("Holidays and kinds of day", "Next-day estimate", check_estimate_calendar),
         ("Weather across a zone in one request", "Live API integration", check_zone_weather_fetch),
         ("The 80% range holds about 80%", "Next-day estimate", check_estimate_range),
@@ -9617,9 +10029,12 @@ def page_market_overview():
         names = ["TTF Natural Gas", "French Power Base", "German Power Base"]
         frame = pd.concat([curves[n].assign(delivery_month=lambda f: pd.to_datetime(f["delivery_month"])) for n in names], ignore_index=True)
         frame = frame.loc[frame["delivery_month"].lt(pd.Timestamp(_add_months(valuation_date, 25))) & frame["delivery_month"].ge(pd.Timestamp(valuation_date.replace(day=1)))]
-        fig = px.line(frame, x="delivery_month", y="price", color="product", title="Forward curves, EUR/MWh" + (lambda st_: " (demo prices)" if st_ == {"Demo"} else " (partly demo prices)" if "Demo" in st_ or "Part real" in st_ else " (real prices)")({product_price_state(p) for p in names}),
-                      labels={"delivery_month": "", "price": "", "product": ""})
-        chart(fig, 290)
+        if frame.empty:
+            st.markdown('<div class="desk-note"><p class="soft">Forward curves aren&#39;t loaded yet. They come from TradingView with the first update.</p></div>', unsafe_allow_html=True)
+        else:
+            fig = px.line(frame, x="delivery_month", y="price", color="product", title="Forward curves, EUR/MWh" + (lambda st_: " (demo prices)" if st_ == {"Demo"} else " (partly demo prices)" if "Demo" in st_ or "Part real" in st_ else " (real prices)")({product_price_state(p) for p in names}),
+                          labels={"delivery_month": "", "price": "", "product": ""})
+            chart(fig, 290)
 
     mtm_trend = trend["mtm_eur"].tolist() if len(trend) >= 3 else None
     st.subheader("Book")
@@ -9889,25 +10304,28 @@ def page_forward_curves():
     spec = CURVE_PRODUCTS[selected]
     curve = validate_curve(curves[selected])
     curve["delivery_month"] = pd.to_datetime(curve["delivery_month"])
-    after_current = curve.loc[curve["delivery_month"] > pd.Timestamp(valuation_date.replace(day=1))]
-    first = after_current.iloc[0] if not after_current.empty else curve.iloc[0]
-    c1, c2, c3, c4 = st.columns(4)
-    kpi(c1, f"Front month, {first['delivery_month']:%b %Y}", f"{float(first['price']):,.2f}", spec["unit"])
-    kpi(c2, "Curve average", f"{curve['price'].mean():,.2f}", spec["unit"])
-    kpi(c3, "Low", f"{curve['price'].min():,.2f}", spec["unit"])
-    kpi(c4, "High", f"{curve['price'].max():,.2f}", spec["unit"])
-
     history = saved_snapshots()
     product_days = sorted(history.loc[history["product"].eq(selected), "snapshot_date"].unique()) if not history.empty else []
     previous = [d for d in product_days if d < valuation_date.isoformat()]
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=curve["delivery_month"], y=curve["price"], mode="lines+markers", name="Today", line=dict(color=ENTITY_COLORS.get(selected, BLUE), width=2)))
-    if previous:
-        earlier = history.loc[history["product"].eq(selected) & history["snapshot_date"].eq(previous[-1])].copy()
-        earlier["delivery_month"] = pd.to_datetime(earlier["delivery_month"])
-        fig.add_trace(go.Scatter(x=earlier["delivery_month"], y=earlier["price"], mode="lines", name=f"Saved {previous[-1]}", line=dict(color=GRAY, width=1.5, dash="dot")))
-    fig.update_layout(title=f"{selected}, {spec['unit']}", yaxis_title="")
-    chart(fig, 400)
+    if curve.empty:
+        st.info(f"No live price for {selected} yet. Select Update market data, or import a curve below. Only live prices are shown: to fill gaps with demo prices, tick that option under the update button.")
+    else:
+        after_current = curve.loc[curve["delivery_month"] > pd.Timestamp(valuation_date.replace(day=1))]
+        first = after_current.iloc[0] if not after_current.empty else curve.iloc[0]
+        c1, c2, c3, c4 = st.columns(4)
+        kpi(c1, f"Front month, {first['delivery_month']:%b %Y}", f"{float(first['price']):,.2f}", spec["unit"])
+        kpi(c2, "Curve average", f"{curve['price'].mean():,.2f}", spec["unit"])
+        kpi(c3, "Low", f"{curve['price'].min():,.2f}", spec["unit"])
+        kpi(c4, "High", f"{curve['price'].max():,.2f}", spec["unit"])
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=curve["delivery_month"], y=curve["price"], mode="lines+markers", name="Today", line=dict(color=ENTITY_COLORS.get(selected, BLUE), width=2)))
+        if previous:
+            earlier = history.loc[history["product"].eq(selected) & history["snapshot_date"].eq(previous[-1])].copy()
+            earlier["delivery_month"] = pd.to_datetime(earlier["delivery_month"])
+            fig.add_trace(go.Scatter(x=earlier["delivery_month"], y=earlier["price"], mode="lines", name=f"Saved {previous[-1]}", line=dict(color=GRAY, width=1.5, dash="dot")))
+        fig.update_layout(title=f"{selected}, {spec['unit']}", yaxis_title="")
+        chart(fig, 400)
 
     sources_here = curve_sources().get(selected, {})
     state = product_price_state(selected)
@@ -10943,6 +11361,29 @@ def render_next_day(zones: Sequence[str]) -> None:
                              error_y=dict(type="data", symmetric=False, array=[result["high"] - result["estimate"]], arrayminus=[result["estimate"] - result["low"]], color=AMBER, thickness=2)))
     fig.update_layout(title=f"{zone}: day-ahead base price, EUR/MWh")
     chart(fig, 380)
+    spread = result.get("distribution")
+    if spread:
+        st.subheader("The chances")
+        left, right = st.columns([1, 1.25], gap="large")
+        with left:
+            level = st.number_input("A price level, EUR/MWh", value=float(round(result["estimate"])), step=5.0, key=f"chance_level_{zone}")
+            above = chance_above(spread, result["estimate"], level)
+            negative = chance_above(spread, result["estimate"], 0.0)
+            c1, c2 = st.columns(2)
+            kpi(c1, f"Chance above €{level:,.0f}", f"{above * 100:.0f}%", f"{(1 - above) * 100:.0f}% at or below")
+            kpi(c2, "Chance of a negative day", f"{(1 - negative) * 100:.0f}%" if negative < 1 else "Under 1%", "Daily average below zero")
+            table(pd.DataFrame({"Chance of being below": [f"{q * 100:.0f}%" for q in spread["levels"]], "Price, EUR/MWh": (result["estimate"] + spread["quantiles"]).round(1),
+                                "How often it was, on tested days": [f"{b * 100:.0f}%" for b in spread["below"]]}))
+        with right:
+            prices = result["estimate"] + spread["offsets"]
+            curve_ = go.Figure(go.Scatter(x=prices, y=(np.arange(len(prices)) + 0.5) / len(prices) * 100, mode="lines", name="Chance of being below", line=dict(color=AMBER, width=2)))
+            curve_.add_vline(x=level, line=dict(color=GRAY, width=1, dash="dot"))
+            curve_.update_layout(title=f"Chance that {result['day']:%a %d %b} comes in below a price, %", xaxis_title="EUR/MWh", yaxis_title="", showlegend=False)
+            chart(curve_, 330)
+        better = 1.0 - spread["score"] / spread["simple_score"] if spread["simple_score"] else None
+        st.caption(f"Scored on {spread['days']} past days, each using only earlier days. The right-hand column should match the left: a 10% line should have the price below it on about 10% of days. "
+                   f"Pinball loss, the standard score for this kind of forecast (lower is better): {spread['score']:.2f}"
+                   + (f", against {spread['simple_score']:.2f} for the last day of the same kind treated the same way, {abs(better) * 100:.0f}% {'better' if better > 0 else 'worse'}." if better is not None else "."))
     comparison = result["comparison"]
     st.subheader("How the methods compare")
     rows = [{"Method": f"Weather at {result['weather_basis']}" if "points" in result["weather_basis"] else f"Weather in {result['weather_basis'] or 'one city'}", "Average miss, EUR/MWh": round(comparison["weather"] if comparison else result["error"], 2)}]
@@ -10992,6 +11433,8 @@ def render_next_day(zones: Sequence[str]) -> None:
                     + f"10 km/h more wind changes the price by **{euros(result['wind_effect'] * 10)}**, one more heating degree day by **{euros(result['hdd_effect'])}**, and 10 W/m² more solar radiation by **{euros(result['solar_effect'] * 10)}**. "
                     f"The app now keeps each day's forecast as it stood before the auction, and tests with it where it has one: **{result.get('kept_forecast_days', 0)} of the {result['n']} tested days** so far. "
                     "The other days use the weather that actually happened, which flatters the test a little. That share shrinks every day the app is updated before noon.\n\n"
+                    "**The chances.** The same misses, scaled the same way, give the whole spread of outcomes: the chance of landing above any level, and of a negative day. "
+                    "Tested on 1,585 real German days, this scored better and was better calibrated than quantile regression, the usual alternative, so that is not used.\n\n"
                     "**The range.** It comes from this method's own misses on the tested days, scaled by how large recent misses were, so it widens when the market turns volatile and narrows when it calms. "
                     "It aims to hold the price on 8 days in 10. After a sudden jump in volatility it takes a week or two to catch up.\n\n"
                     "**ENTSO-E method.** It adds the system operators' day-ahead forecasts of load, wind and solar for the whole zone, and its test uses those forecasts rather than what happened. "
@@ -11263,6 +11706,183 @@ def page_morning_brief() -> None:
         st.session_state["flash_message"] = "Thresholds saved."
         st.rerun()
     st.caption("A threshold shows at the top of this page and in the PDF whenever its condition holds. Levels use each item's own unit.")
+
+
+# =============================================================================
+# SECTION 7E · ASSET VALUATION PAGE
+# =============================================================================
+def _forward_months(product: str, horizon: int) -> pd.DataFrame:
+    """Live marks from next month on, as an unbroken run of months."""
+    curve = validate_curve(curves[product])
+    if curve.empty:
+        return curve
+    curve = curve.assign(delivery_month=pd.to_datetime(curve["delivery_month"])).sort_values("delivery_month")
+    start = pd.Timestamp(_add_months(valuation_date.replace(day=1), 1))
+    curve = curve.loc[curve["delivery_month"] >= start].head(horizon).reset_index(drop=True)
+    expected = pd.date_range(start, periods=len(curve), freq="MS")
+    unbroken = int((curve["delivery_month"].to_numpy() == expected.to_numpy()).cumprod().sum()) if len(curve) else 0
+    return curve.head(unbroken)
+
+
+def _month_timing(months: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    days = months.dt.days_in_month.to_numpy(float)
+    years = np.array([max((m.date() - valuation_date).days, 0) / 365.0 for m in months])
+    return days, years
+
+
+def _vol_note(name: str, measured: dict) -> str:
+    return (f"{name}: measured on {measured['days']} days of saved curves" if measured["estimated"] else
+            f"{name}: typical values, as only {measured['days']} days of saved curves are held and {VOL_MIN_DAYS} are needed")
+
+
+def render_storage_valuation() -> None:
+    curve = _forward_months("TTF Natural Gas", 24)
+    if len(curve) < 6:
+        need_data_note("This needs at least six months of live TTF prices. Select Update market data.")
+        return
+    measured = curve_volatility(saved_snapshots(), "TTF Natural Gas")
+    with st.container(key="panel"):
+        c1, c2, c3, c4 = st.columns(4)
+        volume_gwh = c1.number_input("Working volume, GWh", 1.0, 100_000.0, 1_000.0, 50.0, key="sto_volume")
+        fill_days = c2.number_input("Days to fill from empty", 5.0, 400.0, 150.0, 5.0, key="sto_fill")
+        empty_days = c3.number_input("Days to empty from full", 5.0, 400.0, 75.0, 5.0, key="sto_empty")
+        horizon = c4.selectbox("Months valued", [m for m in (12, 18, 24) if m <= len(curve)] or [len(curve)], key="sto_horizon")
+        c1, c2, c3, c4 = st.columns(4)
+        start_pct = c1.number_input("In store now, % full", 0.0, 100.0, 0.0, 5.0, key="sto_start")
+        end_pct = c2.number_input("To hand back, % full", 0.0, 100.0, 0.0, 5.0, key="sto_end")
+        inject_cost = c3.number_input("Injection cost, EUR/MWh", 0.0, 20.0, 0.5, 0.1, key="sto_cin")
+        withdraw_cost = c4.number_input("Withdrawal cost, EUR/MWh", 0.0, 20.0, 0.3, 0.1, key="sto_cout")
+        c1, c2, c3, _ = st.columns(4)
+        near_vol = c1.number_input("Near-month volatility, % a year", 0.0, 300.0, round(measured["near"] * 100, 0), 5.0, key="sto_near") / 100.0
+        far_vol = c2.number_input("Far-month volatility, % a year", 0.0, 300.0, round(measured["far"] * 100, 0), 5.0, key="sto_far") / 100.0
+        rate = c3.number_input("Interest rate, % a year", 0.0, 20.0, 3.0, 0.25, key="sto_rate") / 100.0
+        st.caption(_vol_note("Volatility", measured) + ". Change it to see what the flexibility is worth under your own view.")
+    curve = curve.head(int(horizon))
+    days, years = _month_timing(curve["delivery_month"])
+    volume = volume_gwh * 1000.0
+    params = {"volume_mwh": volume, "inject_mwh_day": volume / fill_days, "withdraw_mwh_day": volume / empty_days, "start_share": start_pct / 100.0, "end_share": end_pct / 100.0,
+              "inject_cost": inject_cost, "withdraw_cost": withdraw_cost, "rate": rate}
+    key = (data_version("curves", "live"), valuation_date, tuple(sorted(params.items())), near_vol, far_vol, int(horizon))
+    try:
+        result = session_memo("storage_value", key, lambda: storage_rolling(curve["price"].to_numpy(float), days, years, max(near_vol, far_vol), min(near_vol, far_vol), params))
+    except ValueError as exc:
+        st.warning(str(exc))
+        return
+    plan = result["plan"].assign(month=curve["delivery_month"].to_numpy())
+    total, intrinsic, extra = result["rolling"], result["intrinsic"], result["extrinsic"]
+    c1, c2, c3, c4 = st.columns(4)
+    kpi(c1, "Locked in today", f"€{intrinsic:,.0f}", "By trading the curve now", tone="gain" if intrinsic > 0 else "")
+    kpi(c2, "Extra from re-optimising", f"€{extra:,.0f}", f"± €{2 * result['error']:,.0f}, from {result['paths']} simulated curves")
+    kpi(c3, "Storage value", f"€{total:,.0f}", f"€{total / volume:,.2f} per MWh of working volume", tone="gain" if total > 0 else "")
+    kpi(c4, "Cheapest to dearest month", f"€{plan['price'].max() - plan['price'].min():,.2f}", f"{plan.loc[plan['price'].idxmin(), 'month']:%b %y} against {plan.loc[plan['price'].idxmax(), 'month']:%b %y}, EUR/MWh")
+    buys, sells = plan.loc[plan["inject_mwh"] > 0], plan.loc[plan["withdraw_mwh"] > 0]
+    if buys.empty and sells.empty:
+        st.info("On today's curve no injection followed by a withdrawal pays for its costs, so the plan is to do nothing. That is usual when near months are the dearest and the site starts empty. "
+                "Any value then comes only from re-optimising if the curve moves. Try a longer period, or gas already in store.")
+        return
+    else:
+        months_text = lambda part: ", ".join(f"{m:%b %y}" for m in part["month"])
+        with st.container(key="hero"):
+            st.markdown(f'<div class="desk-note"><p>To lock in the €{intrinsic:,.0f}: buy <b>{buys["inject_mwh"].sum() / 1000:,.0f} GWh</b> across {html.escape(months_text(buys))} '
+                        f'at an average €{(buys["inject_mwh"] * buys["price"]).sum() / max(buys["inject_mwh"].sum(), 1e-9):,.2f}, and sell <b>{sells["withdraw_mwh"].sum() / 1000:,.0f} GWh</b> across '
+                        f'{html.escape(months_text(sells))} at an average €{(sells["withdraw_mwh"] * sells["price"]).sum() / max(sells["withdraw_mwh"].sum(), 1e-9):,.2f}.</p>'
+                        f'<p class="soft">Re-optimising is worth about {extra / intrinsic * 100 if intrinsic > 0 else 0:.0f}% on top. In 9 simulated curves out of 10 the total lands between '
+                        f'€{result["low"]:,.0f} and €{result["high"]:,.0f}; it can never fall below what is locked in.</p></div>', unsafe_allow_html=True)
+    left, right = st.columns(2)
+    with left:
+        flow = go.Figure()
+        flow.add_trace(go.Bar(x=plan["month"], y=-plan["inject_mwh"] / 1000, name="Inject (buy)", marker_color=BLUE))
+        flow.add_trace(go.Bar(x=plan["month"], y=plan["withdraw_mwh"] / 1000, name="Withdraw (sell)", marker_color=AMBER))
+        flow.update_layout(title="Plan by month, GWh", barmode="relative", yaxis_title="")
+        chart(flow, 320)
+    with right:
+        level = go.Figure(go.Scatter(x=plan["month"], y=plan["inventory_mwh"] / 1000, mode="lines+markers", name="In store at month end", line=dict(color=TEAL, width=2), fill="tozeroy"))
+        level.update_layout(title="Gas in store at month end, GWh", yaxis_title="", showlegend=False)
+        chart(level, 320)
+    table(pd.DataFrame({"Month": plan["month"].dt.strftime("%b %Y"), "TTF, EUR/MWh": plan["price"].round(2), "Inject, GWh": (plan["inject_mwh"] / 1000).round(1),
+                        "Withdraw, GWh": (plan["withdraw_mwh"] / 1000).round(1), "In store, GWh": (plan["inventory_mwh"] / 1000).round(1), "Cash today, EUR": plan["cash"].round(0)}))
+    with st.expander("How this valuation works"):
+        st.markdown("**Locked in today (intrinsic value).** The best plan of monthly injections and withdrawals on today's TTF curve, within the site's volume and rates and after costs, "
+                    f"found by checking every path through {STORAGE_GRID} inventory levels. Every trade in it can be done today, so it needs no view on volatility. Volumes move in steps of "
+                    f"{100 / (STORAGE_GRID - 1):.1f}% of the working volume.\n\n"
+                    "**Extra from re-optimising (rolling intrinsic).** The curve is simulated month by month. Each month the plan is redone on the new curve, and when it beats the plan already hedged, "
+                    "the gain is locked in by re-hedging. That gain is never negative, which is why the total can't fall below the locked-in value. "
+                    "The simulation moves every month together at the far-month volatility, and adds an extra move to near months that fades with time to delivery; that second move is what changes the "
+                    "summer-winter spread, and it is what the flexibility is paid for.\n\n"
+                    "**What it leaves out.** Decisions are monthly, where a real site re-nominates daily and earns more from short-term swings. Rates don't depend on how full the site is. "
+                    "There are no capacity fees, fuel gas losses, bid-offer spreads or limits on how much the forward market can absorb. "
+                    "The rolling value is a floor for the full option value, and it depends on the volatility you enter.")
+
+
+def render_plant_valuation() -> None:
+    choice = st.columns([1, 2])[0].selectbox("Power market", ["German Power Base", "French Power Base"], key="plant_market")
+    horizon = 24
+    power, gas, carbon = _forward_months(choice, horizon), _forward_months("TTF Natural Gas", horizon), _forward_months("EUA Carbon", horizon)
+    months = power.merge(gas, on="delivery_month", suffixes=("_power", "_gas")).merge(carbon[["delivery_month", "price"]].rename(columns={"price": "price_carbon"}), on="delivery_month")
+    if len(months) < 3:
+        need_data_note("This needs live power, TTF and EUA prices for the same months. Select Update market data.")
+        return
+    history = saved_snapshots()
+    measured = {"power": curve_volatility(history, choice), "gas": curve_volatility(history, "TTF Natural Gas"), "carbon": curve_volatility(history, "EUA Carbon")}
+    pairs = {"power_gas": curve_correlation(history, choice, "TTF Natural Gas", 0.6), "power_carbon": curve_correlation(history, choice, "EUA Carbon", 0.3),
+             "gas_carbon": curve_correlation(history, "TTF Natural Gas", "EUA Carbon", 0.3)}
+    with st.container(key="panel"):
+        c1, c2, c3, c4 = st.columns(4)
+        capacity = c1.number_input("Capacity, MW", 1.0, 5_000.0, PLANT_DEFAULTS["capacity_mw"], 10.0, key="plant_mw")
+        efficiency = c2.number_input("Efficiency, %", 20.0, 70.0, PLANT_DEFAULTS["efficiency"] * 100, 1.0, key="plant_eff") / 100.0
+        variable = c3.number_input("Other running cost, EUR/MWh", 0.0, 50.0, PLANT_DEFAULTS["variable_cost"], 0.5, key="plant_vom")
+        rate = c4.number_input("Interest rate, % a year", 0.0, 20.0, 3.0, 0.25, key="plant_rate") / 100.0
+        c1, c2, c3, c4 = st.columns(4)
+        power_vol = c1.number_input("Power volatility, near months, %", 0.0, 400.0, round(measured["power"]["near"] * 100, 0), 5.0, key="plant_vp") / 100.0
+        gas_vol = c2.number_input("Gas volatility, near months, %", 0.0, 400.0, round(measured["gas"]["near"] * 100, 0), 5.0, key="plant_vg") / 100.0
+        carbon_vol = c3.number_input("Carbon volatility, %", 0.0, 400.0, round(measured["carbon"]["near"] * 100, 0), 5.0, key="plant_vc") / 100.0
+        rho = c4.number_input("Power to gas correlation", -0.95, 0.95, round(pairs["power_gas"][0], 2), 0.05, key="plant_rho")
+        st.caption("; ".join(_vol_note(name, measured[k]) for name, k in (("Power", "power"), ("Gas", "gas"), ("Carbon", "carbon"))) + ". "
+                   f"The power to gas correlation rests on {pairs['power_gas'][1]} days. Far months use lower volatility, in the proportion measured.")
+    scale = lambda kind, near: (near, near * measured[kind]["far"] / measured[kind]["near"] if measured[kind]["near"] > 0 else near)
+    vols = {"power": scale("power", power_vol), "gas": scale("gas", gas_vol), "carbon": scale("carbon", carbon_vol)}
+    correlations = {"power_gas": rho, "power_carbon": pairs["power_carbon"][0], "gas_carbon": pairs["gas_carbon"][0]}
+    days, years = _month_timing(months["delivery_month"])
+    frame = pd.DataFrame({"month": months["delivery_month"], "power": months["price_power"], "gas": months["price_gas"], "carbon": months["price_carbon"], "hours": days * 24.0, "years": years})
+    params = {"capacity_mw": capacity, "efficiency": efficiency, "emission_factor": PLANT_DEFAULTS["emission_factor"], "variable_cost": variable, "rate": rate}
+    strip = plant_option_strip(frame, vols, correlations, params)
+    option, locked = float(strip["value"].sum()), float(strip["intrinsic_value"].sum())
+    c1, c2, c3, c4 = st.columns(4)
+    kpi(c1, "Margin on today's curve", f"€{locked:,.0f}", f"{int((strip['margin'] > 0).sum())} of {len(strip)} months pay to run", tone="gain" if locked > 0 else "")
+    kpi(c2, "Value of the choice to run", f"€{option - locked:,.0f}", "What flexibility adds")
+    kpi(c3, "Plant value", f"€{option:,.0f}", f"€{option / (capacity * 1000):,.1f} per kW, over {len(strip)} months", tone="gain")
+    kpi(c4, "Average clean spark spread", f"€{strip['margin'].mean():,.2f}", "EUR/MWh, after running cost", tone="gain" if strip["margin"].mean() > 0 else "loss")
+    hedge_mw = -strip["hedge_power_mwh"].sum() / frame["hours"].sum()
+    with st.container(key="hero"):
+        st.markdown(f'<div class="desk-note"><p>Run only when it pays, the plant is worth <b>€{option:,.0f}</b> over {strip["month"].iloc[0]:%b %y} to {strip["month"].iloc[-1]:%b %y}, '
+                    f'against €{locked:,.0f} if it were committed today month by month. The hedge that follows the option sells an average <b>{hedge_mw:,.0f} MW</b> of power, '
+                    f'buys {strip["hedge_gas_mwh"].sum() / 1000:,.0f} GWh of gas and {strip["hedge_carbon_t"].sum() / 1000:,.0f} kt of EUAs, and is adjusted as prices move.</p></div>', unsafe_allow_html=True)
+    bars = go.Figure()
+    bars.add_trace(go.Bar(x=strip["month"], y=strip["intrinsic_value"] / 1000, name="Margin on today's curve", marker_color=BLUE))
+    bars.add_trace(go.Bar(x=strip["month"], y=(strip["value"] - strip["intrinsic_value"]) / 1000, name="Value of the choice to run", marker_color=AMBER))
+    bars.update_layout(title="Plant value by month, EUR thousand", barmode="stack", yaxis_title="")
+    chart(bars, 340)
+    table(pd.DataFrame({"Month": strip["month"].dt.strftime("%b %Y"), "Power": strip["power"].round(2), "Gas and carbon cost": strip["fuel_cost"].round(2), "Margin": strip["margin"].round(2),
+                        "Option, EUR/MWh": strip["option"].round(2), "Sell power, MW": (-strip["hedge_power_mwh"] / frame["hours"]).round(0),
+                        "Buy gas, GWh": (strip["hedge_gas_mwh"] / 1000).round(1), "Buy EUAs, kt": (strip["hedge_carbon_t"] / 1000).round(1), "Value, EUR": strip["value"].round(0)}))
+    with st.expander("How this valuation works"):
+        st.markdown("**The idea.** A gas-fired plant earns power minus gas ÷ efficiency minus carbon × 0.202 t/MWh ÷ efficiency minus its other running cost, and it can simply not run when that is negative. "
+                    "So each month is an option on the clean spark spread, worth more than the margin on today's curve whenever prices can still move.\n\n"
+                    "**The formula.** Each month is priced with Kirk's approximation for an option on the difference of two prices, here power and the fuel-and-carbon cost, with the running cost as the strike. "
+                    "At zero strike it is Margrabe's exact formula, and a built-in check compares it with a 400,000-path simulation. Fuel-cost volatility combines gas and carbon by their share of the cost. "
+                    "Higher volatility raises the value; a higher power to gas correlation lowers it, because the spread then moves less.\n\n"
+                    "**What it leaves out.** One decision per month on the month's average prices. A real plant decides hour by hour and earns far more from peak hours, so this understates flexibility. "
+                    "It ignores start costs, minimum run times, outages and ramping, which work the other way. Volatilities and correlations come from the saved curve history when there is enough of it, "
+                    "and the value depends heavily on them.")
+
+
+def page_asset_valuation():
+    title_block("Asset valuation", "What a gas storage site and a gas-fired plant are worth on today's live curves, and how to hedge them.")
+    storage_view, plant_view = view_tabs(["Gas storage", "Gas-fired plant"])
+    if storage_view:
+        render_storage_valuation()
+    else:
+        render_plant_valuation()
 
 
 def page_market_fundamentals():
@@ -12037,6 +12657,7 @@ PAGES = {
     "Spreads & Margins": page_spreads,
     "Forward Curves": page_forward_curves,
     "OTC Quote Builder": page_otc_quote_builder,
+    "Asset Valuation": page_asset_valuation,
     "Trading Book & MtM": page_trading_book_mtm,
     "Daily P&L": page_daily_pnl,
     "Risk & Exposure": page_risk_exposure,
