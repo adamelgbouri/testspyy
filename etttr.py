@@ -5358,6 +5358,7 @@ TRADINGVIEW_INSTALL = "pip install tradingview-datafeed"   # or the maintained f
 TRADINGVIEW_HISTORY_BARS = 60          # first fetch: about three months of daily closes, so P&L and risk start with real history
 TRADINGVIEW_UPDATE_BARS = 7
 TRADINGVIEW_NEAR_MONTHS = 12           # refreshed every hour; the months beyond are refreshed once a day
+TRADINGVIEW_RETRY_SECONDS = 1.0
 TRADINGVIEW_CARRY_DAYS = 5             # a contract with no trade that day keeps its last close for up to this many days
 _TRADINGVIEW_LOGIN: dict = {}
 
@@ -5422,14 +5423,22 @@ def fetch_tradingview_curve(product: str, today: date, n_bars: int, username: st
     # With history, start from contracts that were the front month at the start of that history.
     first = _add_months(date(today.year, today.month, 1), (0 if in_delivery else 1) - history)
     closes, misses, failures = {}, 0, 0
+    def ask(month: date):
+        return client.get_hist(symbol=tradingview_symbol(spec["root"], month), exchange=spec["exchange"], interval=interval, n_bars=int(n_bars))
+
+    empty = lambda bars: bars is None or len(bars) == 0 or "close" not in getattr(bars, "columns", [])
     for month in _tradingview_months(spec, first, today, near_only):
         try:
-            bars = client.get_hist(symbol=tradingview_symbol(spec["root"], month), exchange=spec["exchange"], interval=interval, n_bars=int(n_bars))
+            bars = ask(month)
+            if empty(bars) and month > today:
+                # TradingView sometimes drops a request when busy. Ask once more before reading it as "not listed".
+                sleep(TRADINGVIEW_RETRY_SECONDS if _client is None else 0.0)
+                bars = ask(month)
         except Exception:
             bars, failures = None, failures + 1
             if failures >= 3 and not closes:
                 raise RuntimeError("Can't reach TradingView. Check the connection and try again later.") from None
-        if bars is None or len(bars) == 0 or "close" not in getattr(bars, "columns", []):
+        if empty(bars):
             if month > today:
                 misses += 1
                 if misses >= 3 and closes:
@@ -6321,7 +6330,7 @@ ZONE_WEATHER_HISTORY_DAYS = 430
 STALE_HOURS = {"tradingview": 1.0, "prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0}
 KEEP_DAYS = {"prices": 400, "load": 90, "generation": 90, "lng": 400}
 MAX_UPDATE_WORKERS = 8          # the providers allow far more; this keeps the first update short
-TRADINGVIEW_WORKERS = 4         # TradingView gets its own smaller lane, so it is never asked too fast and never holds up the others
+TRADINGVIEW_WORKERS = 2         # TradingView gets its own small lane: asked too fast, it drops requests
 
 
 @dataclass
@@ -6415,7 +6424,9 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[
         from_tv = held.get("source_type") == "TradingView"
         bars = TRADINGVIEW_UPDATE_BARS if from_tv else TRADINGVIEW_HISTORY_BARS
         # The whole curve once a day; after that, only the near months, which is where prices move within the day.
-        near_only = from_tv and held.get("full_fetch_day") == today.isoformat()
+        # A held curve no longer than the near months may have been cut short, so it is fetched whole again.
+        near_only = (from_tv and held.get("full_fetch_day") == today.isoformat()
+                     and len(st.session_state["custom_curves"][tv_product]) > TRADINGVIEW_NEAR_MONTHS)
         def fetch_tv(product=tv_product, bars=bars, near_only=near_only) -> pd.DataFrame:
             return fetch_tradingview_curve(product, today, bars, *login, near_only=near_only)
         def apply_tv(raw: pd.DataFrame, product=tv_product, near_only=near_only) -> str:
@@ -6856,12 +6867,22 @@ def apply_tradingview_curve(product: str, raw: pd.DataFrame, near_only: bool = F
     newest = parsed[-1]
     held_meta = metadata.get(product, {}) if product in custom else {}
     held = curve_mark_date(held_meta) if held_meta else None
-    curve, full_day = newest["curve"], today.isoformat()
-    if near_only and product in custom:
+    curve, full_day, missing = newest["curve"], today.isoformat(), 0
+    from_tv = product in custom and held_meta.get("source_type") == "TradingView"
+    if from_tv and (near_only or (held is not None and (newest["day"] - held).days <= 5)):
+        # Months TradingView didn't return this time keep their last mark, so a dropped request can never shorten the curve.
         fresh = set(curve["delivery_month"])
         rest = validate_curve(custom[product])
         rest = rest.loc[~rest["delivery_month"].isin(fresh) & (rest["delivery_month"] > min(fresh))]
-        curve, full_day = validate_curve(pd.concat([curve, rest], ignore_index=True)), held_meta.get("full_fetch_day", "")
+        curve = validate_curve(pd.concat([curve, rest], ignore_index=True))
+        if near_only:
+            full_day = held_meta.get("full_fetch_day", "")
+        elif len(rest):
+            missing, full_day = len(rest), ""   # incomplete: the next update asks for the whole curve again
+    months = sorted(pd.to_datetime(curve["delivery_month"]))
+    gaps = (months[-1].year - months[0].year) * 12 + months[-1].month - months[0].month + 1 - len(months)
+    if gaps > 0 and not near_only:
+        missing, full_day = max(missing, gaps), ""   # a month in the middle is missing: ask for the whole curve again next time
     if held is None or newest["day"] >= held:
         commit_custom_curve(product, curve, {"source_label": source, "source_type": "TradingView", "full_fetch_day": full_day,
                                              "imported_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}, curve_date=newest["day"])
@@ -6869,7 +6890,8 @@ def apply_tradingview_curve(product: str, raw: pd.DataFrame, near_only: bool = F
     _stored_live_item("tradingview_curves", "TradingView forward curves", raw.loc[raw["curve_date"].eq(newest["day"])], {"product": product, "days": len(parsed)})
     front = curve.iloc[0]
     return (f"{len(newest['curve'])} near months refreshed, {len(curve)} held" if near_only else f"{len(curve)} months") + \
-        f" dated {newest['day']:%d %b}, front {pd.Timestamp(front['delivery_month']):%b %y} at {front['price']:.2f}" + (f", plus {len(parsed) - 1} earlier days" if len(parsed) > 1 and not near_only else "")
+        f" dated {newest['day']:%d %b}, front {pd.Timestamp(front['delivery_month']):%b %y} at {front['price']:.2f}" + (f", plus {len(parsed) - 1} earlier days" if len(parsed) > 1 and not near_only else "") + \
+        (f". TradingView didn't return {missing} months; the next update asks for the whole curve again" if missing else "")
 
 
 def saved_reads() -> pd.DataFrame:
@@ -9211,8 +9233,16 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         raw = fetch_tradingview_curve("TTF Natural Gas", today, 7, _client=FakeClient())
         if calls[0][:2] != ("TTFZ2026", "NYMEX") or calls[1][0] != "TTFF2027":
             raise AssertionError(f"Wrong symbols: {calls[:2]}")
-        if len(calls) != 8:
-            raise AssertionError(f"It should stop after three months that aren't listed: {len(calls)} requests.")
+        if len(calls) != 11:
+            raise AssertionError(f"It should stop after three months that aren't listed, each asked twice: {len(calls)} requests.")
+        flaky = {"n": 0}
+        class Flaky(FakeClient):
+            def get_hist(self, symbol, exchange, interval, n_bars):
+                flaky["n"] += 1
+                return None if flaky["n"] in (2, 5, 7) else FakeClient.get_hist(self, symbol, exchange, interval, n_bars)
+        dropped = fetch_tradingview_curve("TTF Natural Gas", today, 7, _client=Flaky())
+        if dropped.loc[dropped["curve_date"].eq(today), "contract"].nunique() != 5:
+            raise AssertionError("A request TradingView drops must be asked again, not read as the end of the curve.")
         latest = raw.loc[raw["curve_date"].eq(today)].set_index("contract")["price"]
         for month, price in screen.items():
             assert_close(float(latest[month]), price)
@@ -9235,7 +9265,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         except RuntimeError as exc:
             if "reach" not in str(exc):
                 raise
-        return "Symbols are NYMEX TTFZ2026, TTFF2027 and on. Your screenshot's closes come through as today's marks, a day with no trade keeps the last close, expired months drop out, and an outage stops after three tries."
+        return "Symbols are NYMEX TTFZ2026, TTFF2027 and on. Your screenshot's closes come through as today's marks, a day with no trade keeps the last close, expired months drop out, a dropped request is asked again, and an outage stops after three tries."
 
     def check_demand_weights() -> str:
         archive = pd.DataFrame({"date": ["2026-01-01"] * 3, "location": ["Berlin / German power proxy", "Paris / French power proxy", "London / NBP proxy"], "hdd": [20.0, 10.0, 99.0]})
