@@ -42,8 +42,11 @@ import textwrap
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+import socket
+import ssl
+import zlib
+from urllib.parse import quote, urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.error import HTTPError, URLError
 from typing import Callable, Optional, Sequence
 
@@ -473,6 +476,36 @@ def _check_sign_convention() -> None:
 _check_sign_convention()
 
 
+def content_memo(function):
+    """Remember the result of a pure function of tables, keyed by the tables' content.
+
+    Hashing a small table costs far less than reworking it, and many callers pass the same curve or
+    weather table again and again. Results are copied on the way out, so a caller can't alter the cache.
+    """
+    cache: dict = {}
+
+    def key_of(value):
+        if isinstance(value, pd.DataFrame):
+            try:
+                return ("frame", value.shape, tuple(map(str, value.columns)), int(pd.util.hash_pandas_object(value, index=True).sum()))
+            except TypeError:
+                return None
+        return ("value", repr(value))
+
+    def wrapper(*args, **kwargs):
+        keys = tuple(key_of(a) for a in args) + tuple((k, key_of(v)) for k, v in sorted(kwargs.items()))
+        if any(k is None or (isinstance(k, tuple) and len(k) == 2 and k[1] is None) for k in keys):
+            return function(*args, **kwargs)
+        if keys not in cache:
+            if len(cache) >= 256:
+                cache.clear()
+            cache[keys] = function(*args, **kwargs)
+        return cache[keys].copy()
+
+    wrapper.__name__, wrapper.__doc__, wrapper.uncached = function.__name__, function.__doc__, function
+    return wrapper
+
+
 def _to_date(value) -> date:
     """Accept date, datetime, Timestamp or ISO text and return a plain date."""
     if isinstance(value, datetime):
@@ -579,6 +612,7 @@ def make_sample_curve(product: str, valuation_date: date | None = None, months: 
     })
 
 
+@content_memo
 def validate_curve(curve: pd.DataFrame) -> pd.DataFrame:
     """Validate monthly forward marks, canonicalise tenors, and enforce product units."""
     required = {"delivery_month", "product", "price", "currency", "unit"}
@@ -1438,6 +1472,7 @@ def temperature_normals_from_daily(daily: pd.DataFrame) -> pd.DataFrame:
             .agg(normal_temperature_c=("temperature", "mean"), normal_hdd=("hdd", "mean"), normal_cdd=("cdd", "mean")))
 
 
+@content_memo
 def hdd_vs_normal(daily: pd.DataFrame, normals: pd.DataFrame, horizon_days: int = 7) -> pd.DataFrame:
     """Forecast heating demand against normal for the next few days, by location."""
     columns = ["location", "days", "forecast_hdd", "normal_hdd", "hdd_vs_normal", "temperature_vs_normal_c"]
@@ -2782,7 +2817,12 @@ WEATHER_COLUMNS = ("hdd", "wind", "solar", "hdd_before", "wind_before", "solar_b
 ESTIMATE_COLUMNS = CALENDAR_COLUMNS + WEATHER_COLUMNS
 FORECAST_COLUMNS = CALENDAR_COLUMNS + ("load_gw", "wind_gw", "solar_gw")
 GAS_COLUMNS = ("gas", "gas_before")
-GAS_MIN_GAIN = 0.02                    # gas is used only when it cuts the tested average miss by at least 2%, so noise can't win by luck
+GAS_MIN_GAIN = 0.02                    # an extra input is used only when it cuts the tested average miss by at least 2%, so noise can't win by luck
+COOLING_BASE_C = 21.0                  # daily mean temperature above which cooling demand starts
+COOLING_MIN_DAYS = 15                  # cooling is only tested once the history holds this many warm days
+# Extra inputs, each tested on the user's own history and added only when it clearly helps.
+EXTRA_INPUTS = (("gas", "the TTF front-month price", GAS_COLUMNS), ("load", "ENTSO-E's load forecast", ("load_fc", "load_fc_before")),
+                ("cooling", "cooling demand on hot days", ("cdd", "cdd_before")))
 # Points spread across each zone, latitude and longitude. Wind in one city says little about a whole
 # country's wind output: on real German prices and forecasts, a dozen points cut the average miss by about a sixth.
 ZONE_WEATHER_POINTS = {
@@ -2856,17 +2896,22 @@ def power_weather(history: pd.DataFrame, daily: pd.DataFrame, location: str) -> 
     if not frames:
         return pd.DataFrame(columns=["hdd", "wind", "solar"])
     joined = pd.concat(frames, ignore_index=True).drop_duplicates("date", keep="last").set_index("date").sort_index().astype(float)
-    return pd.DataFrame({"hdd": (18.0 - joined["temperature"]).clip(lower=0), "wind": joined["wind"], "solar": joined["solar"]})
+    return pd.DataFrame({"hdd": (18.0 - joined["temperature"]).clip(lower=0), "wind": joined["wind"], "solar": joined["solar"],
+                         "cdd": (joined["temperature"] - COOLING_BASE_C).clip(lower=0)})
 
 
 def zone_weather(history: pd.DataFrame, forecast: pd.DataFrame, zone: str) -> pd.DataFrame:
-    """Heating demand, wind and solar by day, averaged over the zone's points. Forecast days replace the archive."""
-    frames = [f.loc[f["zone"].eq(zone), ["date", "hdd", "wind", "solar"]] for f in (history, forecast)
-              if f is not None and not f.empty and {"zone", "date", "hdd", "wind", "solar"}.issubset(f.columns)]
+    """Heating demand, wind, solar and cooling demand by day, averaged over the zone's points. Forecast days replace the archive."""
+    needed = ["date", "hdd", "wind", "solar"]
+    frames = [f.loc[f["zone"].eq(zone), needed + (["temperature"] if "temperature" in f.columns else [])] for f in (history, forecast)
+              if f is not None and not f.empty and {"zone", *needed}.issubset(f.columns)]
     if not frames:
         return pd.DataFrame(columns=["hdd", "wind", "solar"])
     joined = pd.concat(frames, ignore_index=True).assign(date=lambda f: pd.to_datetime(f["date"], errors="coerce")).dropna(subset=["date"])
-    return joined.drop_duplicates("date", keep="last").set_index("date").sort_index().astype(float)
+    joined = joined.drop_duplicates("date", keep="last").set_index("date").sort_index().astype(float)
+    if "temperature" in joined.columns:
+        joined["cdd"] = (joined.pop("temperature") - COOLING_BASE_C).clip(lower=0)
+    return joined
 
 
 def estimate_features(base: pd.Series, weather: pd.DataFrame, last_day: pd.Timestamp, zone: str = "") -> pd.DataFrame:
@@ -2888,7 +2933,7 @@ def estimate_features(base: pd.Series, weather: pd.DataFrame, last_day: pd.Times
     frame["saturday"], frame["sunday"] = (classes == 1).astype(float), (classes == 2).astype(float)
     frame["after_off"] = ((classes == 0) & (np.r_[0, classes[:-1]] == 2)).astype(float)
     weather = weather.reindex(days) if weather is not None and not weather.empty else pd.DataFrame(index=days)
-    for column in ("hdd", "wind", "solar"):
+    for column in ("hdd", "wind", "solar", "cdd"):
         frame[column] = weather[column] if column in weather.columns else np.nan
         # The day before's weather explains part of the day before's price, which the fit starts from.
         frame[f"{column}_before"] = frame[column].shift(1)
@@ -3040,26 +3085,33 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
         return {"ready": False, "reason": "Prices and weather overlap on too few days so far."}
     test = _walk_forward(known, ESTIMATE_COLUMNS)
     final = _fit_estimate(known, ESTIMATE_COLUMNS, target)
-    # Gas: tested on the same days with and without it, and used only when it clearly helps.
-    weather_columns, gas_check = ESTIMATE_COLUMNS, None
-    frame = frame.join(gas_at_auction(gas, frame.index))
-    gas_known = frame.iloc[:-1].dropna(subset=["base", *ESTIMATE_COLUMNS, *GAS_COLUMNS])
-    if len(gas_known) >= ESTIMATE_MIN_DAYS + 30:
-        gas_test = _walk_forward(gas_known, ESTIMATE_COLUMNS + GAS_COLUMNS)
-        shared = test.merge(gas_test[["day", "estimate"]].rename(columns={"estimate": "with_gas"}), on="day")
-        if len(shared) >= 30:
-            without, with_gas = float((shared["actual"] - shared["estimate"]).abs().mean()), float((shared["actual"] - shared["with_gas"]).abs().mean())
-            ahead_gas = not frame.iloc[[-1]][list(GAS_COLUMNS)].isna().any(axis=None)
-            gas_check = {"days": len(shared), "without": without, "with": with_gas, "used": ahead_gas and with_gas <= (1.0 - GAS_MIN_GAIN) * without,
-                         "ready": ahead_gas, "effect": None}
-            if gas_check["used"]:
-                weather_columns, test = ESTIMATE_COLUMNS + GAS_COLUMNS, gas_test
-                final = _fit_estimate(gas_known, weather_columns, target)
-                gas_check["effect"] = float(final[weather_columns.index("gas") + 1])
-    ahead = frame.iloc[[-1]]
-
+    # Extra inputs: each is tested on the same days with and without it, on top of what has already earned its place.
     tz = ENTSOE_ZONES[zone]["timezone"]
     published = entsoe_forecast_days(load_forecast, renewable_forecast, tz)
+    frame = frame.join(gas_at_auction(gas, frame.index))
+    load_fc = published["load_gw"].reindex(frame.index) if not published.empty else pd.Series(np.nan, index=frame.index)
+    frame["load_fc"], frame["load_fc_before"] = load_fc, load_fc.shift(1)
+    weather_columns, extras = ESTIMATE_COLUMNS, {}
+    for name, label, columns in EXTRA_INPUTS:
+        candidate = weather_columns + columns
+        with_known = frame.iloc[:-1].dropna(subset=["base", *candidate])
+        if len(with_known) < ESTIMATE_MIN_DAYS + 30 or (name == "cooling" and int((with_known["cdd"] > 0).sum()) < COOLING_MIN_DAYS):
+            continue
+        with_test = _walk_forward(with_known, candidate)
+        shared = test.merge(with_test[["day", "estimate"]].rename(columns={"estimate": "with_input"}), on="day")
+        if len(shared) < 30:
+            continue
+        without, with_input = float((shared["actual"] - shared["estimate"]).abs().mean()), float((shared["actual"] - shared["with_input"]).abs().mean())
+        ready = not frame.iloc[[-1]][list(columns)].isna().any(axis=None)
+        extras[name] = {"label": label, "days": len(shared), "without": without, "with": with_input, "ready": ready, "effect": None,
+                        "used": ready and with_input <= (1.0 - GAS_MIN_GAIN) * without}
+        if extras[name]["used"]:
+            weather_columns, test = candidate, with_test
+            final = _fit_estimate(with_known, weather_columns, target)
+            extras[name]["effect"] = float(final[weather_columns.index(columns[0]) + 1])
+    gas_check = extras.get("gas")
+    ahead = frame.iloc[[-1]]
+
     forecast_frame = frame[["base", *CALENDAR_COLUMNS]].join(published.reindex(frame.index)) if not published.empty else None
     forecast_known = forecast_frame.iloc[:-1].dropna() if forecast_frame is not None else pd.DataFrame()
     forecast_test, forecast_final = pd.DataFrame(), None
@@ -3096,7 +3148,7 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
               "latest_gap": gap, "unusual": abs(gap) > float(check_errors.quantile(0.9)), "check_method": "ENTSO-E forecasts" if checker is forecast_test else "Weather",
               "comparison": comparison, "target_has_forecast": target_has_forecast, "forecast_days": int(published.dropna().shape[0]),
               "wind_effect": float(final[ESTIMATE_COLUMNS.index("wind") + 1]), "hdd_effect": float(final[ESTIMATE_COLUMNS.index("hdd") + 1]),
-              "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1]), "forecast_effects": None, "gas": gas_check}
+              "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1]), "forecast_effects": None, "gas": gas_check, "extras": extras}
     best_simple = min(result["error_same_type"], result["error_last_week"], result["error_yesterday"])
     result["skill"] = 1.0 - result["error"] / best_simple if best_simple > 0 else 0.0
     if forecast_final is not None:
@@ -3775,6 +3827,9 @@ def desk_store() -> Optional[DeskStore]:
         try:
             st.session_state.desk_store = DeskStore(default_db_path())
             st.session_state.desk_store_error = ""
+            # Trades, prices and keys are private: only this user account may read the files.
+            protect_file(st.session_state.desk_store.path)
+            protect_file(keys_file_path())
         except Exception as exc:
             st.session_state.desk_store = None
             st.session_state.desk_store_error = f"{type(exc).__name__}: {exc}"
@@ -4711,49 +4766,6 @@ class ProviderHTTPError(RuntimeError):
         self.body = body
 
 
-def _http_get_bytes(url: str, params: Optional[dict] = None,
-                    headers: Optional[dict] = None,
-                    timeout: int = HTTP_TIMEOUT_SECONDS) -> tuple[bytes, str]:
-    """Small dependency-free HTTP GET with one retry. Errors never echo query tokens or headers."""
-    final_url = _build_url(url, params)
-    req_headers = {"User-Agent": "MERIDIAN-Energy-Desk/2.0", "Accept": "application/json,*/*", "Accept-Encoding": "gzip"}
-    if headers:
-        req_headers.update({str(k): str(v) for k, v in headers.items() if v is not None})
-    request = Request(final_url, headers=req_headers, method="GET")
-    for attempt in (1, 2):
-        try:
-            with urlopen(request, timeout=timeout) as response:
-                content_type = response.headers.get("Content-Type", "")
-                encoding = response.headers.get("Content-Encoding", "")
-                body = response.read(MAX_API_RESPONSE_BYTES + 1)
-                if len(body) > MAX_API_RESPONSE_BYTES:
-                    raise RuntimeError("API response exceeded the 20 MB safety limit. Narrow the requested dates or filters.")
-                return (gzip.decompress(body) if encoding == "gzip" else body), content_type
-        except HTTPError as exc:
-            # Busy or briefly failing servers often recover, so these get one more try.
-            if attempt == 1 and exc.code in RETRY_HTTP_CODES:
-                sleep(RETRY_WAIT_SECONDS)
-                continue
-            # Do not include exc.url because some vendors require tokens in URL query strings.
-            try:
-                detail = exc.read(8192)
-            except Exception:
-                detail = b""
-            raise ProviderHTTPError(f"API returned HTTP {exc.code}. Check access rights, credentials, dates and query parameters.", exc.code, detail) from None
-        except URLError as exc:
-            if attempt == 1:
-                sleep(RETRY_WAIT_SECONDS)
-                continue
-            reason = getattr(exc, "reason", "network error")
-            raise RuntimeError(f"Could not reach the data provider ({reason}). Check your internet connection and provider availability.") from None
-        except TimeoutError:
-            if attempt == 1:
-                sleep(RETRY_WAIT_SECONDS)
-                continue
-            raise RuntimeError("The data provider timed out. Try a shorter date range.") from None
-    raise RuntimeError("The data provider could not be reached.")
-
-
 def _direct_children(parent, name: str) -> list:
     return [child for child in parent if _xml_local_name(child.tag) == name]
 
@@ -4776,13 +4788,13 @@ def parse_entsoe_xml(content: bytes, series_kind: str = "price") -> pd.DataFrame
             xml_names = [n for n in zf.namelist() if n.lower().endswith((".xml", ".xml.gz"))]
             if not xml_names:
                 raise ValueError("ENTSO-E returned a ZIP without an XML document.")
-            content = zf.read(xml_names[0])
+            content = _zip_member_limited(zf, xml_names[0])
             if xml_names[0].lower().endswith(".xml.gz") or content[:2] == b"\x1f\x8b":
-                content = gzip.decompress(content)
+                content = _gunzip_limited(content)
     elif content[:2] == b"\x1f\x8b":
-        content = gzip.decompress(content)
+        content = _gunzip_limited(content)
     try:
-        root = ET.fromstring(content)
+        root = _safe_xml_root(content)
     except ET.ParseError as exc:
         raise ValueError("ENTSO-E response could not be parsed as XML.") from exc
     if _xml_local_name(root.tag) == "Acknowledgement_MarketDocument":
@@ -4875,7 +4887,7 @@ def _entsoe_error_message(exc: ProviderHTTPError) -> str:
     if exc.status == 429:
         return "ENTSO-E is rate-limiting requests (HTTP 429). Wait a minute and try again."
     try:
-        root = ET.fromstring(exc.body)
+        root = _safe_xml_root(exc.body)
         reason = _xml_text(root, ["text"])
         if reason:
             return f"ENTSO-E: {reason}"
@@ -5115,6 +5127,145 @@ def fetch_zone_weather(zone: str, start: Optional[date] = None, end: Optional[da
     out = means.reset_index().rename(columns={"index": "date"})
     out["date"] = pd.to_datetime(out["date"])
     return out.assign(zone=zone, points=len(per_point))[["zone", "date", "temperature", "hdd", "wind", "solar", "points"]]
+
+
+# ---- Safe downloads ---------------------------------------------------------------
+MAX_UNPACKED_BYTES = 80 * 1024 * 1024      # a compressed answer may not unpack to more than this
+
+
+class _SameHostRedirect(HTTPRedirectHandler):
+    """Follow a redirect only to the same host over HTTPS, so keys in headers or the address never reach another site."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old, new = urlsplit(req.full_url), urlsplit(newurl)
+        if new.scheme != "https" or new.hostname != old.hostname:
+            raise RuntimeError("The data provider tried to send the request to another site, so it was stopped.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SAFE_OPENER = build_opener(_SameHostRedirect)
+
+
+def _open_url(request, timeout):
+    return _SAFE_OPENER.open(request, timeout=timeout)
+
+
+def _gunzip_limited(body: bytes, limit: int = MAX_UNPACKED_BYTES) -> bytes:
+    unpacker = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = unpacker.decompress(body, limit + 1)
+    if len(out) > limit or unpacker.unconsumed_tail:
+        raise RuntimeError("The provider's compressed answer unpacks to more than the safety limit, so it was refused.")
+    return out
+
+
+def _safe_xml_root(content: bytes):
+    """Parse provider XML. Documents that declare a DTD or entities are refused: none of these providers
+    send them, and they are how entity-expansion and external-entity attacks work."""
+    head = content[:4096].lower()
+    if b"<!doctype" in head or b"<!entity" in head:
+        raise RuntimeError("The provider's XML declares a document type, which isn't accepted.")
+    return ET.fromstring(content)
+
+
+def _zip_member_limited(archive, name: str, limit: int = MAX_UNPACKED_BYTES) -> bytes:
+    if archive.getinfo(name).file_size > limit:
+        raise RuntimeError("The provider's archive unpacks to more than the safety limit, so it was refused.")
+    return archive.read(name)
+
+
+def _http_get_bytes(url: str, params: Optional[dict] = None, headers: Optional[dict] = None,
+                    timeout: int = HTTP_TIMEOUT_SECONDS) -> tuple[bytes, str]:
+    """HTTPS GET with one retry. Errors never echo the address, query tokens or headers."""
+    final_url = _build_url(url, params)
+    target = urlsplit(final_url)
+    if target.scheme != "https" or not target.hostname:
+        raise RuntimeError("Only HTTPS addresses are used for market data, so keys and prices can't be read or changed on the way.")
+    req_headers = {"User-Agent": "MERIDIAN-Energy-Desk/2.0", "Accept": "application/json,*/*", "Accept-Encoding": "gzip"}
+    if headers:
+        req_headers.update({str(k): str(v) for k, v in headers.items() if v is not None})
+    request = Request(final_url, headers=req_headers, method="GET")
+    for attempt in (1, 2):
+        try:
+            with _open_url(request, timeout) as response:
+                content_type = response.headers.get("Content-Type", "")
+                encoding = response.headers.get("Content-Encoding", "")
+                body = response.read(MAX_API_RESPONSE_BYTES + 1)
+                if len(body) > MAX_API_RESPONSE_BYTES:
+                    raise RuntimeError("API response exceeded the 20 MB safety limit. Narrow the requested dates or filters.")
+                return (_gunzip_limited(body) if encoding == "gzip" else body), content_type
+        except HTTPError as exc:
+            # Busy or briefly failing servers often recover, so these get one more try.
+            if attempt == 1 and exc.code in RETRY_HTTP_CODES:
+                sleep(RETRY_WAIT_SECONDS)
+                continue
+            # The address is left out because some providers take the token in it.
+            try:
+                detail = exc.read(8192)
+            except Exception:
+                detail = b""
+            raise ProviderHTTPError(f"API returned HTTP {exc.code}. Check access rights, credentials, dates and query parameters.", exc.code, detail) from None
+        except URLError as exc:
+            if attempt == 1:
+                sleep(RETRY_WAIT_SECONDS)
+                continue
+            reason = getattr(exc, "reason", "network error")
+            if isinstance(reason, ssl.SSLError):
+                raise RuntimeError("The provider's security certificate couldn't be verified, so nothing was sent or accepted.") from None
+            raise RuntimeError(f"Could not reach the data provider ({type(reason).__name__}). Check your internet connection and provider availability.") from None
+        except (TimeoutError, socket.timeout):
+            if attempt == 1:
+                sleep(RETRY_WAIT_SECONDS)
+                continue
+            raise RuntimeError("The data provider timed out. Try a shorter date range.") from None
+    raise RuntimeError("The data provider could not be reached.")
+
+
+def scrub_secrets(text: str, secrets: Sequence[str]) -> str:
+    """Remove any key or password from a message before it is shown or stored."""
+    for secret in secrets:
+        if secret and len(secret) >= 6:
+            text = text.replace(secret, "[hidden]").replace(quote(secret, safe=""), "[hidden]")
+    return text
+
+
+def protect_file(path) -> bool:
+    """Make a file readable by its owner only, where the system supports it. True when it is, or was made, private."""
+    try:
+        if os.name != "posix" or not os.path.isfile(path):
+            return True
+        mode = os.stat(path).st_mode & 0o777
+        if mode & 0o077:
+            os.chmod(path, mode & 0o700 or 0o600)
+        return True
+    except OSError:
+        return False
+
+
+def keys_file_git_risk(path) -> str:
+    """A warning when the keys file sits in a Git folder without being ignored, since a commit would publish the keys."""
+    try:
+        target = os.path.abspath(path)
+        if not os.path.isfile(target):
+            return ""
+        folder = os.path.dirname(target)
+        while True:
+            if os.path.exists(os.path.join(folder, ".git")):
+                name = os.path.relpath(target, folder).replace(os.sep, "/")
+                try:
+                    rules = [line.strip() for line in open(os.path.join(folder, ".gitignore"), encoding="utf-8", errors="ignore") if line.strip() and not line.startswith("#")]
+                except OSError:
+                    rules = []
+                import fnmatch
+                base = os.path.basename(target)
+                if any(fnmatch.fnmatch(name, rule.lstrip("/")) or fnmatch.fnmatch(base, rule.lstrip("/")) for rule in rules):
+                    return ""
+                return f"{base} is inside a Git folder and isn't listed in .gitignore. Add a line with {base} to .gitignore so a commit can't publish your keys."
+            parent = os.path.dirname(folder)
+            if parent == folder:
+                return ""
+            folder = parent
+    except OSError:
+        return ""
 
 
 # TradingView through tvdatafeed, an unofficial library: it can break when TradingView changes, prices are
@@ -5937,6 +6088,10 @@ def render_sidebar() -> str:
         saved = ("Your work saves automatically." if st.session_state.get("desk_store") is not None and not st.session_state.get("desk_store_error")
                  else "Saving is unavailable, so changes last until you close this tab.")
         st.markdown(f'<div class="side-foot">{loaded} datasets held. {saved}<br>For analysis only, not for trade execution.</div>', unsafe_allow_html=True)
+        if "keys_git_risk" not in st.session_state:
+            st.session_state.keys_git_risk = keys_file_git_risk(keys_file_path())
+        if st.session_state.keys_git_risk:
+            st.warning(st.session_state.keys_git_risk)
     return NAV_TO_PAGE[st.session_state.nav_page]
 
 
@@ -6093,7 +6248,8 @@ FORECAST_HISTORY_DAYS = 300
 ZONE_WEATHER_HISTORY_DAYS = 430
 STALE_HOURS = {"tradingview": 1.0, "prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0}
 KEEP_DAYS = {"prices": 400, "load": 90, "generation": 90, "lng": 400}
-MAX_UPDATE_WORKERS = 4
+MAX_UPDATE_WORKERS = 8          # the providers allow far more; this keeps the first update short
+TRADINGVIEW_WORKERS = 4         # TradingView gets its own smaller lane, so it is never asked too fast and never holds up the others
 
 
 @dataclass
@@ -6103,6 +6259,7 @@ class UpdateTask:
     fetch: Callable[[], object]
     apply: Callable[[object], str]
     start: Optional[date] = None
+    lane: str = "main"
 
 
 def merge_observations(old: Optional[pd.DataFrame], new: pd.DataFrame, keys: Sequence[str],
@@ -6186,7 +6343,7 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[
             return fetch_tradingview_curve(product, today, bars, *login)
         def apply_tv(raw: pd.DataFrame, product=tv_product) -> str:
             return apply_tradingview_curve(product, raw)
-        tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv))
+        tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv, lane="tradingview"))
     held_front = _held_frame("tradingview_gas_front")
     front_bars = TRADINGVIEW_FRONT_HISTORY_BARS if held_front is None or len(held_front) < 200 else 10
     def fetch_front() -> pd.DataFrame:
@@ -6194,7 +6351,7 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[
     def apply_front(frame: pd.DataFrame) -> str:
         merged = store_observations("tradingview_gas_front", "TradingView TTF front month", frame, {"symbol": "NYMEX:TTF1!"}, ("date", "product"), "date", 800)
         return f"{len(frame)} days fetched, {len(merged)} held, last close {frame['close'].iloc[-1]:.2f} on {pd.Timestamp(frame['date'].iloc[-1]):%d %b}"
-    tasks.append(UpdateTask("TTF front-month history from TradingView", fetch_front, apply_front))
+    tasks.append(UpdateTask("TTF front-month history from TradingView", fetch_front, apply_front, lane="tradingview"))
     return tasks
 
 
@@ -6383,8 +6540,9 @@ def start_update(force: bool = True, tasks: Optional[list[UpdateTask]] = None) -
     planned = plan_update(force) if tasks is None else tasks
     if not planned:
         return 0
-    executor = ThreadPoolExecutor(max_workers=MAX_UPDATE_WORKERS)
-    st.session_state.update_job = {"tasks": planned, "futures": [executor.submit(task.fetch) for task in planned], "executor": executor}
+    executors = {"main": ThreadPoolExecutor(max_workers=MAX_UPDATE_WORKERS), "tradingview": ThreadPoolExecutor(max_workers=TRADINGVIEW_WORKERS)}
+    st.session_state.update_job = {"tasks": planned, "futures": [executors.get(task.lane, executors["main"]).submit(task.fetch) for task in planned],
+                                   "executors": executors, "results": {}}
     return len(planned)
 
 
@@ -6396,19 +6554,25 @@ def update_progress() -> tuple[int, int]:
 
 
 def collect_update() -> bool:
-    """Apply a finished update on the main thread. Returns True when one has just finished."""
+    """Apply each source on the main thread as soon as it has arrived, so data is usable before the slowest one ends.
+    Returns True when the whole update has just finished."""
     job = st.session_state.get("update_job")
-    if not job or not all(future.done() for future in job["futures"]):
+    if not job:
         return False
-    results = []
-    for task, future in zip(job["tasks"], job["futures"]):
+    secrets = [value for value in resolved_credentials().values() if value]
+    for index, (task, future) in enumerate(zip(job["tasks"], job["futures"])):
+        if index in job["results"] or not future.done():
+            continue
         try:
-            results.append((task.name, True, task.apply(future.result())))
+            job["results"][index] = (task.name, True, task.apply(future.result()))
         except Exception as exc:
-            results.append((task.name, False, str(exc).split(" Check your internet")[0]))
-    job["executor"].shutdown(wait=False)
+            job["results"][index] = (task.name, False, scrub_secrets(str(exc).split(" Check your internet")[0], secrets))
+    if len(job["results"]) < len(job["tasks"]):
+        return False
+    for executor in job["executors"].values():
+        executor.shutdown(wait=False)
     st.session_state.update_job = None
-    st.session_state.update_results = results
+    st.session_state.update_results = [job["results"][index] for index in range(len(job["tasks"]))]
     st.session_state.update_finished_at = datetime.now(timezone.utc)
     st.session_state.reads_recorded = False
     return True
@@ -6455,8 +6619,7 @@ def _update_panel() -> None:
     """Sidebar control. While fetching, it refreshes itself until the data is ready."""
     done, total = update_progress()
     if total:
-        if done == total:
-            collect_update()
+        if collect_update():
             st.rerun()
         st.progress(done / total, text=f"Updating market data, {done} of {total} sources")
         return
@@ -8125,7 +8288,8 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
                                         UpdateTask("Bad apply", lambda: 1, lambda v: (_ for _ in ()).throw(ValueError("bad frame")))])
             if count != 3 or start_update(tasks=[UpdateTask("Second", lambda: 1, lambda v: "x")]) != 0:
                 raise AssertionError("Only one update may run at a time.")
-            st.session_state.update_job["executor"].shutdown(wait=True)
+            for _executor in st.session_state.update_job["executors"].values():
+                _executor.shutdown(wait=True)
             if update_progress() != (3, 3) or not collect_update():
                 raise AssertionError("A finished update was not collected.")
             results = {name: (good, detail) for name, good, detail in st.session_state.update_results}
@@ -8692,6 +8856,88 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         return (f"Gas uses the last close two days before delivery. When power follows gas it's used (miss €{with_gas['gas']['with']:.1f} against €{with_gas['gas']['without']:.1f}, "
                 f"effect {with_gas['gas']['effect']:.2f} for 2.2 set), and when it doesn't, it's left out.")
 
+    def check_safe_downloads() -> str:
+        def refused(action, words):
+            try:
+                action()
+            except Exception as exc:
+                if words.lower() not in str(exc).lower():
+                    raise AssertionError(f"Wrong refusal: {exc}")
+                return
+            raise AssertionError(f"Not refused: {words}")
+        refused(lambda: _http_get_bytes("http://agsi.gie.eu/api", {"key": "x"}), "Only HTTPS")
+        refused(lambda: _http_get_bytes("file:///etc/passwd"), "Only HTTPS")
+        handler = _SameHostRedirect()
+        request = Request("https://web-api.tp.entsoe.eu/api?securityToken=secret-token-123")
+        refused(lambda: handler.redirect_request(request, None, 302, "Found", {}, "https://elsewhere.example/api"), "another site")
+        refused(lambda: handler.redirect_request(request, None, 302, "Found", {}, "http://web-api.tp.entsoe.eu/api"), "another site")
+        bomb = gzip.compress(b"0" * (3 * 1024 * 1024))
+        refused(lambda: _gunzip_limited(bomb, limit=1024 * 1024), "safety limit")
+        if _gunzip_limited(gzip.compress(b"fine")) != b"fine":
+            raise AssertionError("An ordinary compressed answer must still be read.")
+        laughs = b'<?xml version="1.0"?><!DOCTYPE d [<!ENTITY a "aaaa"><!ENTITY b "&a;&a;&a;">]><d>&b;</d>'
+        refused(lambda: _safe_xml_root(laughs), "document type")
+        if _safe_xml_root(b"<a><b>1</b></a>").tag != "a":
+            raise AssertionError("Ordinary XML must still be read.")
+        message = scrub_secrets("HTTP 401 for securityToken=secret-token-123 and pass%2Fword%21", ["secret-token-123", "pass/word!", "ab"])
+        if "secret-token-123" in message or "pass%2Fword%21" in message or message.count("[hidden]") != 2:
+            raise AssertionError(f"A key survived in a message: {message}")
+        with tempfile.TemporaryDirectory() as folder:
+            keys = os.path.join(folder, "meridian_keys.toml")
+            open(keys, "w").write('GIE_API_KEY = "x"')
+            if os.name == "posix":
+                os.chmod(keys, 0o644)
+                protect_file(keys)
+                if os.stat(keys).st_mode & 0o077:
+                    raise AssertionError("The keys file should be readable by its owner only.")
+            if keys_file_git_risk(keys):
+                raise AssertionError("No warning is due outside a Git folder.")
+            os.mkdir(os.path.join(folder, ".git"))
+            if "gitignore" not in keys_file_git_risk(keys):
+                raise AssertionError("A keys file in a Git folder without an ignore rule must be flagged.")
+            open(os.path.join(folder, ".gitignore"), "w").write("*.db\nmeridian_keys.toml\n")
+            if keys_file_git_risk(keys):
+                raise AssertionError("An ignored keys file is fine.")
+        return ("Plain HTTP and file addresses are refused, a redirect to another site or to HTTP is stopped, a decompression bomb and an XML entity trick are refused, "
+                "keys are removed from messages, the keys file is made private, and a keys file that Git could publish is flagged.")
+
+    def check_estimate_extra_inputs() -> str:
+        rng = np.random.default_rng(21)
+        span = pd.date_range("2025-06-01", periods=330, freq="D")       # summer first, so the history holds warm days
+        wind = rng.uniform(5, 40, len(span))
+        temperature = 14 + 9 * np.cos((span.dayofyear.to_numpy() - 200) / 365 * 2 * np.pi) + rng.normal(0, 2.5, len(span))
+        load = 50 + rng.normal(0, 4, len(span))
+        stamps = (span.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(span)), unit="h")).tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
+        keep = ~stamps.isna()
+        load_frame = pd.DataFrame({"timestamp": stamps[keep].tz_convert("UTC"), "value": np.repeat(load * 1000.0, 24)[keep]})
+        renewables = pd.concat([load_frame.assign(series="Wind Onshore", value=5000.0), load_frame.assign(series="Solar", value=3000.0)])
+        grid = pd.DataFrame({"zone": "France", "date": span, "temperature": temperature, "hdd": np.clip(18 - temperature, 0, None), "wind": wind, "solar": 100.0})
+        ahead_day = span[-1] + pd.Timedelta(days=1)
+        ahead = grid.tail(1).assign(date=ahead_day)
+        ahead_load = load_frame.tail(24).assign(timestamp=lambda f: f["timestamp"] + pd.Timedelta(days=1))
+        def run(price, with_forecast_ahead=True):
+            hourly = pd.DataFrame({"local": span.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(span)), unit="h"), "value": np.repeat(price, 24), "hours": 1.0})
+            loads = pd.concat([load_frame, ahead_load]) if with_forecast_ahead else load_frame
+            return next_day_estimate("France", hourly, pd.DataFrame(), pd.DataFrame(), loads, renewables, grid_history=grid, grid_forecast=ahead)
+        cooling = np.clip(temperature - COOLING_BASE_C, 0, None)
+        driven = run(60 + 2.5 * (load - 50) + 6.0 * cooling - 1.0 * wind + rng.normal(0, 2, len(span)))
+        extras = driven["extras"]
+        if not extras.get("load", {}).get("used") or not extras.get("cooling", {}).get("used"):
+            raise AssertionError(f"When prices follow the load forecast and hot days, both should be used: {extras}")
+        assert_close(extras["load"]["effect"], 2.5, 0.6)
+        plain = run(90 - 1.0 * wind + rng.normal(0, 2, len(span)))
+        if any(item["used"] for item in plain["extras"].values()):
+            raise AssertionError(f"Inputs that don't help must stay out: {plain['extras']}")
+        late = run(60 + 2.5 * (load - 50) - 1.0 * wind + rng.normal(0, 2, len(span)), with_forecast_ahead=False)
+        if late["extras"]["load"]["used"] or late["extras"]["load"]["ready"] or not late["ready"]:
+            raise AssertionError("Without a load forecast for the day, the estimate must still come out, without that input.")
+        winter = grid.assign(temperature=5.0, hdd=13.0)
+        cold = zone_weather(winter, None, "France")
+        if float(cold["cdd"].sum()) != 0.0:
+            raise AssertionError("A cold history has no cooling demand.")
+        return (f"Load forecast and cooling are used when prices follow them (miss €{extras['load']['without']:.1f} to €{extras['cooling']['with']:.1f}), "
+                "stay out when they don't help, and a missing load forecast for the day doesn't stop the estimate.")
+
     def check_estimate_calendar() -> str:
         if _easter(2026) != date(2026, 4, 5) or _easter(2027) != date(2027, 3, 28):
             raise AssertionError("Easter date is wrong.")
@@ -9005,6 +9251,8 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("TradingView curve through tvdatafeed", "Live API integration", check_tradingview_curve),
         ("Power, NBP and EUA from TradingView", "Live API integration", check_tradingview_products),
         ("Gas in the next-day estimate", "Next-day estimate", check_estimate_gas),
+        ("Downloads refuse unsafe addresses and content", "Security", check_safe_downloads),
+        ("Load forecast and cooling in the estimate", "Next-day estimate", check_estimate_extra_inputs),
         ("Holidays and kinds of day", "Next-day estimate", check_estimate_calendar),
         ("Weather across a zone in one request", "Live API integration", check_zone_weather_fetch),
         ("The 80% range holds about 80%", "Next-day estimate", check_estimate_range),
@@ -10475,8 +10723,10 @@ def render_next_day(zones: Sequence[str]) -> None:
     gap_word = "above" if result["latest_gap"] > 0 else "below"
     weather_words = f"the weather forecast at {result['weather_basis']}" if "points" in result["weather_basis"] else f"the weather forecast for {result['weather_basis'] or 'one city'}"
     gas = result.get("gas")
-    if gas and gas["used"]:
-        weather_words += " and the TTF front-month price"
+    extras = result.get("extras") or {}
+    in_use = [item["label"] for item in extras.values() if item["used"]]
+    if in_use:
+        weather_words += ", " + " and ".join(in_use)
     basis = ("It uses ENTSO-E's published load, wind and solar forecasts for that day." if result["method"] != "Weather" else
              f"It uses {weather_words}, which has tested better here than ENTSO-E's forecasts." if result["target_has_forecast"] and result["comparison"] else
              f"It uses {weather_words}, because ENTSO-E's wind and solar forecast is usually published by 18:00 the day before delivery, after the auction.")
@@ -10511,21 +10761,26 @@ def render_next_day(zones: Sequence[str]) -> None:
     rows = [{"Method": f"Weather at {result['weather_basis']}" if "points" in result["weather_basis"] else f"Weather in {result['weather_basis'] or 'one city'}", "Average miss, EUR/MWh": round(comparison["weather"] if comparison else result["error"], 2)}]
     if comparison:
         rows.insert(0, {"Method": "ENTSO-E forecasts", "Average miss, EUR/MWh": round(comparison["forecasts"], 2)})
-    if gas:
-        rows.append({"Method": ("Weather and gas, in use" if gas["used"] else "Weather and gas, not in use"), "Average miss, EUR/MWh": round(gas["with"], 2)})
-        rows.append({"Method": "Weather without gas", "Average miss, EUR/MWh": round(gas["without"], 2)})
+    for item in extras.values():
+        rows.append({"Method": f"Adding {item['label']}: {'in use' if item['used'] else 'not in use'}", "Average miss, EUR/MWh": round(item["with"], 2)})
+        rows.append({"Method": f"The same days without {item['label']}", "Average miss, EUR/MWh": round(item["without"], 2)})
     source = comparison or {"same_type": result["error_same_type"], "last_week": result["error_last_week"], "yesterday": result["error_yesterday"]}
     rows += [{"Method": "Last day of the same kind", "Average miss, EUR/MWh": round(source["same_type"], 2)},
              {"Method": "Same weekday last week", "Average miss, EUR/MWh": round(source["last_week"], 2)}, {"Method": "Previous day", "Average miss, EUR/MWh": round(source["yesterday"], 2)}]
     table(pd.DataFrame(rows))
-    if gas:
-        gain = 1.0 - gas["with"] / gas["without"] if gas["without"] > 0 else 0.0
-        st.caption(f"Gas tested on the same {gas['days']} days: front-month TTF as known at each auction "
-                   + (f"cut the average miss by {gain * 100:.0f}%, so it's in use." if gas["used"] else
-                      "has no gas price for this auction yet, so it's left out today." if not gas["ready"] else
-                      f"changed the average miss by {-gain * 100:+.0f}%, short of the {GAS_MIN_GAIN * 100:.0f}% it needs to be used."))
-    elif result["zone"]:
-        st.caption("Gas isn't tested yet: it needs the TTF front-month history from TradingView, fetched with each update.")
+    notes = []
+    for item in extras.values():
+        gain = 1.0 - item["with"] / item["without"] if item["without"] > 0 else 0.0
+        notes.append(f"{item['label'][0].upper()}{item['label'][1:]}, over {item['days']} days: "
+                     + (f"cut the average miss by {gain * 100:.0f}%, so it's in use." if item["used"] else
+                        "not available for this auction yet, so it's left out today." if not item["ready"] and gain >= GAS_MIN_GAIN else
+                        f"changed the average miss by {-gain * 100:+.0f}%, short of the {GAS_MIN_GAIN * 100:.0f}% cut it needs."))
+    missing = [label for name, label, _ in EXTRA_INPUTS if name not in extras]
+    if notes:
+        st.caption("Extra inputs, each tested on your own history and used only when it clearly helps. " + " ".join(notes))
+    if missing:
+        st.caption("Not tested yet for lack of history: " + ", ".join(missing) + ". Gas needs the TradingView front-month history, the load forecast needs ENTSO-E's, and cooling needs at least "
+                   f"{COOLING_MIN_DAYS} warm days in the weather history.")
     if comparison:
         st.caption(f"On the same {comparison['days']} days. The ENTSO-E method isn't fully comparable: its wind and solar forecasts are usually published after the auction, so it shows how good the forecast information is, not what you could have estimated beforehand.")
     else:
@@ -10556,9 +10811,10 @@ def render_next_day(zones: Sequence[str]) -> None:
                     + "The load forecast is due two hours before the auction deadline, but the wind and solar forecast is only due by 18:00 the day before delivery. "
                     "So it usually can't set the estimate before the auction. Its main use is checking whether a published price looks high or low against those forecasts. It sets the estimate only when the forecast already exists and it has tested at least as well as the weather method.\n\n"
                     f"ENTSO-E's forecasts cover **{result['forecast_days']} days** for this zone so far, and some operators may revise them after first publishing.\n\n"
-                    "**Gas.** The weather method is also tested with the front-month TTF price as known at each auction (the last close two days before delivery) and the day before's. "
-                    + (f"It's in use: €1/MWh more on gas changes the power estimate by **{euros(gas['effect'])}**. " if gas and gas["used"] and gas["effect"] is not None else
-                       f"It's used only when it cuts the tested average miss by at least {GAS_MIN_GAIN * 100:.0f}%. ")
+                    "**Extra inputs.** Three more inputs are each tested on top of the weather method, over the same past days with and without them: the front-month TTF price as known at each auction "
+                    "(the last close two days before delivery), ENTSO-E's load forecast for the day, which is due two hours before the auction closes, and cooling demand on days warmer than "
+                    f"{COOLING_BASE_C:.0f} °C. Each is used only when it cuts the tested average miss by at least {GAS_MIN_GAIN * 100:.0f}%, so an input that doesn't help here stays out. "
+                    + (f"Gas is in use: €1/MWh more on gas changes the power estimate by **{euros(gas['effect'])}**. " if gas and gas["used"] and gas["effect"] is not None else "")
                     + "Neither method knows about carbon prices, plant outages, interconnector limits or the auction itself.")
 
 
