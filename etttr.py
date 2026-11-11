@@ -5900,26 +5900,27 @@ def _build_residual_load_proxy(zone: Optional[str] = None) -> pd.DataFrame:
 
 # =============================================================================
 # SECTION 5 · DESIGN SYSTEM
-# North Sea at dusk: deep petrol surfaces, a sodium-lamp accent for actions, and
-# one fixed colour per market so gas, power and carbon read the same on every chart.
+# A desk screen: flat graphite surfaces, hairlines instead of shadows, dense type with
+# aligned figures. Colour carries meaning only: green and red for up and down, amber for
+# warnings and stale data, one steel accent for what is selected, and one fixed colour
+# per market on every chart.
 # =============================================================================
-BG = "#0B202A"          # deepest layer of the page
-PANEL = "#16353F"       # body of a raised surface
-PANEL_SOFT = "#20485A"  # raised controls
-PLATE_HI = "#1F4656"    # lit top-left edge of a plate
-PLATE_LO = "#122B36"    # shaded bottom-right edge of a plate
-BORDER = "#2F515C"      # hairlines
-TEXT = "#F0F6F5"        # primary ink
-GRAY = "#A9BEC2"        # secondary ink
-SODIUM = "#F7BC45"      # actions
-GAIN = "#5EE0A8"        # profit, long
-LOSS = "#FF8F7E"        # loss, short
+BG = "#0D1014"          # page
+PANEL = "#14181D"       # panels, charts, tiles
+PANEL_SOFT = "#1B2128"  # controls and the selected row
+PLATE_HI = PANEL        # kept for older references: surfaces are flat now
+PLATE_LO = PANEL
+BORDER = "#252C34"      # hairlines
+TEXT = "#E4E8EC"        # primary ink
+GRAY = "#8A96A1"        # secondary ink
+ACCENT = "#6FA8DC"      # selection and actions
+SODIUM = "#E3A72F"      # warnings and stale data
+GAIN = "#3FCB8A"        # up, profit, long
+LOSS = "#F0665C"        # down, loss, short
 
-# Each part of the app has its own light, so you can tell where you are at a glance.
-SECTION_COLORS = {"Market": "#4FB3F6", "Pricing": "#F7BC45", "Book and risk": "#34D6B4", "Data and controls": "#A893F5"}
-_NAV_SECTION_CSS = "\n".join(f".st-key-nav_{i} {{{{ --sec:{c}; }}}}".replace("{{", "{").replace("}}", "}") for i, c in enumerate(SECTION_COLORS.values()))
+SECTION_COLORS = {"Market": ACCENT, "Pricing": ACCENT, "Book and risk": ACCENT, "Data and controls": ACCENT}
 
-# Chart series, validated for colour-blind separation on the page colour.
+# Chart series, validated for colour-blind separation on the panel colour.
 SERIES = ["#4C97E6", "#C2870C", "#17A891", "#E0703C", "#9180EE", "#6EA62E", "#DA6694"]
 BLUE, AMBER, TEAL, ORANGE, PURPLE, GREEN, PINK = SERIES
 
@@ -5935,235 +5936,216 @@ ENTITY_COLORS = {
 
 MAX_LINE_POINTS = 2000    # more than a chart's width can show
 MAX_TABLE_ROWS = 2000
-UI_FONT = "Archivo, 'Helvetica Neue', Arial, sans-serif"
-NOTE_FONT = "Newsreader, Georgia, 'Times New Roman', serif"
+TABLE_ROW_HEIGHT = 28
+UI_FONT = "'IBM Plex Sans', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+NOTE_FONT = UI_FONT       # one face throughout
+GRID = "rgba(138,150,161,0.13)"
 
 # Streamlit re-runs this script on every interaction, so the template is built only once.
-if "meridian" not in pio.templates:
-    pio.templates["meridian"] = go.layout.Template(layout=dict(
+if "meridian_desk" not in pio.templates:
+    pio.templates["meridian_desk"] = go.layout.Template(layout=dict(
     colorway=SERIES,
-    font=dict(family=UI_FONT, size=13, color=TEXT),
+    font=dict(family=UI_FONT, size=11, color=TEXT),
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-    title=dict(font=dict(size=14, color=TEXT), x=0.015, xanchor="left", xref="container", y=0.975, yanchor="top"),
-    xaxis=dict(showgrid=False, linecolor=BORDER, tickcolor=BORDER, ticks="outside", ticklen=4, automargin=True,
-               zeroline=False, separatethousands=True, title=dict(font=dict(size=12, color=GRAY)), tickfont=dict(color=GRAY)),
-    yaxis=dict(gridcolor="rgba(190,214,218,0.12)", zeroline=True, zerolinecolor=BORDER, linecolor="rgba(0,0,0,0)",
-               automargin=True, separatethousands=True, title=dict(font=dict(size=12, color=GRAY)), tickfont=dict(color=GRAY)),
+    title=dict(font=dict(size=12, color=TEXT), x=0.012, xanchor="left", xref="container", y=0.975, yanchor="top"),
+    xaxis=dict(showgrid=True, gridcolor=GRID, linecolor=BORDER, tickcolor=BORDER, ticks="outside", ticklen=3, automargin=True,
+               zeroline=False, separatethousands=True, title=dict(font=dict(size=11, color=GRAY)), tickfont=dict(color=GRAY, size=10),
+               showspikes=True, spikemode="across", spikethickness=1, spikecolor=GRAY, spikedash="dot", spikesnap="cursor"),
+    yaxis=dict(gridcolor=GRID, zeroline=True, zerolinecolor=BORDER, linecolor="rgba(0,0,0,0)", side="right",
+               automargin=True, separatethousands=True, title=dict(font=dict(size=11, color=GRAY)), tickfont=dict(color=GRAY, size=10),
+               showspikes=True, spikemode="across", spikethickness=1, spikecolor=GRAY, spikedash="dot", spikesnap="cursor"),
     legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0, xanchor="left", bgcolor="rgba(0,0,0,0)",
-                title=dict(text=""), font=dict(size=12, color=GRAY)),
-    hoverlabel=dict(bgcolor=PANEL, bordercolor=BORDER, font=dict(family=UI_FONT, size=13, color=TEXT)),
-    bargap=0.25, barcornerradius=4,
+                title=dict(text=""), font=dict(size=10, color=GRAY)),
+    hoverlabel=dict(bgcolor=PANEL_SOFT, bordercolor=BORDER, font=dict(family=UI_FONT, size=11, color=TEXT)),
+    bargap=0.3, barcornerradius=1,
     ))
-px.defaults.template = "meridian"
+px.defaults.template = "meridian_desk"
 px.defaults.color_discrete_sequence = SERIES
 
 _CSS = f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100,400;100,500;100,600;100,700&family=Newsreader:opsz,wght@6..72,400;6..72,500&display=swap');
-:root {{
-  color-scheme: dark;
-  --accent: {SODIUM};
-  --plate: linear-gradient(158deg, {PLATE_HI} 0%, {PANEL} 52%, {PLATE_LO} 100%);
-  --raise: inset 0 1px 0 rgba(255,255,255,0.09), inset 0 -1px 0 rgba(0,0,0,0.30), 0 12px 26px rgba(2,12,18,0.42), 0 2px 5px rgba(2,12,18,0.34);
-  --raise-small: inset 0 1px 0 rgba(255,255,255,0.11), inset 0 -1px 0 rgba(0,0,0,0.28), 0 4px 10px rgba(2,12,18,0.40);
-  --well: inset 0 2px 5px rgba(2,12,18,0.55), inset 0 -1px 0 rgba(255,255,255,0.05);
-}}
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+:root {{ color-scheme: dark; --accent: {ACCENT}; --line: 1px solid {BORDER}; }}
+html {{ font-size:14px; }}   /* Streamlit sizes everything in rem: a smaller base makes every widget and line denser in proportion */
 html, body, .stApp, button, input, textarea, select, .stMarkdown, [data-testid="stWidgetLabel"] {{ font-family:{UI_FONT}; }}
-.stApp {{ color:{TEXT}; font-size:15px; font-feature-settings:"tnum" 1;
-  background:
-    radial-gradient(1150px 620px at 8% -12%, rgba(52,214,180,0.17), transparent 62%),
-    radial-gradient(1050px 560px at 96% -8%, rgba(247,188,69,0.11), transparent 60%),
-    radial-gradient(1300px 800px at 60% 118%, rgba(79,179,246,0.09), transparent 62%),
-    linear-gradient(180deg, #0F2B37 0%, {BG} 100%); }}
+.stApp {{ color:{TEXT}; font-size:13px; font-variant-numeric:tabular-nums; font-feature-settings:"tnum" 1; background:{BG}; }}
 [data-testid="stAppViewContainer"], [data-testid="stMain"], [data-testid="stHeader"] {{ background:transparent; }}
+[data-testid="stHeader"] {{ height:0; min-height:0; }}
 [data-testid="stDeployButton"], [data-testid="stToolbarActions"], [data-testid="stAppDeployButton"] {{ display:none; }}
-[data-testid="stMainBlockContainer"] {{ max-width:1400px; padding:1.5rem 2.5rem 3.5rem; }}
-:focus-visible {{ outline:2px solid {SODIUM} !important; outline-offset:2px; }}
+[data-testid="stMainBlockContainer"] {{ max-width:none; padding:0.7rem 1.1rem 2rem; }}
+[data-testid="stVerticalBlock"] {{ gap:0.55rem; }}
+[data-testid="stHorizontalBlock"] {{ gap:0.55rem; }}
+[data-testid="stMarkdownContainer"]:has(> div:last-child) {{ margin-bottom:0 !important; }}
+:focus-visible {{ outline:1px solid {ACCENT} !important; outline-offset:1px; }}
 
-h1, h2, h3, h4 {{ color:{TEXT}; font-weight:600; letter-spacing:-0.005em; font-family:{UI_FONT}; }}
-.stApp h2, .stApp h3 {{ font-size:1.14rem; font-weight:600; padding:1.25rem 0 0.45rem; line-height:1.3; }}
-.stApp h2::before, .stApp h3::before {{ content:""; display:inline-block; width:4px; height:0.95em; margin-right:9px; border-radius:3px; vertical-align:-0.1em; background:var(--accent); box-shadow:0 0 10px var(--accent); }}
-p, li {{ line-height:1.55; }}
-a {{ color:{SODIUM}; }}
-[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {{ color:{GRAY}; font-size:0.86rem; line-height:1.5; max-width:92ch; }}
-hr {{ border-color:{BORDER}; margin:1.2rem 0; }}
+h1, h2, h3, h4 {{ color:{TEXT}; font-weight:600; font-family:{UI_FONT}; letter-spacing:0; }}
+.stApp h2, .stApp h3 {{ font-size:0.86rem; font-weight:600; padding:0.55rem 0 0.3rem; margin:0.35rem 0 0; line-height:1.3; border-bottom:var(--line); }}
+.stApp p, .stApp li {{ line-height:1.45; font-size:0.93rem; }}
+a {{ color:{ACCENT}; }}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {{ color:{GRAY}; font-size:0.8rem; line-height:1.4; max-width:120ch; }}
+hr {{ border-color:{BORDER}; margin:0.6rem 0; }}
 
-/* Page header: a lit band in the colour of this part of the app */
-.st-key-page_head {{ position:relative; padding:18px 22px; margin-bottom:0.9rem; border-radius:16px; overflow:hidden;
-  background:linear-gradient(100deg, color-mix(in srgb, var(--accent) 24%, {PANEL}) 0%, {PANEL} 46%, {PLATE_LO} 100%);
-  box-shadow:var(--raise); }}
-.st-key-page_head::after {{ content:""; position:absolute; left:0; right:0; bottom:0; height:2px; background:linear-gradient(90deg, var(--accent), transparent 70%); }}
-.head-row {{ display:flex; gap:16px; align-items:center; }}
-.head-icon {{ flex:none; width:54px; height:54px; border-radius:14px; display:flex; align-items:center; justify-content:center; color:#0D2029;
-  background:linear-gradient(150deg, color-mix(in srgb, var(--accent) 80%, white) 0%, var(--accent) 62%, color-mix(in srgb, var(--accent) 72%, black) 100%);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.45), inset 0 -2px 0 rgba(0,0,0,0.18), 0 8px 18px color-mix(in srgb, var(--accent) 34%, transparent); }}
-.head-icon span {{ font-family:'Material Symbols Rounded'; font-size:30px; line-height:1; font-weight:400; }}
-.stApp h1.page-title {{ font-family:{NOTE_FONT}; font-weight:500; font-size:2.15rem; line-height:1.12; color:{TEXT}; margin:0; padding:0; letter-spacing:-0.012em; }}
-.page-sub {{ color:#C2D3D5; font-size:0.95rem; margin:0.25rem 0 0; max-width:78ch; }}
-.pill {{ display:inline-flex; align-items:center; gap:7px; padding:5px 12px; border-radius:999px; font-size:0.8rem; color:{TEXT}; white-space:nowrap; background:rgba(5,20,27,0.42); box-shadow:var(--well); }}
-.pill i {{ width:8px; height:8px; border-radius:50%; display:inline-block; background:{GRAY}; }}
-.pill.good i {{ background:{GAIN}; box-shadow:0 0 8px {GAIN}; }} .pill.warn i {{ background:{SODIUM}; box-shadow:0 0 8px {SODIUM}; }}
+/* Status strip and page header */
+.statusbar {{ display:flex; flex-wrap:wrap; align-items:center; gap:0.2rem 1.1rem; padding:5px 10px; margin:0 0 0.45rem; border:var(--line); border-radius:3px; background:{PANEL}; font-size:0.8rem; color:{GRAY}; }}
+.statusbar b {{ color:{TEXT}; font-weight:500; }}
+.statusbar .dot {{ display:inline-flex; align-items:center; gap:5px; white-space:nowrap; }}
+.statusbar .dot i {{ width:7px; height:7px; border-radius:50%; display:inline-block; background:{GRAY}; }}
+.statusbar .dot.good i {{ background:{GAIN}; }} .statusbar .dot.warn i {{ background:{SODIUM}; }} .statusbar .dot.bad i {{ background:{LOSS}; }}
+.statusbar .dot.warn, .statusbar .dot.bad {{ color:{TEXT}; }}
+.statusbar .grow {{ flex:1; }}
+.st-key-page_head {{ padding:0 0 0.35rem; margin:0 0 0.35rem; border-bottom:var(--line); }}
+.head-row {{ display:flex; gap:0.7rem; align-items:baseline; flex-wrap:wrap; }}
+.stApp h1.page-title {{ font-size:1.12rem; font-weight:600; line-height:1.3; color:{TEXT}; margin:0; padding:0; }}
+.page-sub {{ color:{GRAY}; font-size:0.86rem !important; margin:0; }}
+.pill {{ display:inline-flex; align-items:center; gap:6px; padding:2px 8px; border:var(--line); border-radius:3px; font-size:0.78rem; color:{TEXT}; white-space:nowrap; background:{PANEL}; }}
+.pill i {{ width:7px; height:7px; border-radius:50%; display:inline-block; background:{GRAY}; }}
+.pill.good i {{ background:{GAIN}; }} .pill.warn i {{ background:{SODIUM}; }}
 
-/* The desk note panel */
-.st-key-hero {{ padding:24px 26px 20px; border-radius:18px; position:relative; overflow:hidden;
-  background:
-    radial-gradient(620px 300px at 100% 0%, rgba(79,179,246,0.20), transparent 70%),
-    radial-gradient(520px 320px at 0% 100%, rgba(52,214,180,0.16), transparent 70%),
-    var(--plate);
-  box-shadow:var(--raise); }}
-.st-key-hero [data-testid="stPlotlyChart"] {{ background:none; box-shadow:none; }}
-.desk-note {{ font-family:{NOTE_FONT}; font-size:1.42rem; line-height:1.42; color:{TEXT}; max-width:34em; margin:0.2rem 0 1rem; }}
-.desk-note p {{ margin:0 0 0.7rem; font-size:inherit; line-height:inherit; }}
-.desk-note b {{ font-weight:600; font-family:{UI_FONT}; font-size:0.92em; white-space:nowrap; }}
-.desk-note .soft {{ color:{GRAY}; font-size:0.86em; }}
-.src-row {{ display:flex; flex-wrap:wrap; align-items:center; gap:0.4rem 0.45rem; margin:0.85rem 0 0.1rem; }}
-.src-title {{ font-family:{UI_FONT}; font-size:0.78rem; font-weight:600; color:{GRAY}; margin-right:0.25rem; }}
-.src {{ display:inline-flex; align-items:baseline; gap:0.35rem; padding:0.2rem 0.6rem; border-radius:999px; font-family:{UI_FONT}; font-size:0.78rem; color:{TEXT};
-        border:1px solid rgba(169,190,194,0.25); background:rgba(255,255,255,0.03); }}
-.src b {{ font-weight:700; font-size:0.72rem; }}
-.src.real b, .src.user b {{ color:{GAIN}; }} .src.real {{ border-color:rgba(70,200,150,0.45); }}
-.src.part b, .src.old b {{ color:{AMBER}; }} .src.part, .src.old {{ border-color:rgba(242,184,75,0.45); }}
-.src.demo b {{ color:{AMBER}; }} .src.demo {{ border-color:rgba(242,184,75,0.65); background:rgba(242,184,75,0.08); }}
-.src.missing b, .src.info b {{ color:{GRAY}; }}
-.desk-note ul {{ margin:0 0 0.7rem; padding-left:1.1em; list-style:disc; }}
-.desk-note li {{ margin:0 0 0.28rem; padding:0; font-size:1.12rem; line-height:1.38; color:{TEXT}; }}
+/* Notes: the plain-language summary panels */
+.st-key-hero {{ padding:9px 12px 8px; border:var(--line); border-radius:3px; background:{PANEL}; }}
+.st-key-hero [data-testid="stPlotlyChart"] {{ border:0; background:none; }}
+.desk-note {{ font-size:0.93rem; line-height:1.45; color:{TEXT}; max-width:110ch; margin:0; }}
+.desk-note p {{ margin:0 0 0.35rem; font-size:inherit; line-height:inherit; }}
+.desk-note b {{ font-weight:600; white-space:nowrap; }}
+.desk-note .soft {{ color:{GRAY}; font-size:0.86rem; }}
+.desk-note ul {{ margin:0 0 0.35rem; padding-left:1.1em; list-style:square; }}
+.desk-note li {{ margin:0 0 0.12rem; padding:0; font-size:0.93rem; line-height:1.4; color:{TEXT}; }}
 .desk-note li::marker {{ color:{GRAY}; }}
-.desk-note .desk-label {{ margin:0.9rem 0 0.3rem; font-family:{UI_FONT}; font-size:0.86rem; font-weight:600; color:{GRAY}; }}
+.desk-note .desk-label {{ margin:0.45rem 0 0.15rem; font-size:0.8rem; font-weight:600; color:{GRAY}; }}
 .desk-note b.gain {{ color:{GAIN}; }} .desk-note b.loss {{ color:{LOSS}; }}
+.src-row {{ display:flex; flex-wrap:wrap; align-items:center; gap:0.25rem 0.35rem; margin:0.3rem 0 0; }}
+.src-title {{ font-size:0.76rem; font-weight:500; color:{GRAY}; margin-right:0.2rem; }}
+.src {{ display:inline-flex; align-items:baseline; gap:0.3rem; padding:1px 6px; border-radius:2px; font-size:0.76rem; color:{GRAY}; border:var(--line); background:transparent; }}
+.src b {{ font-weight:600; font-size:0.72rem; }}
+.src.real b, .src.user b {{ color:{GAIN}; }}
+.src.part b, .src.old b, .src.demo b {{ color:{SODIUM}; }} .src.demo {{ border-color:{SODIUM}; color:{TEXT}; }}
+.src.missing b, .src.info b {{ color:{GRAY}; }}
 
-/* Figures: raised tiles lit along the top edge */
-.fig, [data-testid="stMetric"] {{ position:relative; overflow:hidden; border-radius:13px; padding:13px 15px 12px; margin-bottom:0.65rem; min-height:92px;
-  background:var(--plate); box-shadow:var(--raise); }}
-.fig::before, [data-testid="stMetric"]::before {{ content:""; position:absolute; left:0; right:0; top:0; height:3px; background:linear-gradient(90deg, var(--tile, var(--accent)), transparent 85%); }}
-.fig .l, [data-testid="stMetricLabel"] p {{ color:{GRAY}; font-size:0.84rem; line-height:1.3; font-weight:400; }}
-.fig .v, [data-testid="stMetricValue"] {{ color:{TEXT}; font-size:1.5rem; font-weight:600; line-height:1.3; position:relative; }}
-[data-testid="stMetricValue"] > div {{ font-size:1.5rem; }}
-.fig .n {{ color:{GRAY}; font-size:0.8rem; margin-top:1px; line-height:1.35; position:relative; }}
+/* Figures: compact cells, coloured only when the number has a direction */
+.fig, [data-testid="stMetric"] {{ position:relative; overflow:hidden; border:var(--line); border-radius:3px; padding:6px 9px 6px; margin:0; min-height:56px; background:{PANEL}; }}
+.fig[style*="--tile"] {{ border-left:2px solid var(--tile); }}
+.fig .l, [data-testid="stMetricLabel"] p {{ color:{GRAY}; font-size:0.76rem; line-height:1.3; font-weight:400; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.fig .v, [data-testid="stMetricValue"] {{ color:{TEXT}; font-size:1.18rem; font-weight:600; line-height:1.3; position:relative; white-space:nowrap; }}
+[data-testid="stMetricValue"] > div {{ font-size:1.18rem; }}
+.fig .n {{ color:{GRAY}; font-size:0.74rem; line-height:1.3; position:relative; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
 .fig .v.gain {{ color:{GAIN}; }} .fig .v.loss {{ color:{LOSS}; }}
-.fig svg.spark {{ position:absolute; right:0; bottom:0; width:48%; height:38px; opacity:0.92; pointer-events:none; }}
-.fig .meter {{ height:7px; border-radius:6px; margin-top:8px; background:rgba(4,17,24,0.6); box-shadow:var(--well); overflow:hidden; }}
-.fig .meter i {{ display:block; height:100%; border-radius:6px; background:linear-gradient(90deg, color-mix(in srgb, var(--tile) 62%, black), var(--tile)); box-shadow:0 0 10px var(--tile); }}
+.fig svg.spark {{ position:absolute; right:6px; top:8px; width:38%; height:26px; opacity:0.9; pointer-events:none; }}
+.fig .meter {{ height:3px; margin-top:5px; background:{BORDER}; overflow:hidden; }}
+.fig .meter i {{ display:block; height:100%; background:var(--tile, {ACCENT}); }}
 
 /* Charts and tables */
-[data-testid="stPlotlyChart"] {{ background:var(--plate); border-radius:15px; box-shadow:var(--raise); overflow:hidden; }}
-[data-testid="stDataFrame"] {{ border-radius:12px; box-shadow:0 8px 20px rgba(2,12,18,0.36); }}
+[data-testid="stPlotlyChart"] {{ background:{PANEL}; border:var(--line); border-radius:3px; overflow:hidden; }}
+[data-testid="stDataFrame"] {{ border:var(--line); border-radius:3px; }}
 
 /* Sidebar */
-section[data-testid="stSidebar"] {{ width:256px !important; border-right:1px solid rgba(255,255,255,0.05);
-  background:linear-gradient(180deg, #17394A 0%, #102B38 55%, #0C232E 100%); box-shadow:6px 0 22px rgba(2,12,18,0.40); }}
+section[data-testid="stSidebar"] {{ width:204px !important; border-right:var(--line); background:#0A0D10; }}
 section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {{ padding:0 !important; background:none; }}
-section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{ padding:0 12px 24px !important; margin:0 !important; }}
-[data-testid="stSidebarHeader"] {{ padding:12px 12px 2px; }}
-.brand {{ display:flex; align-items:center; gap:11px; padding:0 4px; }}
-.brand .mark {{ flex:none; width:40px; height:40px; border-radius:11px; display:flex; align-items:center; justify-content:center; color:#14262C;
-  background:linear-gradient(150deg, #FFE08A 0%, {SODIUM} 58%, #C98A16 100%); box-shadow:inset 0 1px 0 rgba(255,255,255,0.55), inset 0 -2px 0 rgba(0,0,0,0.16), 0 6px 16px rgba(247,188,69,0.32); }}
-.brand .mark span {{ font-family:'Material Symbols Rounded'; font-size:25px; line-height:1; }}
-.brand .name {{ font-family:{NOTE_FONT}; font-size:1.42rem; font-weight:500; color:{TEXT}; line-height:1.05; }}
-.brand small {{ display:block; font-family:{UI_FONT}; font-size:0.74rem; font-weight:400; color:{GRAY}; margin-top:3px; }}
+section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{ padding:0 8px 14px !important; margin:0 !important; }}
+section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {{ gap:0.35rem; }}
+[data-testid="stSidebarHeader"] {{ padding:6px 8px 0; min-height:0; height:1.6rem; }}
+.brand {{ display:flex; align-items:baseline; gap:8px; padding:0 6px 4px; border-bottom:var(--line); }}
+.brand .mark {{ display:none; }}
+.brand .name {{ font-size:0.98rem; font-weight:600; color:{TEXT}; letter-spacing:0.02em; line-height:1.3; }}
+.brand small {{ display:block; font-size:0.72rem; font-weight:400; color:{GRAY}; margin-top:1px; }}
 section[data-testid="stSidebar"] [data-testid="stRadio"], section[data-testid="stSidebar"] [data-testid="stRadio"] > div, section[data-testid="stSidebar"] [role="radiogroup"] {{ width:100% !important; }}
-section[data-testid="stSidebar"] [data-testid="stRadio"] [data-testid="stWidgetLabel"] p {{ color:var(--sec); font-size:0.8rem; font-weight:600; padding:0 8px; margin-top:6px; }}
-section[data-testid="stSidebar"] [role="radiogroup"] {{ gap:2px; flex-direction:column; }}
+section[data-testid="stSidebar"] [data-testid="stRadio"] [data-testid="stWidgetLabel"] p {{ color:{GRAY}; font-size:0.72rem; font-weight:500; padding:0 6px; margin-top:2px; }}
+section[data-testid="stSidebar"] [role="radiogroup"] {{ gap:0; flex-direction:column; }}
 section[data-testid="stSidebar"] [role="radiogroup"] > div {{ width:100%; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"] {{ width:100% !important; box-sizing:border-box; margin:0; padding:5px 8px; border-radius:8px; cursor:pointer; display:block; transition:background 120ms ease; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"] > div > div:first-child {{ display:none; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"] p {{ font-size:0.93rem; color:{TEXT}; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"] [role="img"] {{ color:{GRAY}; margin-right:4px; font-size:1.05rem !important; vertical-align:-3px; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"]:hover {{ background:rgba(255,255,255,0.06); }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] {{
-  background:linear-gradient(95deg, color-mix(in srgb, var(--sec) 30%, transparent), color-mix(in srgb, var(--sec) 9%, transparent));
-  box-shadow:inset 3px 0 0 var(--sec), inset 0 1px 0 rgba(255,255,255,0.09), 0 4px 10px rgba(2,12,18,0.34); }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] p {{ font-weight:600; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] [role="img"] {{ color:var(--sec); }}
-.side-foot {{ color:{GRAY}; font-size:0.8rem; line-height:1.5; padding:0 8px; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"], section[data-testid="stSidebar"] label[data-baseweb="radio"] {{ width:100% !important; box-sizing:border-box; margin:0; padding:2px 6px; border-radius:2px; cursor:pointer; display:block; border-left:2px solid transparent; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"] > div > div:first-child, section[data-testid="stSidebar"] label[data-baseweb="radio"] > div:first-child {{ display:none; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"] p, section[data-testid="stSidebar"] label[data-baseweb="radio"] p {{ font-size:0.84rem; color:{TEXT}; line-height:1.5; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"] [role="img"], section[data-testid="stSidebar"] label[data-baseweb="radio"] [role="img"] {{ display:none; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"]:hover, section[data-testid="stSidebar"] label[data-baseweb="radio"]:hover {{ background:{PANEL}; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"], section[data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) {{ background:{PANEL_SOFT}; border-left-color:{ACCENT}; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] p, section[data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) p {{ font-weight:600; }}
+.side-foot {{ color:{GRAY}; font-size:0.74rem; line-height:1.4; padding:0 6px; }}
 .side-foot b {{ color:{TEXT}; font-weight:500; }}
-section[data-testid="stSidebar"] label[data-baseweb="radio"] {{ width:100% !important; margin:0; padding:5px 8px; border-radius:8px; }}
-section[data-testid="stSidebar"] label[data-baseweb="radio"] > div:first-child {{ display:none; }}
-section[data-testid="stSidebar"] label[data-baseweb="radio"]:hover {{ background:rgba(255,255,255,0.06); }}
-section[data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) {{ background:linear-gradient(95deg, color-mix(in srgb, var(--sec) 30%, transparent), color-mix(in srgb, var(--sec) 9%, transparent)); box-shadow:inset 3px 0 0 var(--sec), 0 4px 10px rgba(2,12,18,0.34); }}
-{_NAV_SECTION_CSS}
 
-/* Views: a recessed tray with a raised active key */
-[class*="st-key-tabs_view_"] [role="radiogroup"] {{ gap:3px; padding:4px; border-radius:11px; width:fit-content; max-width:100%; flex-wrap:wrap; background:rgba(4,17,24,0.5); box-shadow:var(--well); }}
-[class*="st-key-tabs_view_"] [data-testid="stRadioOption"], [class*="st-key-tabs_view_"] label[data-baseweb="radio"] {{ margin:0; padding:7px 14px; border-radius:8px; cursor:pointer; transition:background 120ms ease; }}
+/* Views: underlined tabs */
+[class*="st-key-tabs_view_"] [role="radiogroup"] {{ gap:0; padding:0; width:100%; flex-wrap:wrap; border-bottom:var(--line); }}
+[class*="st-key-tabs_view_"] [data-testid="stRadioOption"], [class*="st-key-tabs_view_"] label[data-baseweb="radio"] {{ margin:0 0 -1px; padding:4px 12px; border-radius:0; cursor:pointer; border-bottom:2px solid transparent; }}
 [class*="st-key-tabs_view_"] [data-testid="stRadioOption"] > div > div:first-child, [class*="st-key-tabs_view_"] label[data-baseweb="radio"] > div:first-child {{ display:none; }}
-[class*="st-key-tabs_view_"] [data-testid="stRadioOption"] p, [class*="st-key-tabs_view_"] label[data-baseweb="radio"] p {{ font-size:0.93rem; color:{GRAY}; }}
-[class*="st-key-tabs_view_"] [data-testid="stRadioOption"]:hover, [class*="st-key-tabs_view_"] label[data-baseweb="radio"]:hover {{ background:rgba(255,255,255,0.05); }}
-[class*="st-key-tabs_view_"] [data-testid="stRadioOption"][data-selected="true"], [class*="st-key-tabs_view_"] label[data-baseweb="radio"]:has(input:checked) {{ background:linear-gradient(170deg, {PLATE_HI}, {PANEL}); box-shadow:var(--raise-small), inset 0 -2px 0 var(--accent); }}
+[class*="st-key-tabs_view_"] [data-testid="stRadioOption"] p, [class*="st-key-tabs_view_"] label[data-baseweb="radio"] p {{ font-size:0.86rem; color:{GRAY}; }}
+[class*="st-key-tabs_view_"] [data-testid="stRadioOption"]:hover p, [class*="st-key-tabs_view_"] label[data-baseweb="radio"]:hover p {{ color:{TEXT}; }}
+[class*="st-key-tabs_view_"] [data-testid="stRadioOption"][data-selected="true"], [class*="st-key-tabs_view_"] label[data-baseweb="radio"]:has(input:checked) {{ border-bottom-color:{ACCENT}; }}
 [class*="st-key-tabs_view_"] [data-testid="stRadioOption"][data-selected="true"] p, [class*="st-key-tabs_view_"] label[data-baseweb="radio"]:has(input:checked) p {{ color:{TEXT}; font-weight:600; }}
+[data-baseweb="tab-list"] {{ gap:0; border-bottom:var(--line); }}
+[data-baseweb="tab"] {{ padding:4px 12px; height:auto; }}
+[data-baseweb="tab"] p {{ font-size:0.86rem; }}
 
-/* Controls: buttons stand proud and press in, fields sit in wells */
-.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button {{ border-radius:9px; border:0; color:{TEXT}; font-weight:600; min-height:2.5rem;
-  background:linear-gradient(170deg, {PANEL_SOFT}, {PANEL}); box-shadow:var(--raise-small); transition:transform 90ms ease, box-shadow 90ms ease, filter 120ms ease; }}
-.stButton > button:hover, .stDownloadButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {{ color:{TEXT}; filter:brightness(1.16); }}
-.stButton > button:active, .stDownloadButton > button:active, [data-testid="stFormSubmitButton"] > button:active {{ transform:translateY(1px); box-shadow:var(--well); }}
-.stButton > button[kind="primary"], [data-testid="stFormSubmitButton"] > button[kind^="primary"], [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] {{ color:#14262C;
-  background:linear-gradient(170deg, #FFD97A 0%, {SODIUM} 55%, #DD9C22 100%);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,0.5), inset 0 -2px 0 rgba(0,0,0,0.14), 0 7px 16px rgba(247,188,69,0.30); }}
-.stButton > button[kind="primary"]:hover, [data-testid="stFormSubmitButton"] > button[kind^="primary"]:hover, [data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primaryFormSubmit"]:hover {{ color:#14262C; filter:brightness(1.07); }}
-.stButton > button[kind="primary"] p, [data-testid="stBaseButton-primary"] p, [data-testid="stBaseButton-primaryFormSubmit"] p {{ color:#14262C; }}
-[data-testid="stSelectbox"] [role="group"], [data-testid="stMultiSelect"] [role="group"], [data-testid="stTextInputRootElement"], [data-testid="stDateInput"] [role="group"], [data-baseweb="select"] > div, [data-baseweb="input"], [data-baseweb="base-input"], .stTextArea textarea, [data-testid="stNumberInputContainer"] {{ background:rgba(5,20,27,0.46) !important; border-color:rgba(255,255,255,0.06) !important; border-radius:9px; box-shadow:var(--well); }}
-[data-testid="stWidgetLabel"] p {{ color:{GRAY}; font-size:0.86rem; }}
+/* Controls: flat, compact, outlined */
+.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button {{ border-radius:3px; border:var(--line); color:{TEXT}; font-weight:500; min-height:1.85rem; padding:0.1rem 0.7rem; background:{PANEL_SOFT}; box-shadow:none; }}
+.stButton > button p, .stDownloadButton > button p {{ font-size:0.84rem; }}
+.stButton > button:hover, .stDownloadButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {{ color:{TEXT}; border-color:{GRAY}; }}
+.stButton > button[kind="primary"], [data-testid="stFormSubmitButton"] > button[kind^="primary"], [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] {{ color:#08131D; background:{ACCENT}; border-color:{ACCENT}; }}
+.stButton > button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primaryFormSubmit"]:hover {{ color:#08131D; filter:brightness(1.1); }}
+.stButton > button[kind="primary"] p, [data-testid="stBaseButton-primary"] p, [data-testid="stBaseButton-primaryFormSubmit"] p {{ color:#08131D; font-weight:600; }}
+[data-testid="stSelectbox"] [role="group"], [data-testid="stMultiSelect"] [role="group"], [data-testid="stTextInputRootElement"], [data-testid="stDateInput"] [role="group"], [data-baseweb="select"] > div, [data-baseweb="input"], [data-baseweb="base-input"], .stTextArea textarea, [data-testid="stNumberInputContainer"] {{ background:{BG} !important; border-color:{BORDER} !important; border-radius:3px; box-shadow:none; min-height:1.85rem; }}
+[data-baseweb="select"] > div {{ min-height:1.85rem; font-size:0.86rem; }}
+[data-baseweb="select"] [data-baseweb="tag"] {{ height:1.3rem; margin:1px 3px 1px 0; }}
+[data-baseweb="select"] [data-baseweb="tag"] span {{ font-size:0.8rem; }}
+section[data-testid="stSidebar"] .stButton > button {{ min-height:1.9rem; }}
+[data-testid="stNumberInputContainer"] input, [data-testid="stTextInputRootElement"] input, [data-testid="stDateInput"] input {{ padding:0.15rem 0.5rem; font-size:0.86rem; min-height:1.75rem; }}
+[data-testid="stNumberInputContainer"] button {{ width:1.6rem; }}
+[data-testid="stWidgetLabel"] p {{ color:{GRAY}; font-size:0.76rem; }}
+[data-testid="stWidgetLabel"] {{ min-height:0; margin-bottom:1px; }}
 [data-testid="stTextInputRootElement"] input, [data-testid="stSelectbox"] input, [data-testid="stNumberInputContainer"] input, [data-testid="stDateInput"] input {{ background:transparent !important; }}
-[data-tag], [data-baseweb="tag"] {{ background:linear-gradient(170deg, {PANEL_SOFT}, {PANEL}) !important; box-shadow:var(--raise-small); }}
+[data-testid="stCheckbox"] p {{ font-size:0.82rem; }}
+[data-tag], [data-baseweb="tag"] {{ background:{PANEL_SOFT} !important; border-radius:2px !important; }}
 [data-tag] span, [data-tag] button, [data-baseweb="tag"] span, [data-baseweb="tag"] svg {{ color:{TEXT} !important; fill:{TEXT}; }}
 
 /* Panels and notes */
-.st-key-panel {{ padding:16px 18px 6px; border-radius:15px; background:var(--plate); box-shadow:var(--raise); margin-bottom:0.8rem; }}
-[data-testid="stExpander"] details {{ border:0; border-radius:12px; background:var(--plate); box-shadow:var(--raise); }}
-[data-testid="stExpander"] summary {{ padding:0.6rem 0.9rem; }}
-[data-testid="stExpander"] summary:hover {{ color:var(--accent); }}
-[data-testid="stAlertContainer"] {{ border-radius:11px; border:0; color:{TEXT} !important; background:{PANEL} !important; box-shadow:var(--raise-small); }}
-[data-testid="stAlertContainer"] p {{ color:{TEXT}; }}
-[data-testid="stAlertContainer"]:has([data-testid="stAlertContentWarning"]) {{ background:linear-gradient(95deg, rgba(247,188,69,0.24), rgba(247,188,69,0.07)) !important; box-shadow:inset 3px 0 0 {SODIUM}, var(--raise-small); }}
-[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]) {{ background:linear-gradient(95deg, rgba(79,179,246,0.24), rgba(79,179,246,0.07)) !important; box-shadow:inset 3px 0 0 #4FB3F6, var(--raise-small); }}
-[data-testid="stAlertContainer"]:has([data-testid="stAlertContentError"]) {{ background:linear-gradient(95deg, rgba(255,143,126,0.26), rgba(255,143,126,0.07)) !important; box-shadow:inset 3px 0 0 {LOSS}, var(--raise-small); }}
-[data-testid="stAlertContainer"]:has([data-testid="stAlertContentSuccess"]) {{ background:linear-gradient(95deg, rgba(94,224,168,0.22), rgba(94,224,168,0.06)) !important; box-shadow:inset 3px 0 0 {GAIN}, var(--raise-small); }}
-[data-testid="stVerticalBlockBorderWrapper"] {{ border-color:rgba(255,255,255,0.07); }}
+.st-key-panel {{ padding:8px 10px 4px; border:var(--line); border-radius:3px; background:{PANEL}; }}
+[data-testid="stExpander"] details {{ border:var(--line); border-radius:3px; background:{PANEL}; }}
+[data-testid="stExpander"] summary {{ padding:0.3rem 0.6rem; min-height:0; }}
+[data-testid="stExpander"] summary p {{ font-size:0.84rem; color:{GRAY}; }}
+[data-testid="stExpander"] summary:hover p {{ color:{TEXT}; }}
+[data-testid="stAlertContainer"] {{ border-radius:3px; border:var(--line); border-left:2px solid {GRAY}; color:{TEXT} !important; background:{PANEL} !important; padding:6px 10px; min-height:0; }}
+[data-testid="stAlertContainer"] p {{ color:{TEXT}; font-size:0.86rem; }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentWarning"]) {{ border-left-color:{SODIUM}; }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]) {{ border-left-color:{ACCENT}; }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentError"]) {{ border-left-color:{LOSS}; }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentSuccess"]) {{ border-left-color:{GAIN}; }}
+[data-testid="stVerticalBlockBorderWrapper"] {{ border-color:{BORDER}; border-radius:3px; }}
+[data-testid="stProgress"] > div > div {{ height:3px; }}
 
 /* Quote ticket */
-.st-key-ticket {{ position:relative; overflow:hidden; padding:20px 22px; border-radius:16px; box-shadow:var(--raise);
-  background:radial-gradient(420px 200px at 100% 0%, rgba(247,188,69,0.22), transparent 70%), var(--plate); }}
-.st-key-ticket::before {{ content:""; position:absolute; left:0; right:0; top:0; height:3px; background:linear-gradient(90deg, {SODIUM}, transparent 90%); }}
-.ticket-price {{ font-family:{NOTE_FONT}; font-size:2.9rem; line-height:1.1; font-weight:500; margin:0.15rem 0 0.1rem; color:#FFD97A; text-shadow:0 0 26px rgba(247,188,69,0.36); }}
-.ticket-unit {{ color:{GRAY}; font-size:0.9rem; margin-bottom:0.9rem; }}
-.ticket-row {{ display:flex; justify-content:space-between; gap:18px; padding:6px 0; border-top:1px solid rgba(255,255,255,0.08); font-size:0.94rem; }}
+.st-key-ticket {{ padding:10px 12px; border:var(--line); border-top:2px solid {ACCENT}; border-radius:3px; background:{PANEL}; }}
+.ticket-price {{ font-size:1.9rem; line-height:1.15; font-weight:600; margin:0.1rem 0 0; color:{TEXT}; }}
+.ticket-unit {{ color:{GRAY}; font-size:0.8rem; margin-bottom:0.5rem; }}
+.ticket-row {{ display:flex; justify-content:space-between; gap:18px; padding:3px 0; border-top:var(--line); font-size:0.86rem; }}
 .ticket-row span:first-child {{ color:{GRAY}; }}
 
 /* Market Read */
-.dial {{ position:relative; overflow:hidden; border-radius:16px; padding:17px 19px 15px; margin-bottom:0.8rem; min-height:206px; box-shadow:var(--raise);
-  background:radial-gradient(420px 170px at 100% 0%, color-mix(in srgb, var(--accent) 20%, transparent), transparent 72%), var(--plate); }}
+.dial {{ border:var(--line); border-radius:3px; padding:9px 11px 8px; margin:0; min-height:150px; background:{PANEL}; }}
 .dial-top {{ display:flex; justify-content:space-between; align-items:center; gap:10px; }}
-.dial-name {{ color:{GRAY}; font-size:0.92rem; }}
-.dial-verdict {{ font-family:{NOTE_FONT}; font-size:1.95rem; font-weight:500; line-height:1.15; margin:0.5rem 0 0.75rem; color:{TEXT}; }}
+.dial-name {{ color:{GRAY}; font-size:0.8rem; }}
+.dial-verdict {{ font-size:1.18rem; font-weight:600; line-height:1.25; margin:0.25rem 0 0.5rem; color:{TEXT}; }}
 .dial-verdict.gain {{ color:{GAIN}; }} .dial-verdict.loss {{ color:{LOSS}; }}
-.scale {{ position:relative; height:12px; margin:0 8px; }}
-.scale .track {{ position:absolute; left:-8px; right:-8px; top:2px; height:8px; border-radius:6px; box-shadow:var(--well); background:linear-gradient(90deg, {LOSS} 0%, #4A5F66 50%, {GAIN} 100%); }}
-.scale .knob {{ position:absolute; top:-4px; width:20px; height:20px; margin-left:-10px; border-radius:50%; background:linear-gradient(160deg, #FFFFFF, #B9C9CC); box-shadow:inset 0 -2px 2px rgba(0,0,0,0.22), 0 3px 8px rgba(2,12,18,0.6); }}
-.scale-ends {{ display:flex; justify-content:space-between; color:{GRAY}; font-size:0.76rem; margin-top:7px; }}
-.dial-line {{ color:#C2D3D5; font-size:0.86rem; line-height:1.4; margin-top:0.55rem; }}
-.ev {{ display:flex; gap:22px; justify-content:space-between; align-items:center; padding:13px 17px; margin-bottom:9px; border-radius:12px; background:var(--plate); box-shadow:var(--raise-small); }}
+.scale {{ position:relative; height:8px; margin:0 6px; }}
+.scale .track {{ position:absolute; left:-6px; right:-6px; top:3px; height:2px; background:linear-gradient(90deg, {LOSS} 0%, {BORDER} 50%, {GAIN} 100%); }}
+.scale .knob {{ position:absolute; top:-2px; width:3px; height:12px; margin-left:-1px; border-radius:1px; background:{TEXT}; }}
+.scale-ends {{ display:flex; justify-content:space-between; color:{GRAY}; font-size:0.72rem; margin-top:5px; }}
+.dial-line {{ color:{GRAY}; font-size:0.8rem; line-height:1.35; margin-top:0.35rem; }}
+.ev {{ display:flex; gap:16px; justify-content:space-between; align-items:center; padding:5px 9px; margin:0 0 -1px; border:var(--line); background:{PANEL}; }}
 .ev-main {{ min-width:0; flex:1; }}
-.ev-name {{ font-weight:600; font-size:0.96rem; }}
-.ev-value {{ color:{TEXT}; font-size:0.93rem; margin-top:2px; line-height:1.4; }}
-.ev-why {{ color:{GRAY}; font-size:0.84rem; margin-top:2px; line-height:1.4; }}
-.ev-side {{ flex:none; width:170px; }}
-.ev-tag {{ text-align:right; font-size:0.84rem; font-weight:600; margin-bottom:6px; color:{GRAY}; }}
+.ev-name {{ font-weight:600; font-size:0.86rem; }}
+.ev-value {{ color:{TEXT}; font-size:0.84rem; line-height:1.35; }}
+.ev-why {{ color:{GRAY}; font-size:0.78rem; line-height:1.35; }}
+.ev-side {{ flex:none; width:150px; }}
+.ev-tag {{ text-align:right; font-size:0.78rem; font-weight:600; margin-bottom:4px; color:{GRAY}; }}
 .ev-tag.gain {{ color:{GAIN}; }} .ev-tag.loss {{ color:{LOSS}; }}
-.ev-bar {{ position:relative; height:8px; border-radius:5px; background:rgba(4,17,24,0.6); box-shadow:var(--well); }}
+.ev-bar {{ position:relative; height:4px; background:{BORDER}; }}
 .ev-bar::after {{ content:""; position:absolute; left:50%; top:-2px; bottom:-2px; width:1px; background:{GRAY}; }}
-.ev-bar i {{ position:absolute; top:0; bottom:0; border-radius:5px; background:{GRAY}; }}
+.ev-bar i {{ position:absolute; top:0; bottom:0; background:{GRAY}; }}
 .ev-bar i.gain {{ background:{GAIN}; }} .ev-bar i.loss {{ background:{LOSS}; }}
-.flip {{ padding:9px 0; border-top:1px solid rgba(255,255,255,0.08); font-size:0.92rem; line-height:1.45; }}
+.flip {{ padding:4px 0; border-top:var(--line); font-size:0.86rem; line-height:1.4; }}
 .flip b {{ font-weight:600; }}
 
 @media (prefers-reduced-motion: reduce) {{ * {{ transition:none !important; }} }}
 @media (max-width: 720px) {{
-  [data-testid="stMainBlockContainer"] {{ padding:3rem 1rem 2.5rem; }}
-  .stApp h1.page-title {{ font-size:1.65rem; }}
-  .head-icon {{ width:44px; height:44px; }}
-  .desk-note {{ font-size:1.2rem; }}
-  .st-key-hero, .st-key-page_head {{ padding:15px; }}
-  .ev {{ flex-direction:column; align-items:stretch; gap:10px; }}
+  [data-testid="stMainBlockContainer"] {{ padding:2.6rem 0.6rem 2rem; }}
+  .ev {{ flex-direction:column; align-items:stretch; gap:6px; }}
   .ev-side {{ width:100%; }}
 }}
 </style>
@@ -6175,13 +6157,15 @@ def _styled(fig: go.Figure, height: Optional[int] = None) -> go.Figure:
     resolved_height = height or fig.layout.height or 360
     has_title = bool(fig.layout.title and fig.layout.title.text)
     # Set here as well as in the template: Streamlit fills any background the figure itself leaves blank.
-    fig.update_layout(template="meridian", height=resolved_height, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      margin=dict(l=18, r=20, t=70 if has_title else 34, b=14),
+    fig.update_layout(template="meridian_desk", height=resolved_height, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      margin=dict(l=10, r=8, t=52 if has_title else 26, b=8),
                       hovermode=fig.layout.hovermode or ("x unified" if any(t.type == "scatter" and "lines" in str(t.mode) for t in fig.data) else "closest"))
     if fig.layout.title and fig.layout.title.text:
-        fig.update_layout(title=dict(x=0.015, xanchor="left", xref="container", y=0.975, yanchor="top", font=dict(size=14, color=TEXT, weight=600)))
-    fig.update_xaxes(title_font=dict(size=12, color=GRAY))
-    fig.update_yaxes(title_font=dict(size=12, color=GRAY))
+        fig.update_layout(title=dict(x=0.012, xanchor="left", xref="container", y=0.975, yanchor="top", font=dict(size=12, color=TEXT, weight=600)))
+    fig.update_xaxes(title_font=dict(size=11, color=GRAY))
+    fig.update_yaxes(title_font=dict(size=11, color=GRAY))
+    if any((trace.type == "bar" and trace.orientation == "h") or trace.type == "heatmap" for trace in fig.data):
+        fig.update_yaxes(side="left")      # category names read from the left, clear of any colour scale
     for trace in fig.data:
         name = str(getattr(trace, "name", "") or "")
         color = ENTITY_COLORS.get(name)
@@ -6192,11 +6176,11 @@ def _styled(fig: go.Figure, height: Optional[int] = None) -> go.Figure:
             if "lines" in str(trace.mode):
                 if points > 48 and "markers" in str(trace.mode):
                     trace.mode = "lines"
-                if trace.line.width is None:
-                    trace.line.width = 2
+                if trace.line.width is None or trace.line.width > 1.6:
+                    trace.line.width = 1.6
             if "markers" in str(trace.mode):
-                trace.marker.size = trace.marker.size or 8
-                trace.marker.line = dict(width=2, color=PANEL)
+                trace.marker.size = trace.marker.size if trace.marker.size and "lines" not in str(trace.mode) else 5
+                trace.marker.line = dict(width=1, color=PANEL)
             if color:
                 if "lines" in str(trace.mode):
                     trace.line.color = color
@@ -6205,7 +6189,6 @@ def _styled(fig: go.Figure, height: Optional[int] = None) -> go.Figure:
             if color:
                 trace.marker.color = color
             trace.marker.line = dict(width=0)
-    _add_line_glow(fig)
     return fig
 
 
@@ -6225,24 +6208,6 @@ def _thin_line(trace) -> None:
     trace.x, trace.y = x[index], y[index]
 
 
-def _add_line_glow(fig: go.Figure) -> None:
-    """Lay a soft, wide stroke under each line so it lifts off the plate. Purely visual."""
-    glows = []
-    for index, trace in enumerate(fig.data):
-        if trace.type != "scatter" or "lines" not in str(trace.mode) or trace.fill not in (None, "none"):
-            continue
-        if trace.line.dash not in (None, "solid") or trace.line.width == 0 or trace.x is None or len(trace.x) > 800:
-            continue
-        color = trace.line.color or SERIES[index % len(SERIES)]
-        trace.line.color = color
-        glows.append(go.Scatter(x=trace.x, y=trace.y, mode="lines", line=dict(color=color, width=7), opacity=0.17,
-                                hoverinfo="skip", showlegend=False, xaxis=trace.xaxis, yaxis=trace.yaxis))
-    if glows:
-        original = len(fig.data)
-        fig.add_traces(glows)
-        fig.data = tuple(fig.data[original:]) + tuple(fig.data[:original])
-
-
 def chart(fig: go.Figure, height: Optional[int] = None) -> None:
     # Early 1.5x releases size charts with use_container_width instead of width.
     sizing = {"width": "stretch"} if "width" in inspect.signature(st.plotly_chart).parameters else {"use_container_width": True}
@@ -6260,8 +6225,12 @@ def _pretty_column(name: object) -> str:
     return text[:1].upper() + text[1:]
 
 
+_DIRECTION_WORDS = ("change", "chg", "p&l", "pnl", "move", "mtm", "gain", "margin", "vs ", "gap", "miss", "difference", "delta", "cash", "drift")
+
+
 def table(frame: pd.DataFrame, height: Optional[int] = None, **_ignored) -> None:
-    """House table: readable headers, thousands separators, internal columns hidden."""
+    """House table: dense rows, readable headers, thousands separators, internal columns hidden.
+    Numbers in columns that measure a change are green when positive and red when negative."""
     if not isinstance(frame, pd.DataFrame):
         frame = pd.DataFrame(frame)
     if len(frame) > MAX_TABLE_ROWS:
@@ -6278,13 +6247,21 @@ def table(frame: pd.DataFrame, height: Optional[int] = None, **_ignored) -> None
     display = frame[visible].copy()
     for column in display.columns:
         if pd.api.types.is_float_dtype(display[column]):
-            display[column] = display[column].round(2 if display[column].abs().max() >= 100 else 3)
+            display[column] = display[column].round(4 if display[column].abs().max() < 1 else 2)
         elif display[column].dtype == object:
             display[column] = display[column].map(lambda v: v.isoformat() if isinstance(v, (date, datetime)) else v)
+    directional = [c for c in display.columns if pd.api.types.is_numeric_dtype(display[c]) and not pd.api.types.is_bool_dtype(display[c])
+                   and any(word in str(c).lower() for word in _DIRECTION_WORDS) and (display[c] < 0).any()]
+    shown = display
+    if directional and display.columns.is_unique and len(display) <= 600:
+        tint = lambda v: f"color:{GAIN}" if isinstance(v, (int, float)) and v > 0 else f"color:{LOSS}" if isinstance(v, (int, float)) and v < 0 else ""
+        shown = display.style.map(tint, subset=directional).format({c: "{:,.2f}" for c in directional if pd.api.types.is_float_dtype(display[c])})
     arguments = {"width": "stretch", "hide_index": True, "column_config": config}
+    if "row_height" in inspect.signature(st.dataframe).parameters:
+        arguments["row_height"] = TABLE_ROW_HEIGHT
     if height:
         arguments["height"] = height
-    st.dataframe(display, **arguments)
+    st.dataframe(shown, **arguments)
 
 
 def fmt_money(value: float, currency: str = "EUR", signed: bool = True, decimals: int = 0) -> str:
@@ -6312,43 +6289,66 @@ def _sparkline(values: Sequence[float], color: str) -> str:
     span = (high - low) or 1.0
     coords = [(i / (len(points) - 1) * 120, 30 - (p - low) / span * 26) for i, p in enumerate(points)]
     line = " ".join(f"{x:.1f},{y:.1f}" for x, y in coords)
-    gradient = "g" + hashlib.sha1(f"{line}{color}".encode()).hexdigest()[:10]
     return (f'<svg class="spark" viewBox="0 0 120 34" preserveAspectRatio="none" aria-hidden="true">'
-            f'<defs><linearGradient id="{gradient}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{color}" stop-opacity="0.34"/>'
-            f'<stop offset="1" stop-color="{color}" stop-opacity="0"/></linearGradient></defs>'
-            f'<polygon points="0,34 {line} 120,34" fill="url(#{gradient})"/>'
-            f'<polyline points="{line}" fill="none" stroke="{color}" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>')
+            f'<polyline points="{line}" fill="none" stroke="{color}" stroke-width="1.2" vector-effect="non-scaling-stroke"/></svg>')
 
 
 def kpi(col, label: str, value: str, sub: str = "", accent: str = "", tone: str = "",
         spark: Optional[Sequence[float]] = None, meter: Optional[float] = None) -> None:
-    """A raised figure tile: label, number, optional note, trend line or fill meter."""
-    color = accent or {"gain": GAIN, "loss": LOSS}.get(tone, "")
+    """A compact figure cell: label, number, optional note, trend line or fill meter.
+    Only a direction colours it: accent colours passed by older callers are ignored, so colour always means up or down."""
+    color = {"gain": GAIN, "loss": LOSS}.get(tone, "")
     tile = f' style="--tile:{color}"' if color else ""
     note = f'<div class="n">{html.escape(sub)}</div>' if sub else ""
-    trend = _sparkline(spark, color or "#4FB3F6") if spark is not None else ""
+    trend = _sparkline(spark, color or GRAY) if spark is not None else ""
     bar = f'<div class="meter"><i style="width:{max(0.0, min(100.0, float(meter))):.1f}%"></i></div>' if meter is not None else ""
     col.markdown(f'<div class="fig"{tile}>{trend}<div class="l">{html.escape(label)}</div>'
                  f'<div class="v {tone}">{html.escape(value)}</div>{note}{bar}</div>', unsafe_allow_html=True)
 
 
+STATUS_SOURCES = (("ENTSO-E", ("entsoe_",), 30.0), ("GIE", ("gie_",), 30.0), ("Open-Meteo", ("weather_", "zone_weather_"), 30.0),
+                  ("TradingView", ("tradingview_",), 3.0), ("EEX", ("eex_",), 80.0))
+
+
+def status_strip_html() -> str:
+    """One line that is always in view: the valuation date, the last update, and whether each source is fresh.
+    Green is fetched within the source's normal rhythm, amber is older than that, grey has never loaded."""
+    now = datetime.now(timezone.utc)
+    live = st.session_state.get("live_data", {})
+    dots = []
+    for name, prefixes, fresh_hours in STATUS_SOURCES:
+        stamps = []
+        for key, item in live.items():
+            if key.startswith(prefixes) and isinstance(item, dict) and item.get("fetched_at"):
+                try:
+                    stamps.append(pd.Timestamp(str(item["fetched_at"])).to_pydatetime())
+                except Exception:
+                    continue
+        if not stamps:
+            dots.append(f'<span class="dot" title="Not loaded"><i></i>{name}</span>')
+            continue
+        newest = max(stamps)
+        newest = newest if newest.tzinfo else newest.replace(tzinfo=timezone.utc)
+        hours = (now - newest).total_seconds() / 3600.0
+        age = f"{int(hours * 60)} min" if hours < 1 else f"{hours:.0f} h" if hours < 48 else f"{hours / 24:.0f} d"
+        dots.append(f'<span class="dot {"good" if hours <= fresh_hours else "warn"}" title="Fetched {age} ago"><i></i>{name} {age}</span>')
+    running = st.session_state.get("update_job")
+    state = "Updating now" if running else "Live prices only" if not fx_rate("allow_demo") else "Demo fill on"
+    return (f'<div class="statusbar"><span>Valuation <b>{valuation_date:%a %d %b %Y}</b></span>{"".join(dots)}<span class="grow"></span>'
+            f'<span class="dot {"warn" if fx_rate("allow_demo") else ""}">{state}</span></div>')
+
+
 def render_header(title: str, subtitle: str) -> None:
-    label = st.session_state.get("nav_page", DEFAULT_NAV_ITEM)
-    icon = label.split("/", 1)[1].split(":", 1)[0] if label.startswith(":material/") else "bolt"
+    st.markdown(status_strip_html(), unsafe_allow_html=True)
     with st.container(key="page_head"):
-        left, right = st.columns([5, 2], vertical_alignment="center")
-        left.markdown(f'<div class="head-row"><div class="head-icon"><span aria-hidden="true">{html.escape(icon)}</span></div>'
-                      f'<div><h1 class="page-title">{html.escape(title)}</h1><p class="page-sub">{html.escape(subtitle)}</p></div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="head-row"><h1 class="page-title">{html.escape(title)}</h1><p class="page-sub">{html.escape(subtitle)}</p></div>', unsafe_allow_html=True)
         sources = page_sources_html(current_page_name())
         if sources:
             st.markdown(sources, unsafe_allow_html=True)
 
 
 def page_accent_css(label: str) -> str:
-    """Set the accent colour for the section the current page belongs to."""
-    for section, items in NAV_SECTIONS.items():
-        if label in items:
-            return f"<style>:root {{ --accent:{SECTION_COLORS[section]}; }}</style>"
+    """One accent throughout: sections are no longer colour-coded."""
     return ""
 
 
@@ -6361,7 +6361,6 @@ def render_next_step(current_page: str) -> None:
     next_page = WORKFLOW_NEXT.get(current_page)
     if not next_page:
         return
-    st.markdown('<div style="height:1.4rem"></div>', unsafe_allow_html=True)
     if st.button(f"Next: {next_page}", key=f"workflow_next_{current_page}"):
         st.session_state["pending_nav_page"] = next_page
         st.rerun()
@@ -7039,7 +7038,7 @@ def update_report() -> str:
     for key, item in sorted(st.session_state.get("live_data", {}).items()):
         frame = item.get("data") if isinstance(item, dict) else None
         if isinstance(frame, pd.DataFrame) and not frame.empty:
-            lines.append(f"  {key}: {len(frame):,} rows, latest {_latest_observation_date(frame) or 'n/a'}, fetched {str(item.get('fetched_at_utc', 'n/a'))[:16]}")
+            lines.append(f"  {key}: {len(frame):,} rows, latest {_latest_observation_date(frame) or 'n/a'}, fetched {str(item.get('fetched_at', 'n/a'))[:16]}")
     marks = st.session_state.get("curve_metadata", {})
     lines += ["", "Forward curves"] + [f"  {product}: {marks[product].get('source_label', 'imported')}, dated {marks[product].get('curve_date', 'n/a')}" if product in marks else f"  {product}: demo prices"
                                       for product in CURVE_PRODUCTS]
@@ -10162,7 +10161,7 @@ def page_power_spot():
         pivot = heat.pivot_table(index="hour", columns="day", values="value", aggfunc="mean")
         limit = float(pivot.abs().quantile(0.98).max()) if pivot.size else 100.0
         fig = go.Figure(go.Heatmap(z=pivot.values, x=[str(d) for d in pivot.columns], y=pivot.index, xgap=1, ygap=1,
-                                   colorscale=[[0, LOSS], [0.5, "#23434E"], [1, SODIUM]], zmid=0, zmin=-limit, zmax=limit,
+                                   colorscale=[[0, LOSS], [0.5, PANEL_SOFT], [1, GAIN]], zmid=0, zmin=-limit, zmax=limit,
                                    colorbar=dict(title="EUR/MWh", thickness=12, outlinewidth=0),
                                    hovertemplate="%{x}, hour %{y}: %{z:.1f} EUR/MWh<extra></extra>"))
         fig.update_layout(title=f"{zone}: price by day and local hour", yaxis_title="Local hour", hovermode="closest")
@@ -10882,7 +10881,7 @@ def _ladder_figure(rows: pd.DataFrame, title: str, limit: float) -> go.Figure:
     pivot = rows.pivot(index="product", columns="delivery_month", values="net_mwh").sort_index()
     pivot = pivot[sorted(pivot.columns)]
     fig = go.Figure(go.Heatmap(z=pivot.values, x=[month_contract_label(m) for m in pivot.columns], y=list(pivot.index), xgap=2, ygap=2,
-                               colorscale=[[0, LOSS], [0.5, "#23434E"], [1, BLUE]], zmid=0, zmin=-limit, zmax=limit,
+                               colorscale=[[0, LOSS], [0.5, PANEL_SOFT], [1, BLUE]], zmid=0, zmin=-limit, zmax=limit,
                                colorbar=dict(title="MWh", thickness=12, outlinewidth=0),
                                hovertemplate="%{y}, %{x}: %{z:,.0f} MWh<extra></extra>"))
     fig.update_layout(title=title, hovermode="closest")
@@ -12671,9 +12670,9 @@ PAGES = {
 
 def _configure_theme() -> None:
     """Set the dark theme from code, so the app needs no config file beside it."""
-    wanted = {"theme.base": "dark", "theme.primaryColor": SODIUM, "theme.backgroundColor": BG,
+    wanted = {"theme.base": "dark", "theme.primaryColor": ACCENT, "theme.backgroundColor": BG,
               "theme.secondaryBackgroundColor": PANEL, "theme.textColor": TEXT, "theme.borderColor": BORDER,
-              "theme.font": "Archivo, sans-serif", "client.toolbarMode": "minimal"}
+              "theme.font": "sans-serif", "client.toolbarMode": "minimal"}
     changed = False
     for option, value in wanted.items():
         try:
