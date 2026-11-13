@@ -3910,6 +3910,736 @@ def plant_option_strip(months: pd.DataFrame, vols: dict, correlations: dict, par
 
 
 # =============================================================================
+# SECTION 2G · FUNDAMENTALS OUTLOOK
+# Wind and solar output from weather, demand, residual load, gas burnt for power,
+# and gas demand in three parts. Every model is a weighted regression, refitted
+# weekly and tested one day at a time on earlier days only.
+# =============================================================================
+FUND_SEA_POINTS = {"France": ((49.9, 0.2), (48.85, -2.55), (47.15, -2.6)),
+                   "Germany-Luxembourg": ((54.0, 6.5), (54.5, 6.6), (54.8, 13.9))}
+# Where the wind farms and solar parks are. Tested on German data from 2022 to 2026, wind from wind-farm locations
+# missed 8.6% a day ahead against 9.3% from points spread evenly, and solar with the parks added 6.9% against 8.5%.
+FUND_WIND_POINTS = {"Germany-Luxembourg": ((49.30, 9.41), (48.82, 8.52), (52.18, 7.38), (53.59, 8.11), (54.68, 9.17), (48.32, 8.19), (51.87, 7.15),
+                                           (51.85, 7.00), (50.07, 6.08), (53.73, 13.34), (53.38, 13.95), (52.12, 12.58), (54.65, 8.88)),
+                    "France": ((44.16, 2.83), (48.38, 5.34), (49.64, 3.86), (48.89, 4.19), (49.98, 0.45))}
+FUND_SOLAR_POINTS = {"Germany-Luxembourg": ((48.12, 9.12), (48.82, 10.07), (48.54, 10.42), (47.68, 10.39), (48.70, 12.38), (54.63, 9.35), (51.52, 6.92),
+                                            (51.55, 6.93), (50.53, 6.57), (50.04, 8.56), (49.79, 6.05), (52.65, 13.69), (53.53, 11.66), (52.64, 14.19), (49.71, 9.47)),
+                     "France": ((49.59, 3.70), (48.79, 5.98), (44.06, -0.01))}
+FUND_WEATHER_VERSION = 2       # past weather kept under an older set of points is fetched again
+FUND_HISTORY_DAYS = 560        # days of output, demand and weather the power models learn from: demand gains from a second summer
+GAS_DEMAND_HISTORY_DAYS = 760  # two winters, so heating is learnt from more than one
+FUND_OUTLOOK_DAYS = 15
+FUND_TEST_DAYS = 180
+FUND_REFIT_EVERY = 7
+FUND_MIN_TRAIN = 90
+FUND_HORIZONS = (1, 3, 7, 14)
+FUND_RANGE = (0.1, 0.9)
+FUND_NUCLEAR_MIN_MW = 500.0
+FUND_MIN_MEMBERS = 5
+# Cut-in, rated and cut-out speed in m/s at 100 m. Tuned on German output: a fleet reaches full output at a lower
+# gridded wind speed than one turbine does, because the gridded speed is an average over a wide area.
+WIND_CURVES = {"land": (2.5, 10.5, 25.0), "sea": (3.0, 12.0, 25.0)}
+FUND_PSR = {"B19": "wind_onshore", "B18": "wind_offshore", "B16": "solar", "B14": "nuclear", "B04": "gas"}
+FUND_SERIES_NAMES = {"wind onshore": "wind_onshore", "wind offshore": "wind_offshore", "solar": "solar", "nuclear": "nuclear", "natural gas": "gas"}
+# Days learnt from, half-life of their weight, days in the level correction, and its limits.
+FUND_MODELS = {"wind": (365, 180, 14, (0.7, 1.4)), "solar": (365, 60, 14, (0.7, 1.4)), "load": (730, 240, 14, (0.9, 1.1)),
+               "gas": (365, 60, 7, (0.6, 1.6)), "small": (730, 180, 14, (0.7, 1.4)), "large": (180, 45, 14, (0.8, 1.25))}
+FUND_LOAD_COLUMNS = ("sat", "sun", "bridge", "after_off", "friday", "year_end", "summer_break", "hdd", "cdd", "cos", "sin", "sat_hdd", "sun_hdd",
+                     "school", "part_hol")
+FUND_SOLAR_COLUMNS = ("solar", "solar_sq", "solar_trend", "solar_temp")
+# Population in millions, to turn holidays in some regions into a share of the country.
+FUND_COUNTRY = {"Germany-Luxembourg": "DE", "France": "FR"}
+FUND_REGION_POPULATION = {
+    "DE": {"BW": 11.3, "BY": 13.4, "BE": 3.8, "BB": 2.6, "HB": 0.7, "HH": 1.9, "HE": 6.4, "MV": 1.6, "NI": 8.1, "NW": 18.1, "RP": 4.2,
+           "SL": 1.0, "SN": 4.1, "ST": 2.2, "SH": 2.9, "TH": 2.1},
+    "FR": {"IF": 12.3, "AR": 8.1, "HF": 6.0, "NA": 6.1, "OC": 6.1, "GE": 5.6, "PC": 5.1, "PL": 3.9, "BT": 3.4, "NO": 3.3, "BF": 2.8, "CV": 2.6, "CO": 0.35}}
+FUND_SCHOOL_ZONES = {"ZA": ("AR", "BF", "NA"), "ZB": ("BT", "CV", "GE", "HF", "NO", "PC", "PL"), "ZC": ("IF", "OC")}
+# French nuclear output ahead from announced outages. Fitted on 2021-2022 and tested on 2023 to January 2025 against the
+# notices as they stood each day: output = last week's average + k x the announced change in availability + a lead-time
+# shift (notices are optimistic: units come back late and new faults appear) + a weekend term. By days after the last known day.
+FUND_NUCLEAR_FIT = {"France": {"k": (0.88, 0.84, 0.81, 0.80, 0.78, 0.77, 0.76, 0.75, 0.75, 0.74, 0.74, 0.73, 0.73, 0.72),
+                               "shift": (41, -520, -848, -1081, -1261, -1409, -1533, -1641, -1737, -1822, -1899, -1969, -2034, -2094),
+                               "weekend": -1051.0}}
+GAS_PER_POWER_LIMITS = (1.2, 3.0)   # GWh of gas per GWh of gas-fired power: plant efficiencies of 83% down to 33%
+FUND_LABELS = {"wind": "Wind", "solar": "Solar", "load": "Demand", "residual": "Residual load", "gas": "Gas-fired output", "nuclear": "Nuclear"}
+
+
+def wind_power_index(speed_kmh, kind: str = "land") -> np.ndarray:
+    """Share of full output at a 100 m wind speed: nothing below cut-in, a cubic rise to rated, nothing in a storm."""
+    cut_in, rated, cut_out = WIND_CURVES[kind]
+    speed = np.asarray(speed_kmh, float) / 3.6
+    share = np.clip((speed ** 3 - cut_in ** 3) / (rated ** 3 - cut_in ** 3), 0.0, 1.0)
+    return np.where(speed >= cut_out, 0.0, share)
+
+
+def daily_from_entsoe(frame: Optional[pd.DataFrame], zone: str, single: str = "") -> pd.DataFrame:
+    """Daily average MW by series over the zone's local days. A day counts only with at least 20 of its hours."""
+    columns = ["date", "series", "value", "hours"]
+    if frame is None or frame.empty or not {"timestamp", "value"} <= set(frame.columns):
+        return pd.DataFrame(columns=columns)
+    data = pd.DataFrame({"hour": pd.to_datetime(frame["timestamp"], errors="coerce", utc=True).dt.floor("h"), "value": pd.to_numeric(frame["value"], errors="coerce")})
+    # Names are matched whole, so the "(consumption)" side of pumped storage and batteries is left out.
+    data["series"] = single if single or "series" not in frame.columns else frame["series"].astype(str).str.casefold().map(FUND_SERIES_NAMES).to_numpy()
+    data = data.dropna()
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    hourly = data.groupby(["series", "hour"], as_index=False)["value"].mean()
+    hourly["date"] = hourly["hour"].dt.tz_convert(ENTSOE_ZONES[zone]["timezone"]).dt.tz_localize(None).dt.normalize()
+    daily = hourly.groupby(["date", "series"])["value"].agg(value="mean", hours="count").reset_index()
+    return daily.loc[daily["hours"] >= 20, columns].reset_index(drop=True)
+
+
+FUND_KEEP_DAYS = FUND_HISTORY_DAYS + 30
+
+
+def fund_daily_rows(summary: Optional[pd.DataFrame], load: Optional[pd.DataFrame], generation: Optional[pd.DataFrame], zone: str) -> pd.DataFrame:
+    """Daily output and demand: the kept daily history, overwritten by whatever the hourly data held now covers."""
+    parts = [f for f in (summary, daily_from_entsoe(generation, zone), daily_from_entsoe(load, zone, single="load")) if f is not None and not f.empty]
+    if not parts:
+        return pd.DataFrame(columns=["date", "series", "value", "hours"])
+    joined = pd.concat(parts, ignore_index=True)
+    joined["date"] = pd.to_datetime(joined["date"])
+    return joined.drop_duplicates(["date", "series"], keep="last").sort_values(["date", "series"]).reset_index(drop=True)
+
+
+def fund_history_span(summary: Optional[pd.DataFrame], load: Optional[pd.DataFrame], today: date) -> Optional[tuple[date, date]]:
+    """Days of output to request so the daily history reaches back FUND_HISTORY_DAYS without a gap before the hourly data held.
+    None when nothing is missing."""
+    target = today - timedelta(days=FUND_HISTORY_DAYS)
+    end = today + timedelta(days=1)
+    if load is not None and not load.empty and "timestamp" in load.columns:
+        earliest = pd.to_datetime(load["timestamp"], errors="coerce", utc=True).min()
+        if pd.notna(earliest):
+            end = min(end, earliest.date() + timedelta(days=1))
+    if summary is None or summary.empty:
+        start = target
+    else:
+        dates = pd.to_datetime(summary["date"])
+        first, last = dates.min().date(), dates.max().date()
+        start = target if first > target + timedelta(days=3) else last - timedelta(days=2)
+        if first <= target + timedelta(days=3) and last + timedelta(days=1) >= end:
+            return None
+    return (start, end) if (end - start).days >= 1 else None
+
+
+def fundamentals_table(daily: Optional[pd.DataFrame], load_forecast: Optional[pd.DataFrame] = None,
+                       renewable_forecast: Optional[pd.DataFrame] = None, zone: str = "") -> pd.DataFrame:
+    """One row per day: demand, wind, solar, nuclear and gas-fired output in MW, with the operators' day-ahead forecasts."""
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+    wide = daily.assign(date=pd.to_datetime(daily["date"])).pivot_table(index="date", columns="series", values="value", aggfunc="last")
+    forecasts = {}
+    if zone:
+        load_fc = daily_from_entsoe(load_forecast, zone, single="load")
+        if not load_fc.empty:
+            forecasts["load_fc"] = load_fc.set_index("date")["value"]
+        parts = daily_from_entsoe(renewable_forecast, zone)
+        if not parts.empty:
+            parts = parts.pivot_table(index="date", columns="series", values="value", aggfunc="last")
+            if "solar" in parts:
+                forecasts["solar_fc"] = parts["solar"]
+            if "wind_onshore" in parts:
+                forecasts["wind_fc"] = parts["wind_onshore"] + (parts["wind_offshore"].fillna(0.0) if "wind_offshore" in parts else 0.0)
+    last = max([wide.index.max()] + [s.index.max() for s in forecasts.values()])
+    wide = wide.reindex(pd.date_range(wide.index.min(), last, freq="D"))
+    for name in ("load", "wind_onshore", "wind_offshore", "solar", "nuclear", "gas"):
+        if name not in wide:
+            wide[name] = np.nan
+    wide["wind"] = wide["wind_onshore"] + wide["wind_offshore"].fillna(0.0)
+    for name in ("load_fc", "wind_fc", "solar_fc"):
+        wide[name] = forecasts[name].reindex(wide.index) if name in forecasts else np.nan
+    wide.columns.name = None
+    return wide
+
+
+def fundamentals_weather(history: Optional[pd.DataFrame], forecast: Optional[pd.DataFrame], zone: str) -> pd.DataFrame:
+    """Daily weather for one zone: the held history, then the forecast for the days history doesn't cover."""
+    columns = ["temperature", "wind_land", "wind_sea", "solar"]
+    parts = [f.loc[f["zone"].eq(zone)] for f in (history, forecast) if f is not None and not f.empty and "zone" in f.columns]
+    if not parts or all(p.empty for p in parts):
+        return pd.DataFrame(columns=columns)
+    joined = pd.concat(parts, ignore_index=True)
+    joined["date"] = pd.to_datetime(joined["date"])
+    joined = joined.drop_duplicates("date", keep="first").set_index("date").sort_index()
+    return joined.reindex(columns=columns).astype(float)
+
+
+def holiday_shares(days: pd.DatetimeIndex, zone: str, holidays: Optional[pd.DataFrame]) -> tuple[pd.Series, pd.Series]:
+    """Share of the population on school holidays, and on a public holiday that only some regions keep.
+
+    Germany's Corpus Christi or All Saints close shops and offices in some states only. On German data from
+    2022 to 2026 these two shares took the demand miss a day ahead from 2.42% to 2.24%."""
+    school, public = np.zeros(len(days)), np.zeros(len(days))
+    country = FUND_COUNTRY.get(zone)
+    if holidays is None or holidays.empty or country is None or "country" not in holidays.columns:
+        return pd.Series(school, index=days), pd.Series(public, index=days)
+    population = FUND_REGION_POPULATION[country]
+    total = sum(population.values())
+    stamps = days.to_numpy("datetime64[ns]")
+    for row in holidays.loc[holidays["country"].eq(country)].itertuples(index=False):
+        regions = set()
+        for code in str(row.subdivisions or "").split(","):
+            code = code.strip().upper()
+            if not code:
+                continue
+            code = code.split("-")[1] if code.startswith(country + "-") and len(code.split("-")) > 1 else code.split("-")[0]
+            regions |= set(FUND_SCHOOL_ZONES.get(code, (code,))) if country == "FR" else {code}
+        share = 1.0 if bool(row.nationwide) or not regions else sum(population.get(r, 0.0) for r in regions) / total
+        span = (stamps >= np.datetime64(pd.Timestamp(row.start), "ns")) & (stamps <= np.datetime64(pd.Timestamp(row.end), "ns"))
+        target = school if row.kind == "school" else public
+        target[span] = np.maximum(target[span], share)
+    return pd.Series(np.clip(school, 0.0, 1.0), index=days), pd.Series(public, index=days)
+
+
+def fund_design(days: pd.DatetimeIndex, weather: pd.DataFrame, zone: str, holidays: Optional[pd.DataFrame] = None,
+                shares: Optional[tuple] = None) -> pd.DataFrame:
+    """What each model sees for a day: the kind of day, the season and the weather.
+
+    Buildings react to the last few days of temperature, not only today's, so heating uses a weighted
+    average: 6:3:1 over three days for power demand, and 8:4:2:1 over four for gas, the weights German
+    gas networks use for small users."""
+    w = weather.reindex(days)
+    kind = day_classes(days, zone)
+    off_before, off_after = np.r_[False, kind[:-1] == 2], np.r_[kind[1:] == 2, False]
+    temperature = w["temperature"]
+    blend = lambda weights: sum(weight * temperature.shift(i).fillna(temperature) for i, weight in enumerate(weights)) / sum(weights)
+    power_temp, gas_temp = blend((6, 3, 1)), blend((8, 4, 2, 1))
+    angle = 2 * np.pi * days.dayofyear.to_numpy() / 365.25
+    out = pd.DataFrame({
+        "sat": (kind == 1).astype(float), "sun": (kind == 2).astype(float),
+        "bridge": ((kind == 0) & off_before & off_after).astype(float), "after_off": ((kind == 0) & off_before).astype(float),
+        "friday": ((kind == 0) & (days.dayofweek == 4)).astype(float),
+        "year_end": (((days.month == 12) & (days.day >= 24)) | ((days.month == 1) & (days.day == 1))).astype(float),
+        "summer_break": ((days.month == 8) & (days.day <= 21)).astype(float),
+        "hdd": (15.5 - power_temp).clip(lower=0).to_numpy(), "cdd": (power_temp - 20.0).clip(lower=0).to_numpy(),
+        "cos": np.cos(angle), "sin": np.sin(angle),
+        "wind_land": w["wind_land"].to_numpy(), "wind_sea": w["wind_sea"].to_numpy(),
+        "solar": w["solar"].to_numpy(), "solar_sq": (w["solar"] ** 2 / 300.0).to_numpy(),
+        "heat18": (18.0 - gas_temp).clip(lower=0).to_numpy(), "heat13": (13.0 - gas_temp).clip(lower=0).to_numpy(),
+        "heat8": (8.0 - gas_temp).clip(lower=0).to_numpy(), "heat15": (15.5 - gas_temp).clip(lower=0).to_numpy(),
+    }, index=days)
+    out["sat_hdd"], out["sun_hdd"] = out["sat"] * out["hdd"], out["sun"] * out["hdd"]
+    working = (kind == 0)
+    school, public = (shares[0].reindex(days).fillna(0.0), shares[1].reindex(days).fillna(0.0)) if shares is not None else holiday_shares(days, zone, holidays)
+    out["school"] = school.where(working, 0.0).to_numpy()
+    out["part_hol"] = public.where(working & (public < 1.0), 0.0).to_numpy()
+    # Solar capacity grows every month; the trend lets the fit follow it rather than wait for the level check.
+    out["solar_trend"] = out["solar"] * (days - pd.Timestamp("2020-01-01")).days.to_numpy() / 365.25
+    out["solar_temp"] = out["solar"] * w["temperature"].to_numpy() / 100.0
+    return out
+
+
+def _fund_fit(features: np.ndarray, target: np.ndarray, rows: np.ndarray, as_of: int, half_life: float,
+              bounds: Optional[dict] = None) -> np.ndarray:
+    """Weighted least squares on the given rows. A coefficient outside its bounds is held at the bound and the rest refitted."""
+    root = np.sqrt(0.5 ** ((as_of - rows) / half_life))
+    X, y = features[rows] * root[:, None], target[rows] * root
+    beta = np.linalg.lstsq(X, y, rcond=None)[0]
+    for column, (low, high) in (bounds or {}).items():
+        if not low <= beta[column] <= high:
+            held = float(np.clip(beta[column], low, high))
+            others = [j for j in range(features.shape[1]) if j != column]
+            rest = np.linalg.lstsq(X[:, others], y - X[:, column] * held, rcond=None)[0]
+            beta = np.insert(rest, column, held)
+    return beta
+
+
+def _fund_walk(features: np.ndarray, target: np.ndarray, first: int, train: int, half_life: float,
+               apply: Optional[np.ndarray] = None, bounds: Optional[dict] = None) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    """Estimate each row from `first` on from a fit on earlier rows only, refitted every FUND_REFIT_EVERY rows.
+
+    apply holds other values of the same inputs to estimate with, such as forecasts in place of what happened.
+    Also returns the fit on everything known, which is the one used for the days ahead."""
+    X = np.column_stack([np.ones(len(target)), features])
+    A = X if apply is None else np.column_stack([np.ones(len(target)), apply])
+    if bounds:
+        bounds = {column + 1: limits for column, limits in bounds.items()}
+    usable = ~np.isnan(X).any(axis=1) & ~np.isnan(target)
+    out, beta = np.full(len(target), np.nan), None
+    for step, i in enumerate(range(max(first, 0), len(target))):
+        if beta is None or step % FUND_REFIT_EVERY == 0:
+            rows = np.arange(max(0, i - train), i)
+            rows = rows[usable[rows]]
+            beta = _fund_fit(X, target, rows, i, half_life, bounds) if len(rows) >= FUND_MIN_TRAIN else None
+        if beta is not None and not np.isnan(A[i]).any():
+            out[i] = A[i] @ beta
+    known = np.flatnonzero(usable)
+    if len(known) < FUND_MIN_TRAIN:
+        return out, None
+    as_of = int(known[-1]) + 1
+    rows = known[known >= as_of - train]
+    return out, (_fund_fit(X, target, rows, as_of, half_life, bounds) if len(rows) >= FUND_MIN_TRAIN else None)
+
+
+def _level(estimate: pd.Series, actual: pd.Series, days: int, limits: tuple) -> pd.Series:
+    """Actual over estimate across the latest days, within limits. It catches what the weather can't show:
+    new capacity, snow on panels, a change in demand. Shift it by the lead to use only what was known then."""
+    both = estimate.notna() & actual.notna()
+    need = max(3, days // 2)
+    ratio = actual.where(both).rolling(days, min_periods=need).sum() / estimate.where(both).rolling(days, min_periods=need).sum()
+    return ratio.clip(*limits).ffill()
+
+
+def _fund_score(actual: pd.Series, estimate: pd.Series, rows: pd.Series) -> dict:
+    rows = rows & actual.notna() & estimate.notna()
+    if not rows.any():
+        return {"n": 0, "mae": np.nan, "share": np.nan}
+    miss = float((actual - estimate)[rows].abs().mean())
+    mean = float(actual[rows].abs().mean())
+    return {"n": int(rows.sum()), "mae": miss, "share": miss / mean if mean > 0 else np.nan}
+
+
+def _hinges(values, knots: Sequence[float]) -> np.ndarray:
+    values = np.asarray(values, float) / 1000.0
+    return np.column_stack([values] + [np.clip(values - knot / 1000.0, 0.0, None) for knot in knots])
+
+
+def _bucket(lead: int) -> int:
+    return next((h for h in FUND_HORIZONS if h >= lead), FUND_HORIZONS[-1])
+
+
+def _range_from(central: float, errors: np.ndarray, deviations: Optional[np.ndarray] = None) -> tuple[float, float]:
+    """An 80% range around a central value from past misses and, where held, the spread across weather scenarios.
+    Each scenario is shifted by each of 19 evenly spaced past misses, and the range is read off the result."""
+    errors = errors[~np.isnan(errors)]
+    grid = np.quantile(errors, np.linspace(0.05, 0.95, 19)) if len(errors) >= 20 else np.zeros(1)
+    spread = deviations[~np.isnan(deviations)] if deviations is not None else np.zeros(1)
+    samples = central + (spread[:, None] + grid[None, :] if len(spread) else grid[None, :]).ravel()
+    low, high = np.quantile(samples, FUND_RANGE)
+    return float(low), float(high)
+
+
+def announced_unavailable(outages: Optional[pd.DataFrame], zone: str, days: pd.DatetimeIndex) -> pd.Series:
+    """Nuclear capacity announced as unavailable on each day, in MW, from the latest revision of every outage notice.
+
+    Withdrawn and cancelled notices are left out. Where notices for one unit overlap, the lowest availability
+    counts, as REMIT publishers intend. Days no notice reaches count as fully available."""
+    out = pd.Series(0.0, index=days)
+    if outages is None or outages.empty or not {"mrid", "revision", "unit", "nominal", "start", "end", "available"} <= set(outages.columns):
+        return out
+    notices = outages.loc[outages.get("psr", pd.Series("B14", index=outages.index)).astype(str).eq("B14")].copy()
+    if notices.empty:
+        return out
+    notices["revision"] = pd.to_numeric(notices["revision"], errors="coerce").fillna(0)
+    latest = notices.groupby("mrid")["revision"].transform("max")
+    notices = notices.loc[notices["revision"].eq(latest) & ~notices.get("status", pd.Series("", index=notices.index)).astype(str).isin(["A09", "A13"])]
+    zone_tz = ENTSOE_ZONES[zone]["timezone"]
+    hours = pd.date_range(days[0].tz_localize(zone_tz, nonexistent="shift_forward", ambiguous=False).tz_convert("UTC"),
+                          (days[-1] + pd.Timedelta(days=1)).tz_localize(zone_tz, nonexistent="shift_forward", ambiguous=False).tz_convert("UTC"),
+                          freq="h", inclusive="left")
+    local_day = hours.tz_convert(zone_tz).tz_localize(None).normalize()
+    total = np.zeros(len(hours))
+    stamp = hours.tz_localize(None).to_numpy("datetime64[ns]")
+    for unit, part in notices.groupby("unit"):
+        nominal = pd.to_numeric(part["nominal"], errors="coerce").max()
+        if not np.isfinite(nominal) or nominal <= 0:
+            continue
+        available = np.full(len(hours), nominal)
+        starts = pd.to_datetime(part["start"], utc=True).to_numpy("datetime64[ns]")
+        ends = pd.to_datetime(part["end"], utc=True).to_numpy("datetime64[ns]")
+        values = pd.to_numeric(part["available"], errors="coerce").to_numpy(float)
+        dated = ~np.isnat(starts) & ~np.isnat(ends)       # a notice without both dates can't be placed, so it is left out
+        first_slot, last_slot = np.searchsorted(stamp, starts[dated], "left"), np.searchsorted(stamp, ends[dated], "left")
+        for a, b, value in zip(first_slot, last_slot, values[dated]):
+            if b > a and not np.isnan(value):
+                available[a:b] = np.minimum(available[a:b], value)
+        total += np.clip(nominal - available, 0.0, nominal)
+    daily = pd.Series(total, index=local_day).groupby(level=0).mean()
+    return daily.reindex(days).fillna(0.0)
+
+
+def _combine_walk(actual: pd.Series, operator: pd.Series, model: pd.Series, first: int, train: int = 365, half_life: float = 120.0) -> tuple[pd.Series, Optional[np.ndarray]]:
+    """The published forecast and the model together: actual = a + b x published + c x model + d x published miss
+    of the last week + e x model miss of the last week. Each day is fitted on days at least two before it, as
+    for a forecast made the morning before. Tested on German and French data, it beat both on every series."""
+    bias = (actual - operator).shift(2).rolling(7, min_periods=4).mean()
+    model_bias = (actual - model).shift(2).rolling(7, min_periods=4).mean()
+    X = np.column_stack([np.ones(len(actual)), operator, model, bias, model_bias]).astype(float)
+    y = actual.to_numpy(float)
+    usable = ~np.isnan(X).any(axis=1) & ~np.isnan(y)
+    out, beta = np.full(len(y), np.nan), None
+    for step, i in enumerate(range(max(first, 0), len(y))):
+        if beta is None or step % FUND_REFIT_EVERY == 0:
+            rows = np.arange(max(0, i - train), i - 1)
+            rows = rows[usable[rows]]
+            beta = _fund_fit(X, y, rows, i, half_life) if len(rows) >= FUND_MIN_TRAIN else None
+        if beta is not None and not np.isnan(X[i]).any():
+            out[i] = X[i] @ beta
+    known = np.flatnonzero(usable)
+    if len(known) < FUND_MIN_TRAIN:
+        return pd.Series(out, index=actual.index), None
+    rows = known[known >= known[-1] + 1 - train]
+    final = _fund_fit(X, y, rows, int(known[-1]) + 1, half_life) if len(rows) >= FUND_MIN_TRAIN else None
+    return pd.Series(out, index=actual.index), final
+
+
+def power_fundamentals(zone: str, table: pd.DataFrame, weather: pd.DataFrame, ensemble: Optional[pd.DataFrame] = None,
+                       nuclear_shift_mw: float = 0.0, holidays: Optional[pd.DataFrame] = None, outages: Optional[pd.DataFrame] = None) -> dict:
+    """Demand, wind, solar, residual load and gas-fired output: tested by lead time, then projected as far as the weather forecast goes.
+
+    Residual load is demand minus wind and solar, the part other plants must cover. Tests use the weather as it
+    turned out, so past the first day they show the models' own error, not the weather forecast's. The spread
+    across weather scenarios adds that part to the ranges for the days ahead."""
+    needed = FUND_MIN_TRAIN + 30
+    if table is None or table.empty or table[["load", "wind", "solar"]].dropna().shape[0] < needed:
+        held = 0 if table is None or table.empty else table[["load", "wind", "solar"]].dropna().shape[0]
+        return {"ready": False, "reason": f"This needs at least {needed} days of demand, wind and solar output for {zone}; {held} are held. Select Update market data."}
+    if weather is None or weather[["temperature", "wind_land", "solar"]].dropna().shape[0] < needed:
+        return {"ready": False, "reason": f"This needs at least {needed} days of weather across {zone}. Select Update market data."}
+    days = pd.date_range(table.index.min(), max(table.index.max(), weather.index.max()), freq="D")
+    data = table.reindex(days)
+    shares = holiday_shares(days, zone, holidays)
+    design = fund_design(days, weather, zone, shares=shares)
+    complete = data[["load", "wind", "solar"]].notna().all(axis=1).to_numpy()
+    last = int(np.flatnonzero(complete)[-1])
+    first = max(last - FUND_TEST_DAYS + 1, 0)
+    tested = pd.Series((np.arange(len(days)) >= first) & (np.arange(len(days)) <= last), index=days)
+    has_sea = design["wind_sea"].notna().sum() >= needed
+    inputs = {"wind": ["wind_land"] + (["wind_sea"] if has_sea else []), "solar": list(FUND_SOLAR_COLUMNS), "load": list(FUND_LOAD_COLUMNS)}
+    raw, beta, level, estimates = {}, {}, {}, {h: {} for h in FUND_HORIZONS}
+    for name, columns in inputs.items():
+        train, half_life, fix_days, limits = FUND_MODELS[name]
+        walked, beta[name] = _fund_walk(design[columns].to_numpy(float), data[name].to_numpy(float), first, train, half_life)
+        if beta[name] is None:
+            return {"ready": False, "reason": f"Too few days with both weather and {FUND_LABELS[name].lower()} to fit the models for {zone} yet."}
+        raw[name] = pd.Series(walked, index=days).clip(lower=0.0)
+        level[name] = _level(raw[name], data[name], fix_days, limits)
+        for h in FUND_HORIZONS:
+            estimates[h][name] = raw[name] * level[name].shift(h).fillna(1.0)
+    data["residual"] = data["load"] - data["wind"] - data["solar"]
+    for h in FUND_HORIZONS:
+        estimates[h]["residual"] = estimates[h]["load"] - estimates[h]["wind"] - estimates[h]["solar"]
+    has_nuclear = float(data["nuclear"].iloc[max(0, last - 29):last + 1].mean()) > FUND_NUCLEAR_MIN_MW if data["nuclear"].notna().any() else False
+    nuclear = data["nuclear"].fillna(0.0) if has_nuclear else pd.Series(0.0, index=days)
+    nuclear_known = nuclear.rolling(7, min_periods=3).mean()
+    gap = data["residual"] - nuclear
+
+    # Gas-fired output follows the gap left after wind, solar and nuclear, with more of it in cold weather,
+    # when plants that also supply heat must run, and less at weekends.
+    gas_ready = data["gas"].notna().sum() >= needed
+    gas_inputs = lambda gap_values: np.column_stack([_hinges(gap_values, knots), design[["hdd", "sat", "sun"]].to_numpy(float)])
+    if gas_ready:
+        before = gap.iloc[:first].dropna()
+        knots = tuple(float(v) for v in np.quantile(before if len(before) >= 30 else gap.dropna(), [0.25, 0.5, 0.75]))
+        train, half_life, fix_days, limits = FUND_MODELS["gas"]
+        gas_actual, fitted = data["gas"].to_numpy(float), gas_inputs(gap.to_numpy(float))
+        walked, beta["gas"] = _fund_walk(fitted, gas_actual, first, train, half_life)
+        gas_ready = beta["gas"] is not None
+    if gas_ready:
+        level["gas"] = _level(pd.Series(walked, index=days).clip(lower=0.0), data["gas"], fix_days, limits)
+        for h in FUND_HORIZONS:
+            gap_then = estimates[h]["residual"] - nuclear_known.shift(h).fillna(nuclear)
+            chained, _ = _fund_walk(fitted, gas_actual, first, train, half_life, apply=gas_inputs(gap_then.to_numpy(float)))
+            estimates[h]["gas"] = pd.Series(chained, index=days).clip(lower=0.0) * level["gas"].shift(h).fillna(1.0)
+
+    targets = ["wind", "solar", "load", "residual"] + (["gas"] if gas_ready else [])
+    data["residual_fc"] = data["load_fc"] - data["wind_fc"] - data["solar_fc"]
+
+    # Where ENTSO-E publishes a forecast, it and the model are combined. Each series then uses whichever of the
+    # model, the published forecast and the combination missed least on the same tested days.
+    combined, combined_beta, source, best_lead1 = {}, {}, {}, {}
+    for name in ("load", "wind", "solar"):
+        source[name], best_lead1[name] = "Model", estimates[1][name]
+        published = data[name + "_fc"]
+        if published.notna().sum() < needed:
+            continue
+        walked, combined_beta[name] = _combine_walk(data[name], published, estimates[1][name], first)
+        rows = tested & walked.notna() & published.notna() & estimates[1][name].notna()
+        if combined_beta[name] is None or rows.sum() < 30:
+            continue
+        combined[name] = walked
+        misses = {"Model": _fund_score(data[name], estimates[1][name], rows)["mae"], "Operator": _fund_score(data[name], published, rows)["mae"],
+                  "Combined": _fund_score(data[name], walked, rows)["mae"]}
+        source[name] = min(misses, key=misses.get)
+        best_lead1[name] = {"Model": estimates[1][name], "Operator": published, "Combined": walked}[source[name]].where(published.notna(), estimates[1][name])
+    best_lead1["residual"] = best_lead1["load"] - best_lead1["wind"] - best_lead1["solar"]
+    operator_better = {name: source.get(name) == "Operator" for name in ("load", "wind", "solar")}
+
+    tests = []
+    for name in targets:
+        actual = data[name]
+        for h in FUND_HORIZONS:
+            scored = _fund_score(actual, estimates[h][name], tested)
+            same_rows = tested & estimates[h][name].notna()
+            row = {"target": name, "lead": h, "n": scored["n"], "mae": scored["mae"], "share": scored["share"],
+                   "last_known": _fund_score(actual, actual.shift(h), same_rows)["share"], "operator": np.nan, "best": np.nan}
+            if h == 1 and name + "_fc" in data:
+                # Both on the same days, so the two figures compare like for like.
+                both = same_rows & data[name + "_fc"].notna() & (best_lead1[name].notna() if name in best_lead1 else True)
+                theirs = _fund_score(actual, data[name + "_fc"], both)
+                if theirs["n"] >= 30:
+                    row["operator"] = theirs["share"]
+                    if name in best_lead1:
+                        row["best"] = _fund_score(actual, best_lead1[name], both)["share"]
+            tests.append(row)
+    tests = pd.DataFrame(tests)
+
+    # The days ahead: every day after the last complete one that the weather forecast covers.
+    ahead = np.arange(last + 1, min(len(days), last + 1 + FUND_OUTLOOK_DAYS + 1))
+    ahead = ahead[~design.iloc[ahead][inputs["load"] + inputs["wind"] + inputs["solar"]].isna().any(axis=1).to_numpy()]
+    if not len(ahead):
+        return {"ready": False, "reason": f"The weather forecast for {zone} doesn't reach past the last day of output held. Select Update market data."}
+    now = {name: float(level[name].iloc[:last + 1].dropna().iloc[-1]) if level[name].iloc[:last + 1].notna().any() else 1.0 for name in level}
+    lead_days = ahead - last
+    nuclear_from, unavailable_ahead = "Last week", np.full(len(ahead), np.nan)
+    nuclear_ahead = np.full(len(ahead), float(nuclear_known.iloc[last]) if has_nuclear else 0.0)
+    zone_outages = outages.loc[outages["zone"].eq(zone)] if outages is not None and not outages.empty and "zone" in outages.columns else None
+    if has_nuclear and zone in FUND_NUCLEAR_FIT and zone_outages is not None and zone_outages.get("psr", pd.Series(dtype=str)).astype(str).eq("B14").any():
+        fit = FUND_NUCLEAR_FIT[zone]
+        unavailable = announced_unavailable(zone_outages, zone, days)
+        position = np.clip(lead_days - 1, 1, len(fit["k"])) - 1
+        change = -(unavailable.iloc[ahead].to_numpy(float) - float(unavailable.iloc[max(0, last - 6):last + 1].mean()))
+        weekend = (days[ahead].dayofweek >= 5).astype(float)
+        nuclear_ahead = (float(nuclear_known.iloc[last]) + np.asarray(fit["k"])[position] * change + np.asarray(fit["shift"], float)[position]
+                         + fit["weekend"] * weekend).clip(min=0.0)
+        nuclear_from, unavailable_ahead = "Outage notices", unavailable.iloc[ahead].to_numpy(float)
+    if has_nuclear:
+        nuclear_ahead = (nuclear_ahead + float(nuclear_shift_mw)).clip(min=0.0)
+
+    def gas_from(gap_values: np.ndarray, frame: pd.DataFrame) -> np.ndarray:
+        """Gas-fired output ahead. Its rise with the gap is made non-decreasing, so that more left for other
+        plants never means less gas burnt, even where the fitted curve wobbles near its floor."""
+        hinge_count = len(knots) + 1
+        hinge_beta, other_beta = beta["gas"][1:1 + hinge_count], np.r_[beta["gas"][0], beta["gas"][1 + hinge_count:]]
+        known = gap.dropna().to_numpy(float)
+        grid = np.linspace(known.min(), max(known.max(), np.nanmax(gap_values)), 400)   # below what has been seen, held flat
+        rising = np.maximum.accumulate(_hinges(grid, knots) @ hinge_beta)
+        other = np.column_stack([np.ones(len(frame)), frame[["hdd", "sat", "sun"]].to_numpy(float)]) @ other_beta
+        return np.clip(np.interp(gap_values, grid, rising) + other, 0.0, None) * now["gas"]
+
+    def project(frame: pd.DataFrame) -> dict:
+        """Model values for the days ahead from one set of inputs."""
+        values = {name: np.clip(np.column_stack([np.ones(len(frame)), frame[columns].to_numpy(float)]) @ beta[name], 0.0, None) * now[name] for name, columns in inputs.items()}
+        values["residual"] = values["load"] - values["wind"] - values["solar"]
+        if gas_ready:
+            values["gas"] = gas_from(values["residual"] - nuclear_ahead, frame)
+        return values
+
+    central = project(design.iloc[ahead])
+    outlook = pd.DataFrame({"date": days[ahead], "lead": ahead - last})
+    for name in ("load", "wind", "solar"):
+        published = data[name + "_fc"].iloc[ahead].to_numpy(float)
+        has = ~np.isnan(published)
+        value = central[name]
+        if source[name] == "Operator":
+            value = np.where(has, published, central[name])
+        elif source[name] == "Combined":
+            recent_rows = slice(max(0, last - 6), last + 1)
+            bias = float((data[name] - data[name + "_fc"]).iloc[recent_rows].mean())
+            model_bias = float((data[name] - estimates[1][name]).iloc[recent_rows].mean())
+            mix = np.column_stack([np.ones(len(ahead)), published, central[name], np.full(len(ahead), bias), np.full(len(ahead), model_bias)]) @ combined_beta[name]
+            value = np.where(has & np.isfinite(mix), np.clip(mix, 0.0, None), central[name])
+        outlook[name] = value
+        outlook[name + "_source"] = np.where(has & (source[name] != "Model"), source[name], "Model")
+    outlook["residual"] = outlook["load"] - outlook["wind"] - outlook["solar"]
+    outlook["nuclear"] = nuclear_ahead
+    outlook["nuclear_unavailable"] = unavailable_ahead
+    outlook["gap"] = outlook["residual"] - nuclear_ahead
+    if gas_ready:
+        outlook["gas"] = gas_from(outlook["gap"].to_numpy(float), design.iloc[ahead])
+
+    # Weather scenarios: each member's difference from the scenario average is added to the forecast, and run through the same models.
+    members, member_designs = {}, {}
+    scenarios = ensemble.loc[ensemble["zone"].eq(zone)] if ensemble is not None and not ensemble.empty and "zone" in ensemble.columns else pd.DataFrame()
+    if not scenarios.empty:
+        scenarios = scenarios.assign(date=pd.to_datetime(scenarios["date"]))
+        fields = [c for c in ("temperature", "wind_land", "wind_sea", "solar") if c in scenarios.columns and scenarios[c].notna().any()]
+        difference = scenarios.set_index(["member", "date"])[fields]
+        difference = difference - difference.groupby(level="date").transform("mean")
+        tail = days[max(0, last - 5):]
+        base = weather.reindex(tail)
+        for member, part in difference.groupby(level="member"):
+            part = part.droplevel("member").reindex(tail).fillna(0.0)
+            varied = base.copy()
+            for field in fields:
+                varied[field] = base[field] + part[field]
+            varied[["wind_land", "wind_sea"]] = varied[["wind_land", "wind_sea"]].clip(0.0, 1.0)
+            varied["solar"] = varied["solar"].clip(lower=0.0)
+            member_design = fund_design(tail, varied, zone, shares=shares)
+            member_designs[member] = member_design
+            for name, values in project(member_design.reindex(days[ahead])).items():
+                members.setdefault(name, []).append(values)
+        covered = difference.groupby(level="date").size().reindex(days[ahead]).fillna(0).to_numpy() >= FUND_MIN_MEMBERS
+    scenario_count = len(member_designs)
+    outlook["scenarios"] = np.where(covered, scenario_count, 0) if scenario_count >= FUND_MIN_MEMBERS else 0
+    deviations = {}
+    for name in targets:
+        errors = {h: (data[name] - estimates[h][name])[tested].to_numpy(float) for h in FUND_HORIZONS}
+        # Days that use the published forecast or the combination take their range from its own past misses.
+        sources_today = [outlook[n + "_source"] for n in ("load", "wind", "solar")] if name == "residual" else [outlook[name + "_source"]] if name + "_source" in outlook else []
+        published_errors = (data[name] - best_lead1[name])[tested & best_lead1[name].notna()].to_numpy(float) if name in best_lead1 else None
+        if scenario_count >= FUND_MIN_MEMBERS:
+            stacked = np.vstack(members[name])
+            deviations[name] = stacked - np.nanmean(stacked, axis=0)
+        lows, highs = [], []
+        for position, lead in enumerate(outlook["lead"]):
+            spread = deviations[name][:, position] if name in deviations and outlook["scenarios"].iloc[position] else None
+            uses_published = bool(sources_today) and all(str(src.iloc[position]) != "Model" for src in sources_today)
+            past = published_errors if uses_published and published_errors is not None and np.isfinite(published_errors).sum() >= 20 else errors[_bucket(int(lead))]
+            low, high = _range_from(float(outlook[name].iloc[position]), past, spread)
+            lows.append(max(low, 0.0) if name != "residual" else low)
+            highs.append(high)
+        outlook[name + "_low"], outlook[name + "_high"] = lows, highs
+
+    recent = pd.DataFrame({"date": days[max(first, last - 44):last + 1]}).set_index("date")
+    for name in targets:
+        recent[name] = data[name].reindex(recent.index)
+        recent[name + "_model"] = estimates[1][name].reindex(recent.index)
+    return {"ready": True, "zone": zone, "last_actual": days[last].date(), "outlook": outlook, "tests": tests, "recent": recent.reset_index(),
+            "has_nuclear": bool(has_nuclear), "nuclear_now": float(nuclear_known.iloc[last]) if has_nuclear else 0.0, "gas_ready": bool(gas_ready),
+            "operator_better": operator_better, "scenarios": scenario_count if scenario_count >= FUND_MIN_MEMBERS else 0,
+            "tested_days": int(tested.sum()), "has_sea": bool(has_sea), "level": now,
+            "member_designs": member_designs if scenario_count >= FUND_MIN_MEMBERS else {},
+            "sources": source, "nuclear_from": nuclear_from, "holidays_used": bool(design[["school", "part_hol"]].abs().sum().sum() > 0),
+            "member_gas": deviations.get("gas") if gas_ready else None}
+
+
+def gas_demand_model(consumption: Optional[pd.DataFrame], weather: pd.DataFrame, table: Optional[pd.DataFrame] = None,
+                     power: Optional[dict] = None, zone: str = "Germany-Luxembourg") -> dict:
+    """German gas demand in three parts, from Trading Hub Europe's daily figures.
+
+    Small users (households and small businesses, on standard load profiles) follow the temperature of the
+    last four days. Large users (metered daily: industry, power plants, big heating) are a steady level by
+    kind of day, plus gas for power in proportion to gas-fired output, plus a part that moves with the cold.
+    That gives heating, power and industry. Gas per unit of power is fitted, within the range real plants have."""
+    needed = FUND_MIN_TRAIN + 30
+    if consumption is None or consumption.empty or consumption["small"].notna().sum() < needed:
+        return {"ready": False, "reason": f"This needs at least {needed} days of German gas consumption from Trading Hub Europe. Select Update market data."}
+    if weather is None or weather["temperature"].notna().sum() < needed:
+        return {"ready": False, "reason": f"This needs at least {needed} days of weather across Germany. Select Update market data."}
+    held = consumption.assign(date=pd.to_datetime(consumption["gas_day"])).drop_duplicates("date", keep="last").set_index("date").sort_index()
+    days = pd.date_range(max(held.index.min(), weather.index.min()), max(held.index.max(), weather.index.max()), freq="D")
+    data = held.reindex(days)[["small", "large"]].astype(float)
+    design = fund_design(days, weather, zone)
+    gas_power = (table["gas"].reindex(days) * 24.0 / 1000.0) if table is not None and not table.empty and "gas" in table else pd.Series(np.nan, index=days)
+    with_power = gas_power.notna().sum() >= needed
+    last_small = int(np.flatnonzero(data["small"].notna().to_numpy())[-1])
+    if data["large"].notna().sum() < needed:
+        return {"ready": False, "reason": "Too few days of large-user consumption are published yet to fit the model."}
+    last_large = int(np.flatnonzero(data["large"].notna().to_numpy())[-1])
+    first = max(last_large - FUND_TEST_DAYS + 1, 0)
+    position = np.arange(len(days))
+    tested = pd.Series((position >= first) & (position <= last_large), index=days)
+
+    small_columns = ["heat18", "heat13", "heat8", "sat", "sun"]
+    large_columns = ["sat", "sun", "year_end", "heat15"]
+    large_features = design[large_columns].to_numpy(float)
+    bounds = {large_columns.index("heat15"): (0.0, np.inf)}
+    if with_power:
+        large_features = np.column_stack([large_features, gas_power.to_numpy(float)])
+        bounds[len(large_columns)] = GAS_PER_POWER_LIMITS
+    fits = {}
+    for name, features, limits_ in (("small", design[small_columns].to_numpy(float), None), ("large", large_features, bounds)):
+        train, half_life, fix_days, limits = FUND_MODELS[name]
+        walked, beta = _fund_walk(features, data[name].to_numpy(float), first, train, half_life, bounds=limits_)
+        if beta is None:
+            return {"ready": False, "reason": "Too few days with both weather and gas consumption to fit the model yet."}
+        estimate = pd.Series(walked, index=days).clip(lower=0.0)
+        fits[name] = {"beta": beta, "raw": estimate, "level": _level(estimate, data[name], fix_days, limits)}
+    data["total"] = data["small"] + data["large"]
+    estimates = {h: {name: fits[name]["raw"] * fits[name]["level"].shift(h).fillna(1.0) for name in ("small", "large")} for h in FUND_HORIZONS}
+    tests = []
+    for h in FUND_HORIZONS:
+        estimates[h]["total"] = estimates[h]["small"] + estimates[h]["large"]
+        for name in ("small", "large", "total"):
+            scored = _fund_score(data[name], estimates[h][name], tested)
+            tests.append({"target": name, "lead": h, "n": scored["n"], "mae": scored["mae"], "share": scored["share"],
+                          "last_known": _fund_score(data[name], data[name].shift(h), tested & estimates[h][name].notna())["share"]})
+    beta_large = fits["large"]["beta"]
+    per_cold_degree = float(beta_large[1 + large_columns.index("heat15")])
+    per_power = float(beta_large[-1]) if with_power else np.nan
+    level_now = {name: float(fits[name]["level"].iloc[:(last_small if name == "small" else last_large) + 1].dropna().iloc[-1])
+                 if fits[name]["level"].notna().any() else 1.0 for name in fits}
+
+    # Gas-fired output for the days ahead comes from the power model where it reaches, else from the last week.
+    power_ahead = gas_power.copy()
+    recent_power = float(gas_power.dropna().tail(7).mean()) if with_power else np.nan
+    if with_power and power and power.get("ready") and power.get("gas_ready"):
+        projected = power["outlook"].set_index("date")["gas"] * 24.0 / 1000.0
+        power_ahead = power_ahead.fillna(projected.reindex(days))
+    power_ahead = power_ahead.fillna(recent_power) if with_power else power_ahead
+
+    def parts(frame: pd.DataFrame, power_values: np.ndarray) -> dict:
+        ones = np.ones(len(frame))
+        small = np.clip(np.column_stack([ones, frame[small_columns].to_numpy(float)]) @ fits["small"]["beta"], 0.0, None) * level_now["small"]
+        features = np.column_stack([ones, frame[large_columns].to_numpy(float)] + ([power_values] if with_power else []))
+        large = np.clip(features @ beta_large, 0.0, None) * level_now["large"]
+        return {"small": small, "large": large, "cold": per_cold_degree * frame["heat15"].to_numpy(float), "power": per_power * power_values if with_power else np.zeros(len(frame))}
+
+    ahead = position[(position > last_large) & (position <= last_large + FUND_OUTLOOK_DAYS + 2)]
+    ahead = ahead[~design.iloc[ahead][small_columns + large_columns].isna().any(axis=1).to_numpy()]
+    if not len(ahead):
+        return {"ready": False, "reason": "The weather forecast for Germany doesn't reach past the last gas day held. Select Update market data."}
+    central = parts(design.iloc[ahead], power_ahead.iloc[ahead].to_numpy(float))
+    published = data["small"].iloc[ahead].to_numpy(float)
+    outlook = pd.DataFrame({"date": days[ahead], "lead": ahead - last_large, "small": np.where(np.isnan(published), central["small"], published),
+                            "small_source": np.where(np.isnan(published), "Model", "Published"), "large": central["large"]})
+    outlook["heating"] = outlook["small"] + central["cold"]
+    outlook["power"] = central["power"]
+    outlook["industry"] = outlook["large"] - central["cold"] - central["power"]
+    outlook["total"] = outlook["small"] + outlook["large"]
+    spreads = None
+    member_designs = (power or {}).get("member_designs") or {}
+    if member_designs:
+        member_gas, power_dates = (power or {}).get("member_gas"), pd.DatetimeIndex(power["outlook"]["date"])
+        totals = []
+        for index, member_design in enumerate(member_designs.values()):
+            frame = member_design.reindex(days[ahead])
+            shift = np.zeros(len(ahead))
+            if with_power and member_gas is not None:
+                shift = pd.Series(member_gas[index] * 24.0 / 1000.0, index=power_dates).reindex(days[ahead]).fillna(0.0).to_numpy()
+            varied = parts(frame.fillna(design.iloc[ahead]), power_ahead.iloc[ahead].to_numpy(float) + shift)
+            totals.append(np.where(np.isnan(published), varied["small"], published) + varied["large"])
+        totals = np.vstack(totals)
+        spreads = totals - np.nanmean(totals, axis=0)
+    errors = {h: (data["total"] - estimates[h]["total"])[tested].to_numpy(float) for h in FUND_HORIZONS}
+    ranges = [_range_from(float(total), errors[_bucket(int(lead))], spreads[:, i] if spreads is not None else None)
+              for i, (total, lead) in enumerate(zip(outlook["total"], outlook["lead"]))]
+    outlook["low"], outlook["high"] = [max(low, 0.0) for low, _ in ranges], [high for _, high in ranges]
+
+    shown = position[max(first, last_large - 44):last_large + 1]
+    cold = per_cold_degree * design["heat15"].iloc[shown].to_numpy(float)
+    burnt = per_power * gas_power.iloc[shown].to_numpy(float) if with_power else np.zeros(len(shown))
+    recent = pd.DataFrame({"date": days[shown], "small": data["small"].iloc[shown].to_numpy(), "large": data["large"].iloc[shown].to_numpy(),
+                           "total": data["total"].iloc[shown].to_numpy(), "model": estimates[1]["total"].iloc[shown].to_numpy()})
+    recent["heating"], recent["power"] = recent["small"] + cold, burnt
+    recent["industry"] = recent["large"] - cold - np.nan_to_num(burnt)
+    return {"ready": True, "outlook": outlook, "tests": pd.DataFrame(tests), "recent": recent, "with_power": bool(with_power),
+            "gas_per_power": per_power, "per_cold_degree": per_cold_degree, "last_small": days[last_small].date(), "last_large": days[last_large].date(),
+            "tested_days": int(tested.sum()), "scenarios": len(member_designs) if spreads is not None else 0,
+            "power_from_model": bool(with_power and power and power.get("ready") and power.get("gas_ready"))}
+
+
+def record_outlook(held: Optional[pd.DataFrame], outlook: pd.DataFrame, zone: str, made_on: date) -> Optional[pd.DataFrame]:
+    """Keep each day's outlook as first made that day, so it can be scored once the outcome is known.
+    Returns None when today's is already held."""
+    stamp = made_on.isoformat()
+    if held is not None and not held.empty and (held["zone"].eq(zone) & held["made_on"].eq(stamp)).any():
+        return None
+    columns = [c for c in ("load", "wind", "solar", "residual", "gas") if c in outlook.columns]
+    new = outlook[["date", "lead"] + columns].assign(zone=zone, made_on=stamp, date=pd.to_datetime(outlook["date"]).dt.date.astype(str))
+    merged = new if held is None or held.empty else pd.concat([held, new], ignore_index=True)
+    return merged.loc[pd.to_datetime(merged["made_on"]) >= pd.Timestamp(made_on) - pd.Timedelta(days=FUND_HISTORY_DAYS)].reset_index(drop=True)
+
+
+def score_outlook_record(record: Optional[pd.DataFrame], table: pd.DataFrame, zone: str) -> pd.DataFrame:
+    """How the outlooks saved on the day turned out, by lead time. Nothing in them could see the outcome or the weather."""
+    columns = ["lead", "n", "mae", "share"]
+    if record is None or record.empty or table is None or table.empty:
+        return pd.DataFrame(columns=columns)
+    part = record.loc[record["zone"].eq(zone)].assign(date=lambda f: pd.to_datetime(f["date"]))
+    actual = (table["load"] - table["wind"] - table["solar"]).rename("actual")
+    part = part.merge(actual, left_on="date", right_index=True).dropna(subset=["actual", "residual"])
+    if part.empty:
+        return pd.DataFrame(columns=columns)
+    part = part.assign(bucket=[_bucket(int(lead)) for lead in part["lead"]], miss=(part["actual"] - part["residual"]).abs())
+    grouped = part.groupby("bucket")
+    out = pd.DataFrame({"lead": list(grouped.groups), "n": grouped.size().to_numpy(), "mae": grouped["miss"].mean().to_numpy(),
+                        "share": (grouped["miss"].mean() / grouped["actual"].apply(lambda s: s.abs().mean())).to_numpy()})
+    return out[columns]
+
+
+# =============================================================================
 # SECTION 3 · SAVED DATA (SQLite)
 # Everything the desk needs tomorrow lives in one local database file.
 # =============================================================================
@@ -5439,51 +6169,318 @@ def fetch_power_weather(location_names: Sequence[str], days: int = 430, _json_ge
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(), failures
 
 
-def fetch_zone_weather(zone: str, start: Optional[date] = None, end: Optional[date] = None, forecast: bool = False,
-                       api_key: str = "", commercial_endpoint: bool = False, _json_get_fn=None) -> pd.DataFrame:
-    """Daily heating demand, wind at 100 m and solar radiation averaged over a zone's points, in one request.
+OPEN_METEO_HISTORICAL_FORECAST_BASE = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+OPEN_METEO_ENSEMBLE_BASE = "https://ensemble-api.open-meteo.com/v1/ensemble"
+OPEN_METEO_ENSEMBLE_MODEL = "ecmwf_ifs025"     # 51 scenarios, 15 days
+TRADING_HUB_BASE = "https://datenservice.tradinghub.eu/XmlInterface/getXML.ashx"
 
-    The archive gives past days. The forecast gives the last week and the next three days, which also
-    covers the days the archive hasn't published yet.
+
+def _zone_points(zone: str, with_sea: bool, extended: bool = False) -> tuple[list, list]:
+    """Coordinates for one request, and what each point stands for: land (temperature, wind, sun), sea, wind farms, solar parks."""
+    groups = [("land", ZONE_WEATHER_POINTS[zone])]
+    if with_sea:
+        groups.append(("sea", FUND_SEA_POINTS.get(zone, ())))
+    if extended:
+        groups += [("farm", FUND_WIND_POINTS.get(zone, ())), ("park", FUND_SOLAR_POINTS.get(zone, ()))]
+    points, kinds = [], []
+    for kind, coords in groups:
+        points += list(coords)
+        kinds += [kind] * len(coords)
+    return points, kinds
+
+
+def _hourly_frame(hourly: dict, suffix: str = "") -> pd.DataFrame:
+    get = lambda name: pd.to_numeric(pd.Series(hourly.get(name + suffix, [None] * len(hourly["time"]))), errors="coerce")
+    return pd.DataFrame({"date": [str(t)[:10] for t in hourly["time"]], "temperature": get("temperature_2m"),
+                         "wind": get("wind_speed_100m"), "solar": get("shortwave_radiation")})
+
+
+def _daily_zone_means(per_point: list, kinds: list, minimum: int) -> pd.DataFrame:
+    """Average complete days over the land points, and the wind power index over land, sea and wind-farm points separately.
+
+    The index is taken hour by hour at each point before averaging, because output follows the cube of
+    the wind speed: a calm morning and a stormy afternoon don't make an average day. With wind farms held,
+    the land index comes from them, and solar parks are added to the land points for sunshine."""
+    by_kind: dict = {}
+    for frame, kind in zip(per_point, kinds):
+        if frame is None or frame.empty:
+            continue
+        counts = frame.groupby("date")[["temperature", "wind", "solar"]].count().min(axis=1)
+        frame = frame.assign(index_=wind_power_index(frame["wind"].to_numpy(float), "sea" if kind == "sea" else "land"))
+        frame.loc[frame["wind"].isna(), "index_"] = np.nan
+        daily = frame.groupby("date")[["temperature", "wind", "solar", "index_"]].mean().loc[lambda f: counts.reindex(f.index) >= 20]
+        by_kind.setdefault(kind, []).append(daily)
+    if not by_kind.get("land"):
+        return pd.DataFrame()
+    land = pd.concat(by_kind["land"])
+    grouped = land.groupby(level=0)
+    means = grouped[["temperature", "wind", "solar", "index_"]].mean().loc[grouped.size() >= max(1, minimum)]
+    means = means.rename(columns={"index_": "wind_land"})
+    means["hdd"] = (18.0 - land["temperature"]).clip(lower=0).groupby(level=0).mean().reindex(means.index)
+    group_mean = lambda kind, column, share=0.5: (lambda f: f[column].groupby(level=0).mean().where(f.groupby(level=0).size() >= max(1, int(share * len(by_kind[kind])))))(pd.concat(by_kind[kind])) if by_kind.get(kind) else None
+    sea = group_mean("sea", "index_")
+    means["wind_sea"] = sea.reindex(means.index) if sea is not None else np.nan
+    farms = group_mean("farm", "index_")
+    if farms is not None:
+        means["wind_land"] = farms.reindex(means.index)
+    if by_kind.get("park"):
+        both = pd.concat(by_kind["land"] + by_kind["park"])
+        means["solar"] = both["solar"].groupby(level=0).mean().reindex(means.index)
+    return means
+
+
+def fetch_zone_weather(zone: str, start: Optional[date] = None, end: Optional[date] = None, forecast: bool = False,
+                       api_key: str = "", commercial_endpoint: bool = False, _json_get_fn=None,
+                       historical_forecast: bool = False, forecast_days: int = 3, with_sea: bool = False, extended: bool = False) -> pd.DataFrame:
+    """Daily heating demand, wind at 100 m, wind power indices and solar radiation averaged over a zone's points, in one request.
+
+    The archive gives past days as they turned out. The historical forecast gives past days as the weather
+    models first saw them, which is what a model applied to forecasts should learn from. The forecast gives
+    the last week and the days ahead, which also covers days the archive hasn't published yet.
+    extended adds the wind-farm and solar-park points the fundamentals outlook uses.
     """
-    points = ZONE_WEATHER_POINTS[zone]
+    points, kinds = _zone_points(zone, with_sea, extended)
+    land_count = kinds.count("land")
     timezone_name = ENTSOE_ZONES[zone]["timezone"]
     params = {"latitude": ",".join(f"{lat:.2f}" for lat, _ in points), "longitude": ",".join(f"{lon:.2f}" for _, lon in points),
               "hourly": "temperature_2m,wind_speed_100m,shortwave_radiation", "timezone": timezone_name}
     if forecast:
         url = OPEN_METEO_CUSTOMER_BASE if commercial_endpoint else OPEN_METEO_FORECAST_BASE
-        params.update({"past_days": 7, "forecast_days": 3})
+        params.update({"past_days": 7, "forecast_days": int(forecast_days)})
         if api_key.strip():
             params["apikey"] = api_key.strip()
     else:
-        url = OPEN_METEO_ARCHIVE_BASE
+        url = OPEN_METEO_HISTORICAL_FORECAST_BASE if historical_forecast else OPEN_METEO_ARCHIVE_BASE
         params.update({"start_date": start.isoformat(), "end_date": end.isoformat()})
     payload = (_json_get_fn or _json_get)(url, params=params)
     answers = payload if isinstance(payload, list) else [payload]
     per_point = []
     for answer in answers:
         hourly = answer.get("hourly", {}) if isinstance(answer, dict) else {}
-        if not hourly.get("time"):
-            continue
-        frame = pd.DataFrame({"date": [str(t)[:10] for t in hourly["time"]],
-                              "temperature": pd.to_numeric(pd.Series(hourly.get("temperature_2m", [])), errors="coerce"),
-                              "wind": pd.to_numeric(pd.Series(hourly.get("wind_speed_100m", [])), errors="coerce"),
-                              "solar": pd.to_numeric(pd.Series(hourly.get("shortwave_radiation", [])), errors="coerce")})
-        # A day counts only with most of its hours, so a partly published day can't pass as a calm one.
-        counts = frame.groupby("date")[["temperature", "wind", "solar"]].count().min(axis=1)
-        daily = frame.groupby("date")[["temperature", "wind", "solar"]].mean().loc[lambda f: counts.reindex(f.index) >= 20]
-        per_point.append(daily.assign(hdd=(18.0 - daily["temperature"]).clip(lower=0)))
-    if not per_point:
+        per_point.append(_hourly_frame(hourly) if hourly.get("time") else None)
+    if not any(p is not None for p in per_point[:land_count]):
         raise RuntimeError("Open-Meteo returned no weather for this zone.")
-    joined = pd.concat(per_point)
-    grouped = joined.groupby(level=0)
-    means = grouped[["temperature", "hdd", "wind", "solar"]].mean().loc[grouped.size() >= max(1, len(points) // 2)]
+    # A day counts only with most of its hours and most of the points, so a partly published day can't pass as a calm one.
+    means = _daily_zone_means(per_point, kinds[:len(per_point)], len(ZONE_WEATHER_POINTS[zone]) // 2)
     if means.empty:
-        complete = sum(not part.empty for part in per_point)
-        raise RuntimeError(f"Open-Meteo gave complete days for {complete} of {len(points)} points, too few to stand for the zone.")
+        complete = sum(p is not None and not p.empty for p in per_point[:land_count])
+        raise RuntimeError(f"Open-Meteo gave complete days for {complete} of {land_count} points, too few to stand for the zone.")
     out = means.reset_index().rename(columns={"index": "date"})
     out["date"] = pd.to_datetime(out["date"])
-    return out.assign(zone=zone, points=len(per_point))[["zone", "date", "temperature", "hdd", "wind", "solar", "points"]]
+    points_used = sum(p is not None for p in per_point[:land_count])
+    return out.assign(zone=zone, points=points_used)[["zone", "date", "temperature", "hdd", "wind", "solar", "points", "wind_land", "wind_sea"]]
+
+
+def fetch_zone_ensemble(zone: str, api_key: str = "", _json_get_fn=None) -> pd.DataFrame:
+    """ECMWF's 51 weather scenarios for the next 15 days, averaged over the zone's points like the forecast.
+
+    Members are named as Open-Meteo returns them: the control run without a suffix, then _member01 onwards.
+    A variable the model doesn't provide is left empty, and that part of the spread is then not shown."""
+    # Only the spread is taken from the scenarios, so the base points are enough and keep the request light.
+    points, kinds = _zone_points(zone, True)
+    params = {"latitude": ",".join(f"{lat:.2f}" for lat, _ in points), "longitude": ",".join(f"{lon:.2f}" for _, lon in points),
+              "hourly": "temperature_2m,wind_speed_100m,shortwave_radiation", "timezone": ENTSOE_ZONES[zone]["timezone"],
+              "models": OPEN_METEO_ENSEMBLE_MODEL, "forecast_days": FUND_OUTLOOK_DAYS}
+    if api_key.strip():
+        params["apikey"] = api_key.strip()
+    payload = (_json_get_fn or _json_get)(OPEN_METEO_ENSEMBLE_BASE, params=params)
+    answers = payload if isinstance(payload, list) else [payload]
+    hourly_sets = [a.get("hourly", {}) if isinstance(a, dict) else {} for a in answers]
+    names = set()
+    for hourly in hourly_sets:
+        for key in hourly:
+            match = re.fullmatch(r"(temperature_2m|wind_speed_100m|shortwave_radiation)(_member\d+)?", key)
+            if match:
+                names.add(match.group(2) or "")
+    frames = []
+    for suffix in sorted(names):
+        per_point = [_hourly_frame(h, suffix) if h.get("time") else None for h in hourly_sets]
+        means = _daily_zone_means(per_point, kinds[:len(per_point)], len(ZONE_WEATHER_POINTS[zone]) // 2)
+        if means.empty:
+            continue
+        member = int(suffix.replace("_member", "")) if suffix else 0
+        frames.append(means.reset_index().rename(columns={"index": "date"}).assign(member=member))
+    if len(frames) < FUND_MIN_MEMBERS:
+        raise RuntimeError(f"Open-Meteo returned {len(frames)} weather scenarios for {zone}, too few to show a spread.")
+    out = pd.concat(frames, ignore_index=True)
+    out["date"] = pd.to_datetime(out["date"])
+    return out.assign(zone=zone)[["zone", "member", "date", "temperature", "wind_land", "wind_sea", "solar"]]
+
+
+ENTSOE_OUTAGE_PAGE = 200          # ENTSO-E serves outage notices 200 at a time
+ENTSOE_OUTAGE_MAX_PAGES = 15
+ENTSOE_OUTAGE_MAX_FILES = 4000
+OPEN_HOLIDAYS_BASE = "https://openholidaysapi.org"
+
+
+def _iso_duration(text: str) -> pd.Timedelta:
+    match = re.fullmatch(r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?", str(text).strip())
+    if not match or not any(match.groups()):
+        raise RuntimeError(f"ENTSO-E sent an unknown resolution: {text}")
+    days, hours, minutes = (int(v or 0) for v in match.groups())
+    return pd.Timedelta(days=days, hours=hours, minutes=minutes)
+
+
+def parse_entsoe_outages(content: bytes) -> pd.DataFrame:
+    """Unavailability notices for generation units: one row per period of reduced availability.
+
+    ENTSO-E sends a zip with one XML document per notice and revision. Each keeps its notice id, revision,
+    status (A05 active, A09 cancelled, A13 withdrawn), the unit, its type and installed capacity, and the
+    capacity still available over each period."""
+    columns = ["mrid", "revision", "status", "created", "business", "unit", "unit_name", "psr", "nominal", "start", "end", "available"]
+    documents = []
+    if content[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = [n for n in archive.namelist() if n.casefold().endswith(".xml")]
+            if len(names) > ENTSOE_OUTAGE_MAX_FILES:
+                raise RuntimeError("ENTSO-E sent more outage notices than the safety limit, so they were refused.")
+            documents = [_zip_member_limited(archive, n) for n in names]
+    else:
+        documents = [content]
+    rows = []
+    for document in documents:
+        root = _safe_xml_root(document)
+        if "acknowledgement" in _xml_local_name(root.tag).casefold():
+            reason = " ".join(t.text or "" for t in root.iter() if _xml_local_name(t.tag) == "text").strip()
+            if "no matching data" in reason.casefold():
+                continue
+            raise RuntimeError(f"ENTSO-E: {reason or 'the outage request was refused.'}")
+        child = lambda node, name: next((c for c in node if _xml_local_name(c.tag) == name), None)
+        text = lambda node, name: (child(node, name).text or "").strip() if node is not None and child(node, name) is not None else ""
+        status_node = child(root, "docStatus")
+        head = {"mrid": text(root, "mRID"), "revision": int(text(root, "revisionNumber") or 0), "status": text(status_node, "value") if status_node is not None else "",
+                "created": text(root, "createdDateTime")}
+        for series in (node for node in root.iter() if _xml_local_name(node.tag) == "TimeSeries"):
+            unit = text(series, "production_RegisteredResource.pSRType.powerSystemResources.mRID") or text(series, "production_RegisteredResource.mRID")
+            name = text(series, "production_RegisteredResource.pSRType.powerSystemResources.name") or text(series, "production_RegisteredResource.name")
+            base = dict(head, business=text(series, "businessType"), unit=unit, unit_name=name,
+                        psr=text(series, "production_RegisteredResource.pSRType.psrType"),
+                        nominal=pd.to_numeric(text(series, "production_RegisteredResource.pSRType.powerSystemResources.nominalP"), errors="coerce"))
+            for period in (node for node in series if _xml_local_name(node.tag) == "Available_Period"):
+                interval = child(period, "timeInterval")
+                begin, finish = pd.Timestamp(text(interval, "start")), pd.Timestamp(text(interval, "end"))
+                step = _iso_duration(text(period, "resolution") or "PT60M")
+                points = sorted(((int(text(p, "position")), float(text(p, "quantity"))) for p in period if _xml_local_name(p.tag) == "Point"), key=lambda v: v[0])
+                for index, (position, quantity) in enumerate(points):
+                    start = begin + step * (position - 1)
+                    end = begin + step * (points[index + 1][0] - 1) if index + 1 < len(points) else finish
+                    rows.append(dict(base, start=start, end=end, available=quantity))
+    frame = pd.DataFrame(rows, columns=columns)
+    if not frame.empty:
+        frame["start"], frame["end"] = pd.to_datetime(frame["start"], utc=True), pd.to_datetime(frame["end"], utc=True)
+    return frame
+
+
+def fetch_entsoe_outages(token: str, zone: str, start: date, end: date, _http_fn=None) -> tuple[pd.DataFrame, int]:
+    """Outage notices for a zone's generation units that touch these days, page by page. Returns the notices
+    and the number of documents read. Production units are asked for when no generation unit is listed."""
+    if not token.strip():
+        raise ValueError("Enter your ENTSO-E Web API token.")
+    request_http = _http_fn or _http_get_bytes
+    local = ZoneInfo(ENTSOE_ZONES[zone]["timezone"])
+    window = {"periodStart": datetime.combine(start, time.min, tzinfo=local).astimezone(timezone.utc).strftime("%Y%m%d%H%M"),
+              "periodEnd": datetime.combine(end, time.min, tzinfo=local).astimezone(timezone.utc).strftime("%Y%m%d%H%M")}
+    for document_type in ("A80", "A77"):
+        frames, read = [], 0
+        for page in range(ENTSOE_OUTAGE_MAX_PAGES):
+            params = dict(window, documentType=document_type, biddingZone_Domain=ENTSOE_ZONES[zone]["eic"], offset=page * ENTSOE_OUTAGE_PAGE,
+                          securityToken=token.strip())
+            try:
+                body, _ = request_http(ENTSOE_BASE, params=params, headers={"Accept": "application/zip, application/xml, */*"})
+            except ProviderHTTPError as exc:
+                message = _entsoe_error_message(exc)
+                if "no matching data" in message.casefold():
+                    break
+                raise RuntimeError(message) from None
+            files = 1
+            if body[:2] == b"PK":
+                with zipfile.ZipFile(io.BytesIO(body)) as archive:
+                    files = sum(n.casefold().endswith(".xml") for n in archive.namelist())
+            part = parse_entsoe_outages(body)
+            read += files if not part.empty else 0
+            if not part.empty:
+                frames.append(part)
+            if part.empty or files < ENTSOE_OUTAGE_PAGE:
+                break
+        frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if not frame.empty and frame["psr"].eq("B14").any() or document_type == "A77":
+            return (frame.assign(zone=zone) if not frame.empty else frame), read
+    return pd.DataFrame(), 0
+
+
+def fetch_open_holidays(country: str, start: date, end: date, _json_get_fn=None) -> pd.DataFrame:
+    """School holidays and public holidays by region from OpenHolidays (openholidaysapi.org, ODbL). No key is needed.
+    At most three years per request, as the service allows."""
+    rows = []
+    for kind, path in (("school", "SchoolHolidays"), ("public", "PublicHolidays")):
+        cursor = start
+        while cursor <= end:
+            last = min(end, cursor + timedelta(days=3 * 365 - 5))
+            payload = (_json_get_fn or _json_get)(f"{OPEN_HOLIDAYS_BASE}/{path}", params={"countryIsoCode": country, "languageIsoCode": "EN",
+                                                                                         "validFrom": cursor.isoformat(), "validTo": last.isoformat()})
+            for item in payload if isinstance(payload, list) else []:
+                regions = [str(r.get("shortName") or r.get("code") or "") for r in (item.get("subdivisions") or []) if isinstance(r, dict)]
+                if not regions:
+                    regions = [str(r.get("code") or r.get("shortName") or "") for r in (item.get("groups") or []) if isinstance(r, dict)]
+                name = next((n.get("text") for n in item.get("name") or [] if isinstance(n, dict)), "")
+                rows.append({"country": country, "kind": kind, "start": pd.to_datetime(item.get("startDate"), errors="coerce"),
+                             "end": pd.to_datetime(item.get("endDate") or item.get("startDate"), errors="coerce"),
+                             "subdivisions": ",".join(r for r in regions if r), "nationwide": bool(item.get("nationwide")), "name": name})
+            cursor = last + timedelta(days=1)
+    frame = pd.DataFrame(rows, columns=["country", "kind", "start", "end", "subdivisions", "nationwide", "name"]).dropna(subset=["start", "end"])
+    if frame.empty:
+        raise RuntimeError(f"OpenHolidays returned no holidays for {country}.")
+    return frame.drop_duplicates(["kind", "start", "end", "subdivisions"]).reset_index(drop=True)
+
+
+def _the_number(text: object) -> float:
+    if text is None:
+        return np.nan
+    cleaned = str(text).strip().replace("\u00a0", "").replace(" ", "")
+    if not cleaned:
+        return np.nan
+    if "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(",", "") if cleaned.rfind(".") > cleaned.rfind(",") else cleaned.replace(".", "").replace(",", ".")
+    elif "," in cleaned:
+        cleaned = cleaned.replace(",", ".") if len(cleaned.split(",")[-1]) != 3 else cleaned.replace(",", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return np.nan
+
+
+def parse_the_consumption(content: bytes) -> pd.DataFrame:
+    """Trading Hub Europe's aggregated consumption report: German gas use per gas day, in GWh.
+
+    Small users are those on standard load profiles (SLP, synthetic and analytic), large users those
+    metered daily (RLM, with and without tolerance). H-gas and L-gas are added. Figures come in kWh."""
+    root = _safe_xml_root(content)
+    rows = []
+    for element in root.iter():
+        children = {_xml_local_name(child.tag).casefold(): child.text for child in element if len(child) == 0}
+        day_text = next((children[k] for k in ("gasday", "gastag", "dayofuse", "datum") if k in children), None)
+        if not day_text:
+            continue
+        values = {k: _the_number(v) for k, v in children.items() if not k.startswith("unit") and ("slp" in k or "rlm" in k)}
+        small = [v for k, v in values.items() if "slp" in k]
+        large = [v for k, v in values.items() if "rlm" in k]
+        status = next((children[k] for k in ("status", "state") if k in children), "")
+        rows.append({"gas_day": pd.to_datetime(str(day_text)[:10].replace(".", "-").replace("/", "-"), errors="coerce", format="%Y-%m-%d" if re.match(r"\d{4}-", str(day_text)) else "%d-%m-%Y"),
+                     "small": np.nansum(small) / 1e6 if small and not np.isnan(small).all() else np.nan,
+                     "large": np.nansum(large) / 1e6 if large and not np.isnan(large).all() else np.nan,
+                     "status": str(status or "").strip().casefold()})
+    frame = pd.DataFrame(rows, columns=["gas_day", "small", "large", "status"]).dropna(subset=["gas_day"])
+    if frame.empty:
+        raise RuntimeError("Trading Hub Europe returned no consumption figures for these days.")
+    frame = frame.loc[frame[["small", "large"]].notna().any(axis=1)]
+    return frame.sort_values("gas_day").drop_duplicates("gas_day", keep="last").reset_index(drop=True)
+
+
+def fetch_the_consumption(start: date, end: date, _http_fn=None) -> pd.DataFrame:
+    """German gas consumption by gas day from Trading Hub Europe's public XML interface. No key is needed."""
+    body, _ = (_http_fn or _http_get_bytes)(TRADING_HUB_BASE, params={"ReportId": "AggregatedConsumptionData", "Start": start.strftime("%d-%m-%Y"), "End": end.strftime("%d-%m-%Y")},
+                                             headers={"Accept": "application/xml, text/xml, */*"})
+    return parse_the_consumption(body)
 
 
 # ---- Safe downloads ---------------------------------------------------------------
@@ -5905,20 +6902,21 @@ def _build_residual_load_proxy(zone: Optional[str] = None) -> pd.DataFrame:
 # warnings and stale data, one steel accent for what is selected, and one fixed colour
 # per market on every chart.
 # =============================================================================
-BG = "#0D1014"          # page
-PANEL = "#14181D"       # panels, charts, tiles
-PANEL_SOFT = "#1B2128"  # controls and the selected row
+BG = "#0C141B"          # page: deep slate with a blue cast
+PANEL = "#132029"       # panels, charts, tiles
+PANEL_SOFT = "#1B2C38"  # controls and the selected row
 PLATE_HI = PANEL        # kept for older references: surfaces are flat now
 PLATE_LO = PANEL
-BORDER = "#252C34"      # hairlines
+BORDER = "#26394A"      # hairlines
 TEXT = "#E4E8EC"        # primary ink
 GRAY = "#8A96A1"        # secondary ink
-ACCENT = "#6FA8DC"      # selection and actions
+ACCENT = "#4FB3F6"      # selection and actions; each section sets its own below
 SODIUM = "#E3A72F"      # warnings and stale data
 GAIN = "#3FCB8A"        # up, profit, long
 LOSS = "#F0665C"        # down, loss, short
 
-SECTION_COLORS = {"Market": ACCENT, "Pricing": ACCENT, "Book and risk": ACCENT, "Data and controls": ACCENT}
+SECTION_COLORS = {"Market": "#4FB3F6", "Pricing": "#F7BC45", "Book and risk": "#34D6B4", "Data and controls": "#A893F5"}
+_NAV_SECTION_CSS = "\n".join(f".st-key-nav_{i} {{{{ --sec:{c}; }}}}".replace("{{", "{").replace("}}", "}") for i, c in enumerate(SECTION_COLORS.values()))
 
 # Chart series, validated for colour-blind separation on the panel colour.
 SERIES = ["#4C97E6", "#C2870C", "#17A891", "#E0703C", "#9180EE", "#6EA62E", "#DA6694"]
@@ -5939,15 +6937,15 @@ MAX_TABLE_ROWS = 2000
 TABLE_ROW_HEIGHT = 28
 UI_FONT = "'IBM Plex Sans', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
 NOTE_FONT = UI_FONT       # one face throughout
-GRID = "rgba(138,150,161,0.13)"
+GRID = "rgba(138,170,190,0.13)"
 
 # Streamlit re-runs this script on every interaction, so the template is built only once.
 if "meridian_desk" not in pio.templates:
     pio.templates["meridian_desk"] = go.layout.Template(layout=dict(
     colorway=SERIES,
-    font=dict(family=UI_FONT, size=11, color=TEXT),
+    font=dict(family=UI_FONT, size=12, color=TEXT),
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-    title=dict(font=dict(size=12, color=TEXT), x=0.012, xanchor="left", xref="container", y=0.975, yanchor="top"),
+    title=dict(font=dict(size=13, color=TEXT), x=0.012, xanchor="left", xref="container", y=0.975, yanchor="top"),
     xaxis=dict(showgrid=True, gridcolor=GRID, linecolor=BORDER, tickcolor=BORDER, ticks="outside", ticklen=3, automargin=True,
                zeroline=False, separatethousands=True, title=dict(font=dict(size=11, color=GRAY)), tickfont=dict(color=GRAY, size=10),
                showspikes=True, spikemode="across", spikethickness=1, spikecolor=GRAY, spikedash="dot", spikesnap="cursor"),
@@ -5966,97 +6964,101 @@ _CSS = f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap');
 :root {{ color-scheme: dark; --accent: {ACCENT}; --line: 1px solid {BORDER}; }}
-html {{ font-size:14px; }}   /* Streamlit sizes everything in rem: a smaller base makes every widget and line denser in proportion */
+html {{ font-size:15px; }}   /* Streamlit sizes everything in rem: a smaller base makes every widget and line denser in proportion */
 html, body, .stApp, button, input, textarea, select, .stMarkdown, [data-testid="stWidgetLabel"] {{ font-family:{UI_FONT}; }}
-.stApp {{ color:{TEXT}; font-size:13px; font-variant-numeric:tabular-nums; font-feature-settings:"tnum" 1; background:{BG}; }}
+.stApp {{ color:{TEXT}; font-size:14px; font-variant-numeric:tabular-nums; font-feature-settings:"tnum" 1;
+  background:radial-gradient(1100px 520px at 88% -8%, rgba(79,179,246,0.10), transparent 62%), radial-gradient(900px 480px at -6% 105%, rgba(52,214,180,0.06), transparent 60%), {BG}; background-attachment:fixed; }}
+{_NAV_SECTION_CSS}
 [data-testid="stAppViewContainer"], [data-testid="stMain"], [data-testid="stHeader"] {{ background:transparent; }}
 [data-testid="stHeader"] {{ height:0; min-height:0; }}
 [data-testid="stDeployButton"], [data-testid="stToolbarActions"], [data-testid="stAppDeployButton"] {{ display:none; }}
 [data-testid="stMainBlockContainer"] {{ max-width:none; padding:0.7rem 1.1rem 2rem; }}
-[data-testid="stVerticalBlock"] {{ gap:0.55rem; }}
-[data-testid="stHorizontalBlock"] {{ gap:0.55rem; }}
+[data-testid="stVerticalBlock"] {{ gap:0.7rem; }}
+[data-testid="stHorizontalBlock"] {{ gap:0.7rem; }}
 [data-testid="stMarkdownContainer"]:has(> div:last-child) {{ margin-bottom:0 !important; }}
 :focus-visible {{ outline:1px solid {ACCENT} !important; outline-offset:1px; }}
 
 h1, h2, h3, h4 {{ color:{TEXT}; font-weight:600; font-family:{UI_FONT}; letter-spacing:0; }}
-.stApp h2, .stApp h3 {{ font-size:0.86rem; font-weight:600; padding:0.55rem 0 0.3rem; margin:0.35rem 0 0; line-height:1.3; border-bottom:var(--line); }}
+.stApp h2, .stApp h3 {{ font-size:0.95rem; font-weight:600; padding:0.6rem 0 0.3rem 0.55rem; margin:0.4rem 0 0; line-height:1.3; border-bottom:var(--line); border-left:3px solid var(--accent); }}
 .stApp p, .stApp li {{ line-height:1.45; font-size:0.93rem; }}
 a {{ color:{ACCENT}; }}
 [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p {{ color:{GRAY}; font-size:0.8rem; line-height:1.4; max-width:120ch; }}
 hr {{ border-color:{BORDER}; margin:0.6rem 0; }}
 
 /* Status strip and page header */
-.statusbar {{ display:flex; flex-wrap:wrap; align-items:center; gap:0.2rem 1.1rem; padding:5px 10px; margin:0 0 0.45rem; border:var(--line); border-radius:3px; background:{PANEL}; font-size:0.8rem; color:{GRAY}; }}
+.statusbar {{ display:flex; flex-wrap:wrap; align-items:center; gap:0.2rem 1.1rem; padding:5px 12px; margin:0 0 0.5rem; border:var(--line); border-radius:6px; background:{PANEL}; font-size:0.8rem; color:{GRAY}; }}
 .statusbar b {{ color:{TEXT}; font-weight:500; }}
 .statusbar .dot {{ display:inline-flex; align-items:center; gap:5px; white-space:nowrap; }}
 .statusbar .dot i {{ width:7px; height:7px; border-radius:50%; display:inline-block; background:{GRAY}; }}
 .statusbar .dot.good i {{ background:{GAIN}; }} .statusbar .dot.warn i {{ background:{SODIUM}; }} .statusbar .dot.bad i {{ background:{LOSS}; }}
 .statusbar .dot.warn, .statusbar .dot.bad {{ color:{TEXT}; }}
 .statusbar .grow {{ flex:1; }}
-.st-key-page_head {{ padding:0 0 0.35rem; margin:0 0 0.35rem; border-bottom:var(--line); }}
+.st-key-page_head {{ padding:0 0 0.45rem; margin:0 0 0.4rem; border-bottom:1px solid color-mix(in srgb, var(--accent) 45%, {BORDER}); }}
 .head-row {{ display:flex; gap:0.7rem; align-items:baseline; flex-wrap:wrap; }}
-.stApp h1.page-title {{ font-size:1.12rem; font-weight:600; line-height:1.3; color:{TEXT}; margin:0; padding:0; }}
+.stApp h1.page-title {{ font-size:1.35rem; padding-left:0.6rem !important; border-left:4px solid var(--accent); font-weight:600; line-height:1.3; color:{TEXT}; margin:0; padding:0; }}
 .page-sub {{ color:{GRAY}; font-size:0.86rem !important; margin:0; }}
 .pill {{ display:inline-flex; align-items:center; gap:6px; padding:2px 8px; border:var(--line); border-radius:3px; font-size:0.78rem; color:{TEXT}; white-space:nowrap; background:{PANEL}; }}
 .pill i {{ width:7px; height:7px; border-radius:50%; display:inline-block; background:{GRAY}; }}
 .pill.good i {{ background:{GAIN}; }} .pill.warn i {{ background:{SODIUM}; }}
 
 /* Notes: the plain-language summary panels */
-.st-key-hero {{ padding:9px 12px 8px; border:var(--line); border-radius:3px; background:{PANEL}; }}
+.st-key-hero {{ padding:12px 15px 10px; border:var(--line); border-top:2px solid var(--accent); border-radius:6px;
+  background:linear-gradient(135deg, color-mix(in srgb, var(--accent) 11%, {PANEL}) 0%, {PANEL} 55%); }}
 .st-key-hero [data-testid="stPlotlyChart"] {{ border:0; background:none; }}
-.desk-note {{ font-size:0.93rem; line-height:1.45; color:{TEXT}; max-width:110ch; margin:0; }}
+.desk-note {{ font-size:1rem; line-height:1.45; color:{TEXT}; max-width:110ch; margin:0; }}
 .desk-note p {{ margin:0 0 0.35rem; font-size:inherit; line-height:inherit; }}
 .desk-note b {{ font-weight:600; white-space:nowrap; }}
 .desk-note .soft {{ color:{GRAY}; font-size:0.86rem; }}
 .desk-note ul {{ margin:0 0 0.35rem; padding-left:1.1em; list-style:square; }}
-.desk-note li {{ margin:0 0 0.12rem; padding:0; font-size:0.93rem; line-height:1.4; color:{TEXT}; }}
-.desk-note li::marker {{ color:{GRAY}; }}
-.desk-note .desk-label {{ margin:0.45rem 0 0.15rem; font-size:0.8rem; font-weight:600; color:{GRAY}; }}
+.desk-note li {{ margin:0 0 0.15rem; padding:0; font-size:1rem; line-height:1.4; color:{TEXT}; }}
+.desk-note li::marker {{ color:var(--accent); }}
+.desk-note .desk-label {{ margin:0.5rem 0 0.15rem; font-size:0.82rem; font-weight:600; color:var(--accent); }}
 .desk-note b.gain {{ color:{GAIN}; }} .desk-note b.loss {{ color:{LOSS}; }}
 .src-row {{ display:flex; flex-wrap:wrap; align-items:center; gap:0.25rem 0.35rem; margin:0.3rem 0 0; }}
 .src-title {{ font-size:0.76rem; font-weight:500; color:{GRAY}; margin-right:0.2rem; }}
-.src {{ display:inline-flex; align-items:baseline; gap:0.3rem; padding:1px 6px; border-radius:2px; font-size:0.76rem; color:{GRAY}; border:var(--line); background:transparent; }}
+.src {{ display:inline-flex; align-items:baseline; gap:0.3rem; padding:1px 7px; border-radius:4px; font-size:0.76rem; color:{GRAY}; border:var(--line); background:transparent; }}
 .src b {{ font-weight:600; font-size:0.72rem; }}
-.src.real b, .src.user b {{ color:{GAIN}; }}
+.src.real b, .src.user b {{ color:{GAIN}; }} .src.real, .src.user {{ background:rgba(63,203,138,0.07); }}
 .src.part b, .src.old b, .src.demo b {{ color:{SODIUM}; }} .src.demo {{ border-color:{SODIUM}; color:{TEXT}; }}
 .src.missing b, .src.info b {{ color:{GRAY}; }}
 
 /* Figures: compact cells, coloured only when the number has a direction */
-.fig, [data-testid="stMetric"] {{ position:relative; overflow:hidden; border:var(--line); border-radius:3px; padding:6px 9px 6px; margin:0; min-height:56px; background:{PANEL}; }}
-.fig[style*="--tile"] {{ border-left:2px solid var(--tile); }}
-.fig .l, [data-testid="stMetricLabel"] p {{ color:{GRAY}; font-size:0.76rem; line-height:1.3; font-weight:400; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-.fig .v, [data-testid="stMetricValue"] {{ color:{TEXT}; font-size:1.18rem; font-weight:600; line-height:1.3; position:relative; white-space:nowrap; }}
-[data-testid="stMetricValue"] > div {{ font-size:1.18rem; }}
-.fig .n {{ color:{GRAY}; font-size:0.74rem; line-height:1.3; position:relative; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.fig, [data-testid="stMetric"] {{ position:relative; overflow:hidden; border:var(--line); border-radius:6px; padding:9px 12px 8px; margin:0; min-height:72px;
+  border-left:3px solid var(--tile, var(--accent)); background:linear-gradient(160deg, color-mix(in srgb, var(--tile, var(--accent)) 9%, {PANEL}) 0%, {PANEL} 60%); }}
+.fig .l, [data-testid="stMetricLabel"] p {{ color:{GRAY}; font-size:0.8rem; line-height:1.3; font-weight:400; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.fig .v, [data-testid="stMetricValue"] {{ color:{TEXT}; font-size:1.45rem; font-weight:600; line-height:1.3; position:relative; white-space:nowrap; }}
+[data-testid="stMetricValue"] > div {{ font-size:1.45rem; }}
+.fig .n {{ color:{GRAY}; font-size:0.78rem; line-height:1.3; position:relative; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
 .fig .v.gain {{ color:{GAIN}; }} .fig .v.loss {{ color:{LOSS}; }}
-.fig svg.spark {{ position:absolute; right:6px; top:8px; width:38%; height:26px; opacity:0.9; pointer-events:none; }}
-.fig .meter {{ height:3px; margin-top:5px; background:{BORDER}; overflow:hidden; }}
+.fig svg.spark {{ position:absolute; right:8px; top:10px; width:38%; height:32px; opacity:0.95; pointer-events:none; }}
+.fig .meter {{ height:4px; border-radius:2px; margin-top:5px; background:{BORDER}; overflow:hidden; }}
 .fig .meter i {{ display:block; height:100%; background:var(--tile, {ACCENT}); }}
 
 /* Charts and tables */
-[data-testid="stPlotlyChart"] {{ background:{PANEL}; border:var(--line); border-radius:3px; overflow:hidden; }}
-[data-testid="stDataFrame"] {{ border:var(--line); border-radius:3px; }}
+[data-testid="stPlotlyChart"] {{ background:{PANEL}; border:var(--line); border-radius:6px; overflow:hidden; }}
+[data-testid="stDataFrame"] {{ border:var(--line); border-radius:6px; overflow:hidden; }}
 
 /* Sidebar */
-section[data-testid="stSidebar"] {{ width:204px !important; border-right:var(--line); background:#0A0D10; }}
+section[data-testid="stSidebar"] {{ width:226px !important; border-right:var(--line); background:linear-gradient(180deg, #0F1C26 0%, #0A1218 100%); }}
 section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {{ padding:0 !important; background:none; }}
 section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{ padding:0 8px 14px !important; margin:0 !important; }}
 section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {{ gap:0.35rem; }}
 [data-testid="stSidebarHeader"] {{ padding:6px 8px 0; min-height:0; height:1.6rem; }}
 .brand {{ display:flex; align-items:baseline; gap:8px; padding:0 6px 4px; border-bottom:var(--line); }}
-.brand .mark {{ display:none; }}
-.brand .name {{ font-size:0.98rem; font-weight:600; color:{TEXT}; letter-spacing:0.02em; line-height:1.3; }}
+.brand .mark {{ display:flex; align-items:center; justify-content:center; width:26px; height:26px; border-radius:6px; background:linear-gradient(135deg, #4FB3F6, #34D6B4); align-self:center; }}
+.brand .mark span {{ font-family:"Material Symbols Rounded"; font-size:18px; color:#06131B; }}
+.brand .name {{ font-size:1.05rem; font-weight:600; color:{TEXT}; letter-spacing:0.02em; line-height:1.3; }}
 .brand small {{ display:block; font-size:0.72rem; font-weight:400; color:{GRAY}; margin-top:1px; }}
 section[data-testid="stSidebar"] [data-testid="stRadio"], section[data-testid="stSidebar"] [data-testid="stRadio"] > div, section[data-testid="stSidebar"] [role="radiogroup"] {{ width:100% !important; }}
-section[data-testid="stSidebar"] [data-testid="stRadio"] [data-testid="stWidgetLabel"] p {{ color:{GRAY}; font-size:0.72rem; font-weight:500; padding:0 6px; margin-top:2px; }}
+section[data-testid="stSidebar"] [data-testid="stRadio"] [data-testid="stWidgetLabel"] p {{ color:var(--sec, {GRAY}); font-size:0.74rem; font-weight:600; padding:0 6px; margin-top:4px; }}
 section[data-testid="stSidebar"] [role="radiogroup"] {{ gap:0; flex-direction:column; }}
 section[data-testid="stSidebar"] [role="radiogroup"] > div {{ width:100%; }}
 section[data-testid="stSidebar"] [data-testid="stRadioOption"], section[data-testid="stSidebar"] label[data-baseweb="radio"] {{ width:100% !important; box-sizing:border-box; margin:0; padding:2px 6px; border-radius:2px; cursor:pointer; display:block; border-left:2px solid transparent; }}
 section[data-testid="stSidebar"] [data-testid="stRadioOption"] > div > div:first-child, section[data-testid="stSidebar"] label[data-baseweb="radio"] > div:first-child {{ display:none; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"] p, section[data-testid="stSidebar"] label[data-baseweb="radio"] p {{ font-size:0.84rem; color:{TEXT}; line-height:1.5; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"] [role="img"], section[data-testid="stSidebar"] label[data-baseweb="radio"] [role="img"] {{ display:none; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"] p, section[data-testid="stSidebar"] label[data-baseweb="radio"] p {{ font-size:0.9rem; color:{TEXT}; line-height:1.6; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"] [role="img"], section[data-testid="stSidebar"] label[data-baseweb="radio"] [role="img"] {{ color:var(--sec, {GRAY}); opacity:0.85; }}
 section[data-testid="stSidebar"] [data-testid="stRadioOption"]:hover, section[data-testid="stSidebar"] label[data-baseweb="radio"]:hover {{ background:{PANEL}; }}
-section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"], section[data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) {{ background:{PANEL_SOFT}; border-left-color:{ACCENT}; }}
+section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"], section[data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) {{ background:color-mix(in srgb, var(--sec, {ACCENT}) 16%, transparent); border-left-color:var(--sec, {ACCENT}); }}
 section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] p, section[data-testid="stSidebar"] label[data-baseweb="radio"]:has(input:checked) p {{ font-weight:600; }}
 .side-foot {{ color:{GRAY}; font-size:0.74rem; line-height:1.4; padding:0 6px; }}
 .side-foot b {{ color:{TEXT}; font-weight:500; }}
@@ -6065,19 +7067,19 @@ section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="tr
 [class*="st-key-tabs_view_"] [role="radiogroup"] {{ gap:0; padding:0; width:100%; flex-wrap:wrap; border-bottom:var(--line); }}
 [class*="st-key-tabs_view_"] [data-testid="stRadioOption"], [class*="st-key-tabs_view_"] label[data-baseweb="radio"] {{ margin:0 0 -1px; padding:4px 12px; border-radius:0; cursor:pointer; border-bottom:2px solid transparent; }}
 [class*="st-key-tabs_view_"] [data-testid="stRadioOption"] > div > div:first-child, [class*="st-key-tabs_view_"] label[data-baseweb="radio"] > div:first-child {{ display:none; }}
-[class*="st-key-tabs_view_"] [data-testid="stRadioOption"] p, [class*="st-key-tabs_view_"] label[data-baseweb="radio"] p {{ font-size:0.86rem; color:{GRAY}; }}
+[class*="st-key-tabs_view_"] [data-testid="stRadioOption"] p, [class*="st-key-tabs_view_"] label[data-baseweb="radio"] p {{ font-size:0.92rem; color:{GRAY}; }}
 [class*="st-key-tabs_view_"] [data-testid="stRadioOption"]:hover p, [class*="st-key-tabs_view_"] label[data-baseweb="radio"]:hover p {{ color:{TEXT}; }}
-[class*="st-key-tabs_view_"] [data-testid="stRadioOption"][data-selected="true"], [class*="st-key-tabs_view_"] label[data-baseweb="radio"]:has(input:checked) {{ border-bottom-color:{ACCENT}; }}
+[class*="st-key-tabs_view_"] [data-testid="stRadioOption"][data-selected="true"], [class*="st-key-tabs_view_"] label[data-baseweb="radio"]:has(input:checked) {{ border-bottom-color:var(--accent); background:color-mix(in srgb, var(--accent) 10%, transparent); }}
 [class*="st-key-tabs_view_"] [data-testid="stRadioOption"][data-selected="true"] p, [class*="st-key-tabs_view_"] label[data-baseweb="radio"]:has(input:checked) p {{ color:{TEXT}; font-weight:600; }}
 [data-baseweb="tab-list"] {{ gap:0; border-bottom:var(--line); }}
 [data-baseweb="tab"] {{ padding:4px 12px; height:auto; }}
 [data-baseweb="tab"] p {{ font-size:0.86rem; }}
 
 /* Controls: flat, compact, outlined */
-.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button {{ border-radius:3px; border:var(--line); color:{TEXT}; font-weight:500; min-height:1.85rem; padding:0.1rem 0.7rem; background:{PANEL_SOFT}; box-shadow:none; }}
+.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button {{ border-radius:6px; border:var(--line); color:{TEXT}; font-weight:500; min-height:1.85rem; padding:0.1rem 0.7rem; background:{PANEL_SOFT}; box-shadow:none; }}
 .stButton > button p, .stDownloadButton > button p {{ font-size:0.84rem; }}
-.stButton > button:hover, .stDownloadButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {{ color:{TEXT}; border-color:{GRAY}; }}
-.stButton > button[kind="primary"], [data-testid="stFormSubmitButton"] > button[kind^="primary"], [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] {{ color:#08131D; background:{ACCENT}; border-color:{ACCENT}; }}
+.stButton > button:hover, .stDownloadButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {{ color:{TEXT}; border-color:var(--accent); }}
+.stButton > button[kind="primary"], [data-testid="stFormSubmitButton"] > button[kind^="primary"], [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"] {{ color:#08131D; background:linear-gradient(180deg, color-mix(in srgb, var(--accent) 88%, white), var(--accent)); border-color:var(--accent); }}
 .stButton > button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primaryFormSubmit"]:hover {{ color:#08131D; filter:brightness(1.1); }}
 .stButton > button[kind="primary"] p, [data-testid="stBaseButton-primary"] p, [data-testid="stBaseButton-primaryFormSubmit"] p {{ color:#08131D; font-weight:600; }}
 [data-testid="stSelectbox"] [role="group"], [data-testid="stMultiSelect"] [role="group"], [data-testid="stTextInputRootElement"], [data-testid="stDateInput"] [role="group"], [data-baseweb="select"] > div, [data-baseweb="input"], [data-baseweb="base-input"], .stTextArea textarea, [data-testid="stNumberInputContainer"] {{ background:{BG} !important; border-color:{BORDER} !important; border-radius:3px; box-shadow:none; min-height:1.85rem; }}
@@ -6095,47 +7097,47 @@ section[data-testid="stSidebar"] .stButton > button {{ min-height:1.9rem; }}
 [data-tag] span, [data-tag] button, [data-baseweb="tag"] span, [data-baseweb="tag"] svg {{ color:{TEXT} !important; fill:{TEXT}; }}
 
 /* Panels and notes */
-.st-key-panel {{ padding:8px 10px 4px; border:var(--line); border-radius:3px; background:{PANEL}; }}
-[data-testid="stExpander"] details {{ border:var(--line); border-radius:3px; background:{PANEL}; }}
+.st-key-panel {{ padding:10px 12px 6px; border:var(--line); border-radius:6px; background:{PANEL}; }}
+[data-testid="stExpander"] details {{ border:var(--line); border-radius:6px; background:{PANEL}; }}
 [data-testid="stExpander"] summary {{ padding:0.3rem 0.6rem; min-height:0; }}
 [data-testid="stExpander"] summary p {{ font-size:0.84rem; color:{GRAY}; }}
 [data-testid="stExpander"] summary:hover p {{ color:{TEXT}; }}
-[data-testid="stAlertContainer"] {{ border-radius:3px; border:var(--line); border-left:2px solid {GRAY}; color:{TEXT} !important; background:{PANEL} !important; padding:6px 10px; min-height:0; }}
+[data-testid="stAlertContainer"] {{ border-radius:6px; border:var(--line); border-left:3px solid {GRAY}; color:{TEXT} !important; background:{PANEL} !important; padding:6px 10px; min-height:0; }}
 [data-testid="stAlertContainer"] p {{ color:{TEXT}; font-size:0.86rem; }}
 [data-testid="stAlertContainer"]:has([data-testid="stAlertContentWarning"]) {{ border-left-color:{SODIUM}; }}
-[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]) {{ border-left-color:{ACCENT}; }}
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]) {{ border-left-color:var(--accent); }}
 [data-testid="stAlertContainer"]:has([data-testid="stAlertContentError"]) {{ border-left-color:{LOSS}; }}
 [data-testid="stAlertContainer"]:has([data-testid="stAlertContentSuccess"]) {{ border-left-color:{GAIN}; }}
 [data-testid="stVerticalBlockBorderWrapper"] {{ border-color:{BORDER}; border-radius:3px; }}
 [data-testid="stProgress"] > div > div {{ height:3px; }}
 
 /* Quote ticket */
-.st-key-ticket {{ padding:10px 12px; border:var(--line); border-top:2px solid {ACCENT}; border-radius:3px; background:{PANEL}; }}
+.st-key-ticket {{ padding:12px 14px; border:var(--line); border-top:2px solid var(--accent); border-radius:6px; background:linear-gradient(160deg, color-mix(in srgb, var(--accent) 10%, {PANEL}) 0%, {PANEL} 60%); }}
 .ticket-price {{ font-size:1.9rem; line-height:1.15; font-weight:600; margin:0.1rem 0 0; color:{TEXT}; }}
 .ticket-unit {{ color:{GRAY}; font-size:0.8rem; margin-bottom:0.5rem; }}
 .ticket-row {{ display:flex; justify-content:space-between; gap:18px; padding:3px 0; border-top:var(--line); font-size:0.86rem; }}
 .ticket-row span:first-child {{ color:{GRAY}; }}
 
 /* Market Read */
-.dial {{ border:var(--line); border-radius:3px; padding:9px 11px 8px; margin:0; min-height:150px; background:{PANEL}; }}
+.dial {{ border:var(--line); border-top:2px solid var(--accent); border-radius:6px; padding:11px 13px 9px; margin:0; min-height:150px; background:linear-gradient(160deg, color-mix(in srgb, var(--accent) 8%, {PANEL}) 0%, {PANEL} 60%); }}
 .dial-top {{ display:flex; justify-content:space-between; align-items:center; gap:10px; }}
 .dial-name {{ color:{GRAY}; font-size:0.8rem; }}
-.dial-verdict {{ font-size:1.18rem; font-weight:600; line-height:1.25; margin:0.25rem 0 0.5rem; color:{TEXT}; }}
+.dial-verdict {{ font-size:1.35rem; font-weight:600; line-height:1.25; margin:0.25rem 0 0.5rem; color:{TEXT}; }}
 .dial-verdict.gain {{ color:{GAIN}; }} .dial-verdict.loss {{ color:{LOSS}; }}
 .scale {{ position:relative; height:8px; margin:0 6px; }}
 .scale .track {{ position:absolute; left:-6px; right:-6px; top:3px; height:2px; background:linear-gradient(90deg, {LOSS} 0%, {BORDER} 50%, {GAIN} 100%); }}
-.scale .knob {{ position:absolute; top:-2px; width:3px; height:12px; margin-left:-1px; border-radius:1px; background:{TEXT}; }}
+.scale .knob {{ position:absolute; top:-3px; width:12px; height:12px; margin-left:-6px; border-radius:50%; background:{TEXT}; border:2px solid {PANEL}; }}
 .scale-ends {{ display:flex; justify-content:space-between; color:{GRAY}; font-size:0.72rem; margin-top:5px; }}
 .dial-line {{ color:{GRAY}; font-size:0.8rem; line-height:1.35; margin-top:0.35rem; }}
-.ev {{ display:flex; gap:16px; justify-content:space-between; align-items:center; padding:5px 9px; margin:0 0 -1px; border:var(--line); background:{PANEL}; }}
+.ev {{ display:flex; gap:16px; justify-content:space-between; align-items:center; padding:7px 11px; margin:0 0 -1px; border:var(--line); background:{PANEL}; }}
 .ev-main {{ min-width:0; flex:1; }}
-.ev-name {{ font-weight:600; font-size:0.86rem; }}
-.ev-value {{ color:{TEXT}; font-size:0.84rem; line-height:1.35; }}
+.ev-name {{ font-weight:600; font-size:0.93rem; }}
+.ev-value {{ color:{TEXT}; font-size:0.9rem; line-height:1.4; }}
 .ev-why {{ color:{GRAY}; font-size:0.78rem; line-height:1.35; }}
 .ev-side {{ flex:none; width:150px; }}
 .ev-tag {{ text-align:right; font-size:0.78rem; font-weight:600; margin-bottom:4px; color:{GRAY}; }}
 .ev-tag.gain {{ color:{GAIN}; }} .ev-tag.loss {{ color:{LOSS}; }}
-.ev-bar {{ position:relative; height:4px; background:{BORDER}; }}
+.ev-bar {{ position:relative; height:6px; border-radius:3px; background:{BORDER}; }}
 .ev-bar::after {{ content:""; position:absolute; left:50%; top:-2px; bottom:-2px; width:1px; background:{GRAY}; }}
 .ev-bar i {{ position:absolute; top:0; bottom:0; background:{GRAY}; }}
 .ev-bar i.gain {{ background:{GAIN}; }} .ev-bar i.loss {{ background:{LOSS}; }}
@@ -6161,7 +7163,7 @@ def _styled(fig: go.Figure, height: Optional[int] = None) -> go.Figure:
                       margin=dict(l=10, r=8, t=52 if has_title else 26, b=8),
                       hovermode=fig.layout.hovermode or ("x unified" if any(t.type == "scatter" and "lines" in str(t.mode) for t in fig.data) else "closest"))
     if fig.layout.title and fig.layout.title.text:
-        fig.update_layout(title=dict(x=0.012, xanchor="left", xref="container", y=0.975, yanchor="top", font=dict(size=12, color=TEXT, weight=600)))
+        fig.update_layout(title=dict(x=0.012, xanchor="left", xref="container", y=0.975, yanchor="top", font=dict(size=13, color=TEXT, weight=600)))
     fig.update_xaxes(title_font=dict(size=11, color=GRAY))
     fig.update_yaxes(title_font=dict(size=11, color=GRAY))
     if any((trace.type == "bar" and trace.orientation == "h") or trace.type == "heatmap" for trace in fig.data):
@@ -6176,8 +7178,8 @@ def _styled(fig: go.Figure, height: Optional[int] = None) -> go.Figure:
             if "lines" in str(trace.mode):
                 if points > 48 and "markers" in str(trace.mode):
                     trace.mode = "lines"
-                if trace.line.width is None or trace.line.width > 1.6:
-                    trace.line.width = 1.6
+                if trace.line.width is None or trace.line.width > 2.2:
+                    trace.line.width = 2.0
             if "markers" in str(trace.mode):
                 trace.marker.size = trace.marker.size if trace.marker.size and "lines" not in str(trace.mode) else 5
                 trace.marker.line = dict(width=1, color=PANEL)
@@ -6290,24 +7292,24 @@ def _sparkline(values: Sequence[float], color: str) -> str:
     coords = [(i / (len(points) - 1) * 120, 30 - (p - low) / span * 26) for i, p in enumerate(points)]
     line = " ".join(f"{x:.1f},{y:.1f}" for x, y in coords)
     return (f'<svg class="spark" viewBox="0 0 120 34" preserveAspectRatio="none" aria-hidden="true">'
-            f'<polyline points="{line}" fill="none" stroke="{color}" stroke-width="1.2" vector-effect="non-scaling-stroke"/></svg>')
+            f'<polyline points="{line}" fill="none" stroke="{color}" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>')
 
 
 def kpi(col, label: str, value: str, sub: str = "", accent: str = "", tone: str = "",
         spark: Optional[Sequence[float]] = None, meter: Optional[float] = None) -> None:
-    """A compact figure cell: label, number, optional note, trend line or fill meter.
-    Only a direction colours it: accent colours passed by older callers are ignored, so colour always means up or down."""
-    color = {"gain": GAIN, "loss": LOSS}.get(tone, "")
+    """A figure tile: label, number, optional note, trend line or fill meter.
+    Its edge takes the market's colour, or the section's when none is given. A direction, up or down, always wins."""
+    color = {"gain": GAIN, "loss": LOSS}.get(tone, "") or accent
     tile = f' style="--tile:{color}"' if color else ""
     note = f'<div class="n">{html.escape(sub)}</div>' if sub else ""
-    trend = _sparkline(spark, color or GRAY) if spark is not None else ""
+    trend = _sparkline(spark, color or ACCENT) if spark is not None else ""
     bar = f'<div class="meter"><i style="width:{max(0.0, min(100.0, float(meter))):.1f}%"></i></div>' if meter is not None else ""
     col.markdown(f'<div class="fig"{tile}>{trend}<div class="l">{html.escape(label)}</div>'
                  f'<div class="v {tone}">{html.escape(value)}</div>{note}{bar}</div>', unsafe_allow_html=True)
 
 
-STATUS_SOURCES = (("ENTSO-E", ("entsoe_",), 30.0), ("GIE", ("gie_",), 30.0), ("Open-Meteo", ("weather_", "zone_weather_"), 30.0),
-                  ("TradingView", ("tradingview_",), 3.0), ("EEX", ("eex_",), 80.0))
+STATUS_SOURCES = (("ENTSO-E", ("entsoe_", "fund_daily"), 30.0), ("GIE", ("gie_",), 30.0), ("Open-Meteo", ("weather_", "zone_weather_", "fund_weather_"), 30.0),
+                  ("TradingView", ("tradingview_",), 3.0), ("EEX", ("eex_",), 80.0), ("THE", ("the_",), 30.0), ("OpenHolidays", ("holidays",), 24.0 * 10))
 
 
 def status_strip_html() -> str:
@@ -6348,7 +7350,10 @@ def render_header(title: str, subtitle: str) -> None:
 
 
 def page_accent_css(label: str) -> str:
-    """One accent throughout: sections are no longer colour-coded."""
+    """Set the accent colour for the section the current page belongs to."""
+    for section, items in NAV_SECTIONS.items():
+        if label in items:
+            return f"<style>:root {{ --accent:{SECTION_COLORS[section]}; }}</style>"
     return ""
 
 
@@ -6382,7 +7387,7 @@ def need_data_note(message: str) -> None:
 # SECTION 6 · NAVIGATION AND SESSION
 # =============================================================================
 NAV_SECTIONS = {
-    "Market": [":material/dashboard:  Market Overview", ":material/wb_twilight:  Morning Brief", ":material/psychology:  Market Read", ":material/public:  Market Fundamentals",
+    "Market": [":material/dashboard:  Market Overview", ":material/wb_twilight:  Morning Brief", ":material/psychology:  Market Read", ":material/public:  Market Fundamentals", ":material/query_stats:  Fundamentals Outlook",
                ":material/bolt:  Power Spot", ":material/compare_arrows:  Spreads & Margins"],
     "Pricing": [":material/show_chart:  Forward Curves", ":material/request_quote:  OTC Quote Builder", ":material/factory:  Asset Valuation"],
     "Book and risk": [":material/menu_book:  Trading Book & MtM", ":material/calendar_today:  Daily P&L",
@@ -6398,7 +7403,8 @@ WORKFLOW_NEXT = {
     "Market Overview": "Morning Brief",
     "Morning Brief": "Market Read",
     "Market Read": "Market Fundamentals",
-    "Market Fundamentals": "Power Spot",
+    "Market Fundamentals": "Fundamentals Outlook",
+    "Fundamentals Outlook": "Power Spot",
     "Power Spot": "Spreads & Margins",
     "Spreads & Margins": "Forward Curves",
     "Forward Curves": "OTC Quote Builder",
@@ -6616,7 +7622,7 @@ PRICE_HISTORY_DAYS = 365
 # ENTSO-E's forecasts only need to span the tested days and enough earlier days to fit them.
 FORECAST_HISTORY_DAYS = 300
 ZONE_WEATHER_HISTORY_DAYS = 430
-STALE_HOURS = {"tradingview": 1.0, "prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0}
+STALE_HOURS = {"tradingview": 1.0, "prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0, "ensemble": 6.0, "holidays": 24.0 * 7}
 KEEP_DAYS = {"prices": 400, "load": 90, "generation": 90, "lng": 400}
 MAX_UPDATE_WORKERS = 8          # the providers allow far more; this keeps the first update short
 TRADINGVIEW_WORKERS = 2         # TradingView gets its own small lane: asked too fast, it drops requests
@@ -6888,6 +7894,7 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             _stored_live_item("weather_power_history", "Open-Meteo wind and solar history", frame, {"days": 430})
             return f"{frame['location'].nunique()} of {len(power_zones)} locations"
         tasks.append(UpdateTask("Wind and solar history", lambda: fetch_power_weather([ZONE_WEATHER[z] for z in power_zones]), apply_power_weather))
+    tasks.extend(fundamentals_tasks(force, today, keys, grid_zones))
     held_auctions = _live_dataset_frame("eex_eua_auctions")
     auction_age = (today - pd.Timestamp(held_auctions["date"].iloc[-1]).date()).days if not held_auctions.empty and "date" in held_auctions.columns else None
     if force or auction_age is None or (auction_age >= 1 and _needs_update("eex_eua_auctions", "prices", False)):
@@ -7266,6 +8273,141 @@ def winter_outlook() -> dict:
                                                _live_dataset_frame("weather_daily"), valuation_date))
 
 
+def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str]) -> list[UpdateTask]:
+    """What the fundamentals outlook needs beyond the price estimate's data: a year of daily output,
+    weather as the forecast models saw it, 16 days ahead, ECMWF's scenarios and German gas use."""
+    tasks: list[UpdateTask] = []
+    zones = [z for z in zones if z in FUND_SEA_POINTS]
+    open_meteo_key = keys.get("open_meteo", "")
+    for zone in zones:
+        key = f"fund_daily|{zone}"
+        if not _needs_update(key, "fundamentals", force):
+            continue
+        summary, load, generation = _held_frame(key), _held_frame(f"entsoe_load|{zone}"), _held_frame(f"entsoe_generation|{zone}")
+        span = fund_history_span(summary, load, today)
+        def fetch_history(zone=zone, span=span) -> pd.DataFrame:
+            if span is None or not keys["entsoe"]:
+                return pd.DataFrame()
+            start, end = span
+            parts = [daily_from_entsoe(fetch_entsoe_series(keys["entsoe"], "Actual generation by type", zone, start, end), zone),
+                     daily_from_entsoe(fetch_entsoe_series(keys["entsoe"], "Actual load", zone, start, end), zone, single="load")]
+            return pd.concat(parts, ignore_index=True)
+        def apply_history(frame: pd.DataFrame, zone=zone, key=key, span=span) -> str:
+            if span is not None and frame.empty and not keys["entsoe"]:
+                raise RuntimeError(f"No ENTSO-E key found. Put {KEYS_FILE_NAME} in the same folder as this app.")
+            held = _held_frame(key)
+            kept = [f for f in (held, frame) if f is not None and not f.empty]
+            rows = fund_daily_rows(pd.concat(kept, ignore_index=True) if kept else None, _held_frame(f"entsoe_load|{zone}"), _held_frame(f"entsoe_generation|{zone}"), zone)
+            rows = rows.loc[rows["date"] >= pd.Timestamp(today - timedelta(days=FUND_KEEP_DAYS))].reset_index(drop=True)
+            _stored_live_item(key, f"Daily output and demand, {zone}", rows, {"zone": zone})
+            return f"{rows['date'].nunique():,} days held" + (f", {frame['date'].nunique() if not frame.empty else 0:,} fetched" if span else "")
+        tasks.append(UpdateTask(f"Output history for the outlook, {zone}", fetch_history, apply_history, span[0] if span else None))
+    held_item = st.session_state.get("live_data", {}).get("fund_weather_history") or {}
+    old_points = bool(held_item) and (held_item.get("metadata") or {}).get("version") != FUND_WEATHER_VERSION
+    if zones and (_needs_update("fund_weather_history", "power_weather", False) or old_points):
+        # Weather kept under an older set of points would mix two definitions of wind and sun, so it is fetched again.
+        held = None if old_points else _held_frame("fund_weather_history")
+        end = today - timedelta(days=1)
+        def fetch_weather_history() -> tuple[pd.DataFrame, list[str]]:
+            frames, failures = [], []
+            for zone in zones:
+                part = held.loc[held["zone"].eq(zone)] if held is not None and "zone" in held.columns else None
+                start = incremental_start(part if part is not None and not part.empty else None, "date", GAS_DEMAND_HISTORY_DAYS if zone == "Germany-Luxembourg" else FUND_HISTORY_DAYS, 3, today)
+                if start > end:
+                    continue
+                try:
+                    frames.append(fetch_zone_weather(zone, start, end, historical_forecast=True, with_sea=True, extended=True))
+                except Exception as exc:
+                    failures.append(f"{zone}: {exc}")
+            return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), failures
+        def apply_weather_history(outcome: tuple) -> str:
+            frame, failures = outcome
+            if frame.empty and failures:
+                raise RuntimeError("; ".join(failures))
+            if old_points and not frame.empty:
+                st.session_state["live_data"].pop("fund_weather_history", None)
+            merged = store_observations("fund_weather_history", "Past weather as the forecast models saw it", frame, {"zones": zones, "version": FUND_WEATHER_VERSION},
+                                        ("date", "zone"), "date", GAS_DEMAND_HISTORY_DAYS + 30) if not frame.empty else held
+            return f"{len(frame):,} new days, {0 if merged is None else len(merged):,} held" + (f". Failed: {'; '.join(failures)}" if failures else "")
+        tasks.append(UpdateTask("Weather history for the outlook", fetch_weather_history, apply_weather_history))
+    if zones and _needs_update("fund_weather_forecast", "weather", force):
+        def fetch_weather_ahead() -> tuple[pd.DataFrame, list[str]]:
+            frames, failures = [], []
+            for zone in zones:
+                try:
+                    frames.append(fetch_zone_weather(zone, forecast=True, api_key=open_meteo_key, commercial_endpoint=bool(open_meteo_key),
+                                                     forecast_days=FUND_OUTLOOK_DAYS + 1, with_sea=True, extended=True))
+                except Exception as exc:
+                    failures.append(f"{zone}: {exc}")
+            return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), failures
+        def apply_weather_ahead(outcome: tuple) -> str:
+            frame, failures = outcome
+            if frame.empty:
+                raise RuntimeError("; ".join(failures) or "No zone returned a forecast.")
+            _stored_live_item("fund_weather_forecast", "16-day weather forecast across each zone", frame, {"zones": zones})
+            return f"{frame['zone'].nunique()} of {len(zones)} zones, to {pd.Timestamp(frame['date'].max()):%d %b}"
+        tasks.append(UpdateTask("16-day weather forecast", fetch_weather_ahead, apply_weather_ahead))
+    if zones and _needs_update("fund_weather_ensemble", "ensemble", False):
+        def fetch_scenarios() -> tuple[pd.DataFrame, list[str]]:
+            frames, failures = [], []
+            for zone in zones:
+                try:
+                    frames.append(fetch_zone_ensemble(zone, open_meteo_key))
+                except Exception as exc:
+                    failures.append(f"{zone}: {exc}")
+            return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), failures
+        def apply_scenarios(outcome: tuple) -> str:
+            frame, failures = outcome
+            if frame.empty:
+                raise RuntimeError("; ".join(failures) or "No zone returned weather scenarios.")
+            _stored_live_item("fund_weather_ensemble", "ECMWF weather scenarios", frame, {"zones": zones, "model": OPEN_METEO_ENSEMBLE_MODEL})
+            return f"{frame['member'].nunique()} scenarios" + (f". Failed: {'; '.join(failures)}" if failures else "")
+        tasks.append(UpdateTask("Weather scenarios", fetch_scenarios, apply_scenarios))
+    for zone in [z for z in zones if z in FUND_NUCLEAR_FIT]:
+        key = f"entsoe_outages|{zone}"
+        if not _needs_update(key, "fundamentals", force):
+            continue
+        def fetch_outages(zone=zone):
+            if not keys["entsoe"]:
+                raise RuntimeError(f"No ENTSO-E key found. Put {KEYS_FILE_NAME} in the same folder as this app.")
+            return fetch_entsoe_outages(keys["entsoe"], zone, today - timedelta(days=10), today + timedelta(days=FUND_OUTLOOK_DAYS + 5))
+        def apply_outages(outcome, zone=zone, key=key) -> str:
+            frame, read = outcome
+            nuclear = frame.loc[frame["psr"].eq("B14")] if not frame.empty else frame
+            if nuclear.empty:
+                raise RuntimeError(f"ENTSO-E listed no nuclear outage notices for {zone}; the outlook keeps last week's nuclear output.")
+            _stored_live_item(key, f"Nuclear outage notices, {zone}", nuclear.reset_index(drop=True), {"zone": zone, "documents": read})
+            return f"{nuclear['mrid'].nunique():,} notices for {nuclear['unit'].nunique()} units"
+        tasks.append(UpdateTask(f"Nuclear outage notices, {zone}", fetch_outages, apply_outages))
+    countries = sorted({FUND_COUNTRY[z] for z in zones if z in FUND_COUNTRY})
+    if countries and _needs_update("holidays", "holidays", force):
+        def fetch_holidays() -> tuple[pd.DataFrame, list[str]]:
+            frames, failures = [], []
+            for country in countries:
+                try:
+                    frames.append(fetch_open_holidays(country, today - timedelta(days=GAS_DEMAND_HISTORY_DAYS + 40), today + timedelta(days=60)))
+                except Exception as exc:
+                    failures.append(f"{country}: {exc}")
+            return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), failures
+        def apply_holidays(outcome: tuple) -> str:
+            frame, failures = outcome
+            if frame.empty:
+                raise RuntimeError("; ".join(failures) or "No holidays returned.")
+            _stored_live_item("holidays", "School and regional public holidays", frame, {"countries": countries, "source": "OpenHolidays (ODbL)"})
+            return f"{(frame['kind'] == 'school').sum():,} school and {(frame['kind'] == 'public').sum():,} public holidays" + (f". Failed: {'; '.join(failures)}" if failures else "")
+        tasks.append(UpdateTask("School and regional holidays", fetch_holidays, apply_holidays))
+    if "Germany-Luxembourg" in zones and _needs_update("the_gas_consumption", "fundamentals", force):
+        held = _held_frame("the_gas_consumption")
+        # Large users' figures are corrected for weeks after the day, so recent months are reloaded each time.
+        start = incremental_start(held, "gas_day", GAS_DEMAND_HISTORY_DAYS, 75, today)
+        def apply_gas_use(frame: pd.DataFrame) -> str:
+            merged = store_observations("the_gas_consumption", "German gas consumption, Trading Hub Europe", frame, {"source": "Trading Hub Europe"},
+                                        ("gas_day",), "gas_day", GAS_DEMAND_HISTORY_DAYS + 30)
+            return f"{len(frame):,} gas days fetched, {len(merged):,} held, published to {pd.Timestamp(frame['gas_day'].max()):%d %b}"
+        tasks.append(UpdateTask("German gas consumption", lambda: fetch_the_consumption(start, today + timedelta(days=2)), apply_gas_use, start))
+    return tasks
+
+
 # =============================================================================
 # SECTION 6D · REAL OR DEMO: WHERE EACH PRICE ON A PAGE COMES FROM
 # =============================================================================
@@ -7428,6 +8570,19 @@ def src_weather() -> list:
     return [("real", "Open-Meteo weather")] if not _live_dataset_frame("weather_daily").empty else [("missing", "Open-Meteo weather")]
 
 
+def src_outlook() -> list:
+    out = []
+    days = max((f["date"].nunique() for f in (_live_dataset_frame(k) for k in [f"fund_daily|{z}" for z in _live_variants("fund_daily")]) if not f.empty and "date" in f.columns), default=0)
+    out.append(("real", f"ENTSO-E output, {days} days") if days else ("missing", "ENTSO-E output history"))
+    out.append(("real", "Open-Meteo 16-day forecast") if not _live_dataset_frame("fund_weather_forecast").empty else ("missing", "Open-Meteo 16-day forecast"))
+    out.append(("real", "ECMWF scenarios") if not _live_dataset_frame("fund_weather_ensemble").empty else ("missing", "ECMWF scenarios"))
+    last = _latest(_live_dataset_frame("the_gas_consumption"), ("gas_day",))
+    out.append(("real", f"THE gas use to {last:%d %b}") if last else ("missing", "THE gas use"))
+    out.append(("real", "ENTSO-E nuclear outage notices") if not _live_dataset_frame("entsoe_outages|France").empty else ("missing", "ENTSO-E nuclear outage notices"))
+    out.append(("real", "OpenHolidays school and regional holidays") if not _live_dataset_frame("holidays").empty else ("missing", "OpenHolidays holidays"))
+    return out
+
+
 def src_flows() -> list:
     return [("real", "ENTSO-E and ENTSOG flows")] if _live_variants("entsoe_flow") or _live_variants("entsog") else []
 
@@ -7506,6 +8661,7 @@ PAGE_SOURCES = {
     "Market Read": lambda: src_storage() + src_lng() + src_weather() + src_spot() + src_power_system() + src_read_curves(),
     "Market Fundamentals": lambda: src_storage() + src_lng() + src_weather() + src_spot() + src_power_system() + src_flows(),
     "Power Spot": lambda: src_spot() + src_weather() + src_forecasts(),
+    "Fundamentals Outlook": lambda: src_outlook() + src_forecasts(),
     "Spreads & Margins": lambda: src_curves([p for p in CURVE_PRODUCTS if p != "NBP Natural Gas"]) + src_fx(),
     "Forward Curves": lambda: src_curves(ALL_PRICED),
     "OTC Quote Builder": lambda: src_curves(list(PRODUCTS)),
@@ -7769,7 +8925,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
     def check_navigation_registry() -> str:
         pages = set(NAV_TO_PAGE.values())
         required = {"Market Overview", "Forward Curves", "OTC Quote Builder", "Trading Book & MtM", "Daily P&L", "Risk & Exposure",
-                    "Physical Operations", "Market Fundamentals", "Power Spot", "Spreads & Margins", "Market Read", "Hedge Advisor", "Live Data Integrations", "Model Validation", "Data & Assumptions"}
+                    "Physical Operations", "Market Fundamentals", "Fundamentals Outlook", "Power Spot", "Spreads & Margins", "Market Read", "Hedge Advisor", "Live Data Integrations", "Model Validation", "Data & Assumptions"}
         missing = required - pages
         if missing:
             raise AssertionError(f"Navigation is missing page(s): {sorted(missing)}")
@@ -9768,6 +10924,339 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         except ValueError:
             return "Header rows are found, aviation auctions are left out, French decimals are read and same-day auctions are averaged. An unknown layout is refused."
         raise AssertionError("An unknown layout should be refused.")
+
+    def check_fund_weather_and_scenarios() -> str:
+        calls = []
+        land = len(ZONE_WEATHER_POINTS["Germany-Luxembourg"])
+        def fake(url, params=None, members=0):
+            calls.append((url, dict(params)))
+            out = []
+            for i in range(len(params["latitude"].split(","))):
+                times = [f"2026-01-0{d}T{h:02d}:00" for d in (1, 2) for h in range(24)]
+                speed = 36.0 if i < land else 43.2      # 10 m/s on land, 12 m/s at sea
+                hourly = {"time": times}
+                for suffix in [""] + [f"_member{m:02d}" for m in range(1, members + 1)]:
+                    hourly.update({f"temperature_2m{suffix}": [5.0] * 48, f"wind_speed_100m{suffix}": [speed + (2.0 * int(suffix[-2:]) if suffix else 0.0)] * 48,
+                                   f"shortwave_radiation{suffix}": [40.0] * 48})
+                out.append({"hourly": hourly})
+            return out
+        frame = fetch_zone_weather("Germany-Luxembourg", date(2026, 1, 1), date(2026, 1, 2), historical_forecast=True, with_sea=True, _json_get_fn=fake)
+        url, params = calls[-1]
+        if url != OPEN_METEO_HISTORICAL_FORECAST_BASE or len(params["latitude"].split(",")) != land + len(FUND_SEA_POINTS["Germany-Luxembourg"]):
+            raise AssertionError("Past weather for the outlook must come from the historical forecast, with sea points in the same request.")
+        assert_close(float(frame["wind_land"].iloc[0]), float(wind_power_index([36.0], "land")[0]))
+        assert_close(float(frame["wind_sea"].iloc[0]), 1.0)
+        assert_close(float(frame["wind"].iloc[0]), 36.0)            # sea points don't change the land average used by the price estimate
+        if int(frame["points"].iloc[0]) != land:
+            raise AssertionError("Only land points count towards the zone's points.")
+        storm = wind_power_index([20.0 * 3.6, 26.0 * 3.6, 1.0], "land")
+        if not (storm[0] == 1.0 and storm[1] == 0.0 and storm[2] == 0.0):
+            raise AssertionError("Full output above rated speed, none in a storm or a calm.")
+        ahead = fetch_zone_weather("France", forecast=True, forecast_days=16, with_sea=True, _json_get_fn=fake)
+        if calls[-1][1].get("forecast_days") != 16 or ahead["wind_sea"].isna().any():
+            raise AssertionError("The outlook's forecast must reach 16 days and include the sea points.")
+        scenarios = fetch_zone_ensemble("Germany-Luxembourg", _json_get_fn=lambda u, params=None: fake(u, params, members=6))
+        url, params = calls[-1]
+        if url != OPEN_METEO_ENSEMBLE_BASE or params.get("models") != OPEN_METEO_ENSEMBLE_MODEL:
+            raise AssertionError("Scenarios must come from the ensemble endpoint and the chosen model.")
+        if sorted(scenarios["member"].unique()) != list(range(7)):
+            raise AssertionError("The control run and every member must be read.")
+        if not scenarios.groupby("member")["wind_land"].first().is_monotonic_increasing:
+            raise AssertionError("Each member must keep its own wind.")
+        try:
+            fetch_zone_ensemble("Germany-Luxembourg", _json_get_fn=lambda u, params=None: fake(u, params, members=1))
+            raise AssertionError("Two scenarios can't show a spread.")
+        except RuntimeError as exc:
+            if "too few" not in str(exc):
+                raise
+        return (f"Past weather comes from the historical forecast; wind becomes output hour by hour at each point (10 m/s on land gives {wind_power_index([36.0], 'land')[0]:.2f} of full output), "
+                f"sea points are kept apart, and {len(scenarios['member'].unique())} scenarios are read by name.")
+
+    def check_the_consumption() -> str:
+        xml = (b'<?xml version="1.0"?><root xmlns:x="urn:x"><x:row><x:Gasday>2026-11-10</x:Gasday><x:HGasSLPsyn>1000000000</x:HGasSLPsyn><x:UnitHGasSLPsyn>kWh</x:UnitHGasSLPsyn>'
+               b'<x:HGasSLPana>500000000</x:HGasSLPana><x:LGasSLPsyn>200000000</x:LGasSLPsyn><x:LGasSLPana>100000000</x:LGasSLPana>'
+               b'<x:HGasRLMmT>1500000000</x:HGasRLMmT><x:LGasRLMmT>300000000</x:LGasRLMmT><x:HGasRLMoT>100000000</x:HGasRLMoT><x:LGasRLMoT>50000000</x:LGasRLMoT><x:Status>final</x:Status></x:row>'
+               b'<x:row><x:Gasday>11.11.2026</x:Gasday><x:HGasSLPsyn>1,100,000,000</x:HGasSLPsyn><x:HGasSLPana>500000000</x:HGasSLPana><x:HGasRLMmT></x:HGasRLMmT><x:Status>preliminary</x:Status></x:row></root>')
+        frame = parse_the_consumption(xml)
+        if list(frame["gas_day"].dt.date) != [date(2026, 11, 10), date(2026, 11, 11)]:
+            raise AssertionError("Both date styles must be read.")
+        assert_close(float(frame["small"].iloc[0]), 1800.0)
+        assert_close(float(frame["large"].iloc[0]), 1950.0)
+        assert_close(float(frame["small"].iloc[1]), 1600.0)
+        if not np.isnan(frame["large"].iloc[1]) or frame["status"].iloc[1] != "preliminary":
+            raise AssertionError("Large users not yet published must stay empty, not zero.")
+        seen = []
+        def fake_http(url, params=None, headers=None):
+            seen.append(params)
+            return xml, "text/xml"
+        fetch_the_consumption(date(2026, 11, 1), date(2026, 11, 12), _http_fn=fake_http)
+        if seen[-1] != {"ReportId": "AggregatedConsumptionData", "Start": "01-11-2026", "End": "12-11-2026"}:
+            raise AssertionError(f"The request must follow THE's interface: {seen[-1]}")
+        try:
+            parse_the_consumption(b"<!DOCTYPE x [<!ENTITY a 'b'>]><root/>")
+            raise AssertionError("Declared entities must be refused.")
+        except (ValueError, RuntimeError):
+            pass
+        return "Small and large users are added across H- and L-gas and turned from kWh into GWh, both date styles are read, unpublished figures stay empty, and the request uses THE's date format."
+
+    def _fund_synthetic(days: int = 520, nuclear: float = 0.0, seed: int = 3):
+        rng = np.random.default_rng(seed)
+        index = pd.date_range("2024-01-01", periods=days + 12, freq="D")
+        doy = index.dayofyear.to_numpy()
+        weather = pd.DataFrame({"temperature": 10 - 9 * np.cos(2 * np.pi * (doy - 15) / 365) + rng.normal(0, 3, len(index)),
+                                "wind_land": rng.uniform(0.05, 0.75, len(index)), "wind_sea": rng.uniform(0.1, 0.95, len(index)),
+                                "solar": np.clip(130 - 100 * np.cos(2 * np.pi * (doy - 172) / 365) * -1 + rng.normal(0, 25, len(index)), 5, None)}, index=index)
+        design = fund_design(index, weather, "Germany-Luxembourg")
+        table = pd.DataFrame(index=index[:days])
+        d = design.iloc[:days]
+        table["load"] = 55000 + 900 * d["hdd"] - 6000 * d["sat"] - 9000 * d["sun"] + rng.normal(0, 700, days)
+        table["wind"] = 45000 * d["wind_land"] + 7000 * d["wind_sea"] + rng.normal(0, 900, days)
+        table["solar"] = 70 * d["solar"] + rng.normal(0, 400, days)
+        table["nuclear"] = nuclear + (rng.normal(0, 300, days) if nuclear else 0.0)
+        gap = table["load"] - table["wind"] - table["solar"] - table["nuclear"]
+        table["gas"] = np.clip(0.35 * (gap - gap.quantile(0.25)), 0, None) + 1500 + 120 * d["hdd"] + rng.normal(0, 400, days)
+        table["wind_onshore"], table["wind_offshore"] = table["wind"], 0.0
+        for name in ("load_fc", "wind_fc", "solar_fc"):
+            table[name] = np.nan
+        return table, weather, design
+
+    def check_fund_power_models() -> str:
+        table, weather, _ = _fund_synthetic()
+        out = power_fundamentals("Germany-Luxembourg", table, weather)
+        if not out["ready"]:
+            raise AssertionError(out["reason"])
+        tests = out["tests"].set_index(["target", "lead"])
+        for name, limit in (("wind", 0.08), ("solar", 0.12), ("load", 0.03), ("residual", 0.06), ("gas", 0.12)):
+            share, last = tests.loc[(name, 1), "share"], tests.loc[(name, 1), "last_known"]
+            if not share < limit or not share < last:
+                raise AssertionError(f"{name}: missed {share:.1%} a day ahead against {last:.1%} for the last known value.")
+        outlook = out["outlook"]
+        if len(outlook) < 10 or list(outlook["lead"]) != list(range(1, len(outlook) + 1)):
+            raise AssertionError("The outlook must cover each day the weather forecast reaches.")
+        assert_close(float((outlook["load"] - outlook["wind"] - outlook["solar"] - outlook["residual"]).abs().max()), 0.0, 1e-6)
+        for name in ("residual", "wind", "gas"):
+            if not ((outlook[f"{name}_low"] <= outlook[name] + 1e-6) & (outlook[name] <= outlook[f"{name}_high"] + 1e-6)).all():
+                raise AssertionError(f"The {name} range must contain the central value.")
+        last_known = table.index.max()
+        if pd.Timestamp(outlook["date"].iloc[0]) != last_known + pd.Timedelta(days=1) or out["has_nuclear"]:
+            raise AssertionError("The outlook starts the day after the last complete day, and Germany has no nuclear.")
+        rng = np.random.default_rng(9)
+        members = pd.concat([pd.DataFrame({"zone": "Germany-Luxembourg", "member": m, "date": weather.index[-12:], "temperature": weather["temperature"].iloc[-12:] + rng.normal(0, 2, 12),
+                                           "wind_land": np.clip(weather["wind_land"].iloc[-12:] + rng.normal(0, 0.15, 12), 0, 1), "wind_sea": weather["wind_sea"].iloc[-12:],
+                                           "solar": weather["solar"].iloc[-12:]}) for m in range(20)], ignore_index=True)
+        wide = power_fundamentals("Germany-Luxembourg", table, weather, members)
+        width = lambda o: float((o["wind_high"] - o["wind_low"]).mean())
+        if wide["scenarios"] != 20 or not width(wide["outlook"]) > 1.2 * width(outlook):
+            raise AssertionError("Weather scenarios must widen the wind range.")
+        french, french_weather, _ = _fund_synthetic(nuclear=20000.0, seed=4)
+        base = power_fundamentals("France", french, french_weather)
+        cut = power_fundamentals("France", french, french_weather, nuclear_shift_mw=-5000.0)
+        assert_close(float((cut["outlook"]["gap"] - base["outlook"]["gap"]).mean()), 5000.0, 1e-6)
+        if not base["has_nuclear"] or not (cut["outlook"]["gas"] >= base["outlook"]["gas"] - 1e-6).all() or not cut["outlook"]["gas"].mean() > base["outlook"]["gas"].mean() + 500:
+            raise AssertionError("Less nuclear must leave more for gas-fired plants.")
+        return (f"On made-up data with known effects, a day ahead: wind {tests.loc[('wind', 1), 'share']:.1%}, solar {tests.loc[('solar', 1), 'share']:.1%}, "
+                f"demand {tests.loc[('load', 1), 'share']:.1%}, residual load {tests.loc[('residual', 1), 'share']:.1%}, all far better than the last known value. "
+                "Scenarios widen the ranges, and a 5 GW nuclear cut moves the gap by exactly 5 GW and raises gas-fired output.")
+
+    def check_fund_gas_split() -> str:
+        table, weather, design = _fund_synthetic(days=520, seed=6)
+        rng = np.random.default_rng(11)
+        days = table.index
+        d = design.reindex(days)
+        burn = table["gas"] * 24.0 / 1000.0
+        small = 250 + 55 * d["heat18"] + 25 * d["heat13"] + 20 * d["heat8"] - 15 * d["sat"] - 25 * d["sun"] + rng.normal(0, 25, len(days))
+        large = 950 - 160 * d["sat"] - 140 * d["sun"] + 18 * d["heat15"] + 1.9 * burn + rng.normal(0, 25, len(days))
+        consumption = pd.DataFrame({"gas_day": days, "small": small.to_numpy(), "large": large.to_numpy()})
+        consumption.loc[consumption.index[-1], "large"] = np.nan      # large users come a day later
+        out = gas_demand_model(consumption, weather, table)
+        if not out["ready"]:
+            raise AssertionError(out["reason"])
+        assert_close(out["gas_per_power"], 1.9, 0.15)
+        assert_close(out["per_cold_degree"], 18.0, 4.0)
+        outlook = out["outlook"]
+        assert_close(float((outlook["heating"] + outlook["power"] + outlook["industry"] - outlook["total"]).abs().max()), 0.0, 1e-6)
+        if outlook["small_source"].iloc[0] != "Published":
+            raise AssertionError("Small users' published figure must be used where it exists.")
+        tests = out["tests"].set_index(["target", "lead"])
+        for lead in (1, 7):
+            if not tests.loc[("total", lead), "share"] < min(0.05, tests.loc[("total", lead), "last_known"]):
+                raise AssertionError(f"Total gas use missed {tests.loc[('total', lead), 'share']:.1%} {lead} days ahead.")
+        if not ((outlook["low"] <= outlook["total"]) & (outlook["total"] <= outlook["high"])).all():
+            raise AssertionError("The range must contain the central value.")
+        return (f"On made-up gas use it recovers {out['gas_per_power']:.2f} GWh of gas per GWh of power (true 1.9) and {out['per_cold_degree']:.1f} GWh per cold degree (true 18); "
+                f"heating, power and industry add up to the total, which misses {tests.loc[('total', 1), 'share']:.1%} a day ahead.")
+
+    def check_fund_history_and_record() -> str:
+        today = date(2026, 11, 13)
+        raw = pd.DataFrame({"timestamp": pd.date_range("2026-08-15", "2026-11-12", freq="h", tz="UTC"), "value": 50000.0})
+        span = fund_history_span(None, raw, today)
+        if span != (today - timedelta(days=FUND_HISTORY_DAYS), date(2026, 8, 16)):
+            raise AssertionError(f"With nothing kept, the history must reach back to where the hourly data starts: {span}")
+        kept = pd.DataFrame({"date": pd.date_range(today - timedelta(days=FUND_HISTORY_DAYS), "2026-08-20"), "series": "load", "value": 1.0, "hours": 24})
+        if fund_history_span(kept, raw, today) is not None:
+            raise AssertionError("Nothing is missing when the kept days meet the hourly data.")
+        short = kept.loc[kept["date"] <= "2026-08-01"]
+        if fund_history_span(short, raw, today) != (date(2026, 7, 30), date(2026, 8, 16)):
+            raise AssertionError("A gap between kept days and hourly data must be fetched, with a little overlap.")
+        hourly = raw.loc[raw["timestamp"] >= "2026-11-10"].assign(value=60000.0)
+        rows = fund_daily_rows(kept.assign(date=lambda f: f["date"]).query("date >= '2026-08-01'").pipe(lambda f: pd.concat([f, f.assign(date=pd.Timestamp('2026-11-10'))])), hourly, None, "Germany-Luxembourg")
+        if float(rows.loc[rows["date"].eq("2026-11-10"), "value"].iloc[0]) != 60000.0:
+            raise AssertionError("Hourly data held now must replace the kept daily figure.")
+        outlook = pd.DataFrame({"date": pd.date_range("2026-11-14", periods=3), "lead": [1, 2, 3], "load": 50000.0, "wind": 10000.0, "solar": 1000.0, "residual": 39000.0})
+        record = record_outlook(None, outlook, "France", today)
+        if record_outlook(record, outlook.assign(residual=0.0), "France", today) is not None:
+            raise AssertionError("An outlook is kept once a day, as first made.")
+        actual = pd.DataFrame({"load": [52000.0, 50000.0], "wind": [10000.0, 10000.0], "solar": [1000.0, 1000.0]}, index=pd.date_range("2026-11-14", periods=2))
+        scored = score_outlook_record(record, actual, "France").set_index("lead")
+        assert_close(float(scored.loc[1, "mae"]), 2000.0)
+        if set(scored.index) != {1, 3} or int(scored.loc[3, "n"]) != 1:
+            raise AssertionError("Days without an outcome yet can't be scored.")
+        return "Missing history is fetched only where kept days and hourly data don't meet, newer hourly figures win, outlooks are kept once a day and scored only once the outcome is published."
+
+    def _outage_doc(mrid: str, revision: int, status: str, unit: str, psr: str, nominal: float, start: str, end: str, available: float) -> bytes:
+        return (f'<?xml version="1.0"?><Unavailability_MarketDocument xmlns="urn:iec62325.351:tc57wg16:451-6:outagedocument:3:0"><mRID>{mrid}</mRID>'
+                f'<revisionNumber>{revision}</revisionNumber><createdDateTime>2026-11-01T10:00:00Z</createdDateTime><docStatus><value>{status}</value></docStatus>'
+                f'<TimeSeries><businessType>A53</businessType><production_RegisteredResource.mRID>P{unit}</production_RegisteredResource.mRID>'
+                f'<production_RegisteredResource.name>Plant {unit}</production_RegisteredResource.name><production_RegisteredResource.pSRType.psrType>{psr}</production_RegisteredResource.pSRType.psrType>'
+                f'<production_RegisteredResource.pSRType.powerSystemResources.mRID>{unit}</production_RegisteredResource.pSRType.powerSystemResources.mRID>'
+                f'<production_RegisteredResource.pSRType.powerSystemResources.name>Unit {unit}</production_RegisteredResource.pSRType.powerSystemResources.name>'
+                f'<production_RegisteredResource.pSRType.powerSystemResources.nominalP unit="MAW">{nominal}</production_RegisteredResource.pSRType.powerSystemResources.nominalP>'
+                f'<Available_Period><timeInterval><start>{start}</start><end>{end}</end></timeInterval><resolution>PT60M</resolution>'
+                f'<Point><position>1</position><quantity>{available}</quantity></Point></Available_Period></TimeSeries></Unavailability_MarketDocument>').encode()
+
+    def _zip(documents: list) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for i, doc in enumerate(documents):
+                archive.writestr(f"notice_{i}.xml", doc)
+        return buffer.getvalue()
+
+    def check_nuclear_outages() -> str:
+        table_, weather, _ = _fund_synthetic(nuclear=40000.0, seed=4)
+        last = table_.index.max()
+        a, b = (last + pd.Timedelta(days=3)).strftime("%Y-%m-%dT%H:%MZ"), (last + pd.Timedelta(days=8)).strftime("%Y-%m-%dT%H:%MZ")
+        docs = [_outage_doc("N1", 1, "A05", "U1", "B14", 1300, a, b, 0), _outage_doc("N1", 2, "A05", "U1", "B14", 1300, a, b, 300),
+                _outage_doc("N2", 1, "A09", "U2", "B14", 900, a, b, 0), _outage_doc("N3", 1, "A05", "W1", "B19", 400, a, b, 0)]
+        notices = parse_entsoe_outages(_zip(docs))
+        if len(notices) != 4 or set(notices["status"]) != {"A05", "A09"} or notices["nominal"].max() != 1300:
+            raise AssertionError("Every notice, revision, status and capacity must be read.")
+        days = pd.date_range(last + pd.Timedelta(days=1), periods=10)
+        off = announced_unavailable(notices, "France", days)
+        inside = off.loc[last + pd.Timedelta(days=4)]
+        assert_close(float(inside), 1000.0, 1e-6)        # latest revision (300 MW left), the cancelled notice and the wind farm left out
+        if off.loc[last + pd.Timedelta(days=1)] != 0.0:
+            raise AssertionError("Days no notice reaches count as fully available.")
+        undated = pd.concat([notices, notices.iloc[[0]].assign(mrid="N9", unit="U9", end=pd.NaT)], ignore_index=True)
+        if not announced_unavailable(undated, "France", days).equals(off):
+            raise AssertionError("A notice without an end date can't be placed and must be left out.")
+        base = power_fundamentals("France", table_, weather)
+        held = power_fundamentals("France", table_, weather, outages=notices.assign(zone="France"))
+        if base["nuclear_from"] != "Last week" or held["nuclear_from"] != "Outage notices":
+            raise AssertionError("Notices must be used when held, and last week's output otherwise.")
+        fit = FUND_NUCLEAR_FIT["France"]
+        row = held["outlook"].set_index("date").loc[last + pd.Timedelta(days=4)]
+        expected = base["nuclear_now"] - fit["k"][int(np.clip(row["lead"] - 1, 1, 14)) - 1] * 1000.0 + fit["shift"][int(np.clip(row["lead"] - 1, 1, 14)) - 1] + fit["weekend"] * float(pd.Timestamp(row.name).dayofweek >= 5)
+        assert_close(float(row["nuclear"]), expected, 1e-6)
+        if not held["outlook"]["gap"].sum() > base["outlook"]["gap"].sum():
+            raise AssertionError("Announced outages must leave more for other plants.")
+        seen = []
+        def fake(url, params=None, headers=None):
+            seen.append(dict(params))
+            count = ENTSOE_OUTAGE_PAGE if params["offset"] == 0 else 3
+            return _zip([_outage_doc(f"M{params['offset'] + i}", 1, "A05", f"V{i}", "B14", 900, a, b, 0) for i in range(count)]), "application/zip"
+        frame, read = fetch_entsoe_outages("token", "France", date(2026, 11, 1), date(2026, 12, 1), _http_fn=fake)
+        if [p["offset"] for p in seen] != [0, ENTSOE_OUTAGE_PAGE] or read != ENTSOE_OUTAGE_PAGE + 3 or seen[0]["documentType"] != "A80" or frame["zone"].iloc[0] != "France":
+            raise AssertionError("Notices must be read page by page until a short page.")
+        return (f"Revisions, cancellations and other plant types are handled; a 1 GW announced outage lowers expected output by "
+                f"{fit['k'][int(np.clip(row['lead'] - 1, 1, 14)) - 1] * 1000:,.0f} MW on that day, and notices are read in pages of {ENTSOE_OUTAGE_PAGE}.")
+
+    def check_holidays() -> str:
+        calls = []
+        def fake(url, params=None):
+            calls.append((url, dict(params)))
+            if "School" in url and params["countryIsoCode"] == "DE":
+                return [{"startDate": "2026-07-01", "endDate": "2026-07-10", "nationwide": False, "subdivisions": [{"code": "DE-BY", "shortName": "BY"}], "name": [{"language": "EN", "text": "Summer"}]},
+                        {"startDate": "2026-07-06", "endDate": "2026-07-10", "nationwide": False, "subdivisions": [], "groups": [{"code": "DE-MV-ABS", "shortName": "MV-ABS"}]}]
+            if "Public" in url and params["countryIsoCode"] == "DE":
+                return [{"startDate": "2026-06-04", "endDate": "2026-06-04", "nationwide": False, "subdivisions": [{"code": f"DE-{s}", "shortName": s} for s in ("BW", "BY", "HE", "NW", "RP", "SL")]},
+                        {"startDate": "2026-10-03", "endDate": "2026-10-03", "nationwide": True, "subdivisions": []}]
+            if "School" in url:
+                return [{"startDate": "2026-10-17", "endDate": "2026-11-02", "nationwide": False, "subdivisions": [{"code": "FR-ZC", "shortName": "ZC"}]}]
+            return []
+        de = fetch_open_holidays("DE", date(2024, 1, 1), date(2027, 12, 31), _json_get_fn=fake)
+        fr = fetch_open_holidays("FR", date(2026, 1, 1), date(2026, 12, 31), _json_get_fn=fake)
+        per_kind = [c for c in calls if c[1]["countryIsoCode"] == "DE" and "School" in c[0]]
+        if len(per_kind) != 2 or any((date.fromisoformat(p["validTo"]) - date.fromisoformat(p["validFrom"])).days > 3 * 365 for _, p in per_kind):
+            raise AssertionError("Requests must stay within three years each.")
+        both = pd.concat([de, fr])
+        days = pd.date_range("2026-06-01", "2026-11-05")
+        school, public = holiday_shares(days, "Germany-Luxembourg", both)
+        population = FUND_REGION_POPULATION["DE"]; total = sum(population.values())
+        assert_close(float(school.loc["2026-07-02"]), 13.4 / total, 1e-9)
+        assert_close(float(school.loc["2026-07-07"]), 13.4 / total, 1e-9)    # Bavaria still counts once; Mecklenburg's groups are read too
+        assert_close(float(public.loc["2026-06-04"]), sum(population[s] for s in ("BW", "BY", "HE", "NW", "RP", "SL")) / total, 1e-9)
+        if public.loc["2026-10-03"] != 1.0:
+            raise AssertionError("A nationwide holiday covers everyone.")
+        fr_school, _ = holiday_shares(days, "France", both)
+        fr_pop = FUND_REGION_POPULATION["FR"]
+        assert_close(float(fr_school.loc["2026-10-20"]), (fr_pop["IF"] + fr_pop["OC"]) / sum(fr_pop.values()), 1e-9)
+        weather = pd.DataFrame({"temperature": 10.0, "wind_land": 0.3, "wind_sea": 0.4, "solar": 80.0}, index=days)
+        design = fund_design(days, weather, "Germany-Luxembourg", both)
+        if design.loc["2026-10-03", "part_hol"] != 0.0 or design.loc["2026-06-06", "school"] != 0.0 or not design.loc["2026-06-04", "part_hol"] > 0.3:
+            raise AssertionError("Holiday shares apply to working days, and a holiday kept everywhere is already a holiday.")
+        mv = holiday_shares(pd.date_range("2026-07-11", "2026-07-11"), "Germany-Luxembourg",
+                            pd.DataFrame([{"country": "DE", "kind": "school", "start": pd.Timestamp("2026-07-11"), "end": pd.Timestamp("2026-07-11"), "subdivisions": "MV-ABS", "nationwide": False}]))[0]
+        assert_close(float(mv.iloc[0]), 1.6 / total, 1e-9)
+        return (f"School holidays and regional public holidays become population shares: Corpus Christi in six states covers "
+                f"{public.loc['2026-06-04']:.0%} of Germany, French zone C holidays {fr_school.loc['2026-10-20']:.0%} of France; requests stay within three years.")
+
+    def check_combined_forecast() -> str:
+        table_, weather, _ = _fund_synthetic(seed=8)
+        rng = np.random.default_rng(21)
+        # a published forecast that runs 6% high with its own noise: combining it with the model must beat both
+        table_["wind_fc"] = table_["wind"] * 1.06 + rng.normal(0, 1200, len(table_))
+        table_["load_fc"] = table_["load"] + rng.normal(0, 600, len(table_))
+        table_["solar_fc"] = np.nan
+        out = power_fundamentals("Germany-Luxembourg", table_, weather)
+        tests = out["tests"].set_index(["target", "lead"])
+        wind = tests.loc[("wind", 1)]
+        if out["sources"]["wind"] != "Combined" or not wind["best"] < min(wind["share"], wind["operator"]):
+            raise AssertionError(f"Combining must beat both: model {wind['share']:.1%}, published {wind['operator']:.1%}, combined {wind['best']:.1%}.")
+        if out["sources"]["solar"] != "Model":
+            raise AssertionError("Without a published forecast the model is used.")
+        ahead = out["outlook"]
+        if (ahead["wind_source"] == "Combined").any() or (ahead["solar_source"] != "Model").any():
+            raise AssertionError("Days without a published forecast are the model's.")
+        return (f"With a published wind forecast that runs 6% high, wind a day ahead missed {wind['share']:.1%} from the model, {wind['operator']:.1%} from the forecast and "
+                f"{wind['best']:.1%} combined; each series uses whichever missed least.")
+
+    def check_outlook_points() -> str:
+        calls = []
+        z = "Germany-Luxembourg"
+        counts = {k: len(v) for k, v in (("land", ZONE_WEATHER_POINTS[z]), ("sea", FUND_SEA_POINTS[z]), ("farm", FUND_WIND_POINTS[z]), ("park", FUND_SOLAR_POINTS[z]))}
+        def fake(url, params=None):
+            calls.append(dict(params))
+            out, i = [], 0
+            for kind in ("land", "sea", "farm", "park"):
+                for _ in range(counts[kind] if kind in ("land", "sea") or len(params["latitude"].split(",")) > counts["land"] + counts["sea"] else 0):
+                    speed = {"land": 18.0, "sea": 36.0, "farm": 43.2, "park": 18.0}[kind]
+                    sun = {"land": 40.0, "sea": 40.0, "farm": 40.0, "park": 100.0}[kind]
+                    out.append({"hourly": {"time": [f"2026-01-01T{h:02d}:00" for h in range(24)], "temperature_2m": [5.0] * 24,
+                                           "wind_speed_100m": [speed] * 24, "shortwave_radiation": [sun] * 24}})
+            return out
+        plain = fetch_zone_weather(z, date(2026, 1, 1), date(2026, 1, 1), historical_forecast=True, with_sea=True, _json_get_fn=fake)
+        full = fetch_zone_weather(z, date(2026, 1, 1), date(2026, 1, 1), historical_forecast=True, with_sea=True, extended=True, _json_get_fn=fake)
+        if len(calls[-1]["latitude"].split(",")) != sum(counts.values()):
+            raise AssertionError("Wind-farm and solar-park points go in the same request.")
+        assert_close(float(full["wind_land"].iloc[0]), float(wind_power_index([43.2], "land")[0]))
+        assert_close(float(plain["wind_land"].iloc[0]), float(wind_power_index([18.0], "land")[0]))
+        assert_close(float(full["solar"].iloc[0]), (40.0 * counts["land"] + 100.0 * counts["park"]) / (counts["land"] + counts["park"]))
+        assert_close(float(full["wind"].iloc[0]), 18.0)       # the price estimate's average wind is unchanged
+        fetch_zone_ensemble(z, _json_get_fn=lambda u, params=None: [dict(a, hourly=dict(a["hourly"], **{f"{v}_member{m:02d}": a["hourly"][v] for m in range(1, 6) for v in ("temperature_2m", "wind_speed_100m", "shortwave_radiation")})) for a in fake(u, params)])
+        if len(calls[-1]["latitude"].split(",")) != counts["land"] + counts["sea"]:
+            raise AssertionError("Weather scenarios keep to the base points.")
+        return (f"The outlook's weather adds {counts['farm']} wind-farm and {counts['park']} solar-park points in the same request: wind comes from the farms, "
+                "sun from all land points, and the scenarios stay on the base points.")
     cases = [
         ("Product registry and market timezones", "Configuration", check_product_registry),
         ("MWh ↔ MMBtu conversions", "Units & conversions", check_energy_conversion),
@@ -9850,6 +11339,15 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Backups, kept forecasts and near-month refresh", "Data handling", check_backups_and_kept_forecasts),
         ("Gas storage valuation", "Asset valuation", check_storage_valuation),
         ("Plant spread option", "Asset valuation", check_plant_option),
+        ("Wind output, sea points and weather scenarios", "Fundamentals outlook", check_fund_weather_and_scenarios),
+        ("German gas use from Trading Hub Europe", "Fundamentals outlook", check_the_consumption),
+        ("Power models recover known effects", "Fundamentals outlook", check_fund_power_models),
+        ("Gas demand split recovers known effects", "Fundamentals outlook", check_fund_gas_split),
+        ("Output history and saved outlooks", "Fundamentals outlook", check_fund_history_and_record),
+        ("Nuclear outage notices", "Fundamentals outlook", check_nuclear_outages),
+        ("School and regional holidays", "Fundamentals outlook", check_holidays),
+        ("Published forecasts combined with the models", "Fundamentals outlook", check_combined_forecast),
+        ("Wind-farm and solar-park points", "Fundamentals outlook", check_outlook_points),
         ("Chances for the next day", "Next-day estimate", check_estimate_chances),
         ("Holidays and kinds of day", "Next-day estimate", check_estimate_calendar),
         ("Weather across a zone in one request", "Live API integration", check_zone_weather_fetch),
@@ -11884,6 +13382,290 @@ def page_asset_valuation():
         render_plant_valuation()
 
 
+# -----------------------------------------------------------------------------
+# Fundamentals outlook: wind, solar, demand, residual load and German gas demand
+# -----------------------------------------------------------------------------
+FUND_ZONES = tuple(FUND_SEA_POINTS)
+
+
+def fund_table(zone: str) -> pd.DataFrame:
+    return session_memo(f"fund_table|{zone}", data_version("live"), lambda: fundamentals_table(
+        fund_daily_rows(_live_dataset_frame(f"fund_daily|{zone}"), _live_dataset_frame(f"entsoe_load|{zone}"), _live_dataset_frame(f"entsoe_generation|{zone}"), zone),
+        _live_dataset_frame(f"entsoe_load_forecast|{zone}"), _live_dataset_frame(f"entsoe_renewable_forecast|{zone}"), zone))
+
+
+def fund_weather(zone: str) -> pd.DataFrame:
+    return session_memo(f"fund_weather|{zone}", data_version("live"),
+                        lambda: fundamentals_weather(_live_dataset_frame("fund_weather_history"), _live_dataset_frame("fund_weather_forecast"), zone))
+
+
+def fund_power(zone: str, nuclear_shift_mw: float = 0.0) -> dict:
+    return session_memo(f"fund_power|{zone}|{nuclear_shift_mw:.0f}", data_version("live"),
+                        lambda: power_fundamentals(zone, fund_table(zone), fund_weather(zone), _live_dataset_frame("fund_weather_ensemble"), nuclear_shift_mw,
+                                                   holidays=_live_dataset_frame("holidays"), outages=_live_dataset_frame(f"entsoe_outages|{zone}")))
+
+
+FUND_SOURCE_TEXT = {"Operator": "ENTSO-E forecast", "Combined": "ENTSO-E and model", "Model": "From the weather"}
+FUND_SOURCE_PHRASE = {"Operator": "ENTSO-E's forecast", "Combined": "ENTSO-E's forecast and the model combined", "Model": "the model"}
+
+
+def fund_gas() -> dict:
+    zone = "Germany-Luxembourg"
+    return session_memo("fund_gas", data_version("live"),
+                        lambda: gas_demand_model(_live_dataset_frame("the_gas_consumption"), fund_weather(zone), fund_table(zone), fund_power(zone)))
+
+
+def _keep_outlook(result: dict, zone: str) -> None:
+    """Save today's outlook once, as made, so it can be scored later. Saving it changes nothing shown, so nothing is recalculated."""
+    held = _live_dataset_frame("fund_outlook_record")
+    record = record_outlook(held if not held.empty else None, result["outlook"], zone, date.today())
+    if record is None:
+        return
+    item = {"label": "Fundamentals outlooks as made each day", "data": record, "metadata": {},
+            "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    st.session_state.setdefault("live_data", {})["fund_outlook_record"] = item
+    _save(lambda store: store.save_live_item("fund_outlook_record", item))
+
+
+def _gw(value: float) -> str:
+    return f"{value / 1000:,.1f} GW"
+
+
+def _band(fig: go.Figure, x, low, high, color: str, name: str, legend: bool = True) -> None:
+    fill = "rgba({},{},{},0.18)".format(*(int(color[i:i + 2], 16) for i in (1, 3, 5)))
+    fig.add_trace(go.Scatter(x=list(x) + list(x)[::-1], y=list(high) + list(low)[::-1], fill="toself", fillcolor=fill,
+                             line=dict(width=0), hoverinfo="skip", name=name, showlegend=legend))
+
+
+def _first_ahead(outlook: pd.DataFrame) -> pd.Series:
+    ahead = outlook.loc[pd.to_datetime(outlook["date"]).dt.date > date.today()]
+    return (ahead if not ahead.empty else outlook).iloc[0]
+
+
+def _test_table(tests: pd.DataFrame, labels: dict, operator: bool) -> pd.DataFrame:
+    rows = []
+    for name, label in labels.items():
+        part = tests.loc[tests["target"].eq(name)].set_index("lead")
+        if part.empty:
+            continue
+        row = {"Series": label, "Days tested": int(part["n"].max())}
+        for lead in FUND_HORIZONS:
+            if lead in part.index:
+                row[f"{lead} day{'s' if lead > 1 else ''} ahead"] = f"{part.loc[lead, 'share'] * 100:.1f}%"
+        row["Last known value, 1 day"] = f"{part.loc[1, 'last_known'] * 100:.1f}%" if 1 in part.index else "–"
+        if operator:
+            value = part.loc[1, "operator"] if 1 in part.index and "operator" in part else np.nan
+            row["ENTSO-E forecast, 1 day"] = f"{value * 100:.1f}%" if pd.notna(value) else "–"
+            best = part.loc[1, "best"] if 1 in part.index and "best" in part else np.nan
+            row["Used for the published day"] = f"{best * 100:.1f}%" if pd.notna(best) else "–"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def render_power_balance() -> None:
+    top = st.columns([1, 1, 2])
+    zone = top[0].selectbox("Zone", FUND_ZONES, index=len(FUND_ZONES) - 1, key="fund_zone")
+    base = fund_power(zone)
+    if not base["ready"]:
+        need_data_note(base["reason"])
+        update_button("fund_update")
+        return
+    shift = 0.0
+    if base["has_nuclear"]:
+        shift = float(top[1].number_input("Nuclear availability change, MW", -30_000.0, 30_000.0, 0.0, 500.0, key="fund_nuclear",
+                                          format="%.0f", help="An outage scenario on top of the announced outages: added to nuclear output for every day ahead. Negative means less available."))
+    result = fund_power(zone, shift) if shift else base
+    _keep_outlook(base, zone)
+    outlook, tests, recent = result["outlook"], result["tests"], result["recent"]
+    first = _first_ahead(outlook)
+    day = pd.Timestamp(first["date"])
+    week = outlook.head(7)
+    last_week = recent.tail(7)
+    actual_residual = (last_week["load"] - last_week["wind"] - last_week["solar"]).mean()
+    test_at = lambda name, lead=1, col="share": float(tests.loc[tests["target"].eq(name) & tests["lead"].eq(lead), col].iloc[0]) if ((tests["target"] == name) & (tests["lead"] == lead)).any() else np.nan
+    c1, c2, c3, c4 = st.columns(4)
+    kpi(c1, f"Residual load, {day:%a %d %b}", _gw(first["residual"]), f"80% range {first['residual_low'] / 1000:,.1f} to {first['residual_high'] / 1000:,.1f} GW", accent=BLUE)
+    kpi(c2, f"Wind, {day:%a %d %b}", _gw(first["wind"]), f"{FUND_SOURCE_TEXT[first['wind_source']]}, range {first['wind_low'] / 1000:,.1f} to {first['wind_high'] / 1000:,.1f}", accent=TEAL)
+    kpi(c3, f"Solar, {day:%a %d %b}", _gw(first["solar"]), f"{FUND_SOURCE_TEXT[first['solar_source']]}, range {first['solar_low'] / 1000:,.1f} to {first['solar_high'] / 1000:,.1f}", accent=AMBER)
+    if result["gas_ready"]:
+        kpi(c4, f"Gas-fired output, {day:%a %d %b}", _gw(first["gas"]), f"80% range {first['gas_low'] / 1000:,.1f} to {first['gas_high'] / 1000:,.1f} GW", accent=ORANGE)
+    else:
+        kpi(c4, f"Demand, {day:%a %d %b}", _gw(first["load"]), f"80% range {first['load_low'] / 1000:,.1f} to {first['load_high'] / 1000:,.1f} GW", accent=PURPLE)
+    move = week["residual"].mean() - actual_residual
+    direction = "higher than" if move > 500 else "lower than" if move < -500 else "close to"
+    scenario_text = (f"The ranges include the spread across {result['scenarios']} ECMWF weather scenarios as well as the models' own past misses."
+                     if result["scenarios"] else "The ranges come from the models' past misses only; the weather scenarios aren't loaded, so the spread of the weather itself is left out.")
+    left_text = (f"leaving <b>{first['gap'] / 1000:,.1f} GW</b> for other plants and imports" if first["gap"] >= 0 else
+                 f"a surplus of <b>{-first['gap'] / 1000:,.1f} GW</b> to export, store or curtail")
+    if result["nuclear_from"] == "Outage notices":
+        nuclear_basis = (f" Nuclear is expected at {first['nuclear'] / 1000:,.1f} GW, from the {result['nuclear_now'] / 1000:,.1f} GW of the last week and the "
+                         f"{first['nuclear_unavailable'] / 1000:,.1f} GW announced as unavailable in ENTSO-E's outage notices")
+    else:
+        nuclear_basis = f" Nuclear is taken at {result['nuclear_now'] / 1000:,.1f} GW, its average over the last week, as no outage notices are loaded"
+    nuclear_text = (nuclear_basis + (f", {shift / 1000:+,.1f} GW in your scenario" if shift else "") + f", {left_text}." if result["has_nuclear"] else "")
+    gas_text = (f" Gas-fired plants are expected to produce about <b>{week['gas'].mean() / 1000:,.1f} GW</b> on average over the next week." if result["gas_ready"] else "")
+    with st.container(key="hero"):
+        st.markdown(
+            f'<div class="desk-note"><p>Residual load, the demand left after wind and solar, is expected at <b>{first["residual"] / 1000:,.1f} GW</b> on {day:%a %d %b} in {html.escape(zone)}. '
+            f'Over the next {len(week)} days it averages {week["residual"].mean() / 1000:,.1f} GW, {direction} the {actual_residual / 1000:,.1f} GW of the last week.{nuclear_text}{gas_text}</p>'
+            f'<p class="soft">Tested on {result["tested_days"]} earlier days, each estimated only from the days before it, residual load missed by {test_at("residual") * 100:.1f}% a day ahead '
+            f'and {test_at("residual", 7) * 100:.1f}% a week ahead, against {test_at("residual", 1, "last_known") * 100:.1f}% for the last known value'
+            + (f' and {test_at("residual", 1, "operator") * 100:.1f}% for ENTSO-E\'s own forecasts. Where ENTSO-E has published, combining its forecasts with the models '
+               f'missed {test_at("residual", 1, "best") * 100:.1f}%' if pd.notna(test_at("residual", 1, "operator")) and pd.notna(test_at("residual", 1, "best")) else
+               f' and {test_at("residual", 1, "operator") * 100:.1f}% for ENTSO-E\'s own forecasts' if pd.notna(test_at("residual", 1, "operator")) else "")
+            + f'. {html.escape(scenario_text)}</p></div>', unsafe_allow_html=True)
+
+    dates = pd.to_datetime(outlook["date"])
+    fig = go.Figure()
+    _band(fig, dates, outlook["residual_low"] / 1000, outlook["residual_high"] / 1000, BLUE, "80% range")
+    fig.add_trace(go.Scatter(x=recent["date"], y=(recent["load"] - recent["wind"] - recent["solar"]) / 1000, name="What happened", line=dict(color=TEXT, width=2)))
+    fig.add_trace(go.Scatter(x=recent["date"], y=recent["residual_model"] / 1000, name="Estimated a day before", line=dict(color=GRAY, width=1.5, dash="dot")))
+    fig.add_trace(go.Scatter(x=dates, y=outlook["residual"] / 1000, name="Outlook", line=dict(color=BLUE, width=2.5), mode="lines+markers"))
+    if result["has_nuclear"]:
+        fig.add_trace(go.Scatter(x=dates, y=outlook["nuclear"] / 1000, name="Nuclear available", line=dict(color=PURPLE, width=1.5, dash="dash")))
+    fig.update_layout(title="Residual load, GW", yaxis_title="", hovermode="x unified")
+    chart(fig, 380)
+    left, right = st.columns(2)
+    with left:
+        renew = go.Figure()
+        for name, color, label in (("wind", TEAL, "Wind"), ("solar", AMBER, "Solar")):
+            _band(renew, dates, outlook[f"{name}_low"] / 1000, outlook[f"{name}_high"] / 1000, color, f"{label}, 80% range", legend=False)
+            renew.add_trace(go.Scatter(x=recent["date"], y=recent[name] / 1000, name=f"{label}, actual", line=dict(color=color, width=1.2, dash="dot")))
+            renew.add_trace(go.Scatter(x=dates, y=outlook[name] / 1000, name=label, line=dict(color=color, width=2.5), mode="lines+markers"))
+        renew.update_layout(title="Wind and solar, GW (shaded: 80% range)", yaxis_title="", hovermode="x unified")
+        chart(renew, 330)
+    with right:
+        name, color, label = ("gas", ORANGE, "Gas-fired output") if result["gas_ready"] else ("load", PURPLE, "Demand")
+        other = go.Figure()
+        _band(other, dates, outlook[f"{name}_low"] / 1000, outlook[f"{name}_high"] / 1000, color, "80% range")
+        other.add_trace(go.Scatter(x=recent["date"], y=recent[name] / 1000, name="What happened", line=dict(color=TEXT, width=1.5)))
+        other.add_trace(go.Scatter(x=dates, y=outlook[name] / 1000, name="Outlook", line=dict(color=color, width=2.5), mode="lines+markers"))
+        other.update_layout(title=f"{label}, GW", yaxis_title="", hovermode="x unified")
+        chart(other, 330)
+    shown = pd.DataFrame({"Day": dates.dt.strftime("%a %d %b"), "Demand, GW": (outlook["load"] / 1000).round(1), "Wind, GW": (outlook["wind"] / 1000).round(1),
+                          "Solar, GW": (outlook["solar"] / 1000).round(1), "Residual load, GW": (outlook["residual"] / 1000).round(1),
+                          "Residual low": (outlook["residual_low"] / 1000).round(1), "Residual high": (outlook["residual_high"] / 1000).round(1)})
+    if result["has_nuclear"]:
+        shown["Nuclear, GW"] = (outlook["nuclear"] / 1000).round(1)
+        if result["nuclear_from"] == "Outage notices":
+            shown["Nuclear announced off, GW"] = (outlook["nuclear_unavailable"] / 1000).round(1)
+        shown["Left for others, GW"] = (outlook["gap"] / 1000).round(1)
+    if result["gas_ready"]:
+        shown["Gas-fired, GW"] = (outlook["gas"] / 1000).round(1)
+    published = outlook[["load_source", "wind_source", "solar_source"]]
+    shown["Demand, wind and solar from"] = np.where(published.eq("Combined").any(axis=1), "ENTSO-E and models combined",
+                                                    np.where(published.eq("Operator").any(axis=1), "ENTSO-E where published", "Weather models"))
+    shown["Weather scenarios"] = outlook["scenarios"]
+    table(shown)
+    st.markdown("**How far each part can be trusted.** Average miss as a share of the actual value, on days the models hadn't seen. "
+                "The last known value and ENTSO-E's forecasts are the benchmarks to beat. The last column is what the outlook uses on days ENTSO-E has published: "
+                "its forecast, the model, or the two combined, whichever missed least.")
+    table(_test_table(tests, {"residual": "Residual load", "load": "Demand", "wind": "Wind", "solar": "Solar", "gas": "Gas-fired output"}, True))
+    chosen = {FUND_LABELS[k]: FUND_SOURCE_PHRASE[v] for k, v in result["sources"].items()}
+    st.caption("For the days ENTSO-E has published: " + "; ".join(f"{k.lower()} from {v}" for k, v in chosen.items()) + ". The models cover the days after."
+               + ("" if result["holidays_used"] else " School and regional holidays aren't loaded, so demand on those days is less certain."))
+    with st.expander("How this outlook works"):
+        st.markdown(
+            "**Wind and solar.** Wind speed at 100 m at the zone's wind-farm locations is turned hour by hour into the share of full output a turbine fleet gives, "
+            "with offshore points kept apart. Solar follows radiation at spread-out points and solar-park locations, with a curve for clear days, a trend for new capacity and a "
+            "temperature term (hot panels give less). A weighted regression links these to ENTSO-E's actual output, refitted weekly, and a two-week level check catches what "
+            "weather can't show, such as snow on panels.\n\n"
+            "**Demand.** Kind of day (working day, Saturday, Sunday or holiday, bridge days, the Christmas week, August), the share of people on school holidays and on public holidays "
+            "that only some regions keep (OpenHolidays), heating and cooling degrees from a three-day weighted temperature, and the season.\n\n"
+            "**ENTSO-E's forecasts.** Where ENTSO-E has published a forecast, it is combined with the model, together with how far each has been off over the last week. "
+            "Each series uses the forecast, the model or the combination, whichever missed least in the tests.\n\n"
+            "**Nuclear.** Where ENTSO-E's outage notices are loaded, nuclear is last week's output adjusted by the announced change in availability. "
+            "Notices tend to be optimistic, since units come back late and new faults appear, so the change is scaled down and a lead-time correction is applied. "
+            "Both were fitted on French notices as they stood each day in 2021 and 2022, and tested on 2023 to early 2025: the average miss over two weeks fell from 2.7 GW for "
+            "last week's output to 2.0 GW. Your scenario is added on top.\n\n"
+            "**Residual load and gas.** Residual load is demand minus wind and solar. Gas-fired output follows what is left after nuclear, with more in cold weather, "
+            "when plants that also supply heat must run.\n\n"
+            "**Testing.** Every past day is estimated only from earlier days, for each lead time. The models learn from past weather as the forecast models first saw it, "
+            "so they don't learn to trust weather that a forecast can't deliver. Past the first day the tests still use that first-day weather, so they show the models' own error, "
+            "not the weather forecast's: the weather scenarios add that part to the ranges. Outlooks are also saved as made each day and scored once the outcome is known, under Track record.\n\n"
+            "**What it leaves out.** Hydro, imports and exports, and curtailment when prices go negative. "
+            "On real German data from 2023 to 2026, residual load a day ahead missed 6.6% from the models alone, 7.2% from the transmission operators' forecasts "
+            "and 5.6% combined; on French data, 3.7%, 2.4% and 2.0%.")
+
+
+def render_gas_demand() -> None:
+    result = fund_gas()
+    if not result["ready"]:
+        need_data_note(result["reason"])
+        update_button("fund_gas_update")
+        return
+    outlook, recent, tests = result["outlook"], result["recent"], result["tests"]
+    first = _first_ahead(outlook)
+    day = pd.Timestamp(first["date"])
+    c1, c2, c3, c4 = st.columns(4)
+    kpi(c1, f"German gas use, {day:%a %d %b}", f"{first['total']:,.0f} GWh", f"80% range {first['low']:,.0f} to {first['high']:,.0f} GWh", accent=BLUE)
+    kpi(c2, "Heating", f"{first['heating']:,.0f} GWh", "Small users, published by THE" if first["small_source"] == "Published" else "Small users and cold-driven large users", accent=ORANGE)
+    kpi(c3, "Gas for power", f"{first['power']:,.0f} GWh", "From the power outlook" if result["power_from_model"] else "Gas-fired output of the last week", accent=AMBER)
+    kpi(c4, "Industry and other", f"{first['industry']:,.0f} GWh", "Large users' steady level", accent=TEAL)
+    week = outlook.head(7)
+    last_week = recent.dropna(subset=["total"]).tail(7)
+    test_at = lambda lead, col="share": float(tests.loc[tests["target"].eq("total") & tests["lead"].eq(lead), col].iloc[0])
+    efficiency = (f", which means plants turn {100 / result['gas_per_power']:.0f}% of the gas into power" if result["with_power"] and result["gas_per_power"] > 0 else "")
+    with st.container(key="hero"):
+        st.markdown(
+            f'<div class="desk-note"><p>German gas use is expected at <b>{first["total"]:,.0f} GWh</b> on {day:%a %d %b}: {first["heating"]:,.0f} for heating, '
+            f'{first["power"]:,.0f} for power and {first["industry"]:,.0f} for industry and other uses. The next {len(week)} days average {week["total"].mean():,.0f} GWh a day, '
+            f'against {last_week["total"].mean():,.0f} over the last week of published figures.</p>'
+            f'<p>Each degree colder below 15.5°C adds about <b>{result["per_cold_degree"]:,.0f} GWh</b> a day at large users on top of household heating'
+            + (f', and each GWh of gas-fired power burns <b>{result["gas_per_power"]:.2f} GWh</b> of gas{efficiency}' if result["with_power"] else "") + '.</p>'
+            f'<p class="soft">Tested on {result["tested_days"]} earlier days, the total missed by {test_at(1) * 100:.1f}% a day ahead and {test_at(7) * 100:.1f}% a week ahead, '
+            f'against {test_at(1, "last_known") * 100:.1f}% and {test_at(7, "last_known") * 100:.1f}% for the last published value. '
+            f'Small users are published to {result["last_small"]:%d %b}, large users to {result["last_large"]:%d %b}.</p></div>', unsafe_allow_html=True)
+    fig = go.Figure()
+    for name, color, label in (("industry", TEAL, "Industry and other"), ("power", AMBER, "Gas for power"), ("heating", ORANGE, "Heating")):
+        fig.add_trace(go.Bar(x=recent["date"], y=recent[name], name=label, marker_color=color, opacity=0.55, legendgroup=name))
+        fig.add_trace(go.Bar(x=outlook["date"], y=outlook[name], name=f"{label}, outlook", marker_color=color, legendgroup=name, showlegend=False))
+    fig.add_trace(go.Scatter(x=recent["date"], y=recent["model"], name="Estimated a day before", line=dict(color=GRAY, width=1.5, dash="dot")))
+    fig.add_trace(go.Scatter(x=outlook["date"], y=outlook["high"], line=dict(color=BLUE, width=1, dash="dash"), name="80% range"))
+    fig.add_trace(go.Scatter(x=outlook["date"], y=outlook["low"], line=dict(color=BLUE, width=1, dash="dash"), name="80% range", showlegend=False))
+    fig.update_layout(title="German gas use by purpose, GWh a day (faded: published, solid: outlook)", barmode="stack", yaxis_title="", hovermode="x unified")
+    chart(fig, 400)
+    table(pd.DataFrame({"Gas day": pd.to_datetime(outlook["date"]).dt.strftime("%a %d %b"), "Total, GWh": outlook["total"].round(0), "Low": outlook["low"].round(0), "High": outlook["high"].round(0),
+                        "Heating": outlook["heating"].round(0), "Gas for power": outlook["power"].round(0), "Industry and other": outlook["industry"].round(0),
+                        "Small users from": np.where(outlook["small_source"].eq("Published"), "THE's published figure", "Model")}))
+    st.markdown("**How far it can be trusted.** Average miss as a share of actual use, on gas days the model hadn't seen, against the last published value.")
+    table(_test_table(tests, {"total": "Total", "small": "Small users", "large": "Large users"}, False))
+    with st.expander("How this split works"):
+        st.markdown(
+            "**The data.** Trading Hub Europe publishes German gas use by gas day in two groups: small users on standard load profiles (households and small businesses), "
+            "and large users metered daily (industry, power plants and large heating). Small users' figures appear for the next day, large users' a day or two after.\n\n"
+            "**Heating.** Small users follow the temperature of the last four days, weighted 8:4:2:1 as German networks do, with separate slopes below 18, 13 and 8°C. "
+            "Large users add a part that rises with each degree below 15.5°C. Together these are shown as heating.\n\n"
+            "**Gas for power.** Large users' use rises with gas-fired power output, at a rate the model fits within what real plants burn (1.2 to 3 GWh of gas per GWh of power). "
+            "Ahead, gas-fired output comes from the power outlook for Germany.\n\n"
+            "**Industry and other.** What large users use beyond the cold and power parts: a level by kind of day, refitted weekly on the last six months, so it follows demand cuts and recoveries.\n\n"
+            "**Real-data test.** On German figures from 2018 to 2022 the total missed by 3.4% a day ahead and 4.3% two weeks ahead, against 6.7% and 17.4% for the last published value. "
+            "The split is a model's reading: only the two groups are measured.")
+
+
+def render_outlook_record() -> None:
+    zone = st.selectbox("Zone", FUND_ZONES, index=len(FUND_ZONES) - 1, key="fund_record_zone")
+    record = _live_dataset_frame("fund_outlook_record")
+    scored = score_outlook_record(record if not record.empty else None, fund_table(zone), zone)
+    made = record.loc[record["zone"].eq(zone), "made_on"].nunique() if not record.empty and "zone" in record.columns else 0
+    if scored.empty:
+        need_data_note(f"{made} outlook{'s' if made != 1 else ''} saved for {zone} so far. Each one is scored once ENTSO-E publishes what happened, so the first scores appear a day or two after the first outlook.")
+        return
+    st.markdown(f"Residual-load outlooks for {html.escape(zone)} as saved on the day they were made, scored against what happened. {made} days of outlooks are held. "
+                "Unlike the tests on the Power balance view, these used the weather forecast as it stood, so they include the forecast's own error.")
+    table(pd.DataFrame({"Lead, up to": scored["lead"].map(lambda v: f"{v} day{'s' if v > 1 else ''}"), "Days scored": scored["n"],
+                        "Average miss, GW": (scored["mae"] / 1000).round(2), "Share of actual": (scored["share"] * 100).round(1).astype(str) + "%"}))
+
+
+def page_fundamentals_outlook():
+    title_block("Fundamentals outlook", "Wind, solar, demand and residual load for the next two weeks, and German gas demand in three parts, each tested on days the models hadn't seen.")
+    power_view, gas_view, record_view = view_tabs(["Power balance", "German gas demand", "Track record"])
+    if power_view:
+        render_power_balance()
+    elif gas_view:
+        render_gas_demand()
+    else:
+        render_outlook_record()
 def page_market_fundamentals():
     title_block("Market fundamentals", "Storage, LNG, power, gas flows and weather, read together. These describe the market. They are not price forecasts.")
     data_items = st.session_state.get("live_data", {})
@@ -12652,6 +14434,7 @@ PAGES = {
     "Morning Brief": page_morning_brief,
     "Market Read": page_market_read,
     "Market Fundamentals": page_market_fundamentals,
+    "Fundamentals Outlook": page_fundamentals_outlook,
     "Power Spot": page_power_spot,
     "Spreads & Margins": page_spreads,
     "Forward Curves": page_forward_curves,
