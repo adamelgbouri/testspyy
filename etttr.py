@@ -10,13 +10,20 @@ Everything is in this one file, in order:
   3 Saved data              SQLite file beside this script (meridian_desk.db)
   4 Market data connectors  ENTSO-E, GIE, ENTSOG, Open-Meteo, ECB, licensed providers
   5 Design system           colours, styles, chart template, shared components
-  6 Navigation and session
+  6 Navigation, session, updates and demo data
   7 Model checks
   8 Pages
   9 App entry point
 
-The sections above the pages import without opening the app. Built-in curves and trades
-are synthetic demo data, not market quotes. This is an educational prototype, not a
+Demo or live: the sidebar switches between two desks that never mix. Demo is a complete simulated
+market for today, built from real closing levels (see Data & Assumptions), with a sample book; it has
+its own database in a temporary folder and is the default when no API keys are set. Live is your desk,
+your trades and the data you fetch, saved in meridian_desk.db. Force one with MERIDIAN_DEMO=1 or 0,
+or open the app with ?demo=1. The live desk starts with real daily history for the Fundamentals Outlook
+built into this file, and keeps it current without any key (Energy-Charts, Open-Meteo, Trading Hub Europe).
+
+The sections above the pages import without opening the app. Demo curves and trades are
+synthetic, not market quotes. This is an educational prototype, not a
 production ETRM or valuation system. API keys live in meridian_keys.toml beside this file: never share that one.
 """
 from __future__ import annotations
@@ -37,9 +44,12 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import textwrap
 import tempfile
+import threading
+import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 import socket
@@ -2689,13 +2699,13 @@ def project_winter(history: pd.DataFrame, archive: pd.DataFrame, daily_weather: 
         return {"ready": False, "off_season": True, "reason": "The winter projection runs from October to March. It starts again on 1 October."}
     fill = daily_fill(history)
     if fill.dropna().empty:
-        return {"ready": False, "off_season": False, "reason": "Select Update this page to load storage history."}
+        return {"ready": False, "off_season": False, "reason": "Select Update market data to load storage history."}
     fill = fill.dropna()
     fill = fill.asfreq("D")
     start_stamp = fill.dropna().index[-1]
     start = start_stamp.date()
     if (today - start).days > STALE_DAYS:
-        return {"ready": False, "off_season": False, "reason": f"Storage data is {(today - start).days} days old. Select Update this page."}
+        return {"ready": False, "off_season": False, "reason": f"Storage data is {(today - start).days} days old. Select Update market data."}
     year = winter_of(today)
     end = date(year + 1, 3, 31)
     days = pd.date_range(start + timedelta(days=1), end, freq="D")
@@ -2744,7 +2754,7 @@ def project_winter(history: pd.DataFrame, archive: pd.DataFrame, daily_weather: 
     else:
         changes = past_winter_changes(fill, start, year)
         if len(changes) < OUTLOOK_MIN_WINTERS:
-            return {"ready": False, "off_season": False, "reason": "Select Update this page to load six years of storage history and the weather archive."}
+            return {"ready": False, "off_season": False, "reason": "Select Update market data to load six years of storage history and the weather archive."}
         biggest, smallest = min(changes, key=changes.get), max(changes, key=changes.get)
         def analog(winter: int) -> np.ndarray:
             mapped = pd.DatetimeIndex([_in_other_winter(d.date(), year, winter) for d in days])
@@ -2794,7 +2804,7 @@ def outlook_signal(outlook: Optional[dict]) -> Optional[dict]:
         return _signal("winter_outlook", name, 2.0, missing=outlook["reason"])
     band = outlook.get("band_end")
     if not band or outlook.get("basis") != "weather":
-        return _signal("winter_outlook", name, 2.0, missing="Select Update this page to load the weather archive and the five-year range.")
+        return _signal("winter_outlook", name, 2.0, missing="Select Update market data to load the weather archive and the five-year range.")
     central = outlook["scenarios"][outlook["central"]]["end"]
     gap = central - band["average"]
     return _signal("winter_outlook", name, 2.0, -gap / max((band["high"] - band["low"]) / 2.0, 5.0),
@@ -3164,11 +3174,11 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
     """
     base = daily_base_prices(series)
     if zone not in ZONE_WEATHER or len(base) < ESTIMATE_MIN_DAYS + 20:
-        return {"ready": False, "reason": f"This needs at least {ESTIMATE_MIN_DAYS + 20} days of day-ahead prices. Select Update this page."}
+        return {"ready": False, "reason": f"This needs at least {ESTIMATE_MIN_DAYS + 20} days of day-ahead prices. Select Update market data."}
     target = base.index[-1] + pd.Timedelta(days=1)
     weather, basis = _weather_for_estimate(zone, history, daily, grid_history, grid_forecast, target, weather_vintage)
     if weather.empty:
-        return {"ready": False, "reason": "This needs the wind and solar history. Select Update this page."}
+        return {"ready": False, "reason": "This needs the wind and solar history. Select Update market data."}
     frame = estimate_features(base, weather, target, zone)
     known = frame.iloc[:-1].dropna(subset=["base", *ESTIMATE_COLUMNS])
     ahead = frame.iloc[[-1]]
@@ -3220,7 +3230,7 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
     target_has_forecast = forecast_final is not None and not forecast_frame.iloc[[-1]][list(FORECAST_COLUMNS)].isna().any(axis=None)
     use_forecasts = target_has_forecast and comparison is not None and comparison["forecasts"] <= comparison["weather"]
     if not use_forecasts and not weather_ready:
-        return {"ready": False, "reason": f"There's no weather forecast for {target:%d %b}. Select Update this page."}
+        return {"ready": False, "reason": f"There's no weather forecast for {target:%d %b}. Select Update market data."}
     chosen = forecast_test if use_forecasts else test
     errors = (chosen["actual"] - chosen["estimate"]).to_numpy(float)
     value = float(_apply_estimate(forecast_final, forecast_frame.iloc[[-1]], FORECAST_COLUMNS)[0]) if use_forecasts else float(_apply_estimate(final, ahead, weather_columns)[0])
@@ -4283,9 +4293,9 @@ def power_fundamentals(zone: str, table: pd.DataFrame, weather: pd.DataFrame, en
     needed = FUND_MIN_TRAIN + 30
     if table is None or table.empty or table[["load", "wind", "solar"]].dropna().shape[0] < needed:
         held = 0 if table is None or table.empty else table[["load", "wind", "solar"]].dropna().shape[0]
-        return {"ready": False, "reason": f"This needs at least {needed} days of demand, wind and solar output for {zone}; {held} are held. Select Update this page."}
+        return {"ready": False, "reason": f"This needs at least {needed} days of demand, wind and solar output for {zone}; {held} are held. Select Update market data."}
     if weather is None or weather[["temperature", "wind_land", "solar"]].dropna().shape[0] < needed:
-        return {"ready": False, "reason": f"This needs at least {needed} days of weather across {zone}. Select Update this page."}
+        return {"ready": False, "reason": f"This needs at least {needed} days of weather across {zone}. Select Update market data."}
     days = pd.date_range(table.index.min(), max(table.index.max(), weather.index.max()), freq="D")
     data = table.reindex(days)
     shares = holiday_shares(days, zone, holidays)
@@ -4378,7 +4388,7 @@ def power_fundamentals(zone: str, table: pd.DataFrame, weather: pd.DataFrame, en
     ahead = np.arange(last + 1, min(len(days), last + 1 + FUND_OUTLOOK_DAYS + 1))
     ahead = ahead[~design.iloc[ahead][inputs["load"] + inputs["wind"] + inputs["solar"]].isna().any(axis=1).to_numpy()]
     if not len(ahead):
-        return {"ready": False, "reason": f"The weather forecast for {zone} doesn't reach past the last day of output held. Select Update this page."}
+        return {"ready": False, "reason": f"The weather forecast for {zone} doesn't reach past the last day of output held. Select Update market data."}
     now = {name: float(level[name].iloc[:last + 1].dropna().iloc[-1]) if level[name].iloc[:last + 1].notna().any() else 1.0 for name in level}
     lead_days = ahead - last
     nuclear_from, unavailable_ahead = "Last week", np.full(len(ahead), np.nan)
@@ -4504,9 +4514,9 @@ def gas_demand_model(consumption: Optional[pd.DataFrame], weather: pd.DataFrame,
     That gives heating, power and industry. Gas per unit of power is fitted, within the range real plants have."""
     needed = FUND_MIN_TRAIN + 30
     if consumption is None or consumption.empty or consumption["small"].notna().sum() < needed:
-        return {"ready": False, "reason": f"This needs at least {needed} days of German gas consumption from Trading Hub Europe. Select Update this page."}
+        return {"ready": False, "reason": f"This needs at least {needed} days of German gas consumption from Trading Hub Europe. Select Update market data."}
     if weather is None or weather["temperature"].notna().sum() < needed:
-        return {"ready": False, "reason": f"This needs at least {needed} days of weather across Germany. Select Update this page."}
+        return {"ready": False, "reason": f"This needs at least {needed} days of weather across Germany. Select Update market data."}
     held = consumption.assign(date=pd.to_datetime(consumption["gas_day"])).drop_duplicates("date", keep="last").set_index("date").sort_index()
     days = pd.date_range(max(held.index.min(), weather.index.min()), max(held.index.max(), weather.index.max()), freq="D")
     data = held.reindex(days)[["small", "large"]].astype(float)
@@ -4569,7 +4579,7 @@ def gas_demand_model(consumption: Optional[pd.DataFrame], weather: pd.DataFrame,
     ahead = position[(position > last_large) & (position <= last_large + FUND_OUTLOOK_DAYS + 2)]
     ahead = ahead[~design.iloc[ahead][small_columns + large_columns].isna().any(axis=1).to_numpy()]
     if not len(ahead):
-        return {"ready": False, "reason": "The weather forecast for Germany doesn't reach past the last gas day held. Select Update this page."}
+        return {"ready": False, "reason": "The weather forecast for Germany doesn't reach past the last gas day held. Select Update market data."}
     central = parts(design.iloc[ahead], power_ahead.iloc[ahead].to_numpy(float))
     published = data["small"].iloc[ahead].to_numpy(float)
     outlook = pd.DataFrame({"date": days[ahead], "lead": ahead - last_large, "small": np.where(np.isnan(published), central["small"], published),
@@ -4904,7 +4914,10 @@ class DeskStore:
 
 
 def desk_store() -> Optional[DeskStore]:
-    """Open the database once per session. If the folder is read-only, work in memory."""
+    """Open the database once per session. If the folder is read-only, work in memory.
+    In demo, this is the session's copy of the demo desk, so nothing done in demo reaches the live desk."""
+    if demo_mode():
+        return demo_store()
     if "desk_store" not in st.session_state:
         try:
             st.session_state.desk_store = DeskStore(default_db_path())
@@ -6796,6 +6809,10 @@ def fetch_temperature_normals(location_names: Sequence[str], years: int = 10, _j
     return normals, failures
 
 def _stored_live_item(source_key: str, label: str, data, metadata: Optional[dict] = None) -> None:
+    if demo_mode():
+        # Fetched data belongs to the live desk. Kept out of the demo, so demo and live never mix.
+        st.session_state["flash_message"] = "Fetched data isn't added to the demo. Switch to Live in the sidebar to fetch and keep data."
+        return
     item = {
         "label": label,
         "data": data,
@@ -6915,7 +6932,7 @@ SODIUM = "#E3A72F"      # warnings and stale data
 GAIN = "#3FCB8A"        # up, profit, long
 LOSS = "#F0665C"        # down, loss, short
 
-SECTION_COLORS = {"Market": "#4FB3F6", "Pricing": "#F7BC45", "Book and risk": "#34D6B4", "Data and controls": "#A893F5"}
+SECTION_COLORS = {"Morning": "#4FB3F6", "Fundamentals": "#E58A5F", "Pricing and trading": "#F7BC45", "Positions and risk": "#34D6B4", "Data and controls": "#A893F5"}
 _NAV_SECTION_CSS = "\n".join(f".st-key-nav_{i} {{{{ --sec:{c}; }}}}".replace("{{", "{").replace("}}", "}") for i, c in enumerate(SECTION_COLORS.values()))
 
 # Chart series, validated for colour-blind separation on the panel colour.
@@ -6993,6 +7010,9 @@ hr {{ border-color:{BORDER}; margin:0.6rem 0; }}
 .statusbar .dot.good i {{ background:{GAIN}; }} .statusbar .dot.warn i {{ background:{SODIUM}; }} .statusbar .dot.bad i {{ background:{LOSS}; }}
 .statusbar .dot.warn, .statusbar .dot.bad {{ color:{TEXT}; }}
 .statusbar .grow {{ flex:1; }}
+.statusbar .dot.demo i {{ background:{SODIUM}; opacity:0.55; }}
+.demo-banner {{ margin:-0.2rem 0 0.6rem; padding:6px 12px; border-radius:6px; border:1px solid {SODIUM}55; background:{SODIUM}14; font-size:0.82rem; color:{TEXT}; line-height:1.45; }}
+.demo-banner b {{ color:{SODIUM}; font-weight:600; margin-right:0.45rem; text-transform:uppercase; letter-spacing:0.04em; font-size:0.74rem; }}
 .st-key-page_head {{ padding:0 0 0.45rem; margin:0 0 0.4rem; border-bottom:1px solid color-mix(in srgb, var(--accent) 45%, {BORDER}); }}
 .head-row {{ display:flex; gap:0.7rem; align-items:baseline; flex-wrap:wrap; }}
 .stApp h1.page-title {{ font-size:1.35rem; padding-left:0.6rem !important; border-left:4px solid var(--accent); font-weight:600; line-height:1.3; color:{TEXT}; margin:0; padding:0; }}
@@ -7315,6 +7335,10 @@ STATUS_SOURCES = (("ENTSO-E", ("entsoe_", "fund_daily"), 30.0), ("GIE", ("gie_",
 def status_strip_html() -> str:
     """One line that is always in view: the valuation date, the last update, and whether each source is fresh.
     Green is fetched within the source's normal rhythm, amber is older than that, grey has never loaded."""
+    if demo_mode():
+        names = "".join(f'<span class="dot demo" title="Demo data in this source\'s format"><i></i>{name}</span>' for name, _, _ in STATUS_SOURCES)
+        return (f'<div class="statusbar"><span>Valuation <b>{valuation_date:%a %d %b %Y}</b></span>{names}<span class="grow"></span>'
+                f'<span class="dot warn">Demo data</span></div>')
     now = datetime.now(timezone.utc)
     live = st.session_state.get("live_data", {})
     dots = []
@@ -7342,6 +7366,8 @@ def status_strip_html() -> str:
 
 def render_header(title: str, subtitle: str) -> None:
     st.markdown(status_strip_html(), unsafe_allow_html=True)
+    if demo_mode():
+        st.markdown(demo_banner_html(), unsafe_allow_html=True)
     with st.container(key="page_head"):
         st.markdown(f'<div class="head-row"><h1 class="page-title">{html.escape(title)}</h1><p class="page-sub">{html.escape(subtitle)}</p></div>', unsafe_allow_html=True)
         sources = page_sources_html(current_page_name())
@@ -7387,34 +7413,22 @@ def need_data_note(message: str) -> None:
 # SECTION 6 · NAVIGATION AND SESSION
 # =============================================================================
 NAV_SECTIONS = {
-    "Market": [":material/dashboard:  Market Overview", ":material/wb_twilight:  Morning Brief", ":material/psychology:  Market Read", ":material/public:  Market Fundamentals", ":material/query_stats:  Fundamentals Outlook",
-               ":material/bolt:  Power Spot", ":material/compare_arrows:  Spreads & Margins"],
-    "Pricing": [":material/show_chart:  Forward Curves", ":material/request_quote:  OTC Quote Builder", ":material/factory:  Asset Valuation"],
-    "Book and risk": [":material/menu_book:  Trading Book & MtM", ":material/calendar_today:  Daily P&L",
-                      ":material/shield:  Risk & Exposure", ":material/verified_user:  Hedge Advisor", ":material/local_shipping:  Physical Operations"],
-    "Data and controls": [":material/cable:  Live Data Integrations", ":material/tune:  Data & Assumptions",
-                          ":material/rule:  Model Validation"],
+    # Laid out as a trading analyst's day: the morning read, the fundamentals behind it, pricing and quoting,
+    # then positions and risk, with data and controls last.
+    "Morning": [":material/wb_twilight:  Morning Brief", ":material/dashboard:  Market Overview", ":material/psychology:  Market Read"],
+    "Fundamentals": [":material/public:  Market Fundamentals", ":material/query_stats:  Fundamentals Outlook", ":material/bolt:  Power Spot"],
+    "Pricing and trading": [":material/show_chart:  Forward Curves", ":material/compare_arrows:  Spreads & Margins", ":material/request_quote:  OTC Quote Builder",
+                            ":material/factory:  Asset Valuation"],
+    "Positions and risk": [":material/menu_book:  Trading Book & MtM", ":material/calendar_today:  Daily P&L", ":material/shield:  Risk & Exposure",
+                           ":material/verified_user:  Hedge Advisor", ":material/local_shipping:  Physical Operations"],
+    "Data and controls": [":material/cable:  Live Data Integrations", ":material/tune:  Data & Assumptions", ":material/rule:  Model Validation"],
 }
 ALL_NAV_ITEMS = [label for labels in NAV_SECTIONS.values() for label in labels]
 DEFAULT_NAV_ITEM = ALL_NAV_ITEMS[0]
 NAV_TO_PAGE = {label: label.split("  ", 1)[1] for label in ALL_NAV_ITEMS}
-
-WORKFLOW_NEXT = {
-    "Market Overview": "Morning Brief",
-    "Morning Brief": "Market Read",
-    "Market Read": "Market Fundamentals",
-    "Market Fundamentals": "Fundamentals Outlook",
-    "Fundamentals Outlook": "Power Spot",
-    "Power Spot": "Spreads & Margins",
-    "Spreads & Margins": "Forward Curves",
-    "Forward Curves": "OTC Quote Builder",
-    "OTC Quote Builder": "Asset Valuation",
-    "Asset Valuation": "Trading Book & MtM",
-    "Trading Book & MtM": "Daily P&L",
-    "Daily P&L": "Risk & Exposure",
-    "Risk & Exposure": "Hedge Advisor",
-    "Hedge Advisor": "Physical Operations",
-}
+# Each page points to the next one in the day's order.
+_NAV_ORDER = [NAV_TO_PAGE[label] for label in ALL_NAV_ITEMS]
+WORKFLOW_NEXT = {page: following for page, following in zip(_NAV_ORDER[:14], _NAV_ORDER[1:15])}
 
 valuation_date = date.today()
 curves: dict[str, pd.DataFrame] = {}
@@ -7459,7 +7473,8 @@ def render_sidebar() -> str:
         st.markdown('<div style="height:0.5rem"></div>', unsafe_allow_html=True)
         loaded = sum(1 for value in st.session_state.get("live_data", {}).values()
                      if isinstance(value, dict) and isinstance(value.get("data"), pd.DataFrame) and not value["data"].empty)
-        saved = ("Your work saves automatically." if st.session_state.get("desk_store") is not None and not st.session_state.get("desk_store_error")
+        saved = ("Changes made in demo stay in this demo session." if demo_mode()
+                 else "Your work saves automatically." if st.session_state.get("desk_store") is not None and not st.session_state.get("desk_store_error")
                  else "Saving is unavailable, so changes last until you close this tab.")
         st.markdown(f'<div class="side-foot">{loaded} datasets held. {saved}<br>For analysis only, not for trade execution.</div>', unsafe_allow_html=True)
         if "keys_git_risk" not in st.session_state:
@@ -7489,6 +7504,11 @@ def init_session() -> None:
     st.session_state.curve_metadata = metadata
     st.session_state.live_data = live
     st.session_state.settings = settings
+    if not demo_mode():
+        try:
+            seed_builtin_history(st.session_state.live_data)
+        except Exception as exc:
+            st.session_state.desk_store_error = f"Built-in history: {type(exc).__name__}: {exc}"
     if float(settings.get("fx_ecb_epoch", 0.0)) > 0 and "fx_updated_at" not in st.session_state:
         st.session_state.fx_updated_at = datetime.fromtimestamp(float(settings["fx_ecb_epoch"]), timezone.utc)
     if saved_trades is None:
@@ -7626,64 +7646,6 @@ STALE_HOURS = {"tradingview": 1.0, "prices": 6.0, "fundamentals": 6.0, "weather"
 KEEP_DAYS = {"prices": 400, "load": 90, "generation": 90, "lng": 400}
 MAX_UPDATE_WORKERS = 8          # the providers allow far more; this keeps the first update short
 TRADINGVIEW_WORKERS = 2         # TradingView gets its own small lane: asked too fast, it drops requests
-PAGE_RECHECK_SECONDS = 600      # a page left open looks again for stale sources after this long
-
-# Each source the app fetches belongs to one group, and each page names the groups it shows.
-# Opening a page updates only those groups, and only where they are stale.
-UPDATE_GROUPS = {
-    "curves": "Forward curves (TradingView)",
-    "eua_auctions": "EUA auction prices (EEX)",
-    "fx": "FX rates (ECB)",
-    "prices": "Day-ahead prices (ENTSO-E)",
-    "power_system": "Load and generation (ENTSO-E)",
-    "power_forecasts": "Load, wind and solar forecasts (ENTSO-E)",
-    "power_flows": "Saved cross-border flows (ENTSO-E)",
-    "storage": "Gas storage (GIE)",
-    "lng": "LNG terminals (GIE)",
-    "gas_flows": "Saved gas flow point (ENTSOG)",
-    "weather": "Weather forecast (Open-Meteo)",
-    "weather_history": "Temperature history and normals (Open-Meteo)",
-    "zone_weather": "Weather across power zones (Open-Meteo)",
-    "ttf_front": "TTF front-month history (TradingView)",
-    "outlook_output": "Output history for the outlook (ENTSO-E)",
-    "outlook_weather": "16-day weather for the outlook (Open-Meteo)",
-    "scenarios": "Weather scenarios (ECMWF, Open-Meteo)",
-    "nuclear_outages": "Nuclear outage notices (ENTSO-E)",
-    "holidays": "School and regional holidays (OpenHolidays)",
-    "gas_use": "German gas use (THE)",
-}
-UPDATE_GROUP_SHORT = {"curves": "Curves", "eua_auctions": "EUA auctions", "fx": "FX", "prices": "Spot prices", "power_system": "Load and output",
-                      "power_forecasts": "Load and renewables forecasts", "power_flows": "Power flows", "storage": "Gas storage", "lng": "LNG",
-                      "gas_flows": "Gas flows", "weather": "Weather", "weather_history": "Normals", "zone_weather": "Zone weather",
-                      "ttf_front": "TTF front month", "outlook_output": "Output history", "outlook_weather": "16-day weather",
-                      "scenarios": "Weather scenarios", "nuclear_outages": "Nuclear outages", "holidays": "Holidays", "gas_use": "German gas use"}
-_MARKS = ("curves", "eua_auctions", "prices")               # forward curves, with real prices put in
-_BOOK = _MARKS + ("fx",)                                    # anything valued in euros from the book
-_ESTIMATE = ("prices", "power_system", "power_forecasts", "zone_weather", "ttf_front")   # the next-day price estimate
-_GAS = ("storage", "lng", "weather", "weather_history")
-PAGE_UPDATES = {
-    "Market Overview": _BOOK + _GAS,
-    "Morning Brief": _BOOK + _GAS + _ESTIMATE,
-    "Market Read": _MARKS + _GAS + _ESTIMATE,
-    "Market Fundamentals": _GAS + ("prices", "power_system", "power_flows", "gas_flows"),
-    "Fundamentals Outlook": ("power_system", "power_forecasts", "outlook_output", "outlook_weather", "scenarios", "nuclear_outages", "holidays", "gas_use"),
-    "Power Spot": _ESTIMATE + ("weather",),
-    "Spreads & Margins": _BOOK,
-    "Forward Curves": _MARKS,
-    "OTC Quote Builder": _BOOK,
-    "Asset Valuation": _MARKS,
-    "Trading Book & MtM": _BOOK,
-    "Daily P&L": _BOOK,
-    "Risk & Exposure": _BOOK,
-    "Hedge Advisor": _BOOK,
-    "Physical Operations": (),
-    "Live Data Integrations": ("prices", "power_system", "storage", "lng", "weather", "fx"),
-    "Data & Assumptions": _BOOK,
-    "Model Validation": (),
-}
-PAGE_UPDATES = {page: tuple(dict.fromkeys(groups)) for page, groups in PAGE_UPDATES.items()}   # each source once
-ENTSOE_GROUPS = {"entsoe_price": "prices", "entsoe_load": "power_system", "entsoe_generation": "power_system",
-                 "entsoe_load_forecast": "power_forecasts", "entsoe_renewable_forecast": "power_forecasts", "entsoe_flow": "power_flows"}
 
 
 @dataclass
@@ -7694,7 +7656,6 @@ class UpdateTask:
     apply: Callable[[object], str]
     start: Optional[date] = None
     lane: str = "main"
-    group: str = ""
 
 
 def merge_observations(old: Optional[pd.DataFrame], new: pd.DataFrame, keys: Sequence[str],
@@ -7760,26 +7721,20 @@ def _needs_update(key: str, kind: str, force: bool) -> bool:
     return force or age is None or age >= STALE_HOURS[kind]
 
 
-def tradingview_tasks(force: bool = True, today: Optional[date] = None, groups: Optional[Sequence[str]] = None) -> list[UpdateTask]:
-    """Forward curves from TradingView, the default source of marks for every product it lists. Refreshed hourly.
-    The TTF front-month history, used by the next-day estimate, is its own group."""
+def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[UpdateTask]:
+    """Forward curves from TradingView, the default source of marks for every product it lists. Refreshed hourly."""
     today = today or date.today()
-    want_curves, want_front = groups is None or "curves" in groups, groups is None or "ttf_front" in groups
-    if not (want_curves or want_front):
-        return []
     if not tradingview_available():
-        if not want_curves:
-            return []
         def missing() -> None:
             raise RuntimeError(f"Forward curves are on demo prices because tradingview-datafeed isn't installed. Run: {TRADINGVIEW_INSTALL}, then restart the app.")
-        return [UpdateTask("Forward curves from TradingView", missing, lambda _: "", group="curves")]
+        return [UpdateTask("Forward curves from TradingView", missing, lambda _: "")]
     if not _needs_update("tradingview_curves", "tradingview", force):
         return []
     keys = resolved_credentials()
     login = (keys["tradingview_user"], keys["tradingview_password"])
     metadata = st.session_state.get("curve_metadata", {})
     tasks = []
-    for tv_product in (TRADINGVIEW_CURVES if want_curves else ()):
+    for tv_product in TRADINGVIEW_CURVES:
         held = metadata.get(tv_product, {}) if tv_product in st.session_state.get("custom_curves", {}) else {}
         from_tv = held.get("source_type") == "TradingView"
         bars = TRADINGVIEW_UPDATE_BARS if from_tv else TRADINGVIEW_HISTORY_BARS
@@ -7791,7 +7746,7 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None, groups: 
             return fetch_tradingview_curve(product, today, bars, *login, near_only=near_only)
         def apply_tv(raw: pd.DataFrame, product=tv_product, near_only=near_only) -> str:
             return apply_tradingview_curve(product, raw, near_only)
-        tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv, lane="tradingview", group="curves"))
+        tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv, lane="tradingview"))
     held_front = _held_frame("tradingview_gas_front")
     front_bars = TRADINGVIEW_FRONT_HISTORY_BARS if held_front is None or len(held_front) < 200 else 10
     def fetch_front() -> pd.DataFrame:
@@ -7799,18 +7754,15 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None, groups: 
     def apply_front(frame: pd.DataFrame) -> str:
         merged = store_observations("tradingview_gas_front", "TradingView TTF front month", frame, {"symbol": "NYMEX:TTF1!"}, ("date", "product"), "date", 800)
         return f"{len(frame)} days fetched, {len(merged)} held, last close {frame['close'].iloc[-1]:.2f} on {pd.Timestamp(frame['date'].iloc[-1]):%d %b}"
-    if want_front:
-        tasks.append(UpdateTask("TTF front-month history from TradingView", fetch_front, apply_front, lane="tradingview", group="ttf_front"))
+    tasks.append(UpdateTask("TTF front-month history from TradingView", fetch_front, apply_front, lane="tradingview"))
     return tasks
 
 
-def plan_update(force: bool = True, today: Optional[date] = None, groups: Optional[Sequence[str]] = None) -> list[UpdateTask]:
-    """Decide what to request. force ignores recent fetches, except for slow-moving normals.
-    groups limits the plan to those source groups (see UPDATE_GROUPS); None plans every source."""
+def plan_update(force: bool = True, today: Optional[date] = None) -> list[UpdateTask]:
+    """Decide what to request. force ignores recent fetches, except for slow-moving normals."""
     today = today or date.today()
     keys = resolved_credentials()
-    want = lambda group: groups is None or group in groups
-    tasks: list[UpdateTask] = tradingview_tasks(force, today, groups)   # first, so the TTF marks come in first
+    tasks: list[UpdateTask] = tradingview_tasks(force, today)   # first, so the TTF marks come in first
 
     def keyed(kind: str, fetch: Callable[[], object]) -> Callable[[], object]:
         """A source with no key reports what to do, rather than a provider's error."""
@@ -7825,8 +7777,7 @@ def plan_update(force: bool = True, today: Optional[date] = None, groups: Option
                     source: Optional[str] = None, target: Optional[str] = None, variant: Optional[str] = None) -> None:
         name = variant or zone
         full_key = f"{store_key}|{name}"
-        group = ENTSOE_GROUPS[store_key]
-        if not want(group) or not _needs_update(full_key, kind, force):
+        if not _needs_update(full_key, kind, force):
             return
         held = _held_frame(full_key)
         start = incremental_start(held, "timestamp", first_days, 2, today)
@@ -7842,7 +7793,7 @@ def plan_update(force: bool = True, today: Optional[date] = None, groups: Option
         def apply(frame: pd.DataFrame) -> str:
             merged = store_entsoe(full_key, f"{label}, {name}", frame, metadata, keep)
             return f"{len(frame):,} new rows, {len(merged):,} held"
-        tasks.append(UpdateTask(f"{label}, {name}", fetch, apply, start, group=group))
+        tasks.append(UpdateTask(f"{label}, {name}", fetch, apply, start))
 
     price_zones = list(dict.fromkeys(list(UPDATE_DEFAULT_ZONES) + [z for z in _live_variants("entsoe_price") if z in ENTSOE_ZONES]))
     for zone in price_zones:
@@ -7862,7 +7813,7 @@ def plan_update(force: bool = True, today: Optional[date] = None, groups: Option
             entsoe_task("prices", "entsoe_flow", "Physical flow", "Physical flow", meta["source_zone"], KEEP_DAYS["load"], 30, today + timedelta(days=1),
                         meta["source_zone"], meta["target_zone"], variant)
 
-    if want("storage") and _needs_update("gie_agsi_history", "fundamentals", force):
+    if _needs_update("gie_agsi_history", "fundamentals", force):
         held = _held_frame("gie_agsi_history")
         # Providers revise recent gas days, so each update reloads the last 45.
         start = incremental_start(held, "gasDayStart", 0, 45, today) if held is not None else date(today.year - 5, 1, 1)
@@ -7871,23 +7822,23 @@ def plan_update(force: bool = True, today: Optional[date] = None, groups: Option
             merged = store_observations("gie_agsi_history", "AGSI gas storage, 6 years", frame, meta, ("gasDayStart", "name"), "gasDayStart")
             _stored_live_item("gie_agsi", "AGSI gas storage", merged.tail(40).reset_index(drop=True), meta)
             return f"{len(frame):,} new rows, {len(merged):,} held"
-        tasks.append(UpdateTask("EU gas storage", keyed("gie", lambda: fetch_gie_history("AGSI", keys["gie"], "Europe / EU datasets", start, today)), apply_storage, start, group="storage"))
-    if want("lng") and _needs_update("gie_alsi", "fundamentals", force):
+        tasks.append(UpdateTask("EU gas storage", keyed("gie", lambda: fetch_gie_history("AGSI", keys["gie"], "Europe / EU datasets", start, today)), apply_storage, start))
+    if _needs_update("gie_alsi", "fundamentals", force):
         held = _held_frame("gie_alsi")
         lng_start = incremental_start(held, "gasDayStart", 60, 30, today)
         def apply_lng(frame: pd.DataFrame) -> str:
             merged = store_observations("gie_alsi", "ALSI LNG terminals", frame, {"scope": "Europe / EU datasets", "country": ""}, ("gasDayStart", "name"), "gasDayStart", KEEP_DAYS["lng"])
             return f"{len(frame):,} new rows, {len(merged):,} held"
-        tasks.append(UpdateTask("EU LNG terminals", keyed("gie", lambda: fetch_gie_history("ALSI", keys["gie"], "Europe / EU datasets", lng_start, today)), apply_lng, lng_start, group="lng"))
+        tasks.append(UpdateTask("EU LNG terminals", keyed("gie", lambda: fetch_gie_history("ALSI", keys["gie"], "Europe / EU datasets", lng_start, today)), apply_lng, lng_start))
     flow_item = st.session_state.get("live_data", {}).get("entsog_flow")
-    if want("gas_flows") and isinstance(flow_item, dict) and flow_item.get("metadata", {}).get("point_direction") and _needs_update("entsog_flow", "fundamentals", force):
+    if isinstance(flow_item, dict) and flow_item.get("metadata", {}).get("point_direction") and _needs_update("entsog_flow", "fundamentals", force):
         point, indicator = flow_item["metadata"]["point_direction"], flow_item["metadata"].get("indicator", "Physical Flow")
         def apply_gas_flow(frame: pd.DataFrame) -> str:
             _stored_live_item("entsog_flow", f"ENTSOG {indicator}", frame, {"point_direction": point, "indicator": indicator})
             return f"{len(frame):,} rows"
-        tasks.append(UpdateTask("Gas flow at your saved point", lambda: fetch_entsog_flow(point, today - timedelta(days=60), today - timedelta(days=1), indicator), apply_gas_flow, group="gas_flows"))
+        tasks.append(UpdateTask("Gas flow at your saved point", lambda: fetch_entsog_flow(point, today - timedelta(days=60), today - timedelta(days=1), indicator), apply_gas_flow))
 
-    if want("weather") and _needs_update("weather_daily", "weather", force):
+    if _needs_update("weather_daily", "weather", force):
         open_meteo_key = keys["open_meteo"]
         fetch_weather = lambda: fetch_open_meteo_market_pack(list(WEATHER_LOCATIONS), 3, 10, open_meteo_key, bool(open_meteo_key))
         def apply_weather(outcome: tuple) -> str:
@@ -7899,8 +7850,8 @@ def plan_update(force: bool = True, today: Optional[date] = None, groups: Option
             _stored_live_item("weather_daily", "Open-Meteo daily weather", daily, meta)
             st.session_state["weather_fetch_failures"] = failures
             return f"{daily['location'].nunique()} of {len(WEATHER_LOCATIONS)} locations"
-        tasks.append(UpdateTask("Weather forecast", fetch_weather, apply_weather, group="weather"))
-    if want("weather_history") and (_needs_update("weather_normals", "normals", False) or _needs_update("weather_archive", "normals", False)):
+        tasks.append(UpdateTask("Weather forecast", fetch_weather, apply_weather))
+    if _needs_update("weather_normals", "normals", False) or _needs_update("weather_archive", "normals", False):
         def apply_archive(outcome: tuple) -> str:
             archive, normals, failures = outcome
             if normals.empty:
@@ -7908,10 +7859,10 @@ def plan_update(force: bool = True, today: Optional[date] = None, groups: Option
             _stored_live_item("weather_normals", "Open-Meteo temperature normals", normals, {"years": 10})
             _stored_live_item("weather_archive", "Open-Meteo daily temperature history", archive, {"years": 10})
             return f"{normals['location'].nunique()} of {len(WEATHER_LOCATIONS)} locations"
-        tasks.append(UpdateTask("Weather history", lambda: fetch_weather_archive(list(WEATHER_LOCATIONS)), apply_archive, group="weather_history"))
+        tasks.append(UpdateTask("Weather history", lambda: fetch_weather_archive(list(WEATHER_LOCATIONS)), apply_archive))
     power_zones = [z for z in dict.fromkeys(list(UPDATE_DEFAULT_ZONES) + list(_live_variants("entsoe_price"))) if z in ZONE_WEATHER]
     grid_zones = [z for z in power_zones if z in ZONE_WEATHER_POINTS]
-    if want("zone_weather") and grid_zones and _needs_update("zone_weather_history", "power_weather", False):
+    if grid_zones and _needs_update("zone_weather_history", "power_weather", False):
         held_grid = _held_frame("zone_weather_history")
         archive_end = today - timedelta(days=5)
         def fetch_grid_history() -> tuple[pd.DataFrame, list[str]]:
@@ -7932,8 +7883,8 @@ def plan_update(force: bool = True, today: Optional[date] = None, groups: Option
                 raise RuntimeError("; ".join(failures))
             merged = store_observations("zone_weather_history", "Open-Meteo weather across each zone", frame, {"zones": grid_zones}, ("date", "zone"), "date", ZONE_WEATHER_HISTORY_DAYS + 20) if not frame.empty else held_grid
             return f"{len(frame):,} new days, {0 if merged is None else len(merged):,} held" + (f". Failed: {'; '.join(failures)}" if failures else "")
-        tasks.append(UpdateTask("Weather across each power zone", fetch_grid_history, apply_grid_history, group="zone_weather"))
-    if want("zone_weather") and grid_zones and _needs_update("zone_weather_forecast", "weather", force):
+        tasks.append(UpdateTask("Weather across each power zone", fetch_grid_history, apply_grid_history))
+    if grid_zones and _needs_update("zone_weather_forecast", "weather", force):
         open_meteo_key = keys["open_meteo"]
         def fetch_grid_forecast() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
@@ -7952,28 +7903,28 @@ def plan_update(force: bool = True, today: Optional[date] = None, groups: Option
             if kept is not None:
                 _stored_live_item("zone_weather_vintage", "Weather forecasts as they stood the day before", kept, {"zones": grid_zones})
             return f"{frame['zone'].nunique()} of {len(grid_zones)} zones"
-        tasks.append(UpdateTask("Weather forecast across each power zone", fetch_grid_forecast, apply_grid_forecast, group="zone_weather"))
+        tasks.append(UpdateTask("Weather forecast across each power zone", fetch_grid_forecast, apply_grid_forecast))
     # Zones with points across them use those; the single reference city is kept for the others.
     power_zones = [z for z in power_zones if z not in ZONE_WEATHER_POINTS]
-    if want("zone_weather") and power_zones and _needs_update("weather_power_history", "power_weather", False):
+    if power_zones and _needs_update("weather_power_history", "power_weather", False):
         def apply_power_weather(outcome: tuple) -> str:
             frame, failures = outcome
             if frame.empty:
                 raise RuntimeError(f"All {len(failures) or len(power_zones)} locations failed.")
             _stored_live_item("weather_power_history", "Open-Meteo wind and solar history", frame, {"days": 430})
             return f"{frame['location'].nunique()} of {len(power_zones)} locations"
-        tasks.append(UpdateTask("Wind and solar history", lambda: fetch_power_weather([ZONE_WEATHER[z] for z in power_zones]), apply_power_weather, group="zone_weather"))
-    tasks.extend(fundamentals_tasks(force, today, keys, grid_zones, groups))
+        tasks.append(UpdateTask("Wind and solar history", lambda: fetch_power_weather([ZONE_WEATHER[z] for z in power_zones]), apply_power_weather))
+    tasks.extend(fundamentals_tasks(force, today, keys, grid_zones))
     held_auctions = _live_dataset_frame("eex_eua_auctions")
     auction_age = (today - pd.Timestamp(held_auctions["date"].iloc[-1]).date()).days if not held_auctions.empty and "date" in held_auctions.columns else None
-    if want("eua_auctions") and (force or auction_age is None or (auction_age >= 1 and _needs_update("eex_eua_auctions", "prices", False))):
+    if force or auction_age is None or (auction_age >= 1 and _needs_update("eex_eua_auctions", "prices", False)):
         def apply_auctions(frame: pd.DataFrame) -> str:
             _stored_live_item("eex_eua_auctions", "EEX EUA primary auction prices", frame, {"source": "EEX public auction report"})
             last = frame.iloc[-1]
             return f"{pd.Timestamp(last['date']):%d %b}: €{float(last['price']):.2f}/t"
-        tasks.append(UpdateTask("EUA auction prices", lambda: fetch_eua_auctions(today), apply_auctions, group="eua_auctions"))
+        tasks.append(UpdateTask("EUA auction prices", lambda: fetch_eua_auctions(today), apply_auctions))
     fx_age = st.session_state.get("fx_updated_at")
-    if want("fx") and (force or fx_age is None or (datetime.now(timezone.utc) - fx_age).total_seconds() / 3600.0 >= STALE_HOURS["fx"]):
+    if force or fx_age is None or (datetime.now(timezone.utc) - fx_age).total_seconds() / 3600.0 >= STALE_HOURS["fx"]:
         def apply_fx(outcome: tuple) -> str:
             (gbp_per_eur, _), (usd_per_eur, _) = outcome
             set_fx_rate("eur_per_gbp", 1.0 / gbp_per_eur, ecb=True)
@@ -7983,84 +7934,23 @@ def plan_update(force: bool = True, today: Optional[date] = None, groups: Option
             for widget in ("risk_gbp", "risk_usd", "spread_gbp", "spread_usd", "pnl_fx", "data_fx"):
                 st.session_state.pop(widget, None)
             return f"EUR/GBP {gbp_per_eur:.4f}, EUR/USD {usd_per_eur:.4f}"
-        tasks.append(UpdateTask("ECB FX rates", lambda: (fetch_ecb_rate("GBP"), fetch_ecb_rate("USD")), apply_fx, group="fx"))
+        tasks.append(UpdateTask("ECB FX rates", lambda: (fetch_ecb_rate("GBP"), fetch_ecb_rate("USD")), apply_fx))
     return tasks
 
 
-def start_update(force: bool = True, tasks: Optional[list[UpdateTask]] = None, groups: Optional[Sequence[str]] = None) -> int:
-    """Start fetching in the background so the app stays usable. Returns the number of sources added.
-
-    groups limits the update to those source groups; None updates everything. If an update is already
-    running, the new sources join it, and a source already in it isn't asked for twice."""
-    if tasks is None and (groups is None or "curves" in groups):
+def start_update(force: bool = True, tasks: Optional[list[UpdateTask]] = None) -> int:
+    """Start fetching in the background so the app stays usable. Returns the number of sources. Nothing is fetched in demo."""
+    if demo_mode() or st.session_state.get("update_job"):
+        return 0
+    if tasks is None:
         import_curve_folder()
-    planned = plan_update(force, groups=groups) if tasks is None else tasks
-    job = st.session_state.get("update_job")
-    if job:
-        running = {task.name for task in job["tasks"]}
-        planned = [task for task in planned if task.name not in running]
+    planned = plan_update(force) if tasks is None else tasks
     if not planned:
         return 0
-    if not job:
-        executors = {"main": ThreadPoolExecutor(max_workers=MAX_UPDATE_WORKERS), "tradingview": ThreadPoolExecutor(max_workers=TRADINGVIEW_WORKERS)}
-        job = {"tasks": [], "futures": [], "executors": executors, "results": {}}
-        st.session_state.update_job = job
-    for task in planned:
-        job["tasks"].append(task)
-        job["futures"].append(job["executors"].get(task.lane, job["executors"]["main"]).submit(task.fetch))
+    executors = {"main": ThreadPoolExecutor(max_workers=MAX_UPDATE_WORKERS), "tradingview": ThreadPoolExecutor(max_workers=TRADINGVIEW_WORKERS)}
+    st.session_state.update_job = {"tasks": planned, "futures": [executors.get(task.lane, executors["main"]).submit(task.fetch) for task in planned],
+                                   "executors": executors, "results": {}}
     return len(planned)
-
-
-# Where each group's data is kept, to say how fresh it is. A name ending in | covers every zone or variant.
-GROUP_DATASETS = {"curves": ("tradingview_curves",), "eua_auctions": ("eex_eua_auctions",), "fx": (), "prices": ("entsoe_price|",),
-                  "power_system": ("entsoe_load|", "entsoe_generation|"), "power_forecasts": ("entsoe_load_forecast|", "entsoe_renewable_forecast|"),
-                  "power_flows": ("entsoe_flow|",), "storage": ("gie_agsi_history",), "lng": ("gie_alsi",), "gas_flows": ("entsog_flow",),
-                  "weather": ("weather_daily",), "weather_history": ("weather_normals", "weather_archive"),
-                  "zone_weather": ("zone_weather_history", "zone_weather_forecast", "weather_power_history"), "ttf_front": ("tradingview_gas_front",),
-                  "outlook_output": ("fund_daily|",), "outlook_weather": ("fund_weather_history", "fund_weather_forecast"), "scenarios": ("fund_weather_ensemble",),
-                  "nuclear_outages": ("entsoe_outages|",), "holidays": ("holidays",), "gas_use": ("the_gas_consumption",)}
-
-
-def group_fetched_at(group: str) -> Optional[datetime]:
-    """When a group's data was last fetched: the oldest of its datasets, since the page needs them all."""
-    if group == "fx":
-        return st.session_state.get("fx_updated_at")
-    stamps = []
-    for key, item in st.session_state.get("live_data", {}).items():
-        if isinstance(item, dict) and item.get("fetched_at") and any(key == name or (name.endswith("|") and key.startswith(name)) for name in GROUP_DATASETS[group]):
-            try:
-                stamps.append(pd.Timestamp(str(item["fetched_at"])).to_pydatetime())
-            except Exception:
-                continue
-    return min(stamps) if stamps else None
-
-
-def page_update_table() -> pd.DataFrame:
-    """For each section and page of the sidebar, the sources it updates when opened and how fresh they are."""
-    rows = []
-    for section, labels in NAV_SECTIONS.items():
-        for label in labels:
-            page = NAV_TO_PAGE[label]
-            groups = page_groups(page)
-            stamps = [group_fetched_at(g) for g in groups]
-            missing = [UPDATE_GROUP_SHORT[g] for g, t in zip(groups, stamps) if t is None]
-            held = [t for t in stamps if t is not None]
-            rows.append({"Section": section, "Page": page, "Updates when opened": ", ".join(UPDATE_GROUP_SHORT[g] for g in groups) or "Nothing: no market data",
-                         "Oldest fetch": _ago(min(held)) if held else "–", "Not loaded yet": ", ".join(missing) if missing else ("–" if groups else ""),
-                         "Sources": len(groups)})
-    return pd.DataFrame(rows)
-
-
-def page_groups(page: Optional[str] = None) -> tuple:
-    """The source groups a page shows. Without a page, the one open now."""
-    if page is None:
-        page = NAV_TO_PAGE.get(st.session_state.get("nav_page", ""), "")
-    return tuple(PAGE_UPDATES.get(page, ()))
-
-
-def page_sources_text(page: str) -> str:
-    groups = page_groups(page)
-    return ", ".join(UPDATE_GROUPS[g] for g in groups) if groups else "none: this page uses no market data"
 
 
 def update_progress() -> tuple[int, int]:
@@ -8095,21 +7985,14 @@ def collect_update() -> bool:
     return True
 
 
-def maybe_auto_update(page: Optional[str] = None) -> int:
-    """Refresh what the open page shows, where it is stale, unless switched off. Each page looks once when
-    opened and again after PAGE_RECHECK_SECONDS, so the app starts with only the open page's sources."""
-    if os.getenv("MERIDIAN_NO_AUTO_UPDATE") or not fx_rate("auto_update"):
-        return 0
-    page = page or NAV_TO_PAGE.get(st.session_state.get("nav_page", ""), "")
-    groups = page_groups(page)
-    if not groups:
-        return 0
-    checked = st.session_state.setdefault("page_update_checked", {})
-    now = datetime.now(timezone.utc).timestamp()
-    if now - checked.get(page, -1e12) < PAGE_RECHECK_SECONDS:
-        return 0
-    checked[page] = now
-    return start_update(force=False, groups=groups)
+def maybe_auto_update() -> None:
+    """Refresh stale data once when the app opens, unless switched off."""
+    if st.session_state.get("auto_update_checked"):
+        return
+    st.session_state.auto_update_checked = True
+    if os.getenv("MERIDIAN_NO_AUTO_UPDATE") or demo_mode() or not fx_rate("auto_update"):
+        return
+    start_update(force=False)
 
 
 def _ago(moment: datetime) -> str:
@@ -8141,20 +8024,19 @@ def _latest_fetch() -> Optional[datetime]:
 
 def _update_panel() -> None:
     """Sidebar control. While fetching, it refreshes itself until the data is ready."""
+    if demo_mode():
+        st.markdown(f'<div class="side-foot"><b>Demo market for {date.today():%d %b %Y}.</b> Built from real closes of {DEMO_ANCHOR_DAY:%d %b}. '
+                    'Nothing is fetched or saved to your desk. Choose Live to update and use your own data.</div>', unsafe_allow_html=True)
+        return
     done, total = update_progress()
     if total:
         if collect_update():
             st.rerun()
-        st.progress(done / total, text=f"Updating, {done} of {total} sources")
+        st.progress(done / total, text=f"Updating market data, {done} of {total} sources")
         return
-    page = NAV_TO_PAGE.get(st.session_state.get("nav_page", ""), "")
-    groups = page_groups(page)
-    if st.button("Update this page", type="primary", key="sidebar_update", width="stretch", disabled=not groups,
-                 help=f"Fetches what's new for this page only: {page_sources_text(page)}."):
-        if start_update(force=True, groups=groups):
-            st.rerun()
-    if st.button("Update all sources", key="sidebar_update_all", width="stretch", help="Fetches what's new for every page. Takes longer."):
-        if start_update(force=True):
+    if st.button("Update market data", type="primary", key="sidebar_update", width="stretch", help="Uses your saved keys and fetches only what's new."):
+        count = start_update(force=True)
+        if count:
             st.rerun()
     latest = _latest_fetch()
     results = st.session_state.get("update_results") or []
@@ -8195,10 +8077,13 @@ def update_report() -> str:
 
 
 def render_update_panel() -> None:
+    render_mode_switch()
     running = bool(st.session_state.get("update_job"))
     st.fragment(_update_panel, run_every="1.5s" if running else None)()
-    automatic = st.checkbox("Update each page when I open it", value=bool(fx_rate("auto_update")), key="auto_update_toggle",
-                            help="Fetches, in the background, only the stale sources the open page shows. See Live Data Integrations for what each page updates.")
+    if demo_mode():
+        return
+    automatic = st.checkbox("Update when I open the app", value=bool(fx_rate("auto_update")), key="auto_update_toggle",
+                            help="Fetches stale data in the background each time you open the app.")
     if automatic != bool(fx_rate("auto_update")):
         set_fx_rate("auto_update", 1.0 if automatic else 0.0)
     demo = st.checkbox("Fill gaps with demo prices", value=demo_allowed(), key="allow_demo_toggle",
@@ -8210,15 +8095,16 @@ def render_update_panel() -> None:
         st.rerun()
 
 
-def update_button(key: str, label: str = "Update this page", every_source: bool = False) -> None:
-    """The open page's update, offered where the data is used. every_source updates all pages' sources."""
+def update_button(key: str, label: str = "Update market data") -> None:
+    """The same update, offered where the data is used."""
+    if demo_mode():
+        st.button("Demo data: choose Live in the sidebar to update", key=key, disabled=True)
+        return
     done, total = update_progress()
-    groups = None if every_source else page_groups()
     if total:
         st.button(f"Updating, {done} of {total} sources", key=key, disabled=True)
-    elif st.button(label, type="primary", key=key, disabled=groups == (),
-                   help="Fetches what's new for every page." if every_source else f"Fetches what's new for this page: {page_sources_text(NAV_TO_PAGE.get(st.session_state.get('nav_page', ''), ''))}."):
-        if start_update(force=True, groups=groups):
+    elif st.button(label, type="primary", key=key):
+        if start_update(force=True):
             st.rerun()
 
 
@@ -8241,7 +8127,9 @@ def _read_curve_bytes(content: bytes, suffix: str) -> pd.DataFrame:
 
 
 def import_curve_folder() -> list[dict]:
-    """Bring in any new file from the curve folder. Each version of a file is processed once."""
+    """Bring in any new file from the curve folder. Each version of a file is processed once. Your files go to the live desk only."""
+    if demo_mode():
+        return []
     store = desk_store()
     folder = curve_folder()
     if store is None:
@@ -8417,39 +8305,41 @@ def winter_outlook() -> dict:
                                                _live_dataset_frame("weather_daily"), valuation_date))
 
 
-def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str], groups: Optional[Sequence[str]] = None) -> list[UpdateTask]:
+def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str]) -> list[UpdateTask]:
     """What the fundamentals outlook needs beyond the price estimate's data: a year of daily output,
     weather as the forecast models saw it, 16 days ahead, ECMWF's scenarios and German gas use."""
     tasks: list[UpdateTask] = []
-    want = lambda group: groups is None or group in groups
     zones = [z for z in zones if z in FUND_SEA_POINTS]
     open_meteo_key = keys.get("open_meteo", "")
     for zone in zones:
         key = f"fund_daily|{zone}"
-        if not want("outlook_output") or not _needs_update(key, "fundamentals", force):
+        if not _needs_update(key, "fundamentals", force):
             continue
         summary, load, generation = _held_frame(key), _held_frame(f"entsoe_load|{zone}"), _held_frame(f"entsoe_generation|{zone}")
         span = fund_history_span(summary, load, today)
         def fetch_history(zone=zone, span=span) -> pd.DataFrame:
-            if span is None or not keys["entsoe"]:
+            if span is None:
                 return pd.DataFrame()
             start, end = span
+            if not keys["entsoe"]:
+                # Without a key, the same daily figures come from Energy-Charts, which needs none.
+                return fetch_energy_charts_daily(zone, start, min(end, today - timedelta(days=1)))
             parts = [daily_from_entsoe(fetch_entsoe_series(keys["entsoe"], "Actual generation by type", zone, start, end), zone),
                      daily_from_entsoe(fetch_entsoe_series(keys["entsoe"], "Actual load", zone, start, end), zone, single="load")]
             return pd.concat(parts, ignore_index=True)
         def apply_history(frame: pd.DataFrame, zone=zone, key=key, span=span) -> str:
-            if span is not None and frame.empty and not keys["entsoe"]:
-                raise RuntimeError(f"No ENTSO-E key found. Put {KEYS_FILE_NAME} in the same folder as this app.")
+            if span is not None and frame.empty and _held_frame(key) is None:
+                raise RuntimeError(f"No daily output came back for {zone}, from ENTSO-E or Energy-Charts. Check the internet connection.")
             held = _held_frame(key)
             kept = [f for f in (held, frame) if f is not None and not f.empty]
             rows = fund_daily_rows(pd.concat(kept, ignore_index=True) if kept else None, _held_frame(f"entsoe_load|{zone}"), _held_frame(f"entsoe_generation|{zone}"), zone)
             rows = rows.loc[rows["date"] >= pd.Timestamp(today - timedelta(days=FUND_KEEP_DAYS))].reset_index(drop=True)
             _stored_live_item(key, f"Daily output and demand, {zone}", rows, {"zone": zone})
             return f"{rows['date'].nunique():,} days held" + (f", {frame['date'].nunique() if not frame.empty else 0:,} fetched" if span else "")
-        tasks.append(UpdateTask(f"Output history for the outlook, {zone}", fetch_history, apply_history, span[0] if span else None, group="outlook_output"))
+        tasks.append(UpdateTask(f"Output history for the outlook, {zone}", fetch_history, apply_history, span[0] if span else None))
     held_item = st.session_state.get("live_data", {}).get("fund_weather_history") or {}
     old_points = bool(held_item) and (held_item.get("metadata") or {}).get("version") != FUND_WEATHER_VERSION
-    if want("outlook_weather") and zones and (_needs_update("fund_weather_history", "power_weather", False) or old_points):
+    if zones and (_needs_update("fund_weather_history", "power_weather", False) or old_points):
         # Weather kept under an older set of points would mix two definitions of wind and sun, so it is fetched again.
         held = None if old_points else _held_frame("fund_weather_history")
         end = today - timedelta(days=1)
@@ -8474,8 +8364,8 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
             merged = store_observations("fund_weather_history", "Past weather as the forecast models saw it", frame, {"zones": zones, "version": FUND_WEATHER_VERSION},
                                         ("date", "zone"), "date", GAS_DEMAND_HISTORY_DAYS + 30) if not frame.empty else held
             return f"{len(frame):,} new days, {0 if merged is None else len(merged):,} held" + (f". Failed: {'; '.join(failures)}" if failures else "")
-        tasks.append(UpdateTask("Weather history for the outlook", fetch_weather_history, apply_weather_history, group="outlook_weather"))
-    if want("outlook_weather") and zones and _needs_update("fund_weather_forecast", "weather", force):
+        tasks.append(UpdateTask("Weather history for the outlook", fetch_weather_history, apply_weather_history))
+    if zones and _needs_update("fund_weather_forecast", "weather", force):
         def fetch_weather_ahead() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
             for zone in zones:
@@ -8491,8 +8381,8 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
                 raise RuntimeError("; ".join(failures) or "No zone returned a forecast.")
             _stored_live_item("fund_weather_forecast", "16-day weather forecast across each zone", frame, {"zones": zones})
             return f"{frame['zone'].nunique()} of {len(zones)} zones, to {pd.Timestamp(frame['date'].max()):%d %b}"
-        tasks.append(UpdateTask("16-day weather forecast", fetch_weather_ahead, apply_weather_ahead, group="outlook_weather"))
-    if want("scenarios") and zones and _needs_update("fund_weather_ensemble", "ensemble", False):
+        tasks.append(UpdateTask("16-day weather forecast", fetch_weather_ahead, apply_weather_ahead))
+    if zones and _needs_update("fund_weather_ensemble", "ensemble", False):
         def fetch_scenarios() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
             for zone in zones:
@@ -8507,8 +8397,8 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
                 raise RuntimeError("; ".join(failures) or "No zone returned weather scenarios.")
             _stored_live_item("fund_weather_ensemble", "ECMWF weather scenarios", frame, {"zones": zones, "model": OPEN_METEO_ENSEMBLE_MODEL})
             return f"{frame['member'].nunique()} scenarios" + (f". Failed: {'; '.join(failures)}" if failures else "")
-        tasks.append(UpdateTask("Weather scenarios", fetch_scenarios, apply_scenarios, group="scenarios"))
-    for zone in [z for z in zones if z in FUND_NUCLEAR_FIT and want("nuclear_outages")]:
+        tasks.append(UpdateTask("Weather scenarios", fetch_scenarios, apply_scenarios))
+    for zone in [z for z in zones if z in FUND_NUCLEAR_FIT]:
         key = f"entsoe_outages|{zone}"
         if not _needs_update(key, "fundamentals", force):
             continue
@@ -8523,9 +8413,9 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
                 raise RuntimeError(f"ENTSO-E listed no nuclear outage notices for {zone}; the outlook keeps last week's nuclear output.")
             _stored_live_item(key, f"Nuclear outage notices, {zone}", nuclear.reset_index(drop=True), {"zone": zone, "documents": read})
             return f"{nuclear['mrid'].nunique():,} notices for {nuclear['unit'].nunique()} units"
-        tasks.append(UpdateTask(f"Nuclear outage notices, {zone}", fetch_outages, apply_outages, group="nuclear_outages"))
+        tasks.append(UpdateTask(f"Nuclear outage notices, {zone}", fetch_outages, apply_outages))
     countries = sorted({FUND_COUNTRY[z] for z in zones if z in FUND_COUNTRY})
-    if want("holidays") and countries and _needs_update("holidays", "holidays", force):
+    if countries and _needs_update("holidays", "holidays", force):
         def fetch_holidays() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
             for country in countries:
@@ -8540,8 +8430,8 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
                 raise RuntimeError("; ".join(failures) or "No holidays returned.")
             _stored_live_item("holidays", "School and regional public holidays", frame, {"countries": countries, "source": "OpenHolidays (ODbL)"})
             return f"{(frame['kind'] == 'school').sum():,} school and {(frame['kind'] == 'public').sum():,} public holidays" + (f". Failed: {'; '.join(failures)}" if failures else "")
-        tasks.append(UpdateTask("School and regional holidays", fetch_holidays, apply_holidays, group="holidays"))
-    if want("gas_use") and "Germany-Luxembourg" in zones and _needs_update("the_gas_consumption", "fundamentals", force):
+        tasks.append(UpdateTask("School and regional holidays", fetch_holidays, apply_holidays))
+    if "Germany-Luxembourg" in zones and _needs_update("the_gas_consumption", "fundamentals", force):
         held = _held_frame("the_gas_consumption")
         # Large users' figures are corrected for weeks after the day, so recent months are reloaded each time.
         start = incremental_start(held, "gas_day", GAS_DEMAND_HISTORY_DAYS, 75, today)
@@ -8549,7 +8439,13 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
             merged = store_observations("the_gas_consumption", "German gas consumption, Trading Hub Europe", frame, {"source": "Trading Hub Europe"},
                                         ("gas_day",), "gas_day", GAS_DEMAND_HISTORY_DAYS + 30)
             return f"{len(frame):,} gas days fetched, {len(merged):,} held, published to {pd.Timestamp(frame['gas_day'].max()):%d %b}"
-        tasks.append(UpdateTask("German gas consumption", lambda: fetch_the_consumption(start, today + timedelta(days=2)), apply_gas_use, start, group="gas_use"))
+        def fetch_gas_use(start=start) -> pd.DataFrame:
+            try:
+                return fetch_the_consumption(start, today + timedelta(days=2))
+            except Exception as exc:
+                raise RuntimeError("Trading Hub Europe's data interface isn't answering (THE has said it is out of service for now), "
+                                   f"so German gas demand waits until it's back. Detail: {exc}") from None
+        tasks.append(UpdateTask("German gas consumption", fetch_gas_use, apply_gas_use, start))
     return tasks
 
 
@@ -8584,8 +8480,8 @@ def book_months() -> dict:
 
 
 def demo_allowed() -> bool:
-    """Live prices only, unless the user chooses to fill gaps with demo prices."""
-    return bool(fx_rate("allow_demo"))
+    """Live prices only, unless the user chooses to fill gaps with demo prices. Always in demo."""
+    return demo_mode() or bool(fx_rate("allow_demo"))
 
 
 def composed_curves() -> tuple[dict, dict]:
@@ -8617,6 +8513,8 @@ def composed_curves() -> tuple[dict, dict]:
                 curves_[product] = curve.loc[curve["delivery_month"].isin(real)].reset_index(drop=True)
                 curves_[product].attrs["not_loaded"] = True
                 sources[product] = {m: sources[product][m] for m in real}
+        if demo_mode():
+            sources = {product: {month: SOURCE_DEMO for month in months} for product, months in sources.items()}
         return curves_, sources
     return session_memo("composed_curves", (data_version("live", "curves", "trades"), valuation_date, demo_allowed()), build)
 
@@ -8626,6 +8524,8 @@ def curve_sources() -> dict:
 
 
 def product_price_state(product: str) -> str:
+    if demo_mode():
+        return "Demo"
     state = price_state(curve_sources().get(product, {}).values())
     if state == "Real" and product in st.session_state.get("custom_curves", {}):
         status = curve_state(product, st.session_state["custom_curves"], st.session_state.get("curve_metadata", {}), valuation_date)
@@ -8652,7 +8552,9 @@ def _names(products: Sequence[str]) -> str:
 
 
 def price_warning(products: Sequence[str]) -> str:
-    """One sentence naming the curves a result relies on that aren't fully real and current."""
+    """One sentence naming the curves a result relies on that aren't fully real and current. In demo the banner says it once."""
+    if demo_mode():
+        return ""
     states = {p: product_price_state(p) for p in dict.fromkeys(products)}
     demo = [p for p, s in states.items() if s == "Demo"]
     part = [p for p, s in states.items() if s == "Part real"]
@@ -8718,7 +8620,7 @@ def src_weather() -> list:
 def src_outlook() -> list:
     out = []
     days = max((f["date"].nunique() for f in (_live_dataset_frame(k) for k in [f"fund_daily|{z}" for z in _live_variants("fund_daily")]) if not f.empty and "date" in f.columns), default=0)
-    out.append(("real", f"ENTSO-E output, {days} days") if days else ("missing", "ENTSO-E output history"))
+    out.append(("real", f"Daily output (ENTSO-E or Energy-Charts), {days} days") if days else ("missing", "Daily output history"))
     out.append(("real", "Open-Meteo 16-day forecast") if not _live_dataset_frame("fund_weather_forecast").empty else ("missing", "Open-Meteo 16-day forecast"))
     out.append(("real", "ECMWF scenarios") if not _live_dataset_frame("fund_weather_ensemble").empty else ("missing", "ECMWF scenarios"))
     last = _latest(_live_dataset_frame("the_gas_consumption"), ("gas_day",))
@@ -8795,7 +8697,7 @@ def src_history() -> list:
 def src_read_curves() -> list:
     fresh = fresh_curves(st.session_state.get("custom_curves", {}), st.session_state.get("curve_metadata", {}), valuation_date)
     if fresh:
-        return [("real", f"{_names(sorted(fresh))} imported marks")]
+        return [("real", f"{_names(sorted(fresh))} {'forward' if demo_mode() else 'imported'} marks")]
     return [("info", "Curve signals off: they only use real forward marks")]
 
 
@@ -8825,7 +8727,7 @@ SOURCE_LABELS = {"real": "Real", "part": "Part real", "demo": "Demo", "old": "Ol
 
 def page_sources_html(page: str) -> str:
     settings = st.session_state.get("settings", {})
-    key = (data_version("live", "curves", "trades", "snapshots"), valuation_date, settings.get("fx_ecb_epoch"))
+    key = (data_version("live", "curves", "trades", "snapshots"), valuation_date, settings.get("fx_ecb_epoch"), demo_mode())
     return session_memo(f"sources|{page}", key, lambda: _page_sources_html(page))
 
 
@@ -8837,6 +8739,8 @@ def _page_sources_html(page: str) -> str:
         items = builder()
     except Exception:
         return ""
+    if demo_mode():
+        items = [("demo" if state in ("real", "user", "part", "old") else state, text) for state, text in items]
     order = {"real": 0, "user": 1, "part": 2, "old": 3, "demo": 4, "missing": 5, "info": 6}
     chips = "".join(f'<span class="src {state}"><b>{SOURCE_LABELS[state]}</b>{html.escape(text)}</span>'
                     for state, text in sorted(items, key=lambda item: order.get(item[0], 9)))
@@ -8857,6 +8761,1234 @@ def prices_used_lines(products: Sequence[str]) -> list[tuple[str, str]]:
                   "Old": "real but out-of-date imported marks", "Demo": "demo prices"}.get(state, state)
         lines.append((product, detail))
     return lines
+# =============================================================================
+# SECTION 6E · DEMO DATA
+# A whole simulated market for today, anchored on real closing levels. Weather drives demand, wind and
+# solar; those set residual load, which with gas and carbon sets power prices; storage, LNG, outages and
+# curves follow the same story. It lives in its own database, so it never mixes with or replaces live data.
+# =============================================================================
+DEMO_VERSION = 3
+DEMO_ANCHOR_DAY = date(2026, 11, 13)          # the closes the demo market is built from
+DEMO_FX = {"eur_per_usd": 1 / 1.1052, "eur_per_gbp": 1 / 0.8356}   # ECB reference rates of 13 Nov 2026
+DEMO_COUNTERPARTY = " (Demo)"
+# What the demo is anchored on. Shown on Data & Assumptions, so anyone can see where each level comes from.
+DEMO_ANCHORS = (
+    ("TTF Dec-26", "€90.95/MWh", "13 Nov 2026", "ICE Endex settlement, as reported in market news"),
+    ("NBP Dec-26", "230.7 p/th", "13 Nov 2026", "ICE settlement, as reported in market news"),
+    ("German base Cal-27", "€145/MWh", "6–13 Nov 2026", "EEX, as reported in market news"),
+    ("German base Dec-26 / Jan-27", "€188 / €201/MWh", "Nov 2026", "EEX month futures"),
+    ("French base Cal-27 / Cal-28", "€118.49 / €65.14/MWh", "13 Nov 2026", "EEX, as reported in market news"),
+    ("French day-ahead base", "€197.25 (13 Nov), €186.38 (16 Nov)", "Nov 2026", "EPEX day-ahead auction"),
+    ("German day-ahead base", "≈€257 week of 2–8 Nov, €345.64 on 9 Nov", "Nov 2026", "EPEX day-ahead auction"),
+    ("EUA Dec-26", "€88.15/t", "13 Nov 2026", "ICE Endex"),
+    ("API2 coal Dec-26 / Jan-27", "$134.5 / $132.4/t", "13 Nov 2026", "ICE"),
+    ("EU gas storage", "71.0% full, net withdrawal ≈3.9 TWh/d", "gas day 12 Nov 2026", "GIE AGSI+"),
+    ("EUR/USD, EUR/GBP", "1.1052, 0.8356", "13 Nov 2026", "ECB reference rates"),
+)
+DEMO_STORY = ("Winter 2026/27 opens tight: the Strait of Hormuz disruption has cut Qatari LNG, Norwegian outages trim pipeline "
+              "supply and EU storage is the lowest for mid-November in years. A windless, cold spell in early November sent German "
+              "day-ahead power above €300/MWh.")
+
+# Front-month levels on the way to the anchor, by date. Between them the path is a random walk pinned to each level.
+_DEMO_FRONT_KNOTS = {
+    "TTF": ((date(2024, 9, 1), 36.0), (date(2024, 11, 15), 45.0), (date(2025, 2, 10), 55.0), (date(2025, 4, 15), 36.0), (date(2025, 8, 1), 34.0),
+            (date(2025, 11, 15), 30.0), (date(2026, 2, 25), 32.0), (date(2026, 3, 6), 68.5), (date(2026, 3, 12), 52.0), (date(2026, 3, 23), 61.0),
+            (date(2026, 3, 31), 53.6), (date(2026, 4, 15), 47.0), (date(2026, 5, 18), 51.2), (date(2026, 6, 20), 41.0), (date(2026, 7, 31), 50.0),
+            (date(2026, 9, 15), 64.0), (date(2026, 10, 15), 84.0), (date(2026, 10, 28), 99.0), (date(2026, 11, 6), 95.0), (date(2026, 11, 12), 92.26),
+            (DEMO_ANCHOR_DAY, 90.95)),
+    "EUA": ((date(2024, 9, 1), 66.0), (date(2025, 2, 1), 79.0), (date(2025, 4, 10), 63.0), (date(2025, 8, 1), 71.0), (date(2025, 12, 1), 80.0),
+            (date(2026, 3, 10), 74.0), (date(2026, 6, 15), 72.0), (date(2026, 9, 15), 79.0), (DEMO_ANCHOR_DAY, 88.15)),
+    "API2": ((date(2024, 9, 1), 112.0), (date(2025, 3, 1), 100.0), (date(2025, 8, 1), 98.0), (date(2026, 2, 15), 102.0), (date(2026, 3, 10), 125.0),
+             (date(2026, 6, 15), 116.0), (date(2026, 9, 15), 128.0), (date(2026, 10, 28), 140.0), (DEMO_ANCHOR_DAY, 134.5)),
+}
+_DEMO_VOL = {"TTF": 0.030, "EUA": 0.018, "API2": 0.016, "German Power Base": 0.016, "French Power Base": 0.022, "NBP": 0.008, "peak": 0.006}
+_DE_PEAK = (1.13, 1.12, 1.07, 1.0, 0.95, 0.93, 0.95, 0.97, 1.03, 1.08, 1.13, 1.14)
+_FR_PEAK = (1.17, 1.15, 1.10, 1.05, 1.0, 1.0, 1.03, 1.03, 1.08, 1.12, 1.16, 1.18)
+_DE_2027 = (201, 186, 158, 128, 112, 110, 116, 118, 128, 140, 158, 165)
+_FR_2027 = (195, 172, 128, 88, 62, 60, 70, 66, 88, 110, 140, 158)
+_DEMO_FR_UNITS = (("GRAVELINES", 6, 910), ("PALUEL", 4, 1330), ("FLAMANVILLE", 2, 1330), ("CATTENOM", 4, 1300), ("CHOOZ", 2, 1500),
+                  ("CIVAUX", 2, 1495), ("TRICASTIN", 4, 915), ("BUGEY", 4, 900), ("BLAYAIS", 4, 910), ("CRUAS", 4, 915), ("DAMPIERRE", 4, 890),
+                  ("CHINON", 4, 905), ("PENLY", 2, 1330), ("GOLFECH", 2, 1310), ("NOGENT", 2, 1310), ("SAINT-ALBAN", 2, 1335),
+                  ("BELLEVILLE", 2, 1310), ("SAINT-LAURENT", 2, 915))
+
+
+def _months_between(a: date, b: date) -> int:
+    return (b.year - a.year) * 12 + b.month - a.month
+
+
+def _cal_scaled(shape: Sequence[float], year: int, level: float) -> list:
+    """Scale twelve monthly prices so their day-weighted average is the calendar-year price."""
+    days = [(_add_months(date(year, m, 1), 1) - date(year, m, 1)).days for m in range(1, 13)]
+    mean = sum(p * d for p, d in zip(shape, days)) / sum(days)
+    return [p * level / mean for p in shape]
+
+
+@lru_cache(maxsize=1)
+def _demo_shapes() -> dict:
+    """Each product's forward curve on the anchor day, {product: {first of month: price}}, from mid-2024 to 2031."""
+    months = [_add_months(date(2024, 7, 1), i) for i in range(84)]
+    eur_gbp = DEMO_FX["eur_per_gbp"]
+    ttf_knots = {date(2026, 6, 1): 45.0, date(2026, 7, 1): 50.0, date(2026, 8, 1): 60.0, date(2026, 9, 1): 66.0, date(2026, 10, 1): 80.0,
+                 date(2026, 11, 1): 92.0, date(2026, 12, 1): 90.95}
+    ttf_knots.update({date(2027, m, 1): p for m, p in zip(range(1, 13), (89.6, 85.2, 76.0, 61.5, 57.0, 56.0, 55.8, 56.0, 56.8, 58.0, 60.5, 62.5))})
+    ttf_knots.update({date(2028, 1, 1): 63.0, date(2028, 2, 1): 61.0, date(2028, 3, 1): 55.0})
+    season = lambda m: math.cos(2 * math.pi * (m.month - 1) / 12)
+    ttf = {}
+    for m in months:
+        if m in ttf_knots:
+            ttf[m] = ttf_knots[m]
+        elif m < date(2026, 6, 1):
+            ttf[m] = 42.0 * (1 + 0.09 * season(m))
+        else:
+            k = _months_between(date(2027, 4, 1), m)
+            ttf[m] = (36.0 + 26.0 * math.exp(-k / 14.0)) * (1 + 0.09 * season(m))
+    shapes = {"TTF Natural Gas": ttf}
+    # NBP trades at a premium to TTF in winter and a discount in summer. Dec-26 settles at 230.7 p/th.
+    nbp_ratio = lambda m: 1.0359 if m.month in (10, 11, 12, 1, 2, 3) else 0.955
+    shapes["NBP Natural Gas"] = {m: ttf[m] * nbp_ratio(m) / eur_gbp for m in months}
+    de, fr = {}, {}
+    de_cal, fr_cal = {2027: 145.0, 2028: 105.0, 2029: 92.0, 2030: 86.0, 2031: 85.0}, {2027: 118.49, 2028: 65.14, 2029: 60.0, 2030: 58.0, 2031: 57.0}
+    de_h2 = {6: 95, 7: 105, 8: 115, 9: 130, 10: 150, 11: 178, 12: 188}
+    fr_h2 = {6: 55, 7: 70, 8: 80, 9: 105, 10: 125, 11: 172, 12: 182}
+    for year in range(2024, 2032):
+        if year in de_cal:
+            flatten = 1.0 if year == 2027 else 0.8
+            de_shape = [140 * (p / 143.3) ** flatten for p in _DE_2027]
+            fr_shape = [111 * (p / 111.4) ** flatten for p in _FR_2027]
+            de_year, fr_year = _cal_scaled(de_shape, year, de_cal[year]), _cal_scaled(fr_shape, year, fr_cal[year])
+        else:
+            de_year = [de_h2.get(m, 105 * (1 + 0.12 * math.cos(2 * math.pi * (m - 1) / 12))) for m in range(1, 13)]
+            fr_year = [fr_h2.get(m, 85 * (1 + 0.30 * math.cos(2 * math.pi * (m - 1) / 12))) for m in range(1, 13)]
+        for m in range(1, 13):
+            de[date(year, m, 1)], fr[date(year, m, 1)] = de_year[m - 1], fr_year[m - 1]
+    de[date(2027, 1, 1)] = 201.0   # the reported January price; the rest of 2027 still averages €145
+    shapes["German Power Base"] = {m: de[m] for m in months}
+    shapes["German Power Peak"] = {m: de[m] * _DE_PEAK[m.month - 1] for m in months}
+    shapes["French Power Base"] = {m: fr[m] for m in months}
+    shapes["French Power Peak"] = {m: fr[m] * _FR_PEAK[m.month - 1] for m in months}
+    shapes["EUA Carbon"] = {m: 88.15 * (1 + 0.032 * _months_between(date(2026, 12, 1), m) / 12) for m in months}
+    coal_knots = [(date(2024, 7, 1), 112.0), (date(2026, 6, 1), 118.0), (date(2026, 7, 1), 122.0), (date(2026, 8, 1), 126.0), (date(2026, 9, 1), 130.0),
+                  (date(2026, 10, 1), 138.0), (date(2026, 11, 1), 136.0), (date(2026, 12, 1), 134.5), (date(2027, 1, 1), 132.4), (date(2027, 6, 1), 122.0),
+                  (date(2027, 12, 1), 118.0), (date(2028, 12, 1), 106.0), (date(2029, 12, 1), 101.0), (date(2031, 6, 1), 99.0)]
+    xs, ys = [k[0].toordinal() for k in coal_knots], [k[1] for k in coal_knots]
+    shapes["API2 Coal"] = {m: float(np.interp(m.toordinal(), xs, ys)) for m in months}
+    return shapes
+
+
+def _bridge(rng: np.random.Generator, n: int, vol: float) -> np.ndarray:
+    """A random walk of n steps pinned to zero at both ends."""
+    walk = np.concatenate([[0.0], np.cumsum(rng.normal(0.0, vol, n))])
+    return walk - np.linspace(0.0, 1.0, n + 1) * walk[-1]
+
+
+def _pinned_path(rng: np.random.Generator, days: pd.DatetimeIndex, knots: Sequence[tuple], vol: float) -> np.ndarray:
+    """Daily log-levels through every knot; after the last knot, a free random walk."""
+    ords = np.array([d.toordinal() for d in days.date])
+    kx = np.array([k[0].toordinal() for k in knots])
+    ky = np.log([k[1] for k in knots])
+    out = np.interp(ords, kx, ky)
+    for (a, _), (b, _) in zip(knots[:-1], knots[1:]):
+        span = (ords >= a.toordinal()) & (ords <= b.toordinal())
+        if span.sum() > 1:
+            out[span] += _bridge(rng, int(span.sum()) - 1, vol)
+    after = ords > kx[-1]
+    if after.any():
+        out[after] = ky[-1] + np.cumsum(rng.normal(0.0, vol / 2, int(after.sum())))
+    before = ords < kx[0]
+    out[before] = ky[0]
+    return out
+
+
+def _front_month(day: date) -> date:
+    return _add_months(day, 1)
+
+
+def _demo_paths(rng: np.random.Generator, today: date) -> dict:
+    """Daily level of each market, as a ratio to its anchor-day level, plus the front-month price itself."""
+    days = pd.date_range(date(2024, 8, 1), today + timedelta(days=20), freq="D")
+    shapes = _demo_shapes()
+    out = {"days": days}
+    anchor_i = int(np.searchsorted(days, pd.Timestamp(DEMO_ANCHOR_DAY)))
+    for family, product in (("TTF", "TTF Natural Gas"), ("EUA", "EUA Carbon"), ("API2", "API2 Coal")):
+        # The knots are front-month prices; the level is that price relative to the anchor-day curve's own front month.
+        knots = [(d, p / shapes[product][_front_month(d)]) for d, p in _DEMO_FRONT_KNOTS[family]]
+        log_ratio = _pinned_path(rng, days, knots, _DEMO_VOL[family])
+        out[family] = np.exp(log_ratio - log_ratio[anchor_i])
+    for product, weights, vol in (("German Power Base", (0.62, 0.20, 0.18), _DEMO_VOL["German Power Base"]),
+                                  ("French Power Base", (0.55, 0.15, 0.30), _DEMO_VOL["French Power Base"])):
+        noise = _pinned_path(rng, days, [(days[0].date(), 1.0), (DEMO_ANCHOR_DAY, 1.0)], vol)
+        level = (weights[0] * out["TTF"] + weights[1] * out["EUA"] + weights[2]) * np.exp(noise)
+        out[product] = level / level[anchor_i]
+    out["NBP"] = out["TTF"] * np.exp(_pinned_path(rng, days, [(days[0].date(), 1.0), (DEMO_ANCHOR_DAY, 1.0)], _DEMO_VOL["NBP"]))
+    for product in ("German Power Peak", "French Power Peak"):
+        base = out[product.replace("Peak", "Base")]
+        out[product] = base * np.exp(_pinned_path(rng, days, [(days[0].date(), 1.0), (DEMO_ANCHOR_DAY, 1.0)], _DEMO_VOL["peak"]))
+    out["level"] = {"TTF Natural Gas": out["TTF"], "NBP Natural Gas": out["NBP"], "EUA Carbon": out["EUA"], "API2 Coal": out["API2"],
+                    **{p: out[p] for p in PRODUCTS if "Power" in p}}
+    return out
+
+
+def _demo_curve_on(paths: dict, product: str, day: date, months: int = DEMO_CURVE_MONTHS) -> pd.DataFrame:
+    """The product's curve on a day: the anchor-day shape moved by the market's level, near months moving most."""
+    shape = _demo_shapes()[product]
+    i = min(int(np.searchsorted(paths["days"], pd.Timestamp(day))), len(paths["days"]) - 1)
+    level = float(paths["level"][product][i])
+    first = date(day.year, day.month, 1)   # the month in delivery too, as exchanges list it
+    rows = []
+    for k in range(months):
+        month = _add_months(first, k)
+        weight = 0.35 + 0.65 * math.exp(-max(k - 1, 0) / 6.0)
+        price = shape.get(month, shape[max(shape)]) * level ** weight
+        rows.append((month, round(price, 3)))
+    spec = CURVE_PRODUCTS[product]
+    return pd.DataFrame({"delivery_month": [r[0] for r in rows], "product": product, "price": [r[1] for r in rows],
+                         "currency": spec["currency"], "unit": spec["unit"]})
+
+
+def _front_price(paths: dict, product: str, day: date) -> float:
+    i = min(int(np.searchsorted(paths["days"], pd.Timestamp(day))), len(paths["days"]) - 1)
+    return float(_demo_shapes()[product][_front_month(day)] * paths["level"][product][i])
+
+
+# ---- weather ------------------------------------------------------------------------
+def _ar1(rng: np.random.Generator, n: int, phi: float, sd: float) -> np.ndarray:
+    shocks = rng.normal(0.0, sd, n)
+    out = np.empty(n)
+    out[0] = shocks[0] / math.sqrt(max(1e-9, 1 - phi ** 2))
+    for i in range(1, n):
+        out[i] = phi * out[i - 1] + shocks[i]
+    return out
+
+
+def _demo_events(days: pd.DatetimeIndex, today: date) -> dict:
+    """The story in the weather: a cold, windless spell in early November, mild and windy now, colder from next week."""
+    ords = np.array([d.toordinal() for d in days.date], dtype=float)
+    temp = np.zeros(len(days))
+    wind = np.zeros(len(days))
+    for start, end, t_shift, w_shift in ((date(2026, 11, 3), date(2026, 11, 10), -3.0, -1.6), (date(2026, 11, 14), date(2026, 11, 19), 0.5, 0.25),
+                                         (today + timedelta(days=5), today + timedelta(days=12), -4.0, -0.5)):
+        a, b = start.toordinal(), end.toordinal()
+        span = (ords >= a) & (ords <= b)
+        ramp = np.minimum(1.0, np.minimum(ords[span] - a + 1, b - ords[span] + 1) / 2.0)
+        temp[span] += t_shift * ramp
+        wind[span] += w_shift * ramp
+    return {"temp": temp, "wind": wind}
+
+
+def _demo_weather(rng: np.random.Generator, today: date) -> dict:
+    """Daily weather by zone, from 2016 to 16 days ahead: temperature, wind capacity factors on land and at sea, solar in W/m²."""
+    days = pd.date_range(date(2016, 9, 1), today + timedelta(days=16), freq="D")
+    n = len(days)
+    doy = days.dayofyear.to_numpy()
+    winter = np.clip(np.cos(2 * np.pi * (doy - 15) / 365.25), 0, None)
+    common = _ar1(rng, n, 0.82, 1.0) * (2.0 + 0.8 * winter)
+    events = _demo_events(days, today)
+    wind_common = _ar1(rng, n, 0.55, 0.75)
+    cloud_common = _ar1(rng, n, 0.45, 0.30)
+    out = {"days": days}
+    for zone, mean, amp, wind_mean, wind_amp, solar_mean in (("France", 12.3, 7.6, 0.25, 0.08, 175.0), ("Germany-Luxembourg", 9.8, 9.0, 0.22, 0.09, 150.0)):
+        anomaly = 0.75 * common + 0.66 * _ar1(rng, n, 0.8, 1.0) * (1.6 + 0.6 * winter)
+        temperature = mean + amp * np.cos(2 * np.pi * (doy - 200) / 365.25) + anomaly + events["temp"]
+        season = np.cos(2 * np.pi * (doy - 15) / 365.25)
+        logit = lambda p: np.log(p / (1 - p))
+        base_land = logit(wind_mean + wind_amp * season)
+        z = base_land + 0.85 * wind_common + 0.45 * _ar1(rng, n, 0.5, 0.6) + events["wind"]
+        land = 1 / (1 + np.exp(-z))
+        sea = 1 / (1 + np.exp(-(z + 0.75 + 0.2 * rng.normal(size=n))))
+        clear = solar_mean + 135.0 * np.cos(2 * np.pi * (doy - 172) / 365.25)
+        clouds = np.clip(np.exp(-0.32 + 0.8 * cloud_common + 0.25 * rng.normal(size=n) - 0.25 * (events["wind"] > 0)), 0.22, 1.0)
+        solar = np.maximum(clear * clouds, 6.0)
+        out[zone] = pd.DataFrame({"temperature": temperature, "wind_land": land, "wind_sea": sea, "solar": solar}, index=days)
+    # Reference cities: a zone's weather with a local offset, and Madrid on its own climate.
+    cities = {"Paris / French power proxy": ("France", 0.6, 1.0), "Berlin / German power proxy": ("Germany-Luxembourg", 0.2, 1.0),
+              "Amsterdam / TTF proxy": ("Germany-Luxembourg", 1.4, 1.15), "Brussels / Belgian power proxy": ("France", -0.4, 1.05),
+              "London / NBP proxy": ("France", -0.2, 1.2)}
+    out["cities"] = {}
+    for name, (zone, offset, windy) in cities.items():
+        z = out[zone]
+        out["cities"][name] = pd.DataFrame({"temperature": z["temperature"] + offset + 0.7 * rng.normal(size=n),
+                                            "wind_kmh": 9.0 + 34.0 * z["wind_land"] * windy + 1.5 * rng.normal(size=n),
+                                            "solar": z["solar"] * (0.92 + 0.1 * rng.random(n))}, index=days)
+    madrid = 15.0 + 9.5 * np.cos(2 * np.pi * (doy - 205) / 365.25) + _ar1(rng, n, 0.8, 1.1)
+    out["cities"]["Madrid / Iberian power proxy"] = pd.DataFrame({"temperature": madrid, "wind_kmh": np.clip(12 + 6 * _ar1(rng, n, 0.5, 1.0), 3, None),
+                                                                  "solar": np.maximum(205 + 110 * np.cos(2 * np.pi * (doy - 172) / 365.25) * 1.0 - 40 * rng.random(n), 30)}, index=days)
+    return out
+
+
+def _zone_wind_kmh(cf: np.ndarray) -> np.ndarray:
+    """The area-average wind speed at 100 m that gives a fleet capacity factor (inverse of the power curve, roughly)."""
+    return 8.0 + 30.0 * np.power(np.clip(cf, 0, 1), 0.65)
+
+
+# ---- power system ---------------------------------------------------------------------
+def _nuclear_schedule(rng: np.random.Generator, days: pd.DatetimeIndex) -> tuple[pd.DataFrame, list]:
+    """French reactors: a planned outage each year, mostly from spring to autumn, and short forced outages."""
+    units = [(f"{site} {i}", cap) for site, count, cap in _DEMO_FR_UNITS for i in range(1, count + 1)]
+    available = np.zeros(len(days))
+    outages = []
+    first, last = days[0].date(), days[-1].date()
+    for unit, cap in units:
+        up = np.ones(len(days))
+        cursor = first - timedelta(days=int(rng.integers(0, 400)))
+        while cursor < last + timedelta(days=200):
+            month = cursor.month
+            start = cursor if month in (3, 4, 5, 6, 7, 8) else date(cursor.year + (month > 8), 3, 1) + timedelta(days=int(rng.integers(0, 150)))
+            length = int(rng.choice([35, 50, 70, 100, 140], p=[0.3, 0.3, 0.2, 0.15, 0.05]))
+            outages.append({"unit": unit, "nominal": float(cap), "start": start, "end": start + timedelta(days=length), "available": 0.0, "kind": "A53",
+                            "late": int(rng.choice([0, 0, 3, 7, 14, 21]))})
+            cursor = start + timedelta(days=int(rng.integers(330, 520)))
+        for _ in range(int(rng.poisson(1.6 * len(days) / 365))):
+            start = first + timedelta(days=int(rng.integers(0, len(days))))
+            outages.append({"unit": unit, "nominal": float(cap), "start": start, "end": start + timedelta(days=int(rng.integers(2, 16))),
+                            "available": float(rng.choice([0.0, 0.0, round(cap * 0.5)])), "kind": "A54", "late": int(rng.choice([0, 2, 5]))})
+        for o in (o for o in outages if o["unit"] == unit):
+            span = (days.date >= o["start"]) & (days.date < o["end"] + timedelta(days=o["late"]))
+            up[span] = np.minimum(up[span], o["available"] / cap)
+        available += cap * up
+    return pd.DataFrame({"available": available}, index=days), outages
+
+
+def _hour_frame(zone: str, first: date, last: date) -> pd.DataFrame:
+    """Every UTC hour of the zone's local days first..last, with the local date and hour."""
+    tz = ENTSOE_ZONES[zone]["timezone"]
+    start = pd.Timestamp(first).tz_localize(tz).tz_convert("UTC")
+    end = pd.Timestamp(last + timedelta(days=1)).tz_localize(tz).tz_convert("UTC")
+    stamps = pd.date_range(start, end, freq="h", inclusive="left")
+    local = stamps.tz_convert(tz)
+    return pd.DataFrame({"timestamp": stamps, "day": pd.to_datetime(local.date), "hour": local.hour, "weekday": local.dayofweek})
+
+
+def _load_shape(hours: np.ndarray, weekday: np.ndarray, winter: np.ndarray) -> np.ndarray:
+    base = 1 + 0.10 * np.sin(np.pi * np.clip(hours - 5, 0, 15) / 15) - 0.12 * ((hours <= 5) | (hours >= 23))
+    evening = 0.08 * winter * np.exp(-0.5 * ((hours - 18.5) / 1.6) ** 2)
+    shape = base + evening - 0.04 * (weekday >= 5) * np.sin(np.pi * np.clip(hours - 6, 0, 12) / 12)
+    return shape
+
+
+def _solar_shape(hours: np.ndarray, doy: np.ndarray) -> np.ndarray:
+    length = 12.2 + 4.2 * np.sin(2 * np.pi * (doy - 80) / 365.25)
+    rise = 13.0 - length / 2
+    x = (hours + 0.5 - rise) / length
+    return np.where((x > 0) & (x < 1), np.sin(np.pi * np.clip(x, 0, 1)) ** 1.4, 0.0)
+
+
+def _normalised(values: np.ndarray, days: np.ndarray) -> np.ndarray:
+    """Scale an hourly shape so each day averages 1."""
+    frame = pd.DataFrame({"v": values, "d": days})
+    mean = frame.groupby("d")["v"].transform("mean").to_numpy()
+    return np.where(mean > 0, values / np.where(mean > 0, mean, 1), 0.0)
+
+
+def _demo_power(rng: np.random.Generator, weather: dict, paths: dict, today: date, holidays: pd.DataFrame) -> dict:
+    """Daily and hourly demand, output by type and day-ahead prices for France and Germany, consistent with the weather."""
+    first = today - timedelta(days=FUND_KEEP_DAYS + 5)
+    days = pd.date_range(first, today + timedelta(days=1), freq="D")
+    out = {}
+    nuclear, outages = _nuclear_schedule(rng, pd.date_range(first - timedelta(days=30), today + timedelta(days=220), freq="D"))
+    out["outages"] = outages
+    for zone in ("Germany-Luxembourg", "France"):
+        w = weather[zone].reindex(days)
+        temp = w["temperature"]
+        blended = (6 * temp + 3 * temp.shift(1).bfill() + temp.shift(2).bfill()) / 10
+        kind = day_classes(days, zone)
+        school, part_hol = holiday_shares(days, zone, holidays)
+        t = np.arange(len(days))
+        doy = days.dayofyear.to_numpy()
+        winter = np.clip(np.cos(2 * np.pi * (doy - 15) / 365.25), 0, None)
+        year_end = np.isin(days.strftime("%m-%d"), [f"12-{d}" for d in range(24, 32)] + ["01-01"])
+        if zone == "France":
+            load = 42500 + 2150 * np.clip(15.0 - blended, 0, None) + 260 * np.clip(temp - 21.0, 0, None)
+            weekend = np.where(kind == 1, 0.94, np.where(kind == 2, 0.89, 1.0))
+            caps = {"wind_onshore": 23500 + 140 * t / 30, "wind_offshore": 1700 + 25 * t / 30, "solar": 24500 + 330 * t / 30}
+        else:
+            load = 54800 + 640 * np.clip(15.5 - blended, 0, None) + 200 * np.clip(temp - 22.0, 0, None)
+            weekend = np.where(kind == 1, 0.89, np.where(kind == 2, 0.82, 1.0))
+            caps = {"wind_onshore": 61500 + 420 * t / 30, "wind_offshore": 9300 + 40 * t / 30, "solar": 98000 + 1250 * t / 30}
+        load = load * weekend * (1 - 0.025 * school.to_numpy() - 0.06 * part_hol.to_numpy()) * (1 - 0.09 * year_end) * (1 + 0.012 * _ar1(rng, len(days), 0.6, 1.0) + 0.012 * rng.normal(size=len(days)))
+        wind_on = caps["wind_onshore"] * w["wind_land"].to_numpy() * np.clip(0.95 + 0.08 * rng.normal(size=len(days)), 0.6, 1.2)
+        wind_off = caps["wind_offshore"] * w["wind_sea"].to_numpy() * np.clip(0.93 + 0.09 * rng.normal(size=len(days)), 0.6, 1.2)
+        solar = caps["solar"] * w["solar"].to_numpy() / 1000.0 * 0.62 * (1 - 0.004 * (temp.to_numpy() - 15)) * np.clip(1 + 0.09 * rng.normal(size=len(days)), 0.6, 1.4)
+        daily = pd.DataFrame({"load": load, "wind_onshore": np.clip(wind_on, 50, None), "wind_offshore": np.clip(wind_off, 0, None),
+                              "solar": np.clip(solar, 0, None)}, index=days)
+        if zone == "France":
+            avail = nuclear["available"].reindex(days).to_numpy()
+            modulation = np.where(kind == 0, 0.92 - 0.06 * (1 - winter), 0.88 - 0.08 * (1 - winter))
+            hydro = 6800 + 2600 * np.clip(np.cos(2 * np.pi * (doy - 140) / 365.25), 0, None) + 600 * rng.normal(size=len(days))
+            room = daily["load"] + 16000 - daily["wind_onshore"] - daily["wind_offshore"] - daily["solar"] - hydro
+            daily["nuclear"] = np.clip(np.minimum(avail * modulation, room) + 400 * rng.normal(size=len(days)), 20000, None)
+            residual = daily["load"] - daily["nuclear"] - daily["wind_onshore"] - daily["wind_offshore"] - daily["solar"] - hydro
+            daily["gas"] = np.clip(1300 + 0.30 * np.clip(residual + 3000, 0, None) + 250 * rng.normal(size=len(days)), 700, 9500)
+            daily["hydro"] = np.clip(hydro, 2500, None)
+        else:
+            residual = daily["load"] - daily["wind_onshore"] - daily["wind_offshore"] - daily["solar"]
+            daily["gas"] = np.clip(2200 + 0.24 * np.clip(residual - 14000, 0, None) + 500 * rng.normal(size=len(days)), 1500, 24000)
+            daily["lignite"] = np.clip(5500 + 0.20 * np.clip(residual - 10000, 0, None), 4500, 16000)
+            daily["coal"] = np.clip(800 + 0.16 * np.clip(residual - 18000, 0, None), 600, 10500)
+        out[zone] = daily
+    return out
+
+
+def _price_curve(x: np.ndarray, srmc_gas: np.ndarray, srmc_coal: np.ndarray) -> np.ndarray:
+    """Merit order: what the marginal plant costs at a given share of demand left after wind and solar.
+    Below a tenth, renewables set the price and it can go negative; then lignite and coal; then gas; then scarcity."""
+    cheap, dear = np.minimum(srmc_gas, srmc_coal), np.maximum(srmc_gas, srmc_coal)
+    price = np.interp(x, [-0.4, -0.1, 0.05, 0.22, 0.38], [-70.0, -6.0, 4.0, 30.0, 0.0])
+    lift = np.interp(x, [0.22, 0.38, 0.52], [0.0, 0.62, 0.92]) * cheap
+    top = np.interp(x, [0.52, 0.66, 0.80], [0.0, 0.08, 0.18]) * dear + np.interp(x, [0.52, 0.66], [0.0, 1.0]) * np.clip(dear - cheap * 0.92, 0, None)
+    scarcity = 3200.0 * np.clip(x - 0.80, 0, None) ** 2 * (srmc_gas / 200.0)
+    return np.where(x < 0.22, price, price + lift + top + scarcity)
+
+
+def _demo_hourly(rng: np.random.Generator, power: dict, weather: dict, paths: dict, today: date) -> dict:
+    """Hourly load, output by type and day-ahead prices, whose daily means are the daily figures."""
+    out = {}
+    eur_usd = DEMO_FX["eur_per_usd"]
+    pdays = paths["days"]
+    def path_at(product, stamps):
+        idx = np.clip(np.searchsorted(pdays, stamps), 0, len(pdays) - 1)
+        return idx
+    for zone in ("Germany-Luxembourg", "France"):
+        daily = power[zone]
+        first = max(daily.index[0].date(), today - timedelta(days=PRICE_HISTORY_DAYS + 5))
+        frame = _hour_frame(zone, first, today + timedelta(days=1))
+        day_index = frame["day"]
+        d = daily.reindex(day_index).reset_index(drop=True)
+        hours, weekday = frame["hour"].to_numpy(), frame["weekday"].to_numpy()
+        doy = day_index.dt.dayofyear.to_numpy()
+        winter = np.clip(np.cos(2 * np.pi * (doy - 15) / 365.25), 0, None)
+        dkey = day_index.to_numpy()
+        load = d["load"].to_numpy() * _normalised(_load_shape(hours, weekday, winter) * (1 + 0.01 * rng.normal(size=len(frame))), dkey)
+        solar = d["solar"].to_numpy() * _normalised(_solar_shape(hours, doy), dkey)
+        # Wind changes through the day: interpolate between daily means, then rescale so the day's mean holds.
+        wind_shape = np.clip(1 + 0.18 * _ar1(rng, len(frame), 0.92, 0.35), 0.15, None)
+        wind_on = d["wind_onshore"].to_numpy() * _normalised(wind_shape, dkey)
+        wind_off = d["wind_offshore"].to_numpy() * _normalised(np.clip(wind_shape + 0.05 * rng.normal(size=len(frame)), 0.1, None), dkey)
+        hourly = {"load": load, "solar": solar, "wind_onshore": wind_on, "wind_offshore": wind_off}
+        if zone == "France":
+            nuc = d["nuclear"].to_numpy() * _normalised(1 - 0.035 * ((hours <= 6) | (weekday >= 5)) + 0.005 * rng.normal(size=len(frame)), dkey)
+            hydro = d["hydro"].to_numpy() * _normalised(np.clip(_load_shape(hours, weekday, winter) ** 3, 0.3, None), dkey)
+            gas = d["gas"].to_numpy() * _normalised(np.clip(load - nuc - solar - wind_on - hydro + 20000, 1000, None), dkey)
+            hourly.update({"nuclear": nuc, "hydro": hydro, "gas": gas})
+            own_x = (load - nuc - solar - wind_on - wind_off - hydro * 0.55 - 1800) / load + 0.45
+        else:
+            lig = d["lignite"].to_numpy() * _normalised(np.clip(load - solar - wind_on, 5000, None) ** 0.4, dkey)
+            coal = d["coal"].to_numpy() * _normalised(np.clip(load - solar - wind_on - 15000, 500, None), dkey)
+            gas = d["gas"].to_numpy() * _normalised(np.clip(load - solar - wind_on - wind_off - 12000, 800, None), dkey)
+            hourly.update({"lignite": lig, "coal": coal, "gas": gas})
+            own_x = None
+        # Gas and carbon on the delivery day set what gas and coal plants cost.
+        idx = path_at("x", frame["day"].to_numpy())
+        ttf = np.array([_front_price(paths, "TTF Natural Gas", pdays[i].date()) for i in range(len(pdays))])[idx] * 0.985
+        eua = np.array([_front_price(paths, "EUA Carbon", pdays[i].date()) for i in range(len(pdays))])[idx] - 0.6
+        coal_usd = np.array([_front_price(paths, "API2 Coal", pdays[i].date()) for i in range(len(pdays))])[idx]
+        srmc_gas = ttf / 0.52 + 0.365 * eua + 3.0
+        srmc_coal = coal_usd * eur_usd / (8.14 * 0.40) + 0.85 * eua + 4.0
+        x = (load - solar - wind_on - wind_off) / load if own_x is None else own_x
+        price = _price_curve(x, srmc_gas, srmc_coal)
+        if zone == "France":
+            # Coupled to Germany: France follows the German price, cheaper when its own nuclear leaves it long.
+            de_price = out["Germany-Luxembourg"]["hourly"].set_index("timestamp")["price"].reindex(frame["timestamp"]).to_numpy()
+            de_price = np.where(np.isnan(de_price), price, de_price)
+            coupling = 0.65 + 0.30 / (1 + np.exp(-(x - 0.40) * 12))
+            price = coupling * de_price + (1 - coupling) * price
+        price = price + 4.0 * rng.normal(size=len(frame)) * (1 + np.abs(price) / 150)
+        hourly["price"] = price
+        out[zone] = {"hourly": pd.DataFrame({"timestamp": frame["timestamp"], "day": day_index, **hourly})}
+    _calibrate_prices(out, today)
+    return out
+
+
+def _calibrate_prices(hourly: dict, today: date) -> None:
+    """Scale prices smoothly so the reported day-ahead averages come out exactly: France on 13 and 16 Nov, Germany 2–8 and 9 Nov."""
+    targets = {"France": [((date(2026, 11, 13), date(2026, 11, 13)), 197.25), ((date(2026, 11, 16), date(2026, 11, 16)), 186.38)],
+               "Germany-Luxembourg": [((date(2026, 11, 2), date(2026, 11, 8)), 257.0), ((date(2026, 11, 9), date(2026, 11, 9)), 345.64)]}
+    for zone, items in targets.items():
+        frame = hourly[zone]["hourly"]
+        days = frame["day"].dt.date
+        factor = pd.Series(1.0, index=sorted(set(days)))
+        points = []
+        for (a, b), level in items:
+            span = (days >= a) & (days <= b)
+            if not span.any():
+                continue
+            mean = frame.loc[span, "price"].mean()
+            points.append((a, b, level / mean if mean > 1 else 1.0))
+        if not points:
+            continue
+        ords = np.array([d.toordinal() for d in factor.index])
+        xs, ys = [], []
+        for a, b, f in points:
+            xs += [a.toordinal(), b.toordinal()]
+            ys += [f, f]
+        xs = [xs[0] - 12] + xs + [xs[-1] + 1]
+        ys = [1.0] + ys + [1.0]
+        hourly[zone]["factors"] = [round(f, 3) for _, _, f in points]
+        order = np.argsort(xs, kind="stable")
+        smooth = np.interp(ords, np.array(xs)[order], np.array(ys)[order])
+        frame["price"] = frame["price"] * pd.Series(smooth, index=factor.index).reindex(days).to_numpy()
+
+
+# ---- frames in the shapes the providers return -------------------------------------------
+def _entsoe_frame(stamps, values, series: str, psr: str, unit: str = "MW", resolution: str = "PT60M") -> pd.DataFrame:
+    index = pd.DatetimeIndex(stamps)
+    return pd.DataFrame({"timestamp": (index.tz_convert("UTC") if index.tz is not None else index.tz_localize("UTC")).astype("datetime64[us, UTC]"),
+                         "value": np.round(np.asarray(values, float), 2), "series": series, "psr_code": psr, "resolution": resolution, "unit": unit,
+                         "_source": "Demo data (ENTSO-E format)"})
+
+
+def _demo_holidays(today: date) -> pd.DataFrame:
+    """National public holidays from the calendar, regional ones, and school holidays close to each region's usual dates."""
+    rows = []
+    for year in range(today.year - 3, today.year + 2):
+        for zone, country in (("France", "FR"), ("Germany-Luxembourg", "DE")):
+            for day in sorted(public_holidays(zone, year)):
+                rows.append((country, "public", day, day, "", True))
+        e = _easter(year)
+        rows += [("DE", "public", e + timedelta(60), e + timedelta(60), "DE-BW,DE-BY,DE-HE,DE-NW,DE-RP,DE-SL", False),
+                 ("DE", "public", date(year, 11, 1), date(year, 11, 1), "DE-BW,DE-BY,DE-NW,DE-RP,DE-SL", False),
+                 ("DE", "public", date(year, 10, 31), date(year, 10, 31), "DE-BB,DE-HB,DE-HH,DE-MV,DE-NI,DE-SN,DE-ST,DE-SH,DE-TH", False),
+                 ("DE", "public", date(year, 1, 6), date(year, 1, 6), "DE-BW,DE-BY,DE-ST", False)]
+        # France: autumn, Christmas and summer for everyone; winter and spring staggered by zone.
+        toussaint = date(year, 10, 17) + timedelta(days=(5 - date(year, 10, 17).weekday()) % 7)
+        rows.append(("FR", "school", toussaint, toussaint + timedelta(days=15), "ZA,ZB,ZC", False))
+        noel = date(year, 12, 19) + timedelta(days=(5 - date(year, 12, 19).weekday()) % 7)
+        rows.append(("FR", "school", noel, noel + timedelta(days=15), "ZA,ZB,ZC", False))
+        rows.append(("FR", "school", date(year, 7, 4), date(year, 8, 31), "ZA,ZB,ZC", False))
+        for i, zone_code in enumerate(("ZA", "ZB", "ZC")):
+            feb = date(year, 2, 7) + timedelta(days=7 * ((i + year) % 3))
+            rows.append(("FR", "school", feb, feb + timedelta(days=15), zone_code, False))
+            apr = e - timedelta(days=7 * ((i + year) % 3) - 7)
+            rows.append(("FR", "school", apr, apr + timedelta(days=15), zone_code, False))
+        # Germany: each state's own autumn, Christmas, Easter and summer breaks, staggered.
+        states = list(FUND_REGION_POPULATION["DE"])
+        for i, state in enumerate(states):
+            summer = date(year, 6, 22) + timedelta(days=7 * ((i * 3 + year) % 7))
+            rows.append(("DE", "school", summer, summer + timedelta(days=43), f"DE-{state}", False))
+            autumn = date(year, 10, 6) + timedelta(days=7 * ((i + year) % 4))
+            rows.append(("DE", "school", autumn, autumn + timedelta(days=11), f"DE-{state}", False))
+            rows.append(("DE", "school", e - timedelta(days=7 + 3 * (i % 2)), e + timedelta(days=7), f"DE-{state}", False))
+            rows.append(("DE", "school", date(year, 12, 22), date(year + 1, 1, 3 + i % 4), f"DE-{state}", False))
+    frame = pd.DataFrame(rows, columns=["country", "kind", "start", "end", "subdivisions", "nationwide"])
+    frame["start"], frame["end"] = pd.to_datetime(frame["start"]), pd.to_datetime(frame["end"])
+    return frame.sort_values(["country", "start"]).reset_index(drop=True)
+
+
+def _demo_storage(rng: np.random.Generator, today: date) -> pd.DataFrame:
+    """EU storage since 2021: a low end of winter 2026, a short refill and 71.0% on gas day 12 Nov 2026."""
+    capacity = 1132.0
+    knots = [(date(2021, 1, 1), 66), (date(2021, 3, 25), 29), (date(2021, 10, 25), 77), (date(2022, 3, 20), 26), (date(2022, 11, 13), 95.5),
+             (date(2023, 3, 31), 55.7), (date(2023, 11, 1), 99.6), (date(2024, 3, 25), 58.5), (date(2024, 10, 10), 95.3), (date(2025, 3, 28), 34.0),
+             (date(2025, 10, 5), 83.0), (date(2025, 11, 13), 81.5), (date(2026, 3, 28), 28.0), (date(2026, 6, 15), 45.6), (date(2026, 10, 22), 77.2),
+             (date(2026, 11, 1), 74.6), (date(2026, 11, 12), 71.0), (date(2026, 12, 31), 55.5), (date(2027, 3, 31), 22.0)]
+    last = today - timedelta(days=2)
+    # Smoothed over a longer span than shown, so the latest days aren't flattened by a one-sided average.
+    wide = pd.date_range(date(2021, 1, 1), max(last, date(2026, 12, 31)) + timedelta(days=30), freq="D")
+    ords = np.array([d.toordinal() for d in wide.date])
+    full = np.interp(ords, [k[0].toordinal() for k in knots], [k[1] for k in knots])
+    full = pd.Series(full).rolling(21, center=True, min_periods=1).mean().to_numpy()[:len(pd.date_range(date(2021, 1, 1), last))].copy()
+    days = pd.date_range(date(2021, 1, 1), last, freq="D")
+    full += np.cumsum(rng.normal(0, 0.03, len(days))) * 0.2
+    anchor = np.searchsorted(days, pd.Timestamp(date(2026, 11, 12)))
+    if anchor < len(days):
+        full += 71.0 - full[anchor]
+    gas = full / 100 * capacity
+    net = np.r_[0.0, np.diff(gas)] * 1000.0
+    both = 180 + 60 * rng.random(len(days))
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    text = days.strftime("%Y-%m-%d")
+    return pd.DataFrame({"gasDayStart": text, "name": "EU", "code": "eu", "gasInStorage": np.round(gas, 2), "workingGasVolume": capacity,
+                         "full": np.round(full, 2), "injection": np.round(np.clip(net, 0, None) + both, 1), "withdrawal": np.round(np.clip(-net, 0, None) + both, 1),
+                         "observation_date": text, "_source": "Demo data (GIE AGSI+ format)", "_fetched_at_utc": stamp, "_scope": "Europe / EU datasets"})
+
+
+def _demo_lng(rng: np.random.Generator, today: date) -> pd.DataFrame:
+    """EU LNG send-out: strong in 2025, cut when Qatari cargoes stopped in March 2026, partly back since."""
+    days = pd.date_range(today - timedelta(days=400), today - timedelta(days=2), freq="D")
+    ords = np.array([d.toordinal() for d in days.date])
+    knots = [(date(2025, 9, 1), 4300), (date(2026, 1, 15), 5100), (date(2026, 3, 1), 4900), (date(2026, 3, 20), 3600), (date(2026, 6, 1), 3900),
+             (date(2026, 9, 1), 3700), (date(2026, 11, 1), 4150), (date(2026, 12, 31), 4200)]
+    base = np.interp(ords, [k[0].toordinal() for k in knots], [k[1] for k in knots])
+    send = base * (1 + 0.06 * _ar1(rng, len(days), 0.6, 1.0) * 0.6)
+    text = days.strftime("%Y-%m-%d")
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    inventory = 5200 + 1400 * _ar1(rng, len(days), 0.95, 0.25)
+    return pd.DataFrame({"gasDayStart": text, "name": "EU", "code": "eu", "inventory": np.round(np.clip(inventory, 2500, 8800), 0), "sendOut": np.round(send, 0),
+                         "dtmi": 9400.0, "dtrs": 7200.0, "observation_date": text, "_source": "Demo data (GIE ALSI format)", "_fetched_at_utc": stamp,
+                         "_scope": "Europe / EU datasets"})
+
+
+def _demo_gas_use(rng: np.random.Generator, weather: dict, power: dict, today: date) -> pd.DataFrame:
+    """German gas use from Trading Hub Europe: small users by temperature, large users by industry and power stations."""
+    days = pd.date_range(today - timedelta(days=GAS_DEMAND_HISTORY_DAYS + 20), today - timedelta(days=1), freq="D")
+    temp = weather["Germany-Luxembourg"]["temperature"].reindex(days)
+    blended = (8 * temp + 4 * temp.shift(1).bfill() + 2 * temp.shift(2).bfill() + temp.shift(3).bfill()) / 15
+    kind = day_classes(days, "Germany-Luxembourg")
+    small = (230 + 82 * np.clip(15.5 - blended, 0, None)) * np.where(kind == 2, 0.95, 1.0) * (1 + 0.03 * rng.normal(size=len(days)))
+    gas_power = power["Germany-Luxembourg"]["gas"].reindex(days).bfill().ffill().to_numpy() * 24 / 1000 / 0.52
+    large = (900 + 9 * np.clip(15.5 - blended, 0, None)) * np.where(kind == 2, 0.83, np.where(kind == 1, 0.9, 1.0)) + gas_power
+    large = large * (1 + 0.025 * rng.normal(size=len(days)))
+    status = np.where(days.date >= today - timedelta(days=3), "preliminary", "final")
+    return pd.DataFrame({"gas_day": days, "small": np.round(small.to_numpy(), 2), "large": np.round(large.to_numpy(), 2), "status": status})
+
+
+def _demo_notices(outages: list, today: date) -> pd.DataFrame:
+    """ENTSO-E unavailability notices for French reactors: as announced, so some units come back later than they say."""
+    rows = []
+    for i, o in enumerate(outages):
+        end_seen = o["end"]
+        if end_seen < today - timedelta(days=60) or o["start"] > today + timedelta(days=200):
+            continue
+        created = o["start"] - timedelta(days=90 if o["kind"] == "A53" else 0)
+        revisions = [(1, end_seen)]
+        if o["late"] and o["start"] <= today:
+            revisions.append((2, end_seen + timedelta(days=o["late"] // 2)))
+        for revision, end in revisions:
+            rows.append({"zone": "France", "mrid": f"DEMO-{i:04d}", "revision": revision, "status": "A05", "created": f"{min(created, today):%Y-%m-%d}T08:00Z",
+                         "business": o["kind"], "unit": o["unit"], "unit_name": o["unit"], "psr": "B14", "nominal": o["nominal"],
+                         "start": pd.Timestamp(o["start"]).tz_localize("Europe/Paris").tz_convert("UTC"),
+                         "end": pd.Timestamp(end).tz_localize("Europe/Paris").tz_convert("UTC"), "available": o["available"]})
+    return pd.DataFrame(rows).sort_values(["start", "unit"]).reset_index(drop=True)
+
+
+def _weather_pack(rng: np.random.Generator, weather: dict, today: date) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Open-Meteo-style hourly and daily weather for the six reference cities: three past days, today and nine ahead."""
+    days = pd.date_range(today - timedelta(days=3), today + timedelta(days=9), freq="D")
+    daily_rows, hourly_frames = [], []
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    areas = {"Amsterdam / TTF proxy": "TTF", "London / NBP proxy": "NBP", "Paris / French power proxy": "France", "Berlin / German power proxy": "Germany",
+             "Brussels / Belgian power proxy": "Belgium", "Madrid / Iberian power proxy": "Spain"}
+    for name, spec in WEATHER_LOCATIONS.items():
+        city = weather["cities"][name].reindex(days)
+        hours = pd.date_range(pd.Timestamp(days[0]).tz_localize(spec["timezone"]), pd.Timestamp(days[-1] + pd.Timedelta(days=1)).tz_localize(spec["timezone"]), freq="h", inclusive="left")
+        local_day = pd.to_datetime(hours.tz_localize(None).normalize())
+        c = city.reindex(local_day).reset_index(drop=True)
+        hod = hours.hour.to_numpy()
+        temp_h = c["temperature"].to_numpy() + 3.2 * np.sin(2 * np.pi * (hod - 9) / 24) + 0.4 * rng.normal(size=len(hours))
+        wind100 = c["wind_kmh"].to_numpy() * (1 + 0.15 * np.sin(2 * np.pi * (hod + 3) / 24)) + 1.2 * rng.normal(size=len(hours))
+        sw = c["solar"].to_numpy() * _normalised(_solar_shape(hod, local_day.dayofyear.to_numpy()), local_day.to_numpy())
+        cloud = np.clip(100 - c["solar"].to_numpy() / 2.2 + 8 * rng.normal(size=len(hours)), 0, 100)
+        rain = np.clip(rng.gamma(0.3, 0.6, len(hours)) * (cloud > 70), 0, None)
+        hourly = pd.DataFrame({"temperature_2m": np.round(temp_h, 1), "wind_speed_10m": np.round(np.clip(wind100 * 0.55, 0, None), 1),
+                               "wind_speed_100m": np.round(np.clip(wind100, 0, None), 1), "shortwave_radiation": np.round(np.clip(sw, 0, None), 0),
+                               "precipitation": np.round(rain, 1), "cloud_cover": np.round(cloud, 0), "timestamp": hours, "date": local_day.strftime("%Y-%m-%d"),
+                               "timezone": spec["timezone"], "_source": "Demo data (Open-Meteo format)", "_fetched_at_utc": stamp, "location": name,
+                               "market_area": areas[name], "latitude": spec["latitude"], "longitude": spec["longitude"]})
+        hourly_frames.append(hourly)
+        for i, day in enumerate(days):
+            part = hourly.loc[hourly["date"].eq(day.strftime("%Y-%m-%d"))]
+            t = float(part["temperature_2m"].mean())
+            period = "Today (may be partial)" if day.date() == today else "Forecast" if day.date() > today else "Historical / recent"
+            daily_rows.append({"date": day, "temperature_mean_c": t, "wind_speed_mean_kmh": float(part["wind_speed_10m"].mean()),
+                               "wind_speed_100m_mean_kmh": float(part["wind_speed_100m"].mean()), "solar_radiation_mean_wm2": float(part["shortwave_radiation"].mean()),
+                               "cloud_cover_mean_pct": float(part["cloud_cover"].mean()), "precipitation_sum_mm": float(part["precipitation"].sum()),
+                               "timezone": spec["timezone"], "solar_irradiation_sum_whm2": float(part["shortwave_radiation"].sum()), "hours_covered": int(len(part)),
+                               "local_today": pd.Timestamp(today), "forecast_period": period, "heating_degree_day_proxy_18c": max(0.0, 18.0 - t),
+                               "cooling_degree_day_proxy_22c": max(0.0, t - 22.0), "_source": "Demo data (Open-Meteo format)", "location": name,
+                               "market_area": areas[name], "latitude": spec["latitude"], "longitude": spec["longitude"]})
+    return pd.concat(hourly_frames, ignore_index=True), pd.DataFrame(daily_rows)
+
+
+def _zone_weather_rows(weather: dict, zone: str, days: pd.DatetimeIndex, rng: Optional[np.random.Generator] = None, error: float = 0.0) -> pd.DataFrame:
+    w = weather[zone].reindex(days)
+    temp = w["temperature"].to_numpy() + (rng.normal(0, error, len(days)) if rng is not None and error else 0.0)
+    wind = _zone_wind_kmh(w["wind_land"].to_numpy()) * (1 + (rng.normal(0, error / 8, len(days)) if rng is not None and error else 0.0))
+    return pd.DataFrame({"zone": zone, "date": days, "temperature": temp, "hdd": np.clip(18.0 - temp, 0, None), "wind": wind,
+                         "solar": w["solar"].to_numpy(), "points": len(ZONE_WEATHER_POINTS.get(zone, ()))})
+
+
+def _fund_weather_rows(weather: dict, zone: str, days: pd.DatetimeIndex, rng: Optional[np.random.Generator] = None, lead: Optional[np.ndarray] = None) -> pd.DataFrame:
+    """Weather as the fundamentals models read it. A forecast's error grows with lead time."""
+    w = weather[zone].reindex(days)
+    temp, land, sea, solar = (w[c].to_numpy().copy() for c in ("temperature", "wind_land", "wind_sea", "solar"))
+    if rng is not None and lead is not None:
+        # Far ahead a forecast knows less than the outcome: pull it toward the period's average, then add its error.
+        pull = np.minimum(0.6, lead / 20.0)
+        temp, land, sea, solar = (v + (np.nanmean(v) - v) * pull for v in (temp, land, sea, solar))
+        temp += rng.normal(0, 1, len(days)) * (0.4 + 0.22 * lead)
+        shift = lambda cf, sd: 1 / (1 + np.exp(-(np.log(np.clip(cf, 0.01, 0.99) / (1 - np.clip(cf, 0.01, 0.99))) + rng.normal(0, 1, len(days)) * sd)))
+        land, sea = shift(land, 0.08 + 0.045 * lead), shift(sea, 0.08 + 0.04 * lead)
+        solar = np.clip(solar * np.exp(rng.normal(0, 1, len(days)) * (0.06 + 0.03 * lead)), 3, None)
+    return pd.DataFrame({"date": days, "temperature": temp.astype("float32"), "wind_land": land, "wind_sea": sea, "solar": solar.astype("float32"),
+                         "zone": zone, "hdd": np.clip(18.0 - temp, 0, None).astype("float32"), "wind": np.nan, "points": len(FUND_WIND_POINTS.get(zone, ()))})
+
+
+def _demo_live(rng: np.random.Generator, today: date, paths: dict) -> dict:
+    """Every dataset the pages read, keyed as the update stores them."""
+    weather = _demo_weather(rng, today)
+    holidays = _demo_holidays(today)
+    power = _demo_power(rng, weather, paths, today, holidays)
+    hourly = _demo_hourly(rng, power, weather, paths, today)
+    now = datetime.now(timezone.utc)
+    stamp = now.isoformat(timespec="seconds")
+    items = {}
+    def put(key: str, label: str, data: pd.DataFrame, metadata: Optional[dict] = None) -> None:
+        items[key] = {"label": label, "data": data.reset_index(drop=True), "fetched_at": stamp, "metadata": {**(metadata or {}), "demo": True}}
+    yesterday = today - timedelta(days=1)
+    for zone in ("France", "Germany-Luxembourg"):
+        h = hourly[zone]["hourly"]
+        # Day-ahead prices in quarter hours, through tomorrow (the auction has run).
+        quarters = h.loc[h["day"].dt.date >= today - timedelta(days=PRICE_HISTORY_DAYS)]
+        naive = quarters["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None).to_numpy().astype("datetime64[m]")
+        q_stamps = (naive[:, None] + np.array([0, 15, 30, 45], dtype="timedelta64[m]")).ravel()
+        wiggle = rng.normal(0, 3.0, (len(quarters), 4)) * np.array([1.0, 0.6, 0.6, 1.0])
+        q_prices = (quarters["price"].to_numpy()[:, None] + wiggle - wiggle.mean(axis=1, keepdims=True)).ravel()
+        put(f"entsoe_price|{zone}", f"Day-ahead price, {zone}", _entsoe_frame(q_stamps, q_prices, "Day-ahead price", "", "EUR/MWh", "PT15M"), {"zone": zone})
+        actual = h.loc[(h["day"].dt.date >= today - timedelta(days=KEEP_DAYS["load"])) & (h["day"].dt.date <= yesterday)]
+        put(f"entsoe_load|{zone}", f"Actual load, {zone}", _entsoe_frame(actual["timestamp"], actual["load"], "Load", ""), {"zone": zone})
+        recent = actual
+        gens = [("Wind onshore", "B19", "wind_onshore"), ("Wind offshore", "B18", "wind_offshore"), ("Solar", "B16", "solar"), ("Natural gas", "B04", "gas")]
+        if zone == "France":
+            gens += [("Nuclear", "B14", "nuclear"), ("Hydro reservoir", "B12", "hydro")]
+            extra = [("Hydro run-of-river", "B11", 5200 + 600 * np.sin(np.arange(len(recent)) / 90)), ("Biomass", "B01", np.full(len(recent), 950.0))]
+        else:
+            gens += [("Lignite", "B02", "lignite"), ("Hard coal", "B05", "coal")]
+            extra = [("Biomass", "B01", np.full(len(recent), 4300.0)), ("Hydro run-of-river", "B11", 1700 + 200 * np.sin(np.arange(len(recent)) / 120))]
+        frames = [_entsoe_frame(recent["timestamp"], recent[col], name, code) for name, code, col in gens]
+        frames += [_entsoe_frame(recent["timestamp"], values + 60 * rng.normal(size=len(recent)), name, code) for name, code, values in extra]
+        put(f"entsoe_generation|{zone}", f"Actual generation, {zone}", pd.concat(frames, ignore_index=True).sort_values(["timestamp", "series"]), {"zone": zone})
+        # Published forecasts: the outcome plus the day-ahead error each one typically has.
+        fc = h.loc[h["day"].dt.date >= today - timedelta(days=FORECAST_HISTORY_DAYS)]
+        day_err = pd.Series(_ar1(rng, len(fc["day"].unique()), 0.4, 0.02), index=fc["day"].unique()).reindex(fc["day"]).to_numpy()
+        put(f"entsoe_load_forecast|{zone}", f"Load forecast, {zone}",
+            _entsoe_frame(fc["timestamp"], fc["load"] * (1 + day_err + 0.006 * rng.normal(size=len(fc))), "Load", ""), {"zone": zone})
+        wind_err = pd.Series(rng.normal(0, 0.09, len(fc["day"].unique())), index=fc["day"].unique()).reindex(fc["day"]).to_numpy()
+        frames = [_entsoe_frame(fc["timestamp"], np.clip(fc["solar"] * (1 + 0.6 * wind_err), 0, None), "Solar", "B16"),
+                  _entsoe_frame(fc["timestamp"], np.clip(fc["wind_onshore"] * (1 + wind_err), 0, None), "Wind onshore", "B19"),
+                  _entsoe_frame(fc["timestamp"], np.clip(fc["wind_offshore"] * (1 + wind_err), 0, None), "Wind offshore", "B18")]
+        put(f"entsoe_renewable_forecast|{zone}", f"Wind and solar forecast, {zone}", pd.concat(frames, ignore_index=True).sort_values(["timestamp", "series"]), {"zone": zone})
+        # Daily output and demand for the fundamentals models.
+        daily = power[zone].loc[:pd.Timestamp(yesterday)]
+        series = ["load", "wind_onshore", "wind_offshore", "solar", "gas"] + (["nuclear"] if zone == "France" else [])
+        long = daily[series].reset_index(names="date").melt("date", var_name="series", value_name="value")
+        put(f"fund_daily|{zone}", f"Daily output and demand, {zone}", long.assign(hours=24).sort_values(["date", "series"]), {"zone": zone})
+    # Cross-border flow, France to Germany: France exports when its own system is long.
+    fr, de = hourly["France"]["hourly"], hourly["Germany-Luxembourg"]["hourly"]
+    joined = fr.merge(de[["timestamp", "price"]], on="timestamp", suffixes=("", "_de"))
+    joined = joined.loc[(joined["day"].dt.date >= today - timedelta(days=KEEP_DAYS["load"])) & (joined["day"].dt.date <= yesterday)]
+    flow = np.clip(1800 + 22 * (joined["price_de"] - joined["price"]) + 300 * rng.normal(size=len(joined)), 0, 4800)
+    put("entsoe_flow|France to Germany-Luxembourg", "Physical flow, France to Germany-Luxembourg", _entsoe_frame(joined["timestamp"], flow, "Flow", ""),
+        {"zone": "France", "source_zone": "France", "target_zone": "Germany-Luxembourg", "variant": "France to Germany-Luxembourg"})
+    put("entsoe_outages|France", "Nuclear outage notices, France", _demo_notices(power["outages"], today), {"zone": "France", "documents": 1})
+    # Gas.
+    storage = _demo_storage(rng, today)
+    put("gie_agsi_history", "AGSI gas storage, 6 years", storage, {"scope": "Europe / EU datasets", "country": ""})
+    put("gie_agsi", "AGSI gas storage", storage.tail(40), {"scope": "Europe / EU datasets", "country": ""})
+    put("gie_alsi", "ALSI LNG terminals", _demo_lng(rng, today), {"scope": "Europe / EU datasets", "country": ""})
+    put("the_gas_consumption", "German gas use, Trading Hub Europe", _demo_gas_use(rng, weather, power, today), {"source": "Demo data"})
+    gas_days = pd.date_range(today - timedelta(days=60), today - timedelta(days=1), freq="D")
+    norway = 1.30e9 * (1 - 0.22 * ((gas_days.date >= date(2026, 11, 5)) & (gas_days.date <= date(2026, 11, 12)))) * (1 + 0.04 * rng.normal(size=len(gas_days)))
+    put("entsog_flow", "ENTSOG Physical Flow", pd.DataFrame({"periodFrom": gas_days.strftime("%Y-%m-%dT06:00:00+01:00"), "periodTo": (gas_days + pd.Timedelta(days=1)).strftime("%Y-%m-%dT06:00:00+01:00"),
+                                                              "indicator": "Physical Flow", "unit": "kWh/d", "value": np.round(norway, 0),
+                                                              "timestamp": pd.to_datetime(gas_days).tz_localize("Europe/Berlin").tz_convert("UTC") + pd.Timedelta(hours=5),
+                                                              "value_numeric": np.round(norway, 0), "_source": "Demo data (ENTSOG format)",
+                                                              "_fetched_at_utc": stamp, "_point_direction": "demo-norway-to-germany-entry"}),
+        {"point_direction": "demo-norway-to-germany-entry", "indicator": "Physical Flow"})
+    # Weather.
+    hourly_pack, daily_pack = _weather_pack(rng, weather, today)
+    meta = {"locations": list(WEATHER_LOCATIONS), "location": "Multiple locations", "forecast_days": 10}
+    put("weather_hourly", "Open-Meteo hourly weather", hourly_pack, meta)
+    put("weather_daily", "Open-Meteo daily weather", daily_pack, meta)
+    archive_days = pd.date_range(date(today.year - 10, today.month, 1), today - timedelta(days=5), freq="D")
+    archive = pd.concat([pd.DataFrame({"date": archive_days.strftime("%Y-%m-%d"), "temperature": weather["cities"][name]["temperature"].reindex(archive_days).round(2).to_numpy(),
+                                       "location": name}) for name in WEATHER_LOCATIONS], ignore_index=True).dropna()
+    archive["hdd"] = (18.0 - archive["temperature"]).clip(lower=0)
+    normals = pd.concat([temperature_normals_from_daily(archive.loc[archive["location"].eq(name)]).assign(location=name) for name in WEATHER_LOCATIONS], ignore_index=True)
+    put("weather_normals", "Open-Meteo temperature normals", normals, {"years": 10})
+    put("weather_archive", "Open-Meteo daily temperature history", archive, {"years": 10})
+    zones = ["France", "Germany-Luxembourg"]
+    hist_days = pd.date_range(today - timedelta(days=ZONE_WEATHER_HISTORY_DAYS), today - timedelta(days=5), freq="D")
+    put("zone_weather_history", "Open-Meteo weather across each zone", pd.concat([_zone_weather_rows(weather, z, hist_days) for z in zones]).sort_values(["date", "zone"]), {"zones": zones})
+    fc_days = pd.date_range(today - timedelta(days=4), today + timedelta(days=10), freq="D")
+    truth_days = pd.date_range(today - timedelta(days=ZONE_WEATHER_HISTORY_DAYS), today, freq="D")
+    items["_zone_weather_truth"] = {"data": pd.concat([_zone_weather_rows(weather, z, truth_days) for z in zones], ignore_index=True)}
+    put("zone_weather_forecast", "Open-Meteo forecast across each zone", pd.concat([_zone_weather_rows(weather, z, fc_days, rng, 0.3) for z in zones]), {"zones": zones})
+    vintage = []
+    for i in range(60, 0, -1):
+        day = today - timedelta(days=i - 1)
+        made = datetime.combine(day - timedelta(days=1), time(9, 30), tzinfo=timezone.utc)
+        rows = pd.concat([_zone_weather_rows(weather, z, pd.DatetimeIndex([pd.Timestamp(day)]), rng, 0.9) for z in zones])
+        vintage.append(rows.assign(made_at=made.isoformat(timespec="seconds"), before_auction=True))
+    put("zone_weather_vintage", "Weather forecasts as they stood the day before", pd.concat(vintage), {"zones": zones})
+    f_hist = pd.date_range(today - timedelta(days=FUND_KEEP_DAYS), today - timedelta(days=1), freq="D")
+    put("fund_weather_history", "Weather across each zone for the outlook", pd.concat([_fund_weather_rows(weather, z, f_hist) for z in zones]), {"version": FUND_WEATHER_VERSION})
+    f_fc = pd.date_range(today - timedelta(days=3), today + timedelta(days=FUND_OUTLOOK_DAYS), freq="D")
+    lead = np.clip(np.array([d.toordinal() - today.toordinal() for d in f_fc.date], dtype=float), 0, None)
+    forecast = pd.concat([_fund_weather_rows(weather, z, f_fc, rng, lead) for z in zones])
+    put("fund_weather_forecast", "16-day weather forecast across each zone", forecast, {"zones": zones})
+    ens_days = pd.date_range(today, today + timedelta(days=14), freq="D")
+    ens_lead = np.arange(len(ens_days), dtype=float)
+    members = []
+    for zone in zones:
+        centre = forecast.loc[forecast["zone"].eq(zone)].set_index("date").reindex(ens_days)
+        for member in range(51):
+            part = _fund_weather_rows({zone: centre[["temperature", "wind_land", "wind_sea", "solar"]].astype(float)}, zone, ens_days, rng, ens_lead * 1.4)
+            members.append(part[["zone", "date", "temperature", "wind_land", "wind_sea", "solar"]].assign(member=member))
+    ensemble = pd.concat(members, ignore_index=True)[["zone", "member", "date", "temperature", "wind_land", "wind_sea", "solar"]].astype({"temperature": float, "solar": float})
+    put("fund_weather_ensemble", "ECMWF weather scenarios", ensemble, {"zones": zones, "model": OPEN_METEO_ENSEMBLE_MODEL})
+    put("holidays", "School and regional public holidays", holidays, {"countries": ["FR", "DE"], "source": "Demo calendar"})
+    # Prices quoted on exchanges.
+    business = pd.bdate_range(today - timedelta(days=800), today - timedelta(days=1))
+    front = pd.DataFrame({"date": business, "product": "TTF Natural Gas", "close": [round(_front_price(paths, "TTF Natural Gas", d.date()), 3) for d in business]})
+    put("tradingview_gas_front", "TTF front month (demo)", front, {"symbol": "demo"})
+    auction_days = [d for d in pd.bdate_range(today - timedelta(days=60), today - timedelta(days=1)) if d.weekday() in (0, 1, 3)]
+    auctions = pd.DataFrame({"date": [d.strftime("%Y-%m-%d") for d in auction_days],
+                             "price": [round(_front_price(paths, "EUA Carbon", d.date()) - 0.55 + 0.15 * rng.normal(), 2) for d in auction_days]})
+    put("eex_eua_auctions", "EUA auction prices (demo)", auctions, {"source": "Demo data"})
+    return items
+
+
+def _demo_trades(paths: dict, today: date) -> pd.DataFrame:
+    """A small trading-house book: client deals, the desk's hedges on exchange, and a few positions left open on purpose."""
+    def strip_price(product, start, end, day):
+        curve = _demo_curve_on(paths, product, min(day, today), 48)
+        lookup = dict(zip(curve["delivery_month"], curve["price"]))
+        spec = PRODUCTS[product]
+        for month, _ in _month_segments(start, end, spec["profile"], spec["timezone"]):
+            if month not in lookup:   # a month already in delivery on the trade date: its price then
+                lookup[month] = float(_demo_shapes()[product][month] * paths["level"][product][int(np.searchsorted(paths["days"], pd.Timestamp(day)))])
+        return _strip_price(lookup, start, end, spec["profile"], spec["timezone"])
+    m = lambda y, mo: date(y, mo, 1)
+    plan = [
+        ("TR-2601", date(2026, 7, 21), "Rhône Chimie", "TTF Natural Gas", "SWAP", "FINANCIAL", "SELL_FIXED", m(2027, 1), m(2028, 1), 20, 0.85, "EXECUTED", "Client buys Cal-27 fixed-price gas"),
+        ("TR-2602", date(2026, 7, 21), "ICE Endex clearing", "TTF Natural Gas", "SWAP", "FINANCIAL", "BUY_FIXED", m(2027, 1), m(2028, 1), 15, 0.05, "EXECUTED", "Hedge of TR-2601, 75%"),
+        ("TR-2603", date(2026, 7, 30), "Énergie Durance", "French Power Base", "FORWARD", "PHYSICAL", "BUY_FIXED", m(2026, 11), m(2026, 12), 10, -0.9, "EXECUTED", "Bought from a hydro producer, in delivery"),
+        ("TR-2604", date(2026, 8, 12), "Stadtwerke Nordheim", "German Power Base", "SWAP", "PHYSICAL", "SELL_FIXED", m(2027, 1), m(2027, 4), 10, 1.2, "EXECUTED", "Client buys Q1-27 baseload"),
+        ("TR-2605", date(2026, 8, 12), "EEX clearing", "German Power Base", "SWAP", "FINANCIAL", "BUY_FIXED", m(2027, 1), m(2027, 4), 8, 0.05, "EXECUTED", "Hedge of TR-2604, 80%"),
+        ("TR-2606", date(2026, 9, 3), "Énergie Durance", "French Power Base", "FORWARD", "PHYSICAL", "BUY_FIXED", m(2026, 12), m(2027, 1), 15, -1.0, "EXECUTED", "Bought from a hydro producer"),
+        ("TR-2607", date(2026, 9, 3), "Acier Lorrain", "French Power Peak", "FORWARD", "PHYSICAL", "SELL_FIXED", m(2026, 12), m(2027, 1), 6, 1.5, "EXECUTED", "Client buys Dec-26 peak"),
+        ("TR-2608", date(2026, 9, 24), "North Sea Gas Trading", "TTF Natural Gas", "SWAP", "PHYSICAL", "BUY_FIXED", m(2026, 11), m(2027, 4), 10, 0.10, "EXECUTED", "Winter supply, in delivery"),
+        ("TR-2609", date(2026, 10, 6), "Midlands Ceramics", "NBP Natural Gas", "FORWARD", "PHYSICAL", "SELL_FIXED", m(2026, 12), m(2027, 1), 8, 0.6, "EXECUTED", "Client buys Dec-26 NBP"),
+        ("TR-2610", date(2026, 10, 6), "ICE Endex clearing", "TTF Natural Gas", "FORWARD", "FINANCIAL", "BUY_FIXED", m(2026, 12), m(2027, 1), 8, 0.05, "EXECUTED", "Cross-hub hedge of TR-2609"),
+        ("TR-2611", date(2026, 10, 20), "Bavaria Glas", "German Power Peak", "FORWARD", "PHYSICAL", "SELL_FIXED", m(2027, 1), m(2027, 2), 5, 1.8, "EXECUTED", "Client buys Jan-27 peak"),
+        ("TR-2612", date(2026, 10, 29), "EEX clearing", "German Power Base", "SWAP", "FINANCIAL", "BUY_FIXED", m(2027, 1), m(2028, 1), 5, 0.05, "EXECUTED", "Desk view: long Cal-27 German base"),
+        ("TR-2613", date(2026, 11, 4), "Papeteries de l'Isère", "French Power Base", "SWAP", "FINANCIAL", "SELL_FIXED", m(2027, 1), m(2028, 1), 10, 1.1, "EXECUTED", "Client buys Cal-27 French base"),
+        ("TR-2614", date(2026, 11, 10), "EEX clearing", "French Power Base", "SWAP", "FINANCIAL", "BUY_FIXED", m(2027, 1), m(2028, 1), 6, 0.05, "EXECUTED", "Hedge of TR-2613, 60%"),
+        ("TR-2615", date(2026, 11, 13), "Rhône Chimie", "TTF Natural Gas", "SWAP", "FINANCIAL", "SELL_FIXED", m(2027, 4), m(2027, 10), 10, 0.75, "CONFIRMED", "Client buys Summer-27, to hedge"),
+        ("TR-2616", today, "Northstar Utilities", "TTF Natural Gas", "SWAP", "FINANCIAL", "BUY_FIXED", m(2027, 1), m(2027, 4), 5, 0.0, "PROPOSED", "Quote requested this morning"),
+    ]
+    rows = []
+    for tid, day, cpty, product, instrument, settlement, side, start, end, mw, spread, status, note in plan:
+        if day > today:
+            continue
+        mid = strip_price(product, start, end, day)
+        rows.append({"trade_id": tid, "trade_date": day.isoformat(), "counterparty": cpty + DEMO_COUNTERPARTY, "product": product, "instrument": instrument,
+                     "settlement_type": settlement, "side": side, "delivery_start": start.isoformat(), "delivery_end": end.isoformat(),
+                     "profile": PRODUCTS[product]["profile"], "quantity_mw": float(mw), "trade_price": round(mid + spread, 2),
+                     "currency": PRODUCTS[product]["currency"], "status": status, "notes": note})
+    return normalise_trades(pd.DataFrame(rows), allow_missing_quantity_mwh=True)
+
+
+def _demo_ops(trades: pd.DataFrame, today: date) -> pd.DataFrame:
+    """Operations for the physical trades, with deliveries under way this month."""
+    ops = sync_physical_ops_with_trades(None, trades)
+    month = date(today.year, today.month, 1)
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for i, row in ops.iterrows():
+        start, end = _to_date(row["delivery_start"]), _to_date(row["delivery_end"])
+        total = (end - start).days
+        if start <= today < end:
+            done = (today - start).days / total
+            ops.loc[i, ["nominated_mwh", "delivered_mwh", "operational_status", "invoice_status", "updated_at"]] = [
+                round(row["contracted_mwh"] * min(1.0, ((today - start).days + 1) / total), 1), round(row["contracted_mwh"] * done, 1), "IN_DELIVERY",
+                "DRAFT" if start < month else "NOT_DUE", stamp]
+        elif start == _add_months(month, 1):
+            ops.loc[i, ["operational_status", "updated_at"]] = ["NOMINATED" if (start - today).days <= 20 else "SCHEDULED", stamp]
+    return ops
+
+
+def _demo_records(live: dict, rng: np.random.Generator, today: date) -> tuple[pd.DataFrame, list]:
+    """Two weeks of outlooks and next-day estimates, each made by the app's own models from what was known that day:
+    output to the day before, forecasts with the errors forecasts have, and notices as they stood. They are scored like any saved record."""
+    frame = lambda key: live[key]["data"] if key in live else pd.DataFrame()
+    record, estimates = None, []
+    history, forecast = frame("fund_weather_history"), frame("fund_weather_forecast")
+    for zone in ("France", "Germany-Luxembourg"):
+        table = fundamentals_table(fund_daily_rows(frame(f"fund_daily|{zone}"), frame(f"entsoe_load|{zone}"), frame(f"entsoe_generation|{zone}"), zone),
+                                   frame(f"entsoe_load_forecast|{zone}"), frame(f"entsoe_renewable_forecast|{zone}"), zone)
+        truth = pd.concat([history.loc[history["zone"].eq(zone)], forecast.loc[forecast["zone"].eq(zone) & (forecast["date"] >= pd.Timestamp(today))]])
+        truth = truth.drop_duplicates("date", keep="first").set_index("date")[["temperature", "wind_land", "wind_sea", "solar"]].astype(float)
+        notices = frame(f"entsoe_outages|{zone}")
+        actual_columns = [c for c in table.columns if not c.endswith("_fc")]
+        for back in range(14, 0, -1):
+            made = today - timedelta(days=back)
+            known = table.loc[:pd.Timestamp(made + timedelta(days=1))].copy()
+            known.loc[known.index >= pd.Timestamp(made), actual_columns] = np.nan
+            ahead = pd.date_range(made, made + timedelta(days=FUND_OUTLOOK_DAYS), freq="D")
+            lead = np.arange(len(ahead), dtype=float)
+            fc = _fund_weather_rows({zone: truth.reindex(ahead).ffill()}, zone, ahead, rng, lead)
+            weather = fundamentals_weather(history.loc[history["date"] < pd.Timestamp(made)], fc, zone)
+            seen = notices.loc[notices["revision"].eq(1) & (pd.to_datetime(notices["created"].str[:10]) <= pd.Timestamp(made))] if not notices.empty else notices
+            try:
+                result = power_fundamentals(zone, known, weather, None, 0.0, holidays=frame("holidays"), outages=seen)
+            except Exception:
+                continue
+            if result.get("ready"):
+                kept = record_outlook(record, result["outlook"], zone, made)
+                record = kept if kept is not None else record
+        # Next-day estimates, made two days before delivery with the prices then published.
+        series = spot_series(frame(f"entsoe_price|{zone}"), ENTSOE_ZONES[zone]["timezone"])
+        vintage = frame("zone_weather_vintage")
+        for back in range(12, -2, -1):
+            target = today - timedelta(days=back)
+            made = target - timedelta(days=2)
+            known_prices = series.loc[series["local"].dt.date < target]
+            truth = frame("_zone_weather_truth")
+            recent = truth.loc[(truth["date"] >= pd.Timestamp(made - timedelta(days=4))) & (truth["date"] < pd.Timestamp(target))]
+            grid_fc = pd.concat([recent, vintage.loc[vintage["date"].eq(pd.Timestamp(target)), recent.columns]], ignore_index=True)
+            grid_hist = truth.loc[truth["date"] < pd.Timestamp(made - timedelta(days=4))]
+            old = vintage.loc[vintage["date"] < pd.Timestamp(target)]
+            gas = frame("tradingview_gas_front")
+            try:
+                result = next_day_estimate(zone, known_prices, pd.DataFrame(), pd.DataFrame(), frame(f"entsoe_load_forecast|{zone}"), frame(f"entsoe_renewable_forecast|{zone}"),
+                                           grid_hist, grid_fc, gas.loc[gas["date"] < pd.Timestamp(made)], old)
+            except Exception:
+                continue
+            if result.get("ready") and result["day"] == target:
+                estimates.append((target.isoformat(), zone, result["estimate"], result["low"], result["high"], made.isoformat(), result["method"]))
+    return (record if record is not None else pd.DataFrame()), estimates
+
+
+def build_demo_desk(path: Path, today: date) -> None:
+    """Write a complete demo desk to path: market data, curves, price history, trades, operations and settings."""
+    rng = np.random.default_rng(int(today.strftime("%Y%m%d")) * 7 + DEMO_VERSION)
+    paths = _demo_paths(rng, today)
+    store = DeskStore(path)
+    live = _demo_live(rng, today, paths)
+    record, estimates = _demo_records(live, rng, today)
+    live.pop("_zone_weather_truth", None)
+    if not record.empty:
+        live["fund_outlook_record"] = {"label": "Fundamentals outlooks as made each day", "data": record, "metadata": {"demo": True},
+                                       "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    for key, item in live.items():
+        if not store.save_live_item(key, item):
+            raise RuntimeError(f"Demo dataset {key} could not be saved.")
+    if estimates:
+        store.save_price_estimates(estimates)
+    made = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for product in CURVE_PRODUCTS:
+        curve = validate_curve(_demo_curve_on(paths, product, today))
+        store.save_custom_curve(product, curve, {"source_label": "Demo marks", "source_type": "Demo", "curve_date": today.isoformat(), "imported_at_utc": made,
+                                                 "full_fetch_day": today.isoformat()})
+    # Price history: every working day of the last six months, each day's curve as it stood.
+    rows = []
+    for day in pd.bdate_range(today - timedelta(days=190), today).date:
+        for product in CURVE_PRODUCTS:
+            curve = _demo_curve_on(paths, product, day)
+            rows.append(pd.DataFrame({"snapshot_date": day.isoformat(), "product": product, "delivery_month": [m.isoformat() for m in curve["delivery_month"]],
+                                      "price": curve["price"], "source": "Demo marks"}))
+    store.add_snapshot_rows(pd.concat(rows, ignore_index=True), replace=True)
+    trades = _demo_trades(paths, today)
+    store.save_table("trades", trades)
+    store.save_table("physical_ops", _demo_ops(trades, today))
+    store.save_alerts(pd.DataFrame({"metric": ["TTF nearest month", "EU storage fill", "German day-ahead base", "1-day VaR, 95%"],
+                                    "condition": ["Above", "Below", "Above", "Above"], "level": [95.0, 70.0, 300.0, 250000.0]}))
+    settings = {**DEFAULT_SETTINGS, **DEMO_FX, "auto_update": 0.0, "allow_demo": 1.0,
+                "fx_ecb_epoch": datetime.combine(DEMO_ANCHOR_DAY, time(15, 0), tzinfo=timezone.utc).timestamp()}
+    for key, value in settings.items():
+        store.set_setting(key, float(value))
+
+
+# ---- demo or live: which desk the session works on --------------------------------------
+_DEMO_BUILD_LOCK = threading.Lock()
+
+
+def demo_folder() -> Path:
+    configured = os.getenv("MERIDIAN_DEMO_DIR", "").strip()
+    return Path(configured) if configured else Path(tempfile.gettempdir()) / "meridian_demo"
+
+
+def demo_seed_path(today: Optional[date] = None) -> Path:
+    """Today's demo desk, built once a day and shared read-only by every session."""
+    today = today or date.today()
+    folder = demo_folder()
+    folder.mkdir(parents=True, exist_ok=True)
+    seed = folder / f"seed_{today.isoformat()}_v{DEMO_VERSION}.db"
+    with _DEMO_BUILD_LOCK:
+        if not seed.is_file():
+            building = folder / f"building_{os.getpid()}_{threading.get_ident()}.db"
+            building.unlink(missing_ok=True)
+            build_demo_desk(building, today)
+            os.replace(building, seed)
+            for old in folder.glob("seed_*.db"):
+                if old != seed:
+                    old.unlink(missing_ok=True)
+    return seed
+
+
+def demo_mode() -> bool:
+    """Demo data, or the live desk. Starts in demo when no keys are set, so the app is complete straight away."""
+    if "demo_mode" not in st.session_state:
+        choice = os.getenv("MERIDIAN_DEMO", "").strip()
+        if choice not in ("0", "1"):
+            try:
+                choice = str(st.query_params.get("demo", "")).strip()
+            except Exception:
+                choice = ""
+        st.session_state.demo_mode = (choice == "1") if choice in ("0", "1") else not any(resolved_credentials().values())
+    return bool(st.session_state.demo_mode)
+
+
+def demo_store() -> Optional[DeskStore]:
+    """This session's copy of today's demo desk. Changes made in demo stay in this copy and are never saved to the live desk."""
+    today = date.today()
+    if st.session_state.get("demo_store") is None or st.session_state.get("demo_store_day") != today:
+        try:
+            seed = demo_folder() / f"seed_{today.isoformat()}_v{DEMO_VERSION}.db"
+            if not seed.is_file():
+                with st.spinner("Building today's demo market. This takes about fifteen seconds, once a day."):
+                    seed = demo_seed_path(today)
+            else:
+                seed = demo_seed_path(today)
+            session_copy = demo_folder() / f"session_{uuid.uuid4().hex}.db"
+            shutil.copyfile(seed, session_copy)
+            for old in demo_folder().glob("session_*.db"):
+                try:
+                    if old != session_copy and datetime.now().timestamp() - old.stat().st_mtime > 2 * 86400:
+                        old.unlink()
+                except OSError:
+                    pass
+            st.session_state.demo_store = DeskStore(session_copy)
+            st.session_state.demo_store_day = today
+            st.session_state.desk_store_error = ""
+        except Exception as exc:
+            st.session_state.demo_store = None
+            st.session_state.desk_store_error = f"Demo data couldn't be built: {type(exc).__name__}: {exc}"
+    return st.session_state.demo_store
+
+
+def set_demo_mode(on: bool) -> None:
+    """Switch desks. Everything held for the other desk is dropped, and any update under way is stopped, so nothing crosses over."""
+    job = st.session_state.get("update_job")
+    if job:
+        for executor in job.get("executors", {}).values():
+            executor.shutdown(wait=False, cancel_futures=True)
+    keep = {"nav_page", "demo_store", "demo_store_day", "desk_store", "keys_git_risk"}
+    for key in list(st.session_state.keys()):
+        if key not in keep and not str(key).startswith("navsec_"):
+            del st.session_state[key]
+    st.session_state.demo_mode = bool(on)
+
+
+def _on_demo_toggle() -> None:
+    choice = st.session_state.get("data_mode_choice")
+    if choice is None:   # the selected option clicked again: keep the desk as it is
+        st.session_state.data_mode_choice = "Demo" if demo_mode() else "Live"
+        return
+    if (choice == "Demo") != demo_mode():
+        set_demo_mode(choice == "Demo")
+
+
+def render_mode_switch() -> None:
+    st.segmented_control("Data", ["Live", "Demo"], default="Demo" if demo_mode() else "Live", key="data_mode_choice",
+                         on_change=_on_demo_toggle, selection_mode="single", width="stretch",
+                         help="Demo: a complete simulated market for today, anchored on real closing levels, with a sample book. "
+                              "Live: your desk, your trades and the data you fetch. The two are kept apart and never mixed.")
+
+
+def demo_banner_html() -> str:
+    return (f'<div class="demo-banner"><b>Demo data</b> A simulated market for {date.today():%d %b %Y}, built from real closes of '
+            f'{DEMO_ANCHOR_DAY:%d %b} (TTF Dec-26 €90.95, German Cal-27 €145, EUA €88.15, EU storage 71%). '
+            f'No price here is live and nothing is saved to your desk. Switch to Live in the sidebar for your own data.</div>')
+
+
+def demo_anchor_table() -> pd.DataFrame:
+    return pd.DataFrame(DEMO_ANCHORS, columns=["Level", "Value", "As of", "Source"])
+
+
+# =============================================================================
+# SECTION 6F · REAL HISTORY WITHOUT A KEY
+# Daily demand and output from Energy-Charts (Fraunhofer ISE, CC BY 4.0), so the Fundamentals Outlook keeps
+# itself current without an ENTSO-E key, and real history built into this file, so it works from the first open.
+# =============================================================================
+ENERGY_CHARTS_BASE = "https://api.energy-charts.info"
+ENERGY_CHARTS_COUNTRY = {"France": "fr", "Germany-Luxembourg": "de"}
+# Energy-Charts names, lower case, and the series the outlook models use.
+ENERGY_CHARTS_SERIES = {"load": "load", "load (incl. self-consumption)": "load", "wind onshore": "wind_onshore", "wind offshore": "wind_offshore",
+                        "solar": "solar", "nuclear": "nuclear", "fossil gas": "gas"}
+ENERGY_CHARTS_CHUNK_DAYS = 90
+ENERGY_CHARTS_WAIT_SECONDS = 31.0     # the public API allows two requests a minute
+ENERGY_CHARTS_SOURCE = "Energy-Charts (Fraunhofer ISE), CC BY 4.0, from ENTSO-E and SMARD data"
+
+
+def parse_energy_charts_power(payload, zone: str) -> pd.DataFrame:
+    """Daily average MW by series from an Energy-Charts public_power reply, over the zone's local days.
+    A day counts only with at least 20 hours, as with ENTSO-E's data."""
+    columns = ["date", "series", "value", "hours"]
+    if not isinstance(payload, dict) or not payload.get("unix_seconds"):
+        return pd.DataFrame(columns=columns)
+    stamps = pd.to_datetime(pd.Series(payload["unix_seconds"], dtype="float64"), unit="s", utc=True)
+    steps = stamps.diff().dt.total_seconds().dropna()
+    step_hours = float(steps.median()) / 3600.0 if not steps.empty else 0.25
+    local = stamps.dt.tz_convert(ENTSOE_ZONES[zone]["timezone"]).dt.tz_localize(None).dt.normalize()
+    frames, seen = [], set()
+    for item in payload.get("production_types") or []:
+        series = ENERGY_CHARTS_SERIES.get(str(item.get("name", "")).strip().casefold())
+        values = pd.to_numeric(pd.Series(item.get("data") or [], dtype="object"), errors="coerce")
+        if series is None or series in seen or len(values) != len(stamps):
+            continue
+        seen.add(series)
+        part = pd.DataFrame({"date": local.to_numpy(), "value": values.to_numpy(float)}).dropna()
+        daily = part.groupby("date")["value"].agg(value="mean", count="count").reset_index()
+        daily["hours"] = (daily["count"] * step_hours).round().astype(int)
+        frames.append(daily.loc[daily["hours"] >= 20, ["date", "value", "hours"]].assign(series=series))
+    if not frames:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(frames, ignore_index=True)[columns].sort_values(["date", "series"]).reset_index(drop=True)
+
+
+def fetch_energy_charts_daily(zone: str, start: date, end: date, _json_get_fn: Optional[Callable] = None, wait: Callable[[float], None] = sleep) -> pd.DataFrame:
+    """Daily demand, wind, solar, nuclear and gas-fired output for start..end from Energy-Charts. No key is needed.
+    Long spans are asked for in parts, spaced to stay within the public API's two requests a minute."""
+    if zone not in ENERGY_CHARTS_COUNTRY:
+        raise ValueError(f"Energy-Charts output isn't set up for {zone}.")
+    get = _json_get_fn or _json_get
+    frames, cursor, first = [], start, True
+    while cursor <= end:
+        stop = min(end, cursor + timedelta(days=ENERGY_CHARTS_CHUNK_DAYS - 1))
+        if not first:
+            wait(ENERGY_CHARTS_WAIT_SECONDS)
+        first = False
+        params = {"country": ENERGY_CHARTS_COUNTRY[zone], "start": cursor.isoformat(), "end": (stop + timedelta(days=1)).isoformat()}
+        try:
+            payload = get(f"{ENERGY_CHARTS_BASE}/public_power", params=params)
+        except ProviderHTTPError as exc:
+            if getattr(exc, "status", None) != 429 and "429" not in str(exc):
+                raise
+            wait(61.0)
+            payload = get(f"{ENERGY_CHARTS_BASE}/public_power", params=params)
+        frames.append(parse_energy_charts_power(payload, zone))
+        cursor = stop + timedelta(days=1)
+    joined = pd.concat([f for f in frames if not f.empty], ignore_index=True) if any(not f.empty for f in frames) else pd.DataFrame(columns=["date", "series", "value", "hours"])
+    if joined.empty:
+        return joined
+    joined = joined.loc[(joined["date"] >= pd.Timestamp(start)) & (joined["date"] <= pd.Timestamp(end))]
+    return joined.drop_duplicates(["date", "series"], keep="last").reset_index(drop=True)
+
+
+# ---- the history built into this file ------------------------------------------------------------
+# Made by build_builtin_history() from the free sources the app itself uses, and kept current by the normal update.
+BUILTIN_HISTORY_MADE = "2026-11-16"
+BUILTIN_HISTORY_NOTE = "Sources: daily demand and output from Energy-Charts (Fraunhofer ISE, CC BY 4.0, from ENTSO-E and SMARD data); past weather from the Open-Meteo archive (CC BY 4.0); holidays from OpenHolidays (ODbL). German gas use isn't included: Trading Hub Europe's data interface was out of service when this was built."
+BUILTIN_HISTORY = "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"
+BUILTIN_KEYS = ("fund_daily|France", "fund_daily|Germany-Luxembourg", "fund_weather_history", "the_gas_consumption", "holidays")
+_BUILTIN_DATES = {"fund_weather_history": ("date",), "the_gas_consumption": ("gas_day",), "holidays": ("start", "end")}
+
+
+def encode_builtin_history(items: dict) -> str:
+    """{key: (label, metadata, frame)} as compressed text that can sit in this file."""
+    payload = {key: {"label": label, "metadata": metadata, "csv": frame.to_csv(index=False, float_format="%.4g")}
+               for key, (label, metadata, frame) in items.items()}
+    import base64
+    return base64.b64encode(zlib.compress(json.dumps(payload).encode("utf-8"), 9)).decode("ascii")
+
+
+@lru_cache(maxsize=1)
+def _builtin_payload() -> dict:
+    if not BUILTIN_HISTORY:
+        return {}
+    import base64
+    try:
+        return json.loads(zlib.decompress(base64.b64decode(BUILTIN_HISTORY)).decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def builtin_history_items() -> dict:
+    """The built-in datasets, in the same shape as fetched ones, dated the day they were made."""
+    items = {}
+    made = f"{BUILTIN_HISTORY_MADE}T12:00:00+00:00" if BUILTIN_HISTORY_MADE else ""
+    for key, entry in _builtin_payload().items():
+        frame = pd.read_csv(io.StringIO(entry["csv"]))
+        for column in _BUILTIN_DATES.get(key, ("date",)):
+            if column in frame.columns:
+                frame[column] = pd.to_datetime(frame[column])
+        if "nationwide" in frame.columns:
+            frame["nationwide"] = frame["nationwide"].astype(bool)
+        if "subdivisions" in frame.columns:
+            frame["subdivisions"] = frame["subdivisions"].fillna("").astype(str)
+        items[key] = {"label": entry["label"], "data": frame, "fetched_at": made, "metadata": {**entry.get("metadata", {}), "builtin": BUILTIN_HISTORY_MADE}}
+    return items
+
+
+def _days_held(item) -> int:
+    frame = item.get("data") if isinstance(item, dict) else None
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return 0
+    column = next((c for c in ("date", "gas_day", "start") if c in frame.columns), None)
+    return int(pd.to_datetime(frame[column]).dt.normalize().nunique()) if column else len(frame)
+
+
+def seed_builtin_history(live: dict) -> list[str]:
+    """Give the live desk the built-in history where it holds less. Fetched data is never replaced by older built-in data."""
+    added = []
+    for key, item in builtin_history_items().items():
+        held = live.get(key)
+        if _days_held(held) >= _days_held(item):
+            continue
+        if isinstance(held, dict) and isinstance(held.get("data"), pd.DataFrame) and not held["data"].empty and key != "holidays":
+            # Keep what was fetched and add the older built-in days before it.
+            time_col = next(c for c in ("date", "gas_day") if c in item["data"].columns)
+            keys = ("date", "series") if key.startswith("fund_daily|") else ("date", "zone") if key == "fund_weather_history" else (time_col,)
+            item = {**item, "data": merge_observations(item["data"], held["data"], keys, time_col), "fetched_at": held.get("fetched_at", item["fetched_at"]),
+                    "metadata": {**item["metadata"], **(held.get("metadata") or {})}}
+        live[key] = item
+        _save(lambda store, key=key, item=item: store.save_live_item(key, item))
+        added.append(key)
+    if added:
+        bump("live")
+    return added
+
+
+def builtin_history_text() -> str:
+    if not BUILTIN_HISTORY:
+        return ("This copy has no history built in yet. With an internet connection, the live desk fetches it the first time the Fundamentals Outlook "
+                "updates: daily demand and output from Energy-Charts, past weather from Open-Meteo, German gas use from Trading Hub Europe and "
+                "holidays from OpenHolidays. None of these needs a key.")
+    rows = []
+    for key, item in builtin_history_items().items():
+        frame = item["data"]
+        column = next((c for c in ("date", "gas_day", "start") if c in frame.columns), None)
+        span = f"{pd.Timestamp(frame[column].min()):%d %b %Y} to {pd.Timestamp(frame[column].max()):%d %b %Y}" if column else ""
+        rows.append(f"- **{item['label']}**: {len(frame):,} rows, {span}")
+    return (f"The live desk starts with real history, fetched on {pd.Timestamp(BUILTIN_HISTORY_MADE):%d %b %Y}, so the Fundamentals Outlook works from the "
+            f"first open, even without keys. Each update adds the days since, from the same free sources. {BUILTIN_HISTORY_NOTE}\n\n" + "\n".join(rows))
+
+
+def build_builtin_history(today: Optional[date] = None, zones: Sequence[str] = ("France", "Germany-Luxembourg")) -> dict:
+    """Fetch the outlook's history from the free sources: run once by the developer to refresh what's built in."""
+    today = today or date.today()
+    end = today - timedelta(days=1)
+    items = {}
+    for zone in zones:
+        frame = fetch_energy_charts_daily(zone, today - timedelta(days=FUND_KEEP_DAYS), end)
+        items[f"fund_daily|{zone}"] = (f"Daily output and demand, {zone}", {"zone": zone, "source": ENERGY_CHARTS_SOURCE}, frame)
+    weather = [fetch_zone_weather(zone, today - timedelta(days=GAS_DEMAND_HISTORY_DAYS if zone == "Germany-Luxembourg" else FUND_HISTORY_DAYS), end,
+                                  historical_forecast=True, with_sea=True, extended=True) for zone in zones]
+    items["fund_weather_history"] = ("Past weather as the forecast models saw it", {"zones": list(zones), "version": FUND_WEATHER_VERSION},
+                                     pd.concat(weather, ignore_index=True))
+    items["the_gas_consumption"] = ("German gas consumption, Trading Hub Europe", {"source": "Trading Hub Europe"},
+                                    fetch_the_consumption(today - timedelta(days=GAS_DEMAND_HISTORY_DAYS), today))
+    countries = sorted({FUND_COUNTRY[z] for z in zones if z in FUND_COUNTRY})
+    items["holidays"] = ("School and regional public holidays", {"countries": countries, "source": "OpenHolidays (ODbL)"},
+                         pd.concat([fetch_open_holidays(c, today - timedelta(days=GAS_DEMAND_HISTORY_DAYS + 40), today + timedelta(days=60)) for c in countries], ignore_index=True))
+    return items
+
+
+def write_builtin_history(path: Path) -> str:
+    """Fetch the history and write it into this file, so every copy of the app starts with it. Run: python etttr.py --build-history"""
+    items = build_builtin_history()
+    blob = encode_builtin_history(items)
+    made = date.today().isoformat()
+    note = f"Sources: {ENERGY_CHARTS_SOURCE}; Open-Meteo (CC BY 4.0); Trading Hub Europe; OpenHolidays (ODbL)."
+    text = path.read_text(encoding="utf-8")
+    for name, value in (("BUILTIN_HISTORY_MADE", made), ("BUILTIN_HISTORY_NOTE", note), ("BUILTIN_HISTORY", blob)):
+        text, count = re.subn(rf'^{name} = ".*"$', f'{name} = "{value}"', text, count=1, flags=re.M)
+        if count != 1:
+            raise RuntimeError(f"Couldn't find {name} in {path.name}.")
+    path.write_text(text, encoding="utf-8")
+    return ", ".join(f"{key}: {len(frame):,} rows" for key, (_, _, frame) in items.items()) + f". {len(blob) // 1024:,} KB written into {path.name}."
+
+
 # =============================================================================
 # SECTION 7 · MODEL CHECKS
 # =============================================================================
@@ -10028,20 +11160,18 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             st.session_state.update_job = None
             count = start_update(tasks=[UpdateTask("Good", lambda: 5, lambda v: applied.append(v) or "ok"), UpdateTask("Bad", fail, lambda v: "never"),
                                         UpdateTask("Bad apply", lambda: 1, lambda v: (_ for _ in ()).throw(ValueError("bad frame")))])
-            if count != 3 or start_update(tasks=[UpdateTask("Good", lambda: 6, lambda v: applied.append(v) or "ok")]) != 0:
-                raise AssertionError("A source already being fetched must not be asked for twice.")
-            if start_update(tasks=[UpdateTask("Second page", lambda: 1, lambda v: "x")]) != 1 or update_progress()[1] != 4:
-                raise AssertionError("Another page's sources must join the running update.")
+            if count != 3 or start_update(tasks=[UpdateTask("Second", lambda: 1, lambda v: "x")]) != 0:
+                raise AssertionError("Only one update may run at a time.")
             for _executor in st.session_state.update_job["executors"].values():
                 _executor.shutdown(wait=True)
-            if update_progress() != (4, 4) or not collect_update():
+            if update_progress() != (3, 3) or not collect_update():
                 raise AssertionError("A finished update was not collected.")
             results = {name: (good, detail) for name, good, detail in st.session_state.update_results}
             if applied != [5] or not results["Good"][0] or results["Bad"] != (False, "provider down.") or results["Bad apply"][0]:
                 raise AssertionError(f"One failure must not affect the others: {results}")
             if collect_update() or st.session_state.update_job is not None:
                 raise AssertionError("The job must clear once collected.")
-            return "Fetches run in the background, results apply once, another page's sources join a running update without repeats, and one failing source doesn't affect the others."
+            return "Fetches run in the background, results apply once, and one failing source doesn't affect the others."
         finally:
             st.session_state.update_job = saved_job
             st.session_state.update_results = saved_results
@@ -11405,62 +12535,104 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         return (f"The outlook's weather adds {counts['farm']} wind-farm and {counts['park']} solar-park points in the same request: wind comes from the farms, "
                 "sun from all land points, and the scenarios stay on the base points.")
 
-    def check_page_updates() -> str:
-        """Each page updates only its own sources; every source belongs to a page."""
-        saved_live, saved_fx = dict(st.session_state.get("live_data", {})), st.session_state.get("fx_updated_at")
-        saved_job, saved_checked = st.session_state.get("update_job"), st.session_state.get("page_update_checked")
-        try:
-            pages = set(NAV_TO_PAGE.values())
-            if set(PAGE_UPDATES) != pages:
-                raise AssertionError(f"Pages without an update list: {sorted(pages - set(PAGE_UPDATES))}")
-            if any(len(set(groups)) != len(groups) for groups in PAGE_UPDATES.values()):
-                raise AssertionError("A page lists a source twice.")
-            used = {g for groups in PAGE_UPDATES.values() for g in groups}
-            if used - set(UPDATE_GROUPS) or set(UPDATE_GROUPS) - used or set(GROUP_DATASETS) != set(UPDATE_GROUPS):
-                raise AssertionError("Every source group must be known, kept somewhere and shown on at least one page.")
-            st.session_state.live_data, st.session_state.fx_updated_at = {}, None
-            everything = plan_update(force=True, today=date(2026, 11, 13))
-            if any(task.group not in UPDATE_GROUPS for task in everything):
-                raise AssertionError(f"Untagged sources: {[t.name for t in everything if t.group not in UPDATE_GROUPS]}")
-            sizes = {}
-            for page in ("Forward Curves", "Fundamentals Outlook", "Power Spot", "Model Validation"):
-                planned = plan_update(force=True, today=date(2026, 11, 13), groups=PAGE_UPDATES[page])
-                if {t.group for t in planned} - set(PAGE_UPDATES[page]):
-                    raise AssertionError(f"{page} would fetch sources it doesn't show.")
-                sizes[page] = len(planned)
-            if sizes["Model Validation"] != 0 or not 0 < sizes["Forward Curves"] < len(everything) or not 0 < sizes["Fundamentals Outlook"] < len(everything):
-                raise AssertionError(f"Page plans: {sizes} of {len(everything)}")
-            if not any(t.group == "ttf_front" for t in plan_update(force=True, groups=PAGE_UPDATES["Power Spot"])) or \
-                    any(t.group == "ttf_front" for t in plan_update(force=True, groups=PAGE_UPDATES["Forward Curves"])):
-                raise AssertionError("The TTF front month goes with the estimate, not with the curves.")
-            # Opening a page starts its update once, and looks again only after the recheck interval.
-            st.session_state.update_job, st.session_state.page_update_checked = None, {}
-            started = []
-            real_start = globals()["start_update"]
-            globals()["start_update"] = lambda force=True, tasks=None, groups=None: started.append(tuple(groups or ())) or 1
-            try:
-                was = fx_rate("auto_update")
-                set_fx_rate("auto_update", 1.0)
-                hidden = os.environ.pop("MERIDIAN_NO_AUTO_UPDATE", None)
-                maybe_auto_update("Forward Curves"); maybe_auto_update("Forward Curves"); maybe_auto_update("Model Validation")
-                st.session_state.page_update_checked["Forward Curves"] -= PAGE_RECHECK_SECONDS + 1
-                maybe_auto_update("Forward Curves")
-            finally:
-                globals()["start_update"] = real_start
-                set_fx_rate("auto_update", was)
-                if hidden is not None:
-                    os.environ["MERIDIAN_NO_AUTO_UPDATE"] = hidden
-            if started != [PAGE_UPDATES["Forward Curves"]] * 2:
-                raise AssertionError(f"Automatic page updates: {started}")
-            table_ = page_update_table()
-            if len(table_) != len(pages) or table_.loc[table_["Page"].eq("Model Validation"), "Sources"].iloc[0] != 0:
-                raise AssertionError("The page table must list every page and what it updates.")
-            return (f"Every source belongs to a group and every page lists its own: opening Forward Curves plans {sizes['Forward Curves']} of {len(everything)} sources, "
-                    f"Fundamentals Outlook {sizes['Fundamentals Outlook']}, Power Spot {sizes['Power Spot']}, Model Validation none; a page looks again after {PAGE_RECHECK_SECONDS // 60} minutes.")
-        finally:
-            st.session_state.live_data, st.session_state.fx_updated_at = saved_live, saved_fx
-            st.session_state.update_job, st.session_state.page_update_checked = saved_job, saved_checked
+    def check_demo_market():
+        """The demo market hits the levels it is built from, holds every dataset the pages read, and is a desk of its own."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "demo.db"
+            today = date.today()
+            build_demo_desk(path, today)
+            store = DeskStore(path)
+            live = store.load_live_items()
+            wanted = {"eex_eua_auctions", "entsoe_price", "entsoe_load", "entsoe_generation", "entsoe_load_forecast", "entsoe_renewable_forecast", "entsoe_flow",
+                      "gie_agsi_history", "gie_alsi", "entsog_flow", "weather_daily", "weather_normals", "weather_archive", "zone_weather_history",
+                      "zone_weather_forecast", "tradingview_gas_front", "fund_daily", "fund_weather_history", "fund_weather_forecast",
+                      "fund_weather_ensemble", "entsoe_outages", "holidays", "the_gas_consumption", "fund_outlook_record"}
+            missing = sorted(n for n in wanted if not any(k == n or k.startswith(n + "|") for k in live))
+            if missing:
+                raise AssertionError(f"Demo datasets missing: {missing}")
+            empty = sorted(k for k, item in live.items() if item["data"].empty)
+            if empty:
+                raise AssertionError(f"Empty demo datasets: {empty}")
+            rng = np.random.default_rng(int(today.strftime("%Y%m%d")) * 7 + DEMO_VERSION)
+            paths = _demo_paths(rng, today)
+            anchor = {p: _demo_curve_on(paths, p, DEMO_ANCHOR_DAY, 48) for p in ("TTF Natural Gas", "German Power Base", "French Power Base", "EUA Carbon", "NBP Natural Gas")}
+            month = lambda p, m: float(anchor[p].set_index("delivery_month").loc[m, "price"])
+            cal = lambda p, y: float(np.average([month(p, date(y, m, 1)) for m in range(1, 13)], weights=[(_add_months(date(y, m, 1), 1) - date(y, m, 1)).days for m in range(1, 13)]))
+            assert_close(month("TTF Natural Gas", date(2026, 12, 1)), 90.95, 1e-6)
+            assert_close(month("EUA Carbon", date(2026, 12, 1)), 88.15, 1e-6)
+            assert_close(month("German Power Base", date(2027, 1, 1)), 201.0, 1e-6)
+            assert_close(month("NBP Natural Gas", date(2026, 12, 1)) * 100 / THERM_PER_MWH, 230.7, 2e-3)
+            if abs(cal("French Power Base", 2027) - 118.49) > 0.05 or abs(cal("French Power Base", 2028) - 65.14) > 0.05 or abs(cal("German Power Base", 2027) - 145.0) > 1.5:
+                raise AssertionError(f"Calendar years off: French 27 {cal('French Power Base', 2027):.2f}, 28 {cal('French Power Base', 2028):.2f}, German 27 {cal('German Power Base', 2027):.2f}")
+            storage = live["gie_agsi_history"]["data"].set_index("gasDayStart")
+            fill = float(storage.loc["2026-11-12", "full"]) if "2026-11-12" in storage.index else None
+            if fill is not None:
+                assert_close(fill, 71.0, 1e-6)
+                net = float((storage.loc["2026-11-12", "withdrawal"] - storage.loc["2026-11-12", "injection"]) / 1000)
+                if not 3.0 <= net <= 4.8:
+                    raise AssertionError(f"Net withdrawal on 12 Nov is {net:.2f} TWh/d, expected about 3.9")
+            spot = {}
+            for zone, day, level in (("France", date(2026, 11, 13), 197.25), ("Germany-Luxembourg", date(2026, 11, 9), 345.64)):
+                prices = live[f"entsoe_price|{zone}"]["data"]
+                local = prices["timestamp"].dt.tz_convert(ENTSOE_ZONES[zone]["timezone"]).dt.date
+                if (local == day).any():
+                    spot[zone] = float(prices.loc[local == day, "value"].mean())
+                    if abs(spot[zone] - level) > 0.5:
+                        raise AssertionError(f"{zone} day-ahead on {day:%d %b} is {spot[zone]:.2f}, expected {level}")
+            trades = normalise_trades(store.load_table("trades"))
+            if not trades["counterparty"].str.endswith(DEMO_COUNTERPARTY).all():
+                raise AssertionError("A demo trade isn't labelled as demo.")
+            custom, meta = store.load_custom_curves()
+            if set(custom) != set(CURVE_PRODUCTS) or {m["curve_date"] for m in meta.values()} != {today.isoformat()}:
+                raise AssertionError("Demo curves aren't complete and dated today.")
+            if store.load_snapshots()["source"].ne("Demo marks").any():
+                raise AssertionError("Demo price history isn't labelled as demo.")
+            if Path(store.path).resolve() == default_db_path().resolve():
+                raise AssertionError("The demo desk would be the live desk.")
+            return (f"{len(live)} datasets, {len(trades)} trades and {store.load_snapshots()['snapshot_date'].nunique()} days of curves. Anchors hold: TTF Dec-26 €90.95, "
+                    f"French Cal-27 €{cal('French Power Base', 2027):.2f}, EU storage {fill if fill is not None else 'n/a'}% on 12 Nov"
+                    + (f", French day-ahead €{spot['France']:.2f} on 13 Nov" if "France" in spot else "") + ". Every trade and mark is labelled demo.")
+
+    def check_energy_charts_and_builtin():
+        """Daily output from Energy-Charts replies, by hand, and the built-in history reads back in the fetched shape."""
+        start = pd.Timestamp("2026-03-28T23:00Z")   # 29 Mar 2026 in Paris, the 23-hour day when clocks go forward
+        stamps = pd.date_range(start, periods=4 * 23 + 4 * 24, freq="15min")
+        load = [50000.0] * (4 * 23) + [40000.0] * (4 * 24)
+        payload = {"unix_seconds": [int(t.timestamp()) for t in stamps],
+                   "production_types": [{"name": "Load", "data": load}, {"name": "Wind onshore", "data": [1000.0] * len(stamps)},
+                                        {"name": "Solar", "data": [None] * 40 + [200.0] * (len(stamps) - 40)}, {"name": "Fossil hard coal", "data": [5.0] * len(stamps)},
+                                        {"name": "Residual load", "data": [1.0] * len(stamps)}]}
+        daily = parse_energy_charts_power(payload, "France").set_index(["date", "series"])
+        assert_close(daily.loc[(pd.Timestamp("2026-03-29"), "load"), "value"], 50000.0)
+        assert_close(daily.loc[(pd.Timestamp("2026-03-29"), "load"), "hours"], 23)
+        assert_close(daily.loc[(pd.Timestamp("2026-03-30"), "load"), "value"], 40000.0)
+        if (pd.Timestamp("2026-03-29"), "solar") in daily.index:
+            raise AssertionError("A day with fewer than 20 hours of solar was kept.")
+        if set(daily.index.get_level_values("series")) != {"load", "wind_onshore", "solar"}:
+            raise AssertionError(f"Unexpected series: {sorted(set(daily.index.get_level_values('series')))}")
+        calls = []
+        def fake(url, params=None):
+            calls.append(params)
+            return payload
+        waits = []
+        fetch_energy_charts_daily("Germany-Luxembourg", date(2026, 1, 1), date(2026, 6, 30), fake, waits.append)
+        if len(calls) != 3 or len(waits) != 2 or min(waits) < 30:
+            raise AssertionError(f"Expected three spaced requests, got {len(calls)} with waits {waits}.")
+        items = builtin_history_items()
+        if BUILTIN_HISTORY and not ({"fund_daily|France", "fund_daily|Germany-Luxembourg", "fund_weather_history"} <= set(items) <= set(BUILTIN_KEYS)):
+            raise AssertionError(f"Built-in history holds {sorted(items)}")
+        for key, item in items.items():
+            if item["data"].empty:
+                raise AssertionError(f"Built-in {key} is empty.")
+        tables = {z: fundamentals_table(items[f"fund_daily|{z}"]["data"], None, None, z) for z in ("France", "Germany-Luxembourg") if f"fund_daily|{z}" in items}
+        short = [z for z, t in tables.items() if t[["load", "wind", "solar"]].dropna().shape[0] < FUND_MIN_TRAIN + 30]
+        if short:
+            raise AssertionError(f"Built-in output history too short for {short}.")
+        return (f"Energy-Charts days by hand, including the 23-hour day; three requests spaced {min(waits):.0f} s apart for half a year. "
+                + (f"Built-in history from {BUILTIN_HISTORY_MADE}: " + ", ".join(f"{k} {len(v['data']):,} rows" for k, v in items.items()) if BUILTIN_HISTORY else "No history built in."))
     cases = [
+        ("Demo market: anchors, datasets and its own desk", "Demo data", check_demo_market),
+        ("Energy-Charts output and built-in history", "Fundamentals outlook", check_energy_charts_and_builtin),
         ("Product registry and market timezones", "Configuration", check_product_registry),
         ("MWh ↔ MMBtu conversions", "Units & conversions", check_energy_conversion),
         ("EUR/MWh → GBP/therm conversion", "Units & conversions", check_gas_price_conversion),
@@ -11551,7 +12723,6 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("School and regional holidays", "Fundamentals outlook", check_holidays),
         ("Published forecasts combined with the models", "Fundamentals outlook", check_combined_forecast),
         ("Wind-farm and solar-park points", "Fundamentals outlook", check_outlook_points),
-        ("Each page updates only its own sources", "Data updates", check_page_updates),
         ("Chances for the next day", "Next-day estimate", check_estimate_chances),
         ("Holidays and kinds of day", "Next-day estimate", check_estimate_calendar),
         ("Weather across a zone in one request", "Live API integration", check_zone_weather_fetch),
@@ -11592,6 +12763,27 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
 # =============================================================================
 # SECTION 8 · PAGES
 # =============================================================================
+_run_checks_as_built = run_model_validation
+
+
+def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """The checks test the live code paths in either mode. From a demo session they run with saving switched off,
+    so they can't open or write to the live desk."""
+    held = {key: st.session_state[key] for key in ("demo_mode", "desk_store") if key in st.session_state}
+    was_demo = demo_mode()
+    st.session_state.demo_mode = False
+    if was_demo:
+        st.session_state.desk_store = None
+    try:
+        return _run_checks_as_built(current_trades, current_curves)
+    finally:
+        for key in ("demo_mode", "desk_store"):
+            if key in held:
+                st.session_state[key] = held[key]
+            else:
+                st.session_state.pop(key, None)
+
+
 def fx_controls(prefix: str) -> tuple[float, float]:
     """FX inputs shared by every page that consolidates currencies. Saved across sessions."""
     c1, c2, c3 = st.columns([1, 1, 1.2], vertical_alignment="bottom")
@@ -11794,12 +12986,13 @@ def page_market_overview():
 
 def page_power_spot():
     title_block("Power spot", "Compare day-ahead prices across bidding zones: levels, shape, spreads and what wind and solar actually earn.")
-    zones = list(ENTSOE_ZONES)
+    zones = [z for z in ENTSOE_ZONES if z in _live_variants("entsoe_price")] if demo_mode() else list(ENTSOE_ZONES)
     with st.container(key="panel"):
         c1, c2, c3 = st.columns([3, 1, 1], vertical_alignment="bottom")
         selected = c1.multiselect("Bidding zones", zones, default=[z for z in ("France", "Germany-Luxembourg", "Netherlands") if z in zones], key="spot_zones")
         horizon = c2.selectbox("Period", [7, 30, 90, 365], index=1, format_func=lambda d: f"Last {d} days", key="spot_days")
-        fetch = c3.button("Fetch prices", type="primary", width="stretch", key="spot_fetch", disabled=not selected)
+        fetch = c3.button("Fetch prices", type="primary", width="stretch", key="spot_fetch", disabled=not selected or demo_mode(),
+                          help="Demo zones are France and Germany. Choose Live in the sidebar to fetch other zones." if demo_mode() else None)
     if fetch:
         token = resolved_credentials()["entsoe"]
         end = date.today() + timedelta(days=2)
@@ -12009,7 +13202,7 @@ def page_forward_curves():
     product_days = sorted(history.loc[history["product"].eq(selected), "snapshot_date"].unique()) if not history.empty else []
     previous = [d for d in product_days if d < valuation_date.isoformat()]
     if curve.empty:
-        st.info(f"No live price for {selected} yet. Select Update this page, or import a curve below. Only live prices are shown: to fill gaps with demo prices, tick that option under the update button.")
+        st.info(f"No live price for {selected} yet. Select Update market data, or import a curve below. Only live prices are shown: to fill gaps with demo prices, tick that option under the update button.")
     else:
         after_current = curve.loc[curve["delivery_month"] > pd.Timestamp(valuation_date.replace(day=1))]
         first = after_current.iloc[0] if not after_current.empty else curve.iloc[0]
@@ -12032,7 +13225,10 @@ def page_forward_curves():
     state = product_price_state(selected)
     counts = pd.Series(list(sources_here.values())).value_counts()
     mix = "; ".join(f"{n} month{'s' if n > 1 else ''} {label.lower() if label != 'Demo' else 'demo prices'}" for label, n in counts.items())
-    if selected in TRADINGVIEW_CURVES:
+    if demo_mode():
+        st.info(f"Demo curve for {valuation_date:%d %b %Y}, built from real closes of {DEMO_ANCHOR_DAY:%d %b} (see Data & Assumptions for each level). "
+                "Near months move with the day's market and later months less, as on a real curve. It isn't a quote.")
+    elif selected in TRADINGVIEW_CURVES:
         meta = st.session_state.get("curve_metadata", {}).get(selected, {})
         from_tv = meta.get("source_type") == "TradingView" and selected in st.session_state.get("custom_curves", {})
         status, action = st.columns([4, 1])
@@ -12050,11 +13246,15 @@ def page_forward_curves():
                 if start_update(tasks=tradingview_tasks(True)):
                     st.rerun()
         st.caption("Through tvdatafeed: prices are delayed, the library is unofficial and can stop working when TradingView changes, and TradingView's terms don't allow automated access, so keep this to personal use.")
-    if selected in st.session_state.get("custom_curves", {}):
+    if demo_mode():
+        pass
+    elif selected in st.session_state.get("custom_curves", {}):
         meta = st.session_state.get("curve_metadata", {}).get(selected, {})
         marked = curve_mark_date(meta)
         st.caption(f"Imported marks{f' dated {marked:%d %b %Y}' if marked else ''}. Check your data licence. Months: {mix}.")
-    if state in ("Demo", "Part real", "Old"):
+    if demo_mode():
+        pass
+    elif state in ("Demo", "Part real", "Old"):
         st.warning(f"This curve isn't fully real. Months: {mix}. Add real marks in the views below to replace the demo prices.")
     elif selected not in st.session_state.get("custom_curves", {}):
         st.caption(f"Real prices from free sources. Months: {mix}.")
@@ -12547,7 +13747,7 @@ def page_market_read():
                 ranked = sorted(live, key=lambda s: -s["weight"] * abs(s["score"]))
                 st.markdown("".join(_evidence_row(s) for s in ranked), unsafe_allow_html=True)
             else:
-                need_data_note("No evidence for this market yet. Select Update this page and it will load.")
+                need_data_note("No evidence for this market yet. Select Update market data and it will load.")
             left, right = st.columns(2, gap="large")
             with left:
                 st.subheader("What would change this read")
@@ -12777,7 +13977,7 @@ def render_curve_status() -> None:
     current = sum(1 for r in rows if r["Status"] == "Current")
     st.caption(f"{current} of {len(rows)} curves are current. Marks older than {CURVE_STALE_DAYS} days count as out of date, and those older than {STALE_DAYS} days no longer feed Market Read.")
     st.subheader("Add marks without opening the app")
-    st.markdown(f"Save your broker sheet or settlement file in the folder below. New files are imported when you open the app or select Update this page.\n\n`{curve_folder()}`")
+    st.markdown(f"Save your broker sheet or settlement file in the folder below. New files are imported when you open the app or select Update market data.\n\n`{curve_folder()}`")
     left, right = st.columns(2)
     with left:
         st.download_button("Download a template", data=curve_template_csv(today), file_name="curve_template.csv", mime="text/csv", key="curve_template")
@@ -12857,7 +14057,7 @@ def render_track_record() -> None:
     if replayed:
         parts.append("<p>On past data, without forecasts or curve signals:</p>" + "".join(f"<p>{line(r)}</p>" for r in replayed))
     if not rows:
-        parts.append('<p class="soft">Select Update this page to load prices. Past reads are then rebuilt and scored here.</p>')
+        parts.append('<p class="soft">Select Update market data to load prices. Past reads are then rebuilt and scored here.</p>')
     with st.container(key="hero"):
         st.markdown(f'<div class="desk-note">{"".join(parts)}</div>', unsafe_allow_html=True)
     if not paths["European gas"]["days"]:
@@ -12937,7 +14137,7 @@ def render_winter_outlook() -> None:
         second = (f"The coldest winter of the past {len(outlook['years'])} would take it to <b>{scenarios[0]['end']:.0f}%</b>{comparison(scenarios[0]['end'])}, "
                   f"and the mildest to <b>{scenarios[2]['end']:.0f}%</b>{comparison(scenarios[2]['end'])}.")
     else:
-        second = "This repeats past withdrawals because the weather history isn't loaded, so it doesn't separate weather from anything else. Select Update this page to load it."
+        second = "This repeats past withdrawals because the weather history isn't loaded, so it doesn't separate weather from anything else. Select Update market data to load it."
     if outlook["error"] is not None and weather_based:
         beat = outlook["error"] < outlook["average_error"]
         third = (f"Tested on {len(outlook['backtest'])} past winters with their actual weather, the method missed the March level by {outlook['error']:.1f} points on average, "
@@ -13327,14 +14527,16 @@ def build_brief() -> dict:
     if marks_note:
         warnings_.append(marks_note)
     if not metrics.get("EU storage fill"):
-        warnings_.append("There's no storage data yet. Select Update this page.")
+        warnings_.append("There's no storage data yet. Select Update market data.")
     priced = list(dict.fromkeys(held_products + ["TTF Natural Gas", "French Power Base", "German Power Base"]))
     return {"prices_used": prices_used_lines(priced), "book_note": src_book(), "alerts": threshold_alerts(rules, metrics), "changes": changes, "reads": reads, "pnl_text": pnl_text, "drivers": drivers, "estimates": estimates,
             "outlook": outlook_text, "warnings": warnings_}
 
 
 def brief_pdf(brief: dict) -> bytes:
-    blocks: list[tuple] = [("title", "Morning brief"), ("subtitle", f"Meridian, {valuation_date:%A %d %B %Y}. Screening analysis, not investment advice.")]
+    blocks: list[tuple] = [("title", "Morning brief" + (" (demo data)" if demo_mode() else "")),
+                           ("subtitle", f"Meridian, {valuation_date:%A %d %B %Y}. Screening analysis, not investment advice."
+                                        + (f" Demo market built from real closes of {DEMO_ANCHOR_DAY:%d %b %Y}: no price here is live." if demo_mode() else ""))]
     if brief["warnings"]:
         blocks += [("note", w) for w in brief["warnings"]]
     if brief["alerts"]:
@@ -13439,7 +14641,7 @@ def _vol_note(name: str, measured: dict) -> str:
 def render_storage_valuation() -> None:
     curve = _forward_months("TTF Natural Gas", 24)
     if len(curve) < 6:
-        need_data_note("This needs at least six months of live TTF prices. Select Update this page.")
+        need_data_note("This needs at least six months of live TTF prices. Select Update market data.")
         return
     measured = curve_volatility(saved_snapshots(), "TTF Natural Gas")
     with st.container(key="panel"):
@@ -13521,7 +14723,7 @@ def render_plant_valuation() -> None:
     power, gas, carbon = _forward_months(choice, horizon), _forward_months("TTF Natural Gas", horizon), _forward_months("EUA Carbon", horizon)
     months = power.merge(gas, on="delivery_month", suffixes=("_power", "_gas")).merge(carbon[["delivery_month", "price"]].rename(columns={"price": "price_carbon"}), on="delivery_month")
     if len(months) < 3:
-        need_data_note("This needs live power, TTF and EUA prices for the same months. Select Update this page.")
+        need_data_note("This needs live power, TTF and EUA prices for the same months. Select Update market data.")
         return
     history = saved_snapshots()
     measured = {"power": curve_volatility(history, choice), "gas": curve_volatility(history, "TTF Natural Gas"), "carbon": curve_volatility(history, "EUA Carbon")}
@@ -13888,7 +15090,7 @@ def page_market_fundamentals():
         st.rerun()
 
     if not data_items:
-        st.info("No market data yet. Select Update this page in the sidebar.")
+        st.info("No market data yet. Select Update market data in the sidebar.")
     else:
         status_rows = []
         for key, item in data_items.items():
@@ -13968,7 +15170,7 @@ def page_market_fundamentals():
         table(pd.DataFrame(insights)[["Topic", "Observation"]])
         st.caption("These describe observations only. Check weather, consumption, imports and LNG together before forming a price view. Reference-city weather isn't a national forecast.")
     else:
-        st.info("Select Update this page in the sidebar to see what the data shows.")
+        st.info("Select Update market data in the sidebar to see what the data shows.")
 
     fund_tabs = view_tabs(["Gas storage", "Winter outlook", "LNG", "Power", "Gas flows", "Weather", "Cross-market analysis"])
     if fund_tabs[1]:
@@ -14021,7 +15223,7 @@ def page_market_fundamentals():
                     chart(fig_fill)
             table(data)
         else:
-            st.info("Select Update this page in the sidebar to load storage.")
+            st.info("Select Update market data in the sidebar to load storage.")
 
     if fund_tabs[2]:
         data = _live_dataset_frame("gie_alsi")
@@ -14043,7 +15245,7 @@ def page_market_fundamentals():
                 chart(fig)
             table(data)
         else:
-            st.info("Select Update this page in the sidebar to load LNG data.")
+            st.info("Select Update market data in the sidebar to load LNG data.")
 
     if fund_tabs[3]:
         st.subheader("Power prices, load and generation")
@@ -14080,7 +15282,7 @@ def page_market_fundamentals():
                     chart(fig, max(300, 30 * len(mix) + 90))
                 table(data, height=300)
         else:
-            need_data_note("Select Update this page in the sidebar to load prices, load and generation.")
+            need_data_note("Select Update market data in the sidebar to load prices, load and generation.")
 
     if fund_tabs[4]:
         data = _live_dataset_frame("entsog_flow")
@@ -14150,7 +15352,7 @@ def page_market_fundamentals():
                     st.download_button("Download hourly weather (CSV)", hourly_weather.to_csv(index=False).encode("utf-8"), file_name="open_meteo_hourly_weather.csv", mime="text/csv", key="fundamentals_download_weather_hourly")
             st.caption("HDD/CDD use simple daily-mean-temperature bases of 18°C/22°C. Wind at 100 m and shortwave radiation are renewable-resource proxies—not generation forecasts. Representative city points are not national weighted averages. Source: Open-Meteo (CC BY 4.0; attribution required).")
         else:
-            st.info("Select Update this page in the sidebar to load the forecast.")
+            st.info("Select Update market data in the sidebar to load the forecast.")
 
     if fund_tabs[6]:
         st.subheader("Residual load against day-ahead price")
@@ -14174,7 +15376,7 @@ def page_market_fundamentals():
             st.metric("Correlation in this sample", f"{corr:.3f}" if pd.notna(corr) else "Not enough overlap", help="Describes this sample only. It doesn't show cause and isn't a signal.")
             st.download_button("Download as CSV", residual.to_csv(index=False).encode("utf-8"), file_name="meridian_power_context.csv", mime="text/csv", key="download_residual_load_context")
         else:
-            need_data_note("Select Update this page in the sidebar. This view needs prices, load and generation for the same zone, and never combines different zones.")
+            need_data_note("Select Update market data in the sidebar. This view needs prices, load and generation for the same zone, and never combines different zones.")
 
     with st.expander("How to read these indicators"):
         st.markdown("- **GIE AGSI+ and ALSI:** storage and LNG data give gas supply context. Attribution to GIE is required.\n"
@@ -14242,8 +15444,9 @@ def page_live_data_integrations():
     with st.container(key="panel"):
         c1, c2 = st.columns([1, 2.6], vertical_alignment="center")
         with c1:
-            update_button("live_update_all", "Update all sources", every_source=True)
-        c2.caption("Fetches what's new for every page. Each page also updates its own sources when you open it: the table below says which.")
+            update_button("live_update_all", "Update all sources")
+        c2.caption("Fetches only what's new from ENTSO-E, GIE, Open-Meteo, Energy-Charts, Trading Hub Europe and the ECB. You don't need to enter any key, "
+                   "and the Fundamentals Outlook works without one: its daily output comes from Energy-Charts when there's no ENTSO-E key.")
         results = st.session_state.get("update_results") or []
         if results:
             table(pd.DataFrame([{"Source": n, "Result": "Updated" if good else "Failed", "Detail": d} for n, good, d in results]))
@@ -14252,15 +15455,10 @@ def page_live_data_integrations():
                 report = update_report()
                 st.code(report, language=None)
                 st.download_button("Download the report", report, file_name="meridian_update_report.txt", key="update_report_download")
-    st.markdown("**What each page updates.** Opening a page fetches only these sources, and only those older than their refresh interval "
-                "(an hour for forward curves, a few hours for prices, weather and fundamentals, a month for temperature normals). "
-                "Update this page in the sidebar fetches them again straight away.")
-    shown = page_update_table()
-    table(shown.drop(columns="Sources"))
-    with st.expander("Where each source comes from"):
-        table(pd.DataFrame([{"Source": UPDATE_GROUP_SHORT[g], "Provider and data": UPDATE_GROUPS[g],
-                             "Pages": ", ".join(p for p, gs in PAGE_UPDATES.items() if g in gs),
-                             "Last fetched": _ago(group_fetched_at(g)) if group_fetched_at(g) else "Not loaded"} for g in UPDATE_GROUPS]))
+    if demo_mode():
+        st.info("In demo, every source holds demo data in the provider's own format, so each page works as it would live. "
+                "Keys, manual fetches and provider imports are on the live desk: choose Live in the sidebar to use them.")
+        return
     saved = resolved_credentials()
     with st.expander("Replace an access key", expanded=False):
         st.caption("You only need this to use a different key. Your saved keys come from the keys file beside the app and are never sent to your browser, so these fields stay empty. A key pasted here lasts for this session. To change one permanently, edit meridian_keys.toml.")
@@ -14537,6 +15735,18 @@ def page_live_data_integrations():
 
 def page_data_assumptions():
     title_block("Data and assumptions", "Products, curve coverage, conversions, saved data and the limits of this model.")
+    with st.expander("How the demo market is built", expanded=demo_mode()):
+        st.markdown(f"{DEMO_STORY} The demo rebuilds that market for {date.today():%d %b %Y} from the real levels below.")
+        table(demo_anchor_table())
+        st.markdown(
+            "- **Curves** take the shape of each product's curve on the anchor day. Since then they follow a random walk: near months move most, later months less.\n"
+            "- **Weather** drives everything physical: temperature sets demand, wind and solar set renewable output, and what's left is residual load.\n"
+            "- **Day-ahead prices** come from residual load through a merit order priced off that day's gas, coal and carbon, then are scaled so the reported averages come out exactly.\n"
+            "- **Storage, LNG and gas use** follow this year's path to 71% full in mid-November, with withdrawals near 3.9 TWh a day.\n"
+            "- **Nuclear outages, forecasts, holidays and the book** are made to match: notices run late, forecasts carry typical errors, and trades were struck at the curve of their day.\n\n"
+            "The demo has its own database. Nothing in it is saved to your desk, and nothing you fetch in Live goes into it.")
+    with st.expander("Real history built into the app"):
+        st.markdown(builtin_history_text())
     st.subheader("Products")
     registry = pd.DataFrame([{"Product": p, "Commodity": s["commodity"], "Zone": s["zone"], "Currency": s["currency"], "Unit": s["unit"],
                               "Profile": s.get("profile", "n/a").title(), "Timezone": s["timezone"], "Tradable": p in PRODUCTS} for p, s in CURVE_PRODUCTS.items()])
@@ -14562,7 +15772,10 @@ def page_data_assumptions():
         live_rows.append({"Dataset": item.get("label", dataset_key), "Rows": len(frame) if isinstance(frame, pd.DataFrame) else 0,
                           "Latest observation": _latest_observation_date(frame) if is_loaded else None, "Fetched (UTC)": item.get("fetched_at", "")})
     if store is not None:
-        st.write(f"Your book, curves, {days} day{'s' if days != 1 else ''} of curve history and fetched data are saved in `{store.path}`. API keys are never written there. Copy this file to back up the desk.")
+        if demo_mode():
+            st.write("In demo, everything is held in a copy of today's demo desk for this session. Your own desk file isn't opened.")
+        else:
+            st.write(f"Your book, curves, {days} day{'s' if days != 1 else ''} of curve history and fetched data are saved in `{store.path}`. API keys are never written there. Copy this file to back up the desk.")
     else:
         st.warning(f"Saving is unavailable, so changes last until this tab closes. {st.session_state.get('desk_store_error', '')}")
     if live_rows:
@@ -14700,6 +15913,7 @@ def main() -> None:
         import_curve_folder()
     curves = build_curves()
     ensure_daily_snapshot()
+    maybe_auto_update()
     try:
         record_market_reads()
     except Exception as exc:
@@ -14708,10 +15922,6 @@ def main() -> None:
     pending_nav_page = st.session_state.pop("pending_nav_page", None)
     if pending_nav_page:
         set_nav_page(str(pending_nav_page))
-    if st.session_state.get("nav_page") not in ALL_NAV_ITEMS:
-        st.session_state.nav_page = DEFAULT_NAV_ITEM
-    # Only the open page's stale sources, before the sidebar draws, so its progress shows straight away.
-    maybe_auto_update(NAV_TO_PAGE[st.session_state.nav_page])
     page = render_sidebar()
     st.markdown(page_accent_css(st.session_state.nav_page), unsafe_allow_html=True)
     flash_message = st.session_state.pop("flash_message", None)
@@ -14730,4 +15940,10 @@ def test_model_validation_suite() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--build-history" in sys.argv:
+        # Developer step: fetch the Fundamentals Outlook's history from the free sources and build it into this file.
+        print("Fetching about 600 days of output, weather, gas use and holidays. Energy-Charts allows two requests a minute, so this takes about ten minutes.")
+        print(write_builtin_history(Path(__file__).resolve()))
+    else:
+        main()
