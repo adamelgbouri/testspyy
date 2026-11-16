@@ -2689,13 +2689,13 @@ def project_winter(history: pd.DataFrame, archive: pd.DataFrame, daily_weather: 
         return {"ready": False, "off_season": True, "reason": "The winter projection runs from October to March. It starts again on 1 October."}
     fill = daily_fill(history)
     if fill.dropna().empty:
-        return {"ready": False, "off_season": False, "reason": "Select Update market data to load storage history."}
+        return {"ready": False, "off_season": False, "reason": "Select Update this page to load storage history."}
     fill = fill.dropna()
     fill = fill.asfreq("D")
     start_stamp = fill.dropna().index[-1]
     start = start_stamp.date()
     if (today - start).days > STALE_DAYS:
-        return {"ready": False, "off_season": False, "reason": f"Storage data is {(today - start).days} days old. Select Update market data."}
+        return {"ready": False, "off_season": False, "reason": f"Storage data is {(today - start).days} days old. Select Update this page."}
     year = winter_of(today)
     end = date(year + 1, 3, 31)
     days = pd.date_range(start + timedelta(days=1), end, freq="D")
@@ -2744,7 +2744,7 @@ def project_winter(history: pd.DataFrame, archive: pd.DataFrame, daily_weather: 
     else:
         changes = past_winter_changes(fill, start, year)
         if len(changes) < OUTLOOK_MIN_WINTERS:
-            return {"ready": False, "off_season": False, "reason": "Select Update market data to load six years of storage history and the weather archive."}
+            return {"ready": False, "off_season": False, "reason": "Select Update this page to load six years of storage history and the weather archive."}
         biggest, smallest = min(changes, key=changes.get), max(changes, key=changes.get)
         def analog(winter: int) -> np.ndarray:
             mapped = pd.DatetimeIndex([_in_other_winter(d.date(), year, winter) for d in days])
@@ -2794,7 +2794,7 @@ def outlook_signal(outlook: Optional[dict]) -> Optional[dict]:
         return _signal("winter_outlook", name, 2.0, missing=outlook["reason"])
     band = outlook.get("band_end")
     if not band or outlook.get("basis") != "weather":
-        return _signal("winter_outlook", name, 2.0, missing="Select Update market data to load the weather archive and the five-year range.")
+        return _signal("winter_outlook", name, 2.0, missing="Select Update this page to load the weather archive and the five-year range.")
     central = outlook["scenarios"][outlook["central"]]["end"]
     gap = central - band["average"]
     return _signal("winter_outlook", name, 2.0, -gap / max((band["high"] - band["low"]) / 2.0, 5.0),
@@ -3164,11 +3164,11 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
     """
     base = daily_base_prices(series)
     if zone not in ZONE_WEATHER or len(base) < ESTIMATE_MIN_DAYS + 20:
-        return {"ready": False, "reason": f"This needs at least {ESTIMATE_MIN_DAYS + 20} days of day-ahead prices. Select Update market data."}
+        return {"ready": False, "reason": f"This needs at least {ESTIMATE_MIN_DAYS + 20} days of day-ahead prices. Select Update this page."}
     target = base.index[-1] + pd.Timedelta(days=1)
     weather, basis = _weather_for_estimate(zone, history, daily, grid_history, grid_forecast, target, weather_vintage)
     if weather.empty:
-        return {"ready": False, "reason": "This needs the wind and solar history. Select Update market data."}
+        return {"ready": False, "reason": "This needs the wind and solar history. Select Update this page."}
     frame = estimate_features(base, weather, target, zone)
     known = frame.iloc[:-1].dropna(subset=["base", *ESTIMATE_COLUMNS])
     ahead = frame.iloc[[-1]]
@@ -3220,7 +3220,7 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
     target_has_forecast = forecast_final is not None and not forecast_frame.iloc[[-1]][list(FORECAST_COLUMNS)].isna().any(axis=None)
     use_forecasts = target_has_forecast and comparison is not None and comparison["forecasts"] <= comparison["weather"]
     if not use_forecasts and not weather_ready:
-        return {"ready": False, "reason": f"There's no weather forecast for {target:%d %b}. Select Update market data."}
+        return {"ready": False, "reason": f"There's no weather forecast for {target:%d %b}. Select Update this page."}
     chosen = forecast_test if use_forecasts else test
     errors = (chosen["actual"] - chosen["estimate"]).to_numpy(float)
     value = float(_apply_estimate(forecast_final, forecast_frame.iloc[[-1]], FORECAST_COLUMNS)[0]) if use_forecasts else float(_apply_estimate(final, ahead, weather_columns)[0])
@@ -4283,9 +4283,9 @@ def power_fundamentals(zone: str, table: pd.DataFrame, weather: pd.DataFrame, en
     needed = FUND_MIN_TRAIN + 30
     if table is None or table.empty or table[["load", "wind", "solar"]].dropna().shape[0] < needed:
         held = 0 if table is None or table.empty else table[["load", "wind", "solar"]].dropna().shape[0]
-        return {"ready": False, "reason": f"This needs at least {needed} days of demand, wind and solar output for {zone}; {held} are held. Select Update market data."}
+        return {"ready": False, "reason": f"This needs at least {needed} days of demand, wind and solar output for {zone}; {held} are held. Select Update this page."}
     if weather is None or weather[["temperature", "wind_land", "solar"]].dropna().shape[0] < needed:
-        return {"ready": False, "reason": f"This needs at least {needed} days of weather across {zone}. Select Update market data."}
+        return {"ready": False, "reason": f"This needs at least {needed} days of weather across {zone}. Select Update this page."}
     days = pd.date_range(table.index.min(), max(table.index.max(), weather.index.max()), freq="D")
     data = table.reindex(days)
     shares = holiday_shares(days, zone, holidays)
@@ -4378,7 +4378,7 @@ def power_fundamentals(zone: str, table: pd.DataFrame, weather: pd.DataFrame, en
     ahead = np.arange(last + 1, min(len(days), last + 1 + FUND_OUTLOOK_DAYS + 1))
     ahead = ahead[~design.iloc[ahead][inputs["load"] + inputs["wind"] + inputs["solar"]].isna().any(axis=1).to_numpy()]
     if not len(ahead):
-        return {"ready": False, "reason": f"The weather forecast for {zone} doesn't reach past the last day of output held. Select Update market data."}
+        return {"ready": False, "reason": f"The weather forecast for {zone} doesn't reach past the last day of output held. Select Update this page."}
     now = {name: float(level[name].iloc[:last + 1].dropna().iloc[-1]) if level[name].iloc[:last + 1].notna().any() else 1.0 for name in level}
     lead_days = ahead - last
     nuclear_from, unavailable_ahead = "Last week", np.full(len(ahead), np.nan)
@@ -4504,9 +4504,9 @@ def gas_demand_model(consumption: Optional[pd.DataFrame], weather: pd.DataFrame,
     That gives heating, power and industry. Gas per unit of power is fitted, within the range real plants have."""
     needed = FUND_MIN_TRAIN + 30
     if consumption is None or consumption.empty or consumption["small"].notna().sum() < needed:
-        return {"ready": False, "reason": f"This needs at least {needed} days of German gas consumption from Trading Hub Europe. Select Update market data."}
+        return {"ready": False, "reason": f"This needs at least {needed} days of German gas consumption from Trading Hub Europe. Select Update this page."}
     if weather is None or weather["temperature"].notna().sum() < needed:
-        return {"ready": False, "reason": f"This needs at least {needed} days of weather across Germany. Select Update market data."}
+        return {"ready": False, "reason": f"This needs at least {needed} days of weather across Germany. Select Update this page."}
     held = consumption.assign(date=pd.to_datetime(consumption["gas_day"])).drop_duplicates("date", keep="last").set_index("date").sort_index()
     days = pd.date_range(max(held.index.min(), weather.index.min()), max(held.index.max(), weather.index.max()), freq="D")
     data = held.reindex(days)[["small", "large"]].astype(float)
@@ -4569,7 +4569,7 @@ def gas_demand_model(consumption: Optional[pd.DataFrame], weather: pd.DataFrame,
     ahead = position[(position > last_large) & (position <= last_large + FUND_OUTLOOK_DAYS + 2)]
     ahead = ahead[~design.iloc[ahead][small_columns + large_columns].isna().any(axis=1).to_numpy()]
     if not len(ahead):
-        return {"ready": False, "reason": "The weather forecast for Germany doesn't reach past the last gas day held. Select Update market data."}
+        return {"ready": False, "reason": "The weather forecast for Germany doesn't reach past the last gas day held. Select Update this page."}
     central = parts(design.iloc[ahead], power_ahead.iloc[ahead].to_numpy(float))
     published = data["small"].iloc[ahead].to_numpy(float)
     outlook = pd.DataFrame({"date": days[ahead], "lead": ahead - last_large, "small": np.where(np.isnan(published), central["small"], published),
@@ -7626,6 +7626,64 @@ STALE_HOURS = {"tradingview": 1.0, "prices": 6.0, "fundamentals": 6.0, "weather"
 KEEP_DAYS = {"prices": 400, "load": 90, "generation": 90, "lng": 400}
 MAX_UPDATE_WORKERS = 8          # the providers allow far more; this keeps the first update short
 TRADINGVIEW_WORKERS = 2         # TradingView gets its own small lane: asked too fast, it drops requests
+PAGE_RECHECK_SECONDS = 600      # a page left open looks again for stale sources after this long
+
+# Each source the app fetches belongs to one group, and each page names the groups it shows.
+# Opening a page updates only those groups, and only where they are stale.
+UPDATE_GROUPS = {
+    "curves": "Forward curves (TradingView)",
+    "eua_auctions": "EUA auction prices (EEX)",
+    "fx": "FX rates (ECB)",
+    "prices": "Day-ahead prices (ENTSO-E)",
+    "power_system": "Load and generation (ENTSO-E)",
+    "power_forecasts": "Load, wind and solar forecasts (ENTSO-E)",
+    "power_flows": "Saved cross-border flows (ENTSO-E)",
+    "storage": "Gas storage (GIE)",
+    "lng": "LNG terminals (GIE)",
+    "gas_flows": "Saved gas flow point (ENTSOG)",
+    "weather": "Weather forecast (Open-Meteo)",
+    "weather_history": "Temperature history and normals (Open-Meteo)",
+    "zone_weather": "Weather across power zones (Open-Meteo)",
+    "ttf_front": "TTF front-month history (TradingView)",
+    "outlook_output": "Output history for the outlook (ENTSO-E)",
+    "outlook_weather": "16-day weather for the outlook (Open-Meteo)",
+    "scenarios": "Weather scenarios (ECMWF, Open-Meteo)",
+    "nuclear_outages": "Nuclear outage notices (ENTSO-E)",
+    "holidays": "School and regional holidays (OpenHolidays)",
+    "gas_use": "German gas use (THE)",
+}
+UPDATE_GROUP_SHORT = {"curves": "Curves", "eua_auctions": "EUA auctions", "fx": "FX", "prices": "Spot prices", "power_system": "Load and output",
+                      "power_forecasts": "Load and renewables forecasts", "power_flows": "Power flows", "storage": "Gas storage", "lng": "LNG",
+                      "gas_flows": "Gas flows", "weather": "Weather", "weather_history": "Normals", "zone_weather": "Zone weather",
+                      "ttf_front": "TTF front month", "outlook_output": "Output history", "outlook_weather": "16-day weather",
+                      "scenarios": "Weather scenarios", "nuclear_outages": "Nuclear outages", "holidays": "Holidays", "gas_use": "German gas use"}
+_MARKS = ("curves", "eua_auctions", "prices")               # forward curves, with real prices put in
+_BOOK = _MARKS + ("fx",)                                    # anything valued in euros from the book
+_ESTIMATE = ("prices", "power_system", "power_forecasts", "zone_weather", "ttf_front")   # the next-day price estimate
+_GAS = ("storage", "lng", "weather", "weather_history")
+PAGE_UPDATES = {
+    "Market Overview": _BOOK + _GAS,
+    "Morning Brief": _BOOK + _GAS + _ESTIMATE,
+    "Market Read": _MARKS + _GAS + _ESTIMATE,
+    "Market Fundamentals": _GAS + ("prices", "power_system", "power_flows", "gas_flows"),
+    "Fundamentals Outlook": ("power_system", "power_forecasts", "outlook_output", "outlook_weather", "scenarios", "nuclear_outages", "holidays", "gas_use"),
+    "Power Spot": _ESTIMATE + ("weather",),
+    "Spreads & Margins": _BOOK,
+    "Forward Curves": _MARKS,
+    "OTC Quote Builder": _BOOK,
+    "Asset Valuation": _MARKS,
+    "Trading Book & MtM": _BOOK,
+    "Daily P&L": _BOOK,
+    "Risk & Exposure": _BOOK,
+    "Hedge Advisor": _BOOK,
+    "Physical Operations": (),
+    "Live Data Integrations": ("prices", "power_system", "storage", "lng", "weather", "fx"),
+    "Data & Assumptions": _BOOK,
+    "Model Validation": (),
+}
+PAGE_UPDATES = {page: tuple(dict.fromkeys(groups)) for page, groups in PAGE_UPDATES.items()}   # each source once
+ENTSOE_GROUPS = {"entsoe_price": "prices", "entsoe_load": "power_system", "entsoe_generation": "power_system",
+                 "entsoe_load_forecast": "power_forecasts", "entsoe_renewable_forecast": "power_forecasts", "entsoe_flow": "power_flows"}
 
 
 @dataclass
@@ -7636,6 +7694,7 @@ class UpdateTask:
     apply: Callable[[object], str]
     start: Optional[date] = None
     lane: str = "main"
+    group: str = ""
 
 
 def merge_observations(old: Optional[pd.DataFrame], new: pd.DataFrame, keys: Sequence[str],
@@ -7701,20 +7760,26 @@ def _needs_update(key: str, kind: str, force: bool) -> bool:
     return force or age is None or age >= STALE_HOURS[kind]
 
 
-def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[UpdateTask]:
-    """Forward curves from TradingView, the default source of marks for every product it lists. Refreshed hourly."""
+def tradingview_tasks(force: bool = True, today: Optional[date] = None, groups: Optional[Sequence[str]] = None) -> list[UpdateTask]:
+    """Forward curves from TradingView, the default source of marks for every product it lists. Refreshed hourly.
+    The TTF front-month history, used by the next-day estimate, is its own group."""
     today = today or date.today()
+    want_curves, want_front = groups is None or "curves" in groups, groups is None or "ttf_front" in groups
+    if not (want_curves or want_front):
+        return []
     if not tradingview_available():
+        if not want_curves:
+            return []
         def missing() -> None:
             raise RuntimeError(f"Forward curves are on demo prices because tradingview-datafeed isn't installed. Run: {TRADINGVIEW_INSTALL}, then restart the app.")
-        return [UpdateTask("Forward curves from TradingView", missing, lambda _: "")]
+        return [UpdateTask("Forward curves from TradingView", missing, lambda _: "", group="curves")]
     if not _needs_update("tradingview_curves", "tradingview", force):
         return []
     keys = resolved_credentials()
     login = (keys["tradingview_user"], keys["tradingview_password"])
     metadata = st.session_state.get("curve_metadata", {})
     tasks = []
-    for tv_product in TRADINGVIEW_CURVES:
+    for tv_product in (TRADINGVIEW_CURVES if want_curves else ()):
         held = metadata.get(tv_product, {}) if tv_product in st.session_state.get("custom_curves", {}) else {}
         from_tv = held.get("source_type") == "TradingView"
         bars = TRADINGVIEW_UPDATE_BARS if from_tv else TRADINGVIEW_HISTORY_BARS
@@ -7726,7 +7791,7 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[
             return fetch_tradingview_curve(product, today, bars, *login, near_only=near_only)
         def apply_tv(raw: pd.DataFrame, product=tv_product, near_only=near_only) -> str:
             return apply_tradingview_curve(product, raw, near_only)
-        tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv, lane="tradingview"))
+        tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv, lane="tradingview", group="curves"))
     held_front = _held_frame("tradingview_gas_front")
     front_bars = TRADINGVIEW_FRONT_HISTORY_BARS if held_front is None or len(held_front) < 200 else 10
     def fetch_front() -> pd.DataFrame:
@@ -7734,15 +7799,18 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[
     def apply_front(frame: pd.DataFrame) -> str:
         merged = store_observations("tradingview_gas_front", "TradingView TTF front month", frame, {"symbol": "NYMEX:TTF1!"}, ("date", "product"), "date", 800)
         return f"{len(frame)} days fetched, {len(merged)} held, last close {frame['close'].iloc[-1]:.2f} on {pd.Timestamp(frame['date'].iloc[-1]):%d %b}"
-    tasks.append(UpdateTask("TTF front-month history from TradingView", fetch_front, apply_front, lane="tradingview"))
+    if want_front:
+        tasks.append(UpdateTask("TTF front-month history from TradingView", fetch_front, apply_front, lane="tradingview", group="ttf_front"))
     return tasks
 
 
-def plan_update(force: bool = True, today: Optional[date] = None) -> list[UpdateTask]:
-    """Decide what to request. force ignores recent fetches, except for slow-moving normals."""
+def plan_update(force: bool = True, today: Optional[date] = None, groups: Optional[Sequence[str]] = None) -> list[UpdateTask]:
+    """Decide what to request. force ignores recent fetches, except for slow-moving normals.
+    groups limits the plan to those source groups (see UPDATE_GROUPS); None plans every source."""
     today = today or date.today()
     keys = resolved_credentials()
-    tasks: list[UpdateTask] = tradingview_tasks(force, today)   # first, so the TTF marks come in first
+    want = lambda group: groups is None or group in groups
+    tasks: list[UpdateTask] = tradingview_tasks(force, today, groups)   # first, so the TTF marks come in first
 
     def keyed(kind: str, fetch: Callable[[], object]) -> Callable[[], object]:
         """A source with no key reports what to do, rather than a provider's error."""
@@ -7757,7 +7825,8 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
                     source: Optional[str] = None, target: Optional[str] = None, variant: Optional[str] = None) -> None:
         name = variant or zone
         full_key = f"{store_key}|{name}"
-        if not _needs_update(full_key, kind, force):
+        group = ENTSOE_GROUPS[store_key]
+        if not want(group) or not _needs_update(full_key, kind, force):
             return
         held = _held_frame(full_key)
         start = incremental_start(held, "timestamp", first_days, 2, today)
@@ -7773,7 +7842,7 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
         def apply(frame: pd.DataFrame) -> str:
             merged = store_entsoe(full_key, f"{label}, {name}", frame, metadata, keep)
             return f"{len(frame):,} new rows, {len(merged):,} held"
-        tasks.append(UpdateTask(f"{label}, {name}", fetch, apply, start))
+        tasks.append(UpdateTask(f"{label}, {name}", fetch, apply, start, group=group))
 
     price_zones = list(dict.fromkeys(list(UPDATE_DEFAULT_ZONES) + [z for z in _live_variants("entsoe_price") if z in ENTSOE_ZONES]))
     for zone in price_zones:
@@ -7793,7 +7862,7 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             entsoe_task("prices", "entsoe_flow", "Physical flow", "Physical flow", meta["source_zone"], KEEP_DAYS["load"], 30, today + timedelta(days=1),
                         meta["source_zone"], meta["target_zone"], variant)
 
-    if _needs_update("gie_agsi_history", "fundamentals", force):
+    if want("storage") and _needs_update("gie_agsi_history", "fundamentals", force):
         held = _held_frame("gie_agsi_history")
         # Providers revise recent gas days, so each update reloads the last 45.
         start = incremental_start(held, "gasDayStart", 0, 45, today) if held is not None else date(today.year - 5, 1, 1)
@@ -7802,23 +7871,23 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             merged = store_observations("gie_agsi_history", "AGSI gas storage, 6 years", frame, meta, ("gasDayStart", "name"), "gasDayStart")
             _stored_live_item("gie_agsi", "AGSI gas storage", merged.tail(40).reset_index(drop=True), meta)
             return f"{len(frame):,} new rows, {len(merged):,} held"
-        tasks.append(UpdateTask("EU gas storage", keyed("gie", lambda: fetch_gie_history("AGSI", keys["gie"], "Europe / EU datasets", start, today)), apply_storage, start))
-    if _needs_update("gie_alsi", "fundamentals", force):
+        tasks.append(UpdateTask("EU gas storage", keyed("gie", lambda: fetch_gie_history("AGSI", keys["gie"], "Europe / EU datasets", start, today)), apply_storage, start, group="storage"))
+    if want("lng") and _needs_update("gie_alsi", "fundamentals", force):
         held = _held_frame("gie_alsi")
         lng_start = incremental_start(held, "gasDayStart", 60, 30, today)
         def apply_lng(frame: pd.DataFrame) -> str:
             merged = store_observations("gie_alsi", "ALSI LNG terminals", frame, {"scope": "Europe / EU datasets", "country": ""}, ("gasDayStart", "name"), "gasDayStart", KEEP_DAYS["lng"])
             return f"{len(frame):,} new rows, {len(merged):,} held"
-        tasks.append(UpdateTask("EU LNG terminals", keyed("gie", lambda: fetch_gie_history("ALSI", keys["gie"], "Europe / EU datasets", lng_start, today)), apply_lng, lng_start))
+        tasks.append(UpdateTask("EU LNG terminals", keyed("gie", lambda: fetch_gie_history("ALSI", keys["gie"], "Europe / EU datasets", lng_start, today)), apply_lng, lng_start, group="lng"))
     flow_item = st.session_state.get("live_data", {}).get("entsog_flow")
-    if isinstance(flow_item, dict) and flow_item.get("metadata", {}).get("point_direction") and _needs_update("entsog_flow", "fundamentals", force):
+    if want("gas_flows") and isinstance(flow_item, dict) and flow_item.get("metadata", {}).get("point_direction") and _needs_update("entsog_flow", "fundamentals", force):
         point, indicator = flow_item["metadata"]["point_direction"], flow_item["metadata"].get("indicator", "Physical Flow")
         def apply_gas_flow(frame: pd.DataFrame) -> str:
             _stored_live_item("entsog_flow", f"ENTSOG {indicator}", frame, {"point_direction": point, "indicator": indicator})
             return f"{len(frame):,} rows"
-        tasks.append(UpdateTask("Gas flow at your saved point", lambda: fetch_entsog_flow(point, today - timedelta(days=60), today - timedelta(days=1), indicator), apply_gas_flow))
+        tasks.append(UpdateTask("Gas flow at your saved point", lambda: fetch_entsog_flow(point, today - timedelta(days=60), today - timedelta(days=1), indicator), apply_gas_flow, group="gas_flows"))
 
-    if _needs_update("weather_daily", "weather", force):
+    if want("weather") and _needs_update("weather_daily", "weather", force):
         open_meteo_key = keys["open_meteo"]
         fetch_weather = lambda: fetch_open_meteo_market_pack(list(WEATHER_LOCATIONS), 3, 10, open_meteo_key, bool(open_meteo_key))
         def apply_weather(outcome: tuple) -> str:
@@ -7830,8 +7899,8 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             _stored_live_item("weather_daily", "Open-Meteo daily weather", daily, meta)
             st.session_state["weather_fetch_failures"] = failures
             return f"{daily['location'].nunique()} of {len(WEATHER_LOCATIONS)} locations"
-        tasks.append(UpdateTask("Weather forecast", fetch_weather, apply_weather))
-    if _needs_update("weather_normals", "normals", False) or _needs_update("weather_archive", "normals", False):
+        tasks.append(UpdateTask("Weather forecast", fetch_weather, apply_weather, group="weather"))
+    if want("weather_history") and (_needs_update("weather_normals", "normals", False) or _needs_update("weather_archive", "normals", False)):
         def apply_archive(outcome: tuple) -> str:
             archive, normals, failures = outcome
             if normals.empty:
@@ -7839,10 +7908,10 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             _stored_live_item("weather_normals", "Open-Meteo temperature normals", normals, {"years": 10})
             _stored_live_item("weather_archive", "Open-Meteo daily temperature history", archive, {"years": 10})
             return f"{normals['location'].nunique()} of {len(WEATHER_LOCATIONS)} locations"
-        tasks.append(UpdateTask("Weather history", lambda: fetch_weather_archive(list(WEATHER_LOCATIONS)), apply_archive))
+        tasks.append(UpdateTask("Weather history", lambda: fetch_weather_archive(list(WEATHER_LOCATIONS)), apply_archive, group="weather_history"))
     power_zones = [z for z in dict.fromkeys(list(UPDATE_DEFAULT_ZONES) + list(_live_variants("entsoe_price"))) if z in ZONE_WEATHER]
     grid_zones = [z for z in power_zones if z in ZONE_WEATHER_POINTS]
-    if grid_zones and _needs_update("zone_weather_history", "power_weather", False):
+    if want("zone_weather") and grid_zones and _needs_update("zone_weather_history", "power_weather", False):
         held_grid = _held_frame("zone_weather_history")
         archive_end = today - timedelta(days=5)
         def fetch_grid_history() -> tuple[pd.DataFrame, list[str]]:
@@ -7863,8 +7932,8 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
                 raise RuntimeError("; ".join(failures))
             merged = store_observations("zone_weather_history", "Open-Meteo weather across each zone", frame, {"zones": grid_zones}, ("date", "zone"), "date", ZONE_WEATHER_HISTORY_DAYS + 20) if not frame.empty else held_grid
             return f"{len(frame):,} new days, {0 if merged is None else len(merged):,} held" + (f". Failed: {'; '.join(failures)}" if failures else "")
-        tasks.append(UpdateTask("Weather across each power zone", fetch_grid_history, apply_grid_history))
-    if grid_zones and _needs_update("zone_weather_forecast", "weather", force):
+        tasks.append(UpdateTask("Weather across each power zone", fetch_grid_history, apply_grid_history, group="zone_weather"))
+    if want("zone_weather") and grid_zones and _needs_update("zone_weather_forecast", "weather", force):
         open_meteo_key = keys["open_meteo"]
         def fetch_grid_forecast() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
@@ -7883,28 +7952,28 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             if kept is not None:
                 _stored_live_item("zone_weather_vintage", "Weather forecasts as they stood the day before", kept, {"zones": grid_zones})
             return f"{frame['zone'].nunique()} of {len(grid_zones)} zones"
-        tasks.append(UpdateTask("Weather forecast across each power zone", fetch_grid_forecast, apply_grid_forecast))
+        tasks.append(UpdateTask("Weather forecast across each power zone", fetch_grid_forecast, apply_grid_forecast, group="zone_weather"))
     # Zones with points across them use those; the single reference city is kept for the others.
     power_zones = [z for z in power_zones if z not in ZONE_WEATHER_POINTS]
-    if power_zones and _needs_update("weather_power_history", "power_weather", False):
+    if want("zone_weather") and power_zones and _needs_update("weather_power_history", "power_weather", False):
         def apply_power_weather(outcome: tuple) -> str:
             frame, failures = outcome
             if frame.empty:
                 raise RuntimeError(f"All {len(failures) or len(power_zones)} locations failed.")
             _stored_live_item("weather_power_history", "Open-Meteo wind and solar history", frame, {"days": 430})
             return f"{frame['location'].nunique()} of {len(power_zones)} locations"
-        tasks.append(UpdateTask("Wind and solar history", lambda: fetch_power_weather([ZONE_WEATHER[z] for z in power_zones]), apply_power_weather))
-    tasks.extend(fundamentals_tasks(force, today, keys, grid_zones))
+        tasks.append(UpdateTask("Wind and solar history", lambda: fetch_power_weather([ZONE_WEATHER[z] for z in power_zones]), apply_power_weather, group="zone_weather"))
+    tasks.extend(fundamentals_tasks(force, today, keys, grid_zones, groups))
     held_auctions = _live_dataset_frame("eex_eua_auctions")
     auction_age = (today - pd.Timestamp(held_auctions["date"].iloc[-1]).date()).days if not held_auctions.empty and "date" in held_auctions.columns else None
-    if force or auction_age is None or (auction_age >= 1 and _needs_update("eex_eua_auctions", "prices", False)):
+    if want("eua_auctions") and (force or auction_age is None or (auction_age >= 1 and _needs_update("eex_eua_auctions", "prices", False))):
         def apply_auctions(frame: pd.DataFrame) -> str:
             _stored_live_item("eex_eua_auctions", "EEX EUA primary auction prices", frame, {"source": "EEX public auction report"})
             last = frame.iloc[-1]
             return f"{pd.Timestamp(last['date']):%d %b}: €{float(last['price']):.2f}/t"
-        tasks.append(UpdateTask("EUA auction prices", lambda: fetch_eua_auctions(today), apply_auctions))
+        tasks.append(UpdateTask("EUA auction prices", lambda: fetch_eua_auctions(today), apply_auctions, group="eua_auctions"))
     fx_age = st.session_state.get("fx_updated_at")
-    if force or fx_age is None or (datetime.now(timezone.utc) - fx_age).total_seconds() / 3600.0 >= STALE_HOURS["fx"]:
+    if want("fx") and (force or fx_age is None or (datetime.now(timezone.utc) - fx_age).total_seconds() / 3600.0 >= STALE_HOURS["fx"]):
         def apply_fx(outcome: tuple) -> str:
             (gbp_per_eur, _), (usd_per_eur, _) = outcome
             set_fx_rate("eur_per_gbp", 1.0 / gbp_per_eur, ecb=True)
@@ -7914,23 +7983,84 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             for widget in ("risk_gbp", "risk_usd", "spread_gbp", "spread_usd", "pnl_fx", "data_fx"):
                 st.session_state.pop(widget, None)
             return f"EUR/GBP {gbp_per_eur:.4f}, EUR/USD {usd_per_eur:.4f}"
-        tasks.append(UpdateTask("ECB FX rates", lambda: (fetch_ecb_rate("GBP"), fetch_ecb_rate("USD")), apply_fx))
+        tasks.append(UpdateTask("ECB FX rates", lambda: (fetch_ecb_rate("GBP"), fetch_ecb_rate("USD")), apply_fx, group="fx"))
     return tasks
 
 
-def start_update(force: bool = True, tasks: Optional[list[UpdateTask]] = None) -> int:
-    """Start fetching in the background so the app stays usable. Returns the number of sources."""
-    if st.session_state.get("update_job"):
-        return 0
-    if tasks is None:
+def start_update(force: bool = True, tasks: Optional[list[UpdateTask]] = None, groups: Optional[Sequence[str]] = None) -> int:
+    """Start fetching in the background so the app stays usable. Returns the number of sources added.
+
+    groups limits the update to those source groups; None updates everything. If an update is already
+    running, the new sources join it, and a source already in it isn't asked for twice."""
+    if tasks is None and (groups is None or "curves" in groups):
         import_curve_folder()
-    planned = plan_update(force) if tasks is None else tasks
+    planned = plan_update(force, groups=groups) if tasks is None else tasks
+    job = st.session_state.get("update_job")
+    if job:
+        running = {task.name for task in job["tasks"]}
+        planned = [task for task in planned if task.name not in running]
     if not planned:
         return 0
-    executors = {"main": ThreadPoolExecutor(max_workers=MAX_UPDATE_WORKERS), "tradingview": ThreadPoolExecutor(max_workers=TRADINGVIEW_WORKERS)}
-    st.session_state.update_job = {"tasks": planned, "futures": [executors.get(task.lane, executors["main"]).submit(task.fetch) for task in planned],
-                                   "executors": executors, "results": {}}
+    if not job:
+        executors = {"main": ThreadPoolExecutor(max_workers=MAX_UPDATE_WORKERS), "tradingview": ThreadPoolExecutor(max_workers=TRADINGVIEW_WORKERS)}
+        job = {"tasks": [], "futures": [], "executors": executors, "results": {}}
+        st.session_state.update_job = job
+    for task in planned:
+        job["tasks"].append(task)
+        job["futures"].append(job["executors"].get(task.lane, job["executors"]["main"]).submit(task.fetch))
     return len(planned)
+
+
+# Where each group's data is kept, to say how fresh it is. A name ending in | covers every zone or variant.
+GROUP_DATASETS = {"curves": ("tradingview_curves",), "eua_auctions": ("eex_eua_auctions",), "fx": (), "prices": ("entsoe_price|",),
+                  "power_system": ("entsoe_load|", "entsoe_generation|"), "power_forecasts": ("entsoe_load_forecast|", "entsoe_renewable_forecast|"),
+                  "power_flows": ("entsoe_flow|",), "storage": ("gie_agsi_history",), "lng": ("gie_alsi",), "gas_flows": ("entsog_flow",),
+                  "weather": ("weather_daily",), "weather_history": ("weather_normals", "weather_archive"),
+                  "zone_weather": ("zone_weather_history", "zone_weather_forecast", "weather_power_history"), "ttf_front": ("tradingview_gas_front",),
+                  "outlook_output": ("fund_daily|",), "outlook_weather": ("fund_weather_history", "fund_weather_forecast"), "scenarios": ("fund_weather_ensemble",),
+                  "nuclear_outages": ("entsoe_outages|",), "holidays": ("holidays",), "gas_use": ("the_gas_consumption",)}
+
+
+def group_fetched_at(group: str) -> Optional[datetime]:
+    """When a group's data was last fetched: the oldest of its datasets, since the page needs them all."""
+    if group == "fx":
+        return st.session_state.get("fx_updated_at")
+    stamps = []
+    for key, item in st.session_state.get("live_data", {}).items():
+        if isinstance(item, dict) and item.get("fetched_at") and any(key == name or (name.endswith("|") and key.startswith(name)) for name in GROUP_DATASETS[group]):
+            try:
+                stamps.append(pd.Timestamp(str(item["fetched_at"])).to_pydatetime())
+            except Exception:
+                continue
+    return min(stamps) if stamps else None
+
+
+def page_update_table() -> pd.DataFrame:
+    """For each section and page of the sidebar, the sources it updates when opened and how fresh they are."""
+    rows = []
+    for section, labels in NAV_SECTIONS.items():
+        for label in labels:
+            page = NAV_TO_PAGE[label]
+            groups = page_groups(page)
+            stamps = [group_fetched_at(g) for g in groups]
+            missing = [UPDATE_GROUP_SHORT[g] for g, t in zip(groups, stamps) if t is None]
+            held = [t for t in stamps if t is not None]
+            rows.append({"Section": section, "Page": page, "Updates when opened": ", ".join(UPDATE_GROUP_SHORT[g] for g in groups) or "Nothing: no market data",
+                         "Oldest fetch": _ago(min(held)) if held else "–", "Not loaded yet": ", ".join(missing) if missing else ("–" if groups else ""),
+                         "Sources": len(groups)})
+    return pd.DataFrame(rows)
+
+
+def page_groups(page: Optional[str] = None) -> tuple:
+    """The source groups a page shows. Without a page, the one open now."""
+    if page is None:
+        page = NAV_TO_PAGE.get(st.session_state.get("nav_page", ""), "")
+    return tuple(PAGE_UPDATES.get(page, ()))
+
+
+def page_sources_text(page: str) -> str:
+    groups = page_groups(page)
+    return ", ".join(UPDATE_GROUPS[g] for g in groups) if groups else "none: this page uses no market data"
 
 
 def update_progress() -> tuple[int, int]:
@@ -7965,14 +8095,21 @@ def collect_update() -> bool:
     return True
 
 
-def maybe_auto_update() -> None:
-    """Refresh stale data once when the app opens, unless switched off."""
-    if st.session_state.get("auto_update_checked"):
-        return
-    st.session_state.auto_update_checked = True
+def maybe_auto_update(page: Optional[str] = None) -> int:
+    """Refresh what the open page shows, where it is stale, unless switched off. Each page looks once when
+    opened and again after PAGE_RECHECK_SECONDS, so the app starts with only the open page's sources."""
     if os.getenv("MERIDIAN_NO_AUTO_UPDATE") or not fx_rate("auto_update"):
-        return
-    start_update(force=False)
+        return 0
+    page = page or NAV_TO_PAGE.get(st.session_state.get("nav_page", ""), "")
+    groups = page_groups(page)
+    if not groups:
+        return 0
+    checked = st.session_state.setdefault("page_update_checked", {})
+    now = datetime.now(timezone.utc).timestamp()
+    if now - checked.get(page, -1e12) < PAGE_RECHECK_SECONDS:
+        return 0
+    checked[page] = now
+    return start_update(force=False, groups=groups)
 
 
 def _ago(moment: datetime) -> str:
@@ -8008,11 +8145,16 @@ def _update_panel() -> None:
     if total:
         if collect_update():
             st.rerun()
-        st.progress(done / total, text=f"Updating market data, {done} of {total} sources")
+        st.progress(done / total, text=f"Updating, {done} of {total} sources")
         return
-    if st.button("Update market data", type="primary", key="sidebar_update", width="stretch", help="Uses your saved keys and fetches only what's new."):
-        count = start_update(force=True)
-        if count:
+    page = NAV_TO_PAGE.get(st.session_state.get("nav_page", ""), "")
+    groups = page_groups(page)
+    if st.button("Update this page", type="primary", key="sidebar_update", width="stretch", disabled=not groups,
+                 help=f"Fetches what's new for this page only: {page_sources_text(page)}."):
+        if start_update(force=True, groups=groups):
+            st.rerun()
+    if st.button("Update all sources", key="sidebar_update_all", width="stretch", help="Fetches what's new for every page. Takes longer."):
+        if start_update(force=True):
             st.rerun()
     latest = _latest_fetch()
     results = st.session_state.get("update_results") or []
@@ -8055,8 +8197,8 @@ def update_report() -> str:
 def render_update_panel() -> None:
     running = bool(st.session_state.get("update_job"))
     st.fragment(_update_panel, run_every="1.5s" if running else None)()
-    automatic = st.checkbox("Update when I open the app", value=bool(fx_rate("auto_update")), key="auto_update_toggle",
-                            help="Fetches stale data in the background each time you open the app.")
+    automatic = st.checkbox("Update each page when I open it", value=bool(fx_rate("auto_update")), key="auto_update_toggle",
+                            help="Fetches, in the background, only the stale sources the open page shows. See Live Data Integrations for what each page updates.")
     if automatic != bool(fx_rate("auto_update")):
         set_fx_rate("auto_update", 1.0 if automatic else 0.0)
     demo = st.checkbox("Fill gaps with demo prices", value=demo_allowed(), key="allow_demo_toggle",
@@ -8068,13 +8210,15 @@ def render_update_panel() -> None:
         st.rerun()
 
 
-def update_button(key: str, label: str = "Update market data") -> None:
-    """The same update, offered where the data is used."""
+def update_button(key: str, label: str = "Update this page", every_source: bool = False) -> None:
+    """The open page's update, offered where the data is used. every_source updates all pages' sources."""
     done, total = update_progress()
+    groups = None if every_source else page_groups()
     if total:
         st.button(f"Updating, {done} of {total} sources", key=key, disabled=True)
-    elif st.button(label, type="primary", key=key):
-        if start_update(force=True):
+    elif st.button(label, type="primary", key=key, disabled=groups == (),
+                   help="Fetches what's new for every page." if every_source else f"Fetches what's new for this page: {page_sources_text(NAV_TO_PAGE.get(st.session_state.get('nav_page', ''), ''))}."):
+        if start_update(force=True, groups=groups):
             st.rerun()
 
 
@@ -8273,15 +8417,16 @@ def winter_outlook() -> dict:
                                                _live_dataset_frame("weather_daily"), valuation_date))
 
 
-def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str]) -> list[UpdateTask]:
+def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str], groups: Optional[Sequence[str]] = None) -> list[UpdateTask]:
     """What the fundamentals outlook needs beyond the price estimate's data: a year of daily output,
     weather as the forecast models saw it, 16 days ahead, ECMWF's scenarios and German gas use."""
     tasks: list[UpdateTask] = []
+    want = lambda group: groups is None or group in groups
     zones = [z for z in zones if z in FUND_SEA_POINTS]
     open_meteo_key = keys.get("open_meteo", "")
     for zone in zones:
         key = f"fund_daily|{zone}"
-        if not _needs_update(key, "fundamentals", force):
+        if not want("outlook_output") or not _needs_update(key, "fundamentals", force):
             continue
         summary, load, generation = _held_frame(key), _held_frame(f"entsoe_load|{zone}"), _held_frame(f"entsoe_generation|{zone}")
         span = fund_history_span(summary, load, today)
@@ -8301,10 +8446,10 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
             rows = rows.loc[rows["date"] >= pd.Timestamp(today - timedelta(days=FUND_KEEP_DAYS))].reset_index(drop=True)
             _stored_live_item(key, f"Daily output and demand, {zone}", rows, {"zone": zone})
             return f"{rows['date'].nunique():,} days held" + (f", {frame['date'].nunique() if not frame.empty else 0:,} fetched" if span else "")
-        tasks.append(UpdateTask(f"Output history for the outlook, {zone}", fetch_history, apply_history, span[0] if span else None))
+        tasks.append(UpdateTask(f"Output history for the outlook, {zone}", fetch_history, apply_history, span[0] if span else None, group="outlook_output"))
     held_item = st.session_state.get("live_data", {}).get("fund_weather_history") or {}
     old_points = bool(held_item) and (held_item.get("metadata") or {}).get("version") != FUND_WEATHER_VERSION
-    if zones and (_needs_update("fund_weather_history", "power_weather", False) or old_points):
+    if want("outlook_weather") and zones and (_needs_update("fund_weather_history", "power_weather", False) or old_points):
         # Weather kept under an older set of points would mix two definitions of wind and sun, so it is fetched again.
         held = None if old_points else _held_frame("fund_weather_history")
         end = today - timedelta(days=1)
@@ -8329,8 +8474,8 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
             merged = store_observations("fund_weather_history", "Past weather as the forecast models saw it", frame, {"zones": zones, "version": FUND_WEATHER_VERSION},
                                         ("date", "zone"), "date", GAS_DEMAND_HISTORY_DAYS + 30) if not frame.empty else held
             return f"{len(frame):,} new days, {0 if merged is None else len(merged):,} held" + (f". Failed: {'; '.join(failures)}" if failures else "")
-        tasks.append(UpdateTask("Weather history for the outlook", fetch_weather_history, apply_weather_history))
-    if zones and _needs_update("fund_weather_forecast", "weather", force):
+        tasks.append(UpdateTask("Weather history for the outlook", fetch_weather_history, apply_weather_history, group="outlook_weather"))
+    if want("outlook_weather") and zones and _needs_update("fund_weather_forecast", "weather", force):
         def fetch_weather_ahead() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
             for zone in zones:
@@ -8346,8 +8491,8 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
                 raise RuntimeError("; ".join(failures) or "No zone returned a forecast.")
             _stored_live_item("fund_weather_forecast", "16-day weather forecast across each zone", frame, {"zones": zones})
             return f"{frame['zone'].nunique()} of {len(zones)} zones, to {pd.Timestamp(frame['date'].max()):%d %b}"
-        tasks.append(UpdateTask("16-day weather forecast", fetch_weather_ahead, apply_weather_ahead))
-    if zones and _needs_update("fund_weather_ensemble", "ensemble", False):
+        tasks.append(UpdateTask("16-day weather forecast", fetch_weather_ahead, apply_weather_ahead, group="outlook_weather"))
+    if want("scenarios") and zones and _needs_update("fund_weather_ensemble", "ensemble", False):
         def fetch_scenarios() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
             for zone in zones:
@@ -8362,8 +8507,8 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
                 raise RuntimeError("; ".join(failures) or "No zone returned weather scenarios.")
             _stored_live_item("fund_weather_ensemble", "ECMWF weather scenarios", frame, {"zones": zones, "model": OPEN_METEO_ENSEMBLE_MODEL})
             return f"{frame['member'].nunique()} scenarios" + (f". Failed: {'; '.join(failures)}" if failures else "")
-        tasks.append(UpdateTask("Weather scenarios", fetch_scenarios, apply_scenarios))
-    for zone in [z for z in zones if z in FUND_NUCLEAR_FIT]:
+        tasks.append(UpdateTask("Weather scenarios", fetch_scenarios, apply_scenarios, group="scenarios"))
+    for zone in [z for z in zones if z in FUND_NUCLEAR_FIT and want("nuclear_outages")]:
         key = f"entsoe_outages|{zone}"
         if not _needs_update(key, "fundamentals", force):
             continue
@@ -8378,9 +8523,9 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
                 raise RuntimeError(f"ENTSO-E listed no nuclear outage notices for {zone}; the outlook keeps last week's nuclear output.")
             _stored_live_item(key, f"Nuclear outage notices, {zone}", nuclear.reset_index(drop=True), {"zone": zone, "documents": read})
             return f"{nuclear['mrid'].nunique():,} notices for {nuclear['unit'].nunique()} units"
-        tasks.append(UpdateTask(f"Nuclear outage notices, {zone}", fetch_outages, apply_outages))
+        tasks.append(UpdateTask(f"Nuclear outage notices, {zone}", fetch_outages, apply_outages, group="nuclear_outages"))
     countries = sorted({FUND_COUNTRY[z] for z in zones if z in FUND_COUNTRY})
-    if countries and _needs_update("holidays", "holidays", force):
+    if want("holidays") and countries and _needs_update("holidays", "holidays", force):
         def fetch_holidays() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
             for country in countries:
@@ -8395,8 +8540,8 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
                 raise RuntimeError("; ".join(failures) or "No holidays returned.")
             _stored_live_item("holidays", "School and regional public holidays", frame, {"countries": countries, "source": "OpenHolidays (ODbL)"})
             return f"{(frame['kind'] == 'school').sum():,} school and {(frame['kind'] == 'public').sum():,} public holidays" + (f". Failed: {'; '.join(failures)}" if failures else "")
-        tasks.append(UpdateTask("School and regional holidays", fetch_holidays, apply_holidays))
-    if "Germany-Luxembourg" in zones and _needs_update("the_gas_consumption", "fundamentals", force):
+        tasks.append(UpdateTask("School and regional holidays", fetch_holidays, apply_holidays, group="holidays"))
+    if want("gas_use") and "Germany-Luxembourg" in zones and _needs_update("the_gas_consumption", "fundamentals", force):
         held = _held_frame("the_gas_consumption")
         # Large users' figures are corrected for weeks after the day, so recent months are reloaded each time.
         start = incremental_start(held, "gas_day", GAS_DEMAND_HISTORY_DAYS, 75, today)
@@ -8404,7 +8549,7 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
             merged = store_observations("the_gas_consumption", "German gas consumption, Trading Hub Europe", frame, {"source": "Trading Hub Europe"},
                                         ("gas_day",), "gas_day", GAS_DEMAND_HISTORY_DAYS + 30)
             return f"{len(frame):,} gas days fetched, {len(merged):,} held, published to {pd.Timestamp(frame['gas_day'].max()):%d %b}"
-        tasks.append(UpdateTask("German gas consumption", lambda: fetch_the_consumption(start, today + timedelta(days=2)), apply_gas_use, start))
+        tasks.append(UpdateTask("German gas consumption", lambda: fetch_the_consumption(start, today + timedelta(days=2)), apply_gas_use, start, group="gas_use"))
     return tasks
 
 
@@ -9883,18 +10028,20 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             st.session_state.update_job = None
             count = start_update(tasks=[UpdateTask("Good", lambda: 5, lambda v: applied.append(v) or "ok"), UpdateTask("Bad", fail, lambda v: "never"),
                                         UpdateTask("Bad apply", lambda: 1, lambda v: (_ for _ in ()).throw(ValueError("bad frame")))])
-            if count != 3 or start_update(tasks=[UpdateTask("Second", lambda: 1, lambda v: "x")]) != 0:
-                raise AssertionError("Only one update may run at a time.")
+            if count != 3 or start_update(tasks=[UpdateTask("Good", lambda: 6, lambda v: applied.append(v) or "ok")]) != 0:
+                raise AssertionError("A source already being fetched must not be asked for twice.")
+            if start_update(tasks=[UpdateTask("Second page", lambda: 1, lambda v: "x")]) != 1 or update_progress()[1] != 4:
+                raise AssertionError("Another page's sources must join the running update.")
             for _executor in st.session_state.update_job["executors"].values():
                 _executor.shutdown(wait=True)
-            if update_progress() != (3, 3) or not collect_update():
+            if update_progress() != (4, 4) or not collect_update():
                 raise AssertionError("A finished update was not collected.")
             results = {name: (good, detail) for name, good, detail in st.session_state.update_results}
             if applied != [5] or not results["Good"][0] or results["Bad"] != (False, "provider down.") or results["Bad apply"][0]:
                 raise AssertionError(f"One failure must not affect the others: {results}")
             if collect_update() or st.session_state.update_job is not None:
                 raise AssertionError("The job must clear once collected.")
-            return "Fetches run in the background, results apply once, and one failing source doesn't affect the others."
+            return "Fetches run in the background, results apply once, another page's sources join a running update without repeats, and one failing source doesn't affect the others."
         finally:
             st.session_state.update_job = saved_job
             st.session_state.update_results = saved_results
@@ -11257,6 +11404,62 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             raise AssertionError("Weather scenarios keep to the base points.")
         return (f"The outlook's weather adds {counts['farm']} wind-farm and {counts['park']} solar-park points in the same request: wind comes from the farms, "
                 "sun from all land points, and the scenarios stay on the base points.")
+
+    def check_page_updates() -> str:
+        """Each page updates only its own sources; every source belongs to a page."""
+        saved_live, saved_fx = dict(st.session_state.get("live_data", {})), st.session_state.get("fx_updated_at")
+        saved_job, saved_checked = st.session_state.get("update_job"), st.session_state.get("page_update_checked")
+        try:
+            pages = set(NAV_TO_PAGE.values())
+            if set(PAGE_UPDATES) != pages:
+                raise AssertionError(f"Pages without an update list: {sorted(pages - set(PAGE_UPDATES))}")
+            if any(len(set(groups)) != len(groups) for groups in PAGE_UPDATES.values()):
+                raise AssertionError("A page lists a source twice.")
+            used = {g for groups in PAGE_UPDATES.values() for g in groups}
+            if used - set(UPDATE_GROUPS) or set(UPDATE_GROUPS) - used or set(GROUP_DATASETS) != set(UPDATE_GROUPS):
+                raise AssertionError("Every source group must be known, kept somewhere and shown on at least one page.")
+            st.session_state.live_data, st.session_state.fx_updated_at = {}, None
+            everything = plan_update(force=True, today=date(2026, 11, 13))
+            if any(task.group not in UPDATE_GROUPS for task in everything):
+                raise AssertionError(f"Untagged sources: {[t.name for t in everything if t.group not in UPDATE_GROUPS]}")
+            sizes = {}
+            for page in ("Forward Curves", "Fundamentals Outlook", "Power Spot", "Model Validation"):
+                planned = plan_update(force=True, today=date(2026, 11, 13), groups=PAGE_UPDATES[page])
+                if {t.group for t in planned} - set(PAGE_UPDATES[page]):
+                    raise AssertionError(f"{page} would fetch sources it doesn't show.")
+                sizes[page] = len(planned)
+            if sizes["Model Validation"] != 0 or not 0 < sizes["Forward Curves"] < len(everything) or not 0 < sizes["Fundamentals Outlook"] < len(everything):
+                raise AssertionError(f"Page plans: {sizes} of {len(everything)}")
+            if not any(t.group == "ttf_front" for t in plan_update(force=True, groups=PAGE_UPDATES["Power Spot"])) or \
+                    any(t.group == "ttf_front" for t in plan_update(force=True, groups=PAGE_UPDATES["Forward Curves"])):
+                raise AssertionError("The TTF front month goes with the estimate, not with the curves.")
+            # Opening a page starts its update once, and looks again only after the recheck interval.
+            st.session_state.update_job, st.session_state.page_update_checked = None, {}
+            started = []
+            real_start = globals()["start_update"]
+            globals()["start_update"] = lambda force=True, tasks=None, groups=None: started.append(tuple(groups or ())) or 1
+            try:
+                was = fx_rate("auto_update")
+                set_fx_rate("auto_update", 1.0)
+                hidden = os.environ.pop("MERIDIAN_NO_AUTO_UPDATE", None)
+                maybe_auto_update("Forward Curves"); maybe_auto_update("Forward Curves"); maybe_auto_update("Model Validation")
+                st.session_state.page_update_checked["Forward Curves"] -= PAGE_RECHECK_SECONDS + 1
+                maybe_auto_update("Forward Curves")
+            finally:
+                globals()["start_update"] = real_start
+                set_fx_rate("auto_update", was)
+                if hidden is not None:
+                    os.environ["MERIDIAN_NO_AUTO_UPDATE"] = hidden
+            if started != [PAGE_UPDATES["Forward Curves"]] * 2:
+                raise AssertionError(f"Automatic page updates: {started}")
+            table_ = page_update_table()
+            if len(table_) != len(pages) or table_.loc[table_["Page"].eq("Model Validation"), "Sources"].iloc[0] != 0:
+                raise AssertionError("The page table must list every page and what it updates.")
+            return (f"Every source belongs to a group and every page lists its own: opening Forward Curves plans {sizes['Forward Curves']} of {len(everything)} sources, "
+                    f"Fundamentals Outlook {sizes['Fundamentals Outlook']}, Power Spot {sizes['Power Spot']}, Model Validation none; a page looks again after {PAGE_RECHECK_SECONDS // 60} minutes.")
+        finally:
+            st.session_state.live_data, st.session_state.fx_updated_at = saved_live, saved_fx
+            st.session_state.update_job, st.session_state.page_update_checked = saved_job, saved_checked
     cases = [
         ("Product registry and market timezones", "Configuration", check_product_registry),
         ("MWh ↔ MMBtu conversions", "Units & conversions", check_energy_conversion),
@@ -11348,6 +11551,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("School and regional holidays", "Fundamentals outlook", check_holidays),
         ("Published forecasts combined with the models", "Fundamentals outlook", check_combined_forecast),
         ("Wind-farm and solar-park points", "Fundamentals outlook", check_outlook_points),
+        ("Each page updates only its own sources", "Data updates", check_page_updates),
         ("Chances for the next day", "Next-day estimate", check_estimate_chances),
         ("Holidays and kinds of day", "Next-day estimate", check_estimate_calendar),
         ("Weather across a zone in one request", "Live API integration", check_zone_weather_fetch),
@@ -11805,7 +12009,7 @@ def page_forward_curves():
     product_days = sorted(history.loc[history["product"].eq(selected), "snapshot_date"].unique()) if not history.empty else []
     previous = [d for d in product_days if d < valuation_date.isoformat()]
     if curve.empty:
-        st.info(f"No live price for {selected} yet. Select Update market data, or import a curve below. Only live prices are shown: to fill gaps with demo prices, tick that option under the update button.")
+        st.info(f"No live price for {selected} yet. Select Update this page, or import a curve below. Only live prices are shown: to fill gaps with demo prices, tick that option under the update button.")
     else:
         after_current = curve.loc[curve["delivery_month"] > pd.Timestamp(valuation_date.replace(day=1))]
         first = after_current.iloc[0] if not after_current.empty else curve.iloc[0]
@@ -12343,7 +12547,7 @@ def page_market_read():
                 ranked = sorted(live, key=lambda s: -s["weight"] * abs(s["score"]))
                 st.markdown("".join(_evidence_row(s) for s in ranked), unsafe_allow_html=True)
             else:
-                need_data_note("No evidence for this market yet. Select Update market data and it will load.")
+                need_data_note("No evidence for this market yet. Select Update this page and it will load.")
             left, right = st.columns(2, gap="large")
             with left:
                 st.subheader("What would change this read")
@@ -12573,7 +12777,7 @@ def render_curve_status() -> None:
     current = sum(1 for r in rows if r["Status"] == "Current")
     st.caption(f"{current} of {len(rows)} curves are current. Marks older than {CURVE_STALE_DAYS} days count as out of date, and those older than {STALE_DAYS} days no longer feed Market Read.")
     st.subheader("Add marks without opening the app")
-    st.markdown(f"Save your broker sheet or settlement file in the folder below. New files are imported when you open the app or select Update market data.\n\n`{curve_folder()}`")
+    st.markdown(f"Save your broker sheet or settlement file in the folder below. New files are imported when you open the app or select Update this page.\n\n`{curve_folder()}`")
     left, right = st.columns(2)
     with left:
         st.download_button("Download a template", data=curve_template_csv(today), file_name="curve_template.csv", mime="text/csv", key="curve_template")
@@ -12653,7 +12857,7 @@ def render_track_record() -> None:
     if replayed:
         parts.append("<p>On past data, without forecasts or curve signals:</p>" + "".join(f"<p>{line(r)}</p>" for r in replayed))
     if not rows:
-        parts.append('<p class="soft">Select Update market data to load prices. Past reads are then rebuilt and scored here.</p>')
+        parts.append('<p class="soft">Select Update this page to load prices. Past reads are then rebuilt and scored here.</p>')
     with st.container(key="hero"):
         st.markdown(f'<div class="desk-note">{"".join(parts)}</div>', unsafe_allow_html=True)
     if not paths["European gas"]["days"]:
@@ -12733,7 +12937,7 @@ def render_winter_outlook() -> None:
         second = (f"The coldest winter of the past {len(outlook['years'])} would take it to <b>{scenarios[0]['end']:.0f}%</b>{comparison(scenarios[0]['end'])}, "
                   f"and the mildest to <b>{scenarios[2]['end']:.0f}%</b>{comparison(scenarios[2]['end'])}.")
     else:
-        second = "This repeats past withdrawals because the weather history isn't loaded, so it doesn't separate weather from anything else. Select Update market data to load it."
+        second = "This repeats past withdrawals because the weather history isn't loaded, so it doesn't separate weather from anything else. Select Update this page to load it."
     if outlook["error"] is not None and weather_based:
         beat = outlook["error"] < outlook["average_error"]
         third = (f"Tested on {len(outlook['backtest'])} past winters with their actual weather, the method missed the March level by {outlook['error']:.1f} points on average, "
@@ -13123,7 +13327,7 @@ def build_brief() -> dict:
     if marks_note:
         warnings_.append(marks_note)
     if not metrics.get("EU storage fill"):
-        warnings_.append("There's no storage data yet. Select Update market data.")
+        warnings_.append("There's no storage data yet. Select Update this page.")
     priced = list(dict.fromkeys(held_products + ["TTF Natural Gas", "French Power Base", "German Power Base"]))
     return {"prices_used": prices_used_lines(priced), "book_note": src_book(), "alerts": threshold_alerts(rules, metrics), "changes": changes, "reads": reads, "pnl_text": pnl_text, "drivers": drivers, "estimates": estimates,
             "outlook": outlook_text, "warnings": warnings_}
@@ -13235,7 +13439,7 @@ def _vol_note(name: str, measured: dict) -> str:
 def render_storage_valuation() -> None:
     curve = _forward_months("TTF Natural Gas", 24)
     if len(curve) < 6:
-        need_data_note("This needs at least six months of live TTF prices. Select Update market data.")
+        need_data_note("This needs at least six months of live TTF prices. Select Update this page.")
         return
     measured = curve_volatility(saved_snapshots(), "TTF Natural Gas")
     with st.container(key="panel"):
@@ -13317,7 +13521,7 @@ def render_plant_valuation() -> None:
     power, gas, carbon = _forward_months(choice, horizon), _forward_months("TTF Natural Gas", horizon), _forward_months("EUA Carbon", horizon)
     months = power.merge(gas, on="delivery_month", suffixes=("_power", "_gas")).merge(carbon[["delivery_month", "price"]].rename(columns={"price": "price_carbon"}), on="delivery_month")
     if len(months) < 3:
-        need_data_note("This needs live power, TTF and EUA prices for the same months. Select Update market data.")
+        need_data_note("This needs live power, TTF and EUA prices for the same months. Select Update this page.")
         return
     history = saved_snapshots()
     measured = {"power": curve_volatility(history, choice), "gas": curve_volatility(history, "TTF Natural Gas"), "carbon": curve_volatility(history, "EUA Carbon")}
@@ -13684,7 +13888,7 @@ def page_market_fundamentals():
         st.rerun()
 
     if not data_items:
-        st.info("No market data yet. Select Update market data in the sidebar.")
+        st.info("No market data yet. Select Update this page in the sidebar.")
     else:
         status_rows = []
         for key, item in data_items.items():
@@ -13764,7 +13968,7 @@ def page_market_fundamentals():
         table(pd.DataFrame(insights)[["Topic", "Observation"]])
         st.caption("These describe observations only. Check weather, consumption, imports and LNG together before forming a price view. Reference-city weather isn't a national forecast.")
     else:
-        st.info("Select Update market data in the sidebar to see what the data shows.")
+        st.info("Select Update this page in the sidebar to see what the data shows.")
 
     fund_tabs = view_tabs(["Gas storage", "Winter outlook", "LNG", "Power", "Gas flows", "Weather", "Cross-market analysis"])
     if fund_tabs[1]:
@@ -13817,7 +14021,7 @@ def page_market_fundamentals():
                     chart(fig_fill)
             table(data)
         else:
-            st.info("Select Update market data in the sidebar to load storage.")
+            st.info("Select Update this page in the sidebar to load storage.")
 
     if fund_tabs[2]:
         data = _live_dataset_frame("gie_alsi")
@@ -13839,7 +14043,7 @@ def page_market_fundamentals():
                 chart(fig)
             table(data)
         else:
-            st.info("Select Update market data in the sidebar to load LNG data.")
+            st.info("Select Update this page in the sidebar to load LNG data.")
 
     if fund_tabs[3]:
         st.subheader("Power prices, load and generation")
@@ -13876,7 +14080,7 @@ def page_market_fundamentals():
                     chart(fig, max(300, 30 * len(mix) + 90))
                 table(data, height=300)
         else:
-            need_data_note("Select Update market data in the sidebar to load prices, load and generation.")
+            need_data_note("Select Update this page in the sidebar to load prices, load and generation.")
 
     if fund_tabs[4]:
         data = _live_dataset_frame("entsog_flow")
@@ -13946,7 +14150,7 @@ def page_market_fundamentals():
                     st.download_button("Download hourly weather (CSV)", hourly_weather.to_csv(index=False).encode("utf-8"), file_name="open_meteo_hourly_weather.csv", mime="text/csv", key="fundamentals_download_weather_hourly")
             st.caption("HDD/CDD use simple daily-mean-temperature bases of 18°C/22°C. Wind at 100 m and shortwave radiation are renewable-resource proxies—not generation forecasts. Representative city points are not national weighted averages. Source: Open-Meteo (CC BY 4.0; attribution required).")
         else:
-            st.info("Select Update market data in the sidebar to load the forecast.")
+            st.info("Select Update this page in the sidebar to load the forecast.")
 
     if fund_tabs[6]:
         st.subheader("Residual load against day-ahead price")
@@ -13970,7 +14174,7 @@ def page_market_fundamentals():
             st.metric("Correlation in this sample", f"{corr:.3f}" if pd.notna(corr) else "Not enough overlap", help="Describes this sample only. It doesn't show cause and isn't a signal.")
             st.download_button("Download as CSV", residual.to_csv(index=False).encode("utf-8"), file_name="meridian_power_context.csv", mime="text/csv", key="download_residual_load_context")
         else:
-            need_data_note("Select Update market data in the sidebar. This view needs prices, load and generation for the same zone, and never combines different zones.")
+            need_data_note("Select Update this page in the sidebar. This view needs prices, load and generation for the same zone, and never combines different zones.")
 
     with st.expander("How to read these indicators"):
         st.markdown("- **GIE AGSI+ and ALSI:** storage and LNG data give gas supply context. Attribution to GIE is required.\n"
@@ -14038,8 +14242,8 @@ def page_live_data_integrations():
     with st.container(key="panel"):
         c1, c2 = st.columns([1, 2.6], vertical_alignment="center")
         with c1:
-            update_button("live_update_all", "Update all sources")
-        c2.caption("Fetches only what's new from ENTSO-E, GIE, Open-Meteo and the ECB. You don't need to enter any key.")
+            update_button("live_update_all", "Update all sources", every_source=True)
+        c2.caption("Fetches what's new for every page. Each page also updates its own sources when you open it: the table below says which.")
         results = st.session_state.get("update_results") or []
         if results:
             table(pd.DataFrame([{"Source": n, "Result": "Updated" if good else "Failed", "Detail": d} for n, good, d in results]))
@@ -14048,6 +14252,15 @@ def page_live_data_integrations():
                 report = update_report()
                 st.code(report, language=None)
                 st.download_button("Download the report", report, file_name="meridian_update_report.txt", key="update_report_download")
+    st.markdown("**What each page updates.** Opening a page fetches only these sources, and only those older than their refresh interval "
+                "(an hour for forward curves, a few hours for prices, weather and fundamentals, a month for temperature normals). "
+                "Update this page in the sidebar fetches them again straight away.")
+    shown = page_update_table()
+    table(shown.drop(columns="Sources"))
+    with st.expander("Where each source comes from"):
+        table(pd.DataFrame([{"Source": UPDATE_GROUP_SHORT[g], "Provider and data": UPDATE_GROUPS[g],
+                             "Pages": ", ".join(p for p, gs in PAGE_UPDATES.items() if g in gs),
+                             "Last fetched": _ago(group_fetched_at(g)) if group_fetched_at(g) else "Not loaded"} for g in UPDATE_GROUPS]))
     saved = resolved_credentials()
     with st.expander("Replace an access key", expanded=False):
         st.caption("You only need this to use a different key. Your saved keys come from the keys file beside the app and are never sent to your browser, so these fields stay empty. A key pasted here lasts for this session. To change one permanently, edit meridian_keys.toml.")
@@ -14487,7 +14700,6 @@ def main() -> None:
         import_curve_folder()
     curves = build_curves()
     ensure_daily_snapshot()
-    maybe_auto_update()
     try:
         record_market_reads()
     except Exception as exc:
@@ -14496,6 +14708,10 @@ def main() -> None:
     pending_nav_page = st.session_state.pop("pending_nav_page", None)
     if pending_nav_page:
         set_nav_page(str(pending_nav_page))
+    if st.session_state.get("nav_page") not in ALL_NAV_ITEMS:
+        st.session_state.nav_page = DEFAULT_NAV_ITEM
+    # Only the open page's stale sources, before the sidebar draws, so its progress shows straight away.
+    maybe_auto_update(NAV_TO_PAGE[st.session_state.nav_page])
     page = render_sidebar()
     st.markdown(page_accent_css(st.session_state.nav_page), unsafe_allow_html=True)
     flash_message = st.session_state.pop("flash_message", None)
