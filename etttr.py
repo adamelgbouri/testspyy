@@ -7466,12 +7466,10 @@ hr {{ border-color:{BORDER}; margin:0.6rem 0; }}
 .head-row {{ display:flex; gap:0.7rem; align-items:baseline; flex-wrap:wrap; }}
 .stApp h1.page-title {{ font-size:1.35rem; padding-left:0.6rem !important; border-left:4px solid var(--accent); font-weight:600; line-height:1.3; color:{TEXT}; margin:0; padding:0; }}
 .page-sub {{ color:{GRAY}; font-size:0.86rem !important; margin:0; }}
-/* Author signature: small-caps "by", a fading accent rule, then the name in the brand-mark gradient */
-.byline {{ display:inline-flex; align-items:center; gap:0.55rem; margin:0.4rem 0 0 0.85rem !important; padding:3px 11px 3px 9px; border:var(--line); border-radius:999px;
-  background:linear-gradient(90deg, color-mix(in srgb, var(--accent) 10%, {PANEL}) 0%, {PANEL} 100%); font-size:0.8rem !important; line-height:1.3 !important; }}
-.byline .by {{ display:inline-flex; align-items:center; gap:0.45rem; color:{GRAY}; font-size:0.64rem; font-weight:500; text-transform:uppercase; letter-spacing:0.16em; }}
-.byline .by::after {{ content:""; width:16px; height:1px; background:linear-gradient(90deg, var(--accent), transparent); }}
-.sig {{ font-weight:600; letter-spacing:0.03em; background:linear-gradient(90deg, #4FB3F6, #34D6B4); -webkit-background-clip:text; background-clip:text; color:transparent; }}
+/* Author signature: quiet grey "by", name in primary ink */
+.byline {{ margin:0.3rem 0 0 0.85rem !important; font-size:0.78rem !important; line-height:1.3 !important; color:{GRAY}; letter-spacing:0.01em; }}
+.byline .by {{ margin-right:0.3rem; }}
+.sig {{ font-weight:500; color:{TEXT}; letter-spacing:0.01em; }}
 .page-foot {{ color:{GRAY}; font-size:0.78rem; text-align:center; margin:2.2rem 0 0.4rem 0; padding-top:0.7rem; border-top:1px solid {BORDER}; }}
 .pill {{ display:inline-flex; align-items:center; gap:6px; padding:2px 8px; border:var(--line); border-radius:3px; font-size:0.78rem; color:{TEXT}; white-space:nowrap; background:{PANEL}; }}
 .pill i {{ width:7px; height:7px; border-radius:50%; display:inline-block; background:{GRAY}; }}
@@ -7525,8 +7523,7 @@ section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {{ gap:0.35rem;
 .brand .mark span {{ font-family:"Material Symbols Rounded"; font-size:18px; color:#06131B; }}
 .brand .name {{ font-size:1.05rem; font-weight:600; color:{TEXT}; letter-spacing:0.02em; line-height:1.3; }}
 .brand small {{ display:block; font-size:0.72rem; font-weight:400; color:{GRAY}; margin-top:1px; }}
-.brand small.by-line {{ margin-top:3px; font-size:0.7rem; letter-spacing:0.02em; }}
-.brand small.by-line .sig {{ font-size:0.74rem; }}
+.brand small.by-line {{ margin-top:2px; }}
 section[data-testid="stSidebar"] [data-testid="stRadio"], section[data-testid="stSidebar"] [data-testid="stRadio"] > div, section[data-testid="stSidebar"] [role="radiogroup"] {{ width:100% !important; }}
 section[data-testid="stSidebar"] [data-testid="stRadio"] [data-testid="stWidgetLabel"] p {{ color:var(--sec, {GRAY}); font-size:0.74rem; font-weight:600; padding:0 6px; margin-top:4px; }}
 section[data-testid="stSidebar"] [role="radiogroup"] {{ gap:0; flex-direction:column; }}
