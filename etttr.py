@@ -1,4 +1,5 @@
 """Meridian Energy Desk: European gas and power trading and risk.
+By Adam El Gbouri.
 
 Run with:   streamlit run etttr.py          (needs Python 3.10+ and: pip install -U streamlit pandas plotly numpy)
 Test with:  pytest etttr.py
@@ -33,19 +34,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from time import perf_counter, sleep
+from time import monotonic, perf_counter, sleep
 from zoneinfo import ZoneInfo
 import gzip
 import hashlib
 import html
 import inspect
 import io
+import itertools
 import json
 import math
 import os
 import re
+import random
 import shutil
 import sqlite3
+import string
 import textwrap
 import tempfile
 import threading
@@ -68,6 +72,7 @@ import plotly.io as pio
 import streamlit as st
 
 MIN_STREAMLIT_VERSION = (1, 50)
+AUTHOR = "Adam El Gbouri"
 
 # pandas 3 always copies on write. Earlier versions need it switched on, which makes
 # sharing large frames between calculations safe.
@@ -1487,7 +1492,7 @@ def temperature_normals_from_daily(daily: pd.DataFrame) -> pd.DataFrame:
 @content_memo
 def hdd_vs_normal(daily: pd.DataFrame, normals: pd.DataFrame, horizon_days: int = 7) -> pd.DataFrame:
     """Forecast heating demand against normal for the next few days, by location."""
-    columns = ["location", "days", "forecast_hdd", "normal_hdd", "hdd_vs_normal", "temperature_vs_normal_c"]
+    columns = ["location", "days", "forecast_hdd", "normal_hdd", "hdd_vs_normal", "temperature_vs_normal_c", "first", "last"]
     if daily is None or daily.empty or normals is None or normals.empty or "location" not in daily.columns:
         return pd.DataFrame(columns=columns)
     data = daily.copy()
@@ -1505,7 +1510,8 @@ def hdd_vs_normal(daily: pd.DataFrame, normals: pd.DataFrame, horizon_days: int 
                      "forecast_hdd": float(group["heating_degree_day_proxy_18c"].sum()),
                      "normal_hdd": float(group["normal_hdd"].sum()),
                      "hdd_vs_normal": float(group["heating_degree_day_proxy_18c"].sum() - group["normal_hdd"].sum()),
-                     "temperature_vs_normal_c": float((group["temperature_mean_c"] - group["normal_temperature_c"]).mean())})
+                     "temperature_vs_normal_c": float((group["temperature_mean_c"] - group["normal_temperature_c"]).mean()),
+                     "first": group["date"].min(), "last": group["date"].max()})
     return pd.DataFrame(rows, columns=columns)
 
 
@@ -1785,6 +1791,7 @@ def hedge_plan(buckets: pd.DataFrame, history: pd.DataFrame, curves: dict[str, p
             last = fitted[-1]
             held = pnl[cut:] + np.column_stack([candidates[i]["series"][cut:] for i in last["indices"]]) @ last["sizes"]
             plan["out_of_sample"] = {"test_days": len(days) - cut, "train_days": cut,
+                                     "train_span": (days[0], days[cut - 1]), "test_span": (days[cut], days[-1]),
                                      "unhedged_std": float(np.std(pnl[cut:])), "hedged_std": float(np.std(held)),
                                      "unhedged_worst": float(pnl[cut:].min()), "hedged_worst": float(held.min()),
                                      "contracts": [f"{candidates[i]['product']} {candidates[i]['contract']}" for i in last["indices"]]}
@@ -1865,6 +1872,32 @@ def _signal(key: str, name: str, weight: float, z: Optional[float] = None, value
     return {"key": key, "name": name, "weight": float(weight), "available": available,
             "score": float(np.clip(float(z) / 2.0, -1.0, 1.0)) if available else 0.0,
             "value": value, "why": why, "flip": flip, "missing": missing}
+
+
+def day_text(day) -> str:
+    """One day as '16 Nov 2026'."""
+    return f"{pd.Timestamp(day):%d %b %Y}".lstrip("0")
+
+
+def period_text(first, last) -> str:
+    """A run of days as '10–16 Nov 2026', '28 Oct–3 Nov 2026' or '28 Dec 2025–3 Jan 2026'. One day reads as that day."""
+    a, b = pd.Timestamp(first), pd.Timestamp(last)
+    if a > b:
+        a, b = b, a
+    if a.normalize() == b.normalize():
+        return day_text(a)
+    if a.year != b.year:
+        return f"{day_text(a)}–{day_text(b)}"
+    if a.month != b.month:
+        return f"{a.day} {a:%b}–{b.day} {b:%b %Y}"
+    return f"{a.day}–{b.day} {b:%b %Y}"
+
+
+def periods_text(recent_days, prior_days) -> tuple[str, str]:
+    """The recent and earlier windows of a comparison, each as a dated period."""
+    recent_days, prior_days = list(recent_days), list(prior_days)
+    return (period_text(min(recent_days), max(recent_days)) if recent_days else "",
+            period_text(min(prior_days), max(prior_days)) if prior_days else "")
 
 
 def _theme(signal: dict) -> str:
@@ -1948,8 +1981,9 @@ def _heating_signal(daily: pd.DataFrame, normals: pd.DataFrame, locations: Seque
         return _signal("weather", name, weight, 0.0, f"Outside the heating season: only {normal:.0f} normal degree days ahead.",
                        "Temperature has little effect on heating demand at this time of year.", "This becomes relevant when heating demand returns.")
     gap = (forecast - normal) / normal
+    window = period_text(anomaly["first"].min(), anomaly["last"].max()) if anomaly["first"].notna().any() else f"the next {days} days"
     return _signal("weather", name, weight, gap / 0.15,
-                   f"Next {days} days: {forecast:.0f} heating degree days against a normal of {normal:.0f} ({gap * 100:+.0f}%).",
+                   f"Forecast for {window} ({days} days): {forecast:.0f} heating degree days, against a 10-year normal of {normal:.0f} for the same dates ({gap * 100:+.0f}%).",
                    f"Colder than normal lifts {market} demand, and milder than normal reduces it.",
                    f"Reverses if the forecast moves {'below' if gap > 0 else 'above'} {normal:.0f} degree days.")
 
@@ -1975,23 +2009,27 @@ def gas_signals(history: pd.DataFrame, alsi: pd.DataFrame, daily: pd.DataFrame, 
                 gap = float(latest["fill"]) - float(near["average"])
                 spread = max((float(near["high"]) - float(near["low"])) / 2.0, 3.0)
                 level = _signal("storage_level", level["name"], 3.0, -gap / spread,
-                                f"{latest['fill']:.1f}% full, {abs(gap):.1f} points {'above' if gap >= 0 else 'below'} the five-year average of {near['average']:.1f}% for this date.",
+                                f"{latest['fill']:.1f}% full on gas day {day_text(latest['day'])}, {abs(gap):.1f} points {'above' if gap >= 0 else 'below'} "
+                                f"the {seasonal['band_years'][0]}–{seasonal['band_years'][-1]} average of {near['average']:.1f}% for {latest['day']:%d %b}.",
                                 "Less gas in store than usual leaves less cushion for the rest of the season.",
                                 f"Reverses if fill moves {'below' if gap >= 0 else 'above'} {near['average']:.1f}% at this time of year.")
             lookup = dict(zip(store["day"], store["fill"]))
             then = lookup.get(latest["day"] - pd.Timedelta(days=7))
-            history_changes = []
+            history_changes, history_years = [], []
             for offset in range(1, 6):
                 a = lookup.get(latest["day"] - pd.DateOffset(years=offset))
                 b = lookup.get(latest["day"] - pd.DateOffset(years=offset) - pd.Timedelta(days=7))
                 if a is not None and b is not None:
                     history_changes.append(float(a) - float(b))
+                    history_years.append((latest["day"] - pd.DateOffset(years=offset)).year)
             if then is not None and len(history_changes) >= 2:
                 change = float(latest["fill"]) - float(then)
                 usual = float(np.mean(history_changes))
                 scale = max(float(np.std(history_changes)), 0.3)
                 pace = _signal("storage_pace", pace["name"], 2.0, -(change - usual) / scale,
-                               f"Changed {change:+.1f} points in 7 days, against {usual:+.1f} usually at this time of year.",
+                               f"Changed {change:+.1f} points from gas day {day_text(latest['day'] - pd.Timedelta(days=7))} ({float(then):.1f}%) "
+                               f"to {day_text(latest['day'])} ({float(latest['fill']):.1f}%), against {usual:+.1f} on average over the same 7 days "
+                               f"in {min(history_years)}–{max(history_years)}.",
                                "Storage falling faster, or filling slower, than normal points to a tighter balance.",
                                f"Reverses if the weekly change moves {'below' if change > usual else 'above'} {usual:+.1f} points.")
     signals += [level, pace, _heating_signal(daily, normals, GAS_WEATHER_LOCATIONS, 2.5, "gas")]
@@ -2005,11 +2043,12 @@ def gas_signals(history: pd.DataFrame, alsi: pd.DataFrame, daily: pd.DataFrame, 
             flow = flow.groupby("day", as_index=False)["value"].mean().sort_values("day")
             if len(flow) >= 14:
                 recent, prior = flow["value"].tail(7), flow["value"].iloc[:-7].tail(23)
+                recent_span, prior_span = periods_text(flow["day"].tail(7), flow["day"].iloc[:-7].tail(23))
                 base = float(prior.mean())
                 scale = max(float(prior.std()), abs(base) * 0.01, 1.0)
                 gap = float(recent.mean()) - base
                 lng = _signal("lng", lng["name"], 1.5, -gap / scale,
-                              f"{recent.mean():,.0f} GWh/d over the last week, against {base:,.0f} GWh/d before that.",
+                              f"{recent.mean():,.0f} GWh/d on gas days {recent_span}, against {base:,.0f} GWh/d on {prior_span}.",
                               "More LNG reaching Europe adds supply, and less removes it.",
                               f"Reverses if send-out moves {'below' if gap >= 0 else 'above'} {base:,.0f} GWh/d.")
     signals.append(lng)
@@ -2089,10 +2128,11 @@ def _nuclear_signal(generation: pd.DataFrame, tz: str, today: date) -> Optional[
     if (today - daily.index.max()).days > STALE_DAYS:
         return _signal("nuclear", name, weight, missing="Actual generation is out of date. Fetch it again.")
     recent, prior = daily.tail(7), daily.iloc[:-7].tail(21)
+    recent_span, prior_span = periods_text(recent.index, prior.index)
     gap = float(recent.mean()) - float(prior.mean())
     scale = max(float(prior.std()), float(prior.mean()) * 0.03, 1.0)
     return _signal("nuclear", name, weight, -gap / scale,
-                   f"{recent.mean() / 1000:.1f} GW over the last 7 days, {gap / float(prior.mean()) * 100:+.1f}% against {prior.mean() / 1000:.1f} GW before that.",
+                   f"{recent.mean() / 1000:.1f} GW on {recent_span}, {gap / float(prior.mean()) * 100:+.1f}% against {prior.mean() / 1000:.1f} GW on {prior_span}.",
                    "Lower nuclear output means dearer plants or imports must fill the gap. This shows output so far, not planned outages ahead.",
                    f"Reverses if output moves {'above' if gap < 0 else 'below'} {prior.mean() / 1000:.1f} GW.")
 
@@ -2112,9 +2152,10 @@ def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generatio
             momentum["missing"] = negative["missing"] = f"Day-ahead prices are {age} days old. Fetch them again."
         elif len(by_day) >= 14:
             recent, prior = by_day["value"].tail(7), by_day["value"].iloc[:-7].tail(21)
+            recent_span, prior_span = periods_text(by_day["day"].tail(7), by_day["day"].iloc[:-7].tail(21))
             gap = float(recent.mean()) - float(prior.mean())
             momentum = _signal("momentum", momentum["name"], 2.0, gap / max(float(prior.std()), 3.0),
-                               f"{recent.mean():.1f} EUR/MWh over the last 7 days, against {prior.mean():.1f} before that.",
+                               f"{recent.mean():.1f} EUR/MWh on delivery days {recent_span}, against {prior.mean():.1f} on {prior_span}.",
                                "Shows the direction prices are already moving in, not why.",
                                f"Reverses if the 7-day average moves {'below' if gap >= 0 else 'above'} {prior.mean():.1f} EUR/MWh.")
             cut = series_day >= by_day["day"].iloc[-7]
@@ -2122,8 +2163,9 @@ def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generatio
             share = lambda part: float(part.loc[part["value"] < 0, "hours"].sum() / part["hours"].sum() * 100.0) if not part.empty else 0.0
             recent_share, prior_share = share(series.loc[cut]), share(series.loc[earlier & ~cut])
             hours = float(series.loc[cut & series["value"].lt(0), "hours"].sum())
+            negative_prior = period_text(by_day["day"].iloc[max(len(by_day) - 28, 0)], by_day["day"].iloc[-8])
             negative = _signal("negative", negative["name"], 1.5, -(recent_share - prior_share) / 2.5,
-                               f"{hours:.0f} negative hours in the last 7 days, {recent_share:.1f}% of the time against {prior_share:.1f}% before.",
+                               f"{hours:.0f} negative hours on delivery days {recent_span}, {recent_share:.1f}% of the time, against {prior_share:.1f}% on {negative_prior}.",
                                "More negative hours mean renewables are oversupplying the system, which pushes prices down.",
                                f"Reverses if the share moves {'below' if recent_share > prior_share else 'above'} {prior_share:.1f}%.")
     residual = _signal("residual", "Residual load against the past weeks", 2.5, missing=f"Fetch actual load and generation for {zone}.")
@@ -2132,10 +2174,11 @@ def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generatio
         days = hourly.assign(day=hourly["hour"].dt.tz_convert(tz).dt.date).groupby("day", as_index=False)["residual"].mean()
         if len(days) >= 14 and (today - days["day"].max()).days <= STALE_DAYS:
             recent, prior = days["residual"].tail(7), days["residual"].iloc[:-7].tail(21)
+            recent_span, prior_span = periods_text(days["day"].tail(7), days["day"].iloc[:-7].tail(21))
             gap = float(recent.mean()) - float(prior.mean())
             scale = max(float(prior.std()), abs(float(prior.mean())) * 0.02, 1.0)
             residual = _signal("residual", residual["name"], 2.5, gap / scale,
-                               f"{recent.mean() / 1000:.1f} GW over the last 7 days, against {prior.mean() / 1000:.1f} GW before that.",
+                               f"{recent.mean() / 1000:.1f} GW on {recent_span}, against {prior.mean() / 1000:.1f} GW on {prior_span}.",
                                "Residual load is what wind and solar leave for other plants. More of it brings dearer plants into the merit order.",
                                f"Reverses if it moves {'below' if gap >= 0 else 'above'} {prior.mean() / 1000:.1f} GW.")
     location = ZONE_WEATHER.get(zone)
@@ -2143,12 +2186,17 @@ def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generatio
     wind = _signal("wind", "Wind outlook against recent days", 1.5, missing="Fetch the weather forecast.")
     if daily is not None and not daily.empty and {"location", "forecast_period", "wind_speed_100m_mean_kmh"}.issubset(daily.columns) and location:
         here = daily.loc[daily["location"].eq(location)]
-        ahead = pd.to_numeric(here.loc[here["forecast_period"].eq("Forecast"), "wind_speed_100m_mean_kmh"], errors="coerce").head(7).dropna()
-        before = pd.to_numeric(here.loc[here["forecast_period"].ne("Forecast"), "wind_speed_100m_mean_kmh"], errors="coerce").dropna()
+        ahead_rows = here.loc[here["forecast_period"].eq("Forecast")].head(7)
+        before_rows = here.loc[here["forecast_period"].ne("Forecast")]
+        ahead = pd.to_numeric(ahead_rows["wind_speed_100m_mean_kmh"], errors="coerce").dropna()
+        before = pd.to_numeric(before_rows["wind_speed_100m_mean_kmh"], errors="coerce").dropna()
+        dated = "date" in here.columns
+        ahead_span = period_text(pd.to_datetime(ahead_rows["date"]).min(), pd.to_datetime(ahead_rows["date"]).max()) if dated and len(ahead_rows) else "the days ahead"
+        before_span = period_text(pd.to_datetime(before_rows["date"]).min(), pd.to_datetime(before_rows["date"]).max()) if dated and len(before_rows) else "recent days"
         if len(ahead) >= 3 and len(before) >= 2 and before.mean() > 0:
             gap = float(ahead.mean()) - float(before.mean())
             wind = _signal("wind", wind["name"], 1.5, -gap / (0.2 * float(before.mean())),
-                           f"{ahead.mean():.0f} km/h forecast at 100 m, against {before.mean():.0f} km/h in recent days.",
+                           f"{ahead.mean():.0f} km/h forecast at 100 m for {ahead_span}, against {before.mean():.0f} km/h on {before_span}.",
                            "Windier weather adds cheap output and calmer weather removes it. This uses one reference city, so treat it as a rough guide.",
                            f"Reverses if the forecast moves {'above' if gap < 0 else 'below'} {before.mean():.0f} km/h.")
     fuel = _signal("fuel", "Day-ahead against gas plant cost", 1.5, missing="Import real TTF and EUA curves in Forward Curves.")
@@ -2159,10 +2207,13 @@ def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generatio
         if shared:
             eta, factor = DEFAULT_SPREAD_PARAMS["gas_efficiency"], DEFAULT_SPREAD_PARAMS["gas_emission_factor"]
             cost = gas[shared[0]] / eta + carbon[shared[0]] * factor / eta
-            spot = float(series.tail(int(7 * 24 / max(float(series["hours"].median()), 0.25)))["value"].mean())
+            last_week = series.tail(int(7 * 24 / max(float(series["hours"].median()), 0.25)))
+            spot = float(last_week["value"].mean())
+            spot_span = period_text(last_week["local"].min(), last_week["local"].max())
             gap = spot - cost
             fuel = _signal("fuel", fuel["name"], 1.5, -gap / 15.0,
-                           f"{spot:.1f} EUR/MWh over the last week, against a {cost:.1f} EUR/MWh cost for a 50% efficient gas plant.",
+                           f"{spot:.1f} EUR/MWh on delivery days {spot_span}, against a {cost:.1f} EUR/MWh cost for a 50% efficient gas plant "
+                           f"on {pd.Timestamp(shared[0]):%b-%y} TTF and EUA.",
                            "Prices far above gas plant cost tend to attract supply, and prices far below it leave little room to fall.",
                            f"Reverses if the price moves through {cost:.1f} EUR/MWh.")
     nuclear = _nuclear_signal(generation, tz, today)
@@ -2808,7 +2859,8 @@ def outlook_signal(outlook: Optional[dict]) -> Optional[dict]:
     central = outlook["scenarios"][outlook["central"]]["end"]
     gap = central - band["average"]
     return _signal("winter_outlook", name, 2.0, -gap / max((band["high"] - band["low"]) / 2.0, 5.0),
-                   f"Normal weather ends March at {central:.0f}%, against a five-year average of {band['average']:.0f}%.",
+                   f"From {outlook['start_fill']:.1f}% on gas day {day_text(outlook['start'])}, normal weather ends {day_text(outlook['end'])} at {central:.0f}%, "
+                   f"against a five-year average of {band['average']:.0f}% on {outlook['end']:%d %b}.",
                    "A low end to winter means more gas to buy back next summer, and a high end means less.",
                    f"Reverses if the projected end moves {'below' if gap >= 0 else 'above'} {band['average']:.0f}%.")
 
@@ -3297,16 +3349,19 @@ def pnl_drivers(step: pd.DataFrame, factor: pd.Series) -> pd.DataFrame:
     return grouped.loc[grouped["total"].abs().argsort()[::-1], columns].reset_index(drop=True)
 
 
-def pnl_sentence(drivers: pd.DataFrame) -> str:
-    """The period's result in words, naming what moved it most."""
+def pnl_sentence(drivers: pd.DataFrame, period: Optional[tuple] = None) -> str:
+    """The period's result in words, naming what moved it most. period is (first curve date, last curve date)."""
+    when = f" from the {day_text(period[0])} curves to the {day_text(period[1])} curves" if period else ""
     if drivers is None or drivers.empty:
-        return "There's no P&L to explain in this period."
+        return f"There's no P&L to explain{when or ' in this period'}."
     total, moves, new = float(drivers["total"].sum()), float(drivers["price_move"].sum()), float(drivers["new_trades"].sum())
-    parts = [f"P&L was {fmt_money(total)}: {fmt_money(moves)} from price moves and {fmt_money(new)} from new trades."]
+    parts = [f"P&L{when} was {fmt_money(total)}: {fmt_money(moves)} from price moves and {fmt_money(new)} from new trades."]
     top = drivers.loc[drivers["price_move"].abs().idxmax()]
     if abs(float(top["price_move"])) > 0.005:
         side = "long" if top["net_mwh"] > 0 else "short"
-        parts.append(f"The largest price effect was {top['product']} {month_contract_label(top['delivery_month'])}: {side} {abs(top['net_mwh']):,.0f} MWh while the mark moved {top['mark_change']:+.2f}, worth {fmt_money(float(top['price_move']))}.")
+        moved = (f"while the mark moved {top['mark_change']:+.2f}, from {top['previous_mark']:.2f} to {top['current_mark']:.2f}"
+                 if pd.notna(top.get("previous_mark")) and pd.notna(top.get("current_mark")) else f"while the mark moved {top['mark_change']:+.2f}")
+        parts.append(f"The largest price effect was {top['product']} {month_contract_label(top['delivery_month'])}: {side} {abs(top['net_mwh']):,.0f} MWh {moved}, worth {fmt_money(float(top['price_move']))}.")
     return " ".join(parts)
 
 
@@ -3514,7 +3569,7 @@ def simple_pdf(blocks: Sequence[tuple], title: str = "") -> bytes:
                 pages[-1].append(b"0.88 0.91 0.92 RG 0.4 w %d %.1f m %d %.1f l S\n" % (margin, y, width - margin, y))
             y -= 6
     objects = [b"<< /Type /Catalog /Pages 2 0 R >>", None, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
-               b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>", b"<< /Title (" + _pdf_text(title) + b") >>"]
+               b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>", b"<< /Title (" + _pdf_text(title) + b") /Author (" + _pdf_text(AUTHOR) + b") >>"]
     kids = []
     for number, commands in enumerate(pages, start=1):
         footer = b"BT /F1 8 Tf 0.45 0.50 0.52 rg %d 28 Td (" % margin + _pdf_text(f"Page {number} of {len(pages)}") + b") Tj ET\n"
@@ -4111,9 +4166,6 @@ def fund_design(days: pd.DatetimeIndex, weather: pd.DataFrame, zone: str, holida
     w = weather.reindex(days)
     kind = day_classes(days, zone)
     off_before, off_after = np.r_[False, kind[:-1] == 2], np.r_[kind[1:] == 2, False]
-    temperature = w["temperature"]
-    blend = lambda weights: sum(weight * temperature.shift(i).fillna(temperature) for i, weight in enumerate(weights)) / sum(weights)
-    power_temp, gas_temp = blend((6, 3, 1)), blend((8, 4, 2, 1))
     angle = 2 * np.pi * days.dayofyear.to_numpy() / 365.25
     out = pd.DataFrame({
         "sat": (kind == 1).astype(float), "sun": (kind == 2).astype(float),
@@ -4121,22 +4173,48 @@ def fund_design(days: pd.DatetimeIndex, weather: pd.DataFrame, zone: str, holida
         "friday": ((kind == 0) & (days.dayofweek == 4)).astype(float),
         "year_end": (((days.month == 12) & (days.day >= 24)) | ((days.month == 1) & (days.day == 1))).astype(float),
         "summer_break": ((days.month == 8) & (days.day <= 21)).astype(float),
-        "hdd": (15.5 - power_temp).clip(lower=0).to_numpy(), "cdd": (power_temp - 20.0).clip(lower=0).to_numpy(),
-        "cos": np.cos(angle), "sin": np.sin(angle),
-        "wind_land": w["wind_land"].to_numpy(), "wind_sea": w["wind_sea"].to_numpy(),
-        "solar": w["solar"].to_numpy(), "solar_sq": (w["solar"] ** 2 / 300.0).to_numpy(),
-        "heat18": (18.0 - gas_temp).clip(lower=0).to_numpy(), "heat13": (13.0 - gas_temp).clip(lower=0).to_numpy(),
-        "heat8": (8.0 - gas_temp).clip(lower=0).to_numpy(), "heat15": (15.5 - gas_temp).clip(lower=0).to_numpy(),
+        "hdd": 0.0, "cdd": 0.0, "cos": np.cos(angle), "sin": np.sin(angle),
+        "wind_land": 0.0, "wind_sea": 0.0, "solar": 0.0, "solar_sq": 0.0, "heat18": 0.0, "heat13": 0.0, "heat8": 0.0, "heat15": 0.0,
     }, index=days)
-    out["sat_hdd"], out["sun_hdd"] = out["sat"] * out["hdd"], out["sun"] * out["hdd"]
+    out["sat_hdd"], out["sun_hdd"] = 0.0, 0.0
     working = (kind == 0)
     school, public = (shares[0].reindex(days).fillna(0.0), shares[1].reindex(days).fillna(0.0)) if shares is not None else holiday_shares(days, zone, holidays)
     out["school"] = school.where(working, 0.0).to_numpy()
     out["part_hol"] = public.where(working & (public < 1.0), 0.0).to_numpy()
+    out["solar_trend"], out["solar_temp"] = 0.0, 0.0
+    return with_weather(out, w)
+
+
+def with_weather(calendar: pd.DataFrame, weather: pd.DataFrame) -> pd.DataFrame:
+    """A design with its weather columns (re)computed from weather, keeping the calendar columns. The outlook runs each of
+    the 51 weather scenarios through the models, and only these columns differ between them, so the calendar is built once
+    and the weather columns are plain array arithmetic."""
+    days = calendar.index
+    w = weather.reindex(days)
+    temperature = w["temperature"].to_numpy(float)
+
+    def blend(weights: Sequence[int]) -> np.ndarray:
+        # Today's temperature stands in for a missing earlier day, as shift().fillna(today) does.
+        total = np.zeros(len(temperature))
+        for lag, weight in enumerate(weights):
+            earlier = np.full(len(temperature), np.nan)
+            earlier[lag:] = temperature[:len(temperature) - lag] if lag else temperature
+            total += weight * np.where(np.isnan(earlier), temperature, earlier)
+        return total / sum(weights)
+
+    floor = lambda values: np.where(np.isnan(values), np.nan, np.maximum(values, 0.0))
+    power_temp, gas_temp = blend((6, 3, 1)), blend((8, 4, 2, 1))
+    solar = w["solar"].to_numpy(float)
+    columns = {name: calendar[name].to_numpy() for name in calendar.columns}
+    columns.update({"hdd": floor(15.5 - power_temp), "cdd": floor(power_temp - 20.0),
+                    "wind_land": w["wind_land"].to_numpy(float), "wind_sea": w["wind_sea"].to_numpy(float),
+                    "solar": solar, "solar_sq": solar ** 2 / 300.0,
+                    "heat18": floor(18.0 - gas_temp), "heat13": floor(13.0 - gas_temp), "heat8": floor(8.0 - gas_temp), "heat15": floor(15.5 - gas_temp)})
+    columns["sat_hdd"], columns["sun_hdd"] = columns["sat"] * columns["hdd"], columns["sun"] * columns["hdd"]
     # Solar capacity grows every month; the trend lets the fit follow it rather than wait for the level check.
-    out["solar_trend"] = out["solar"] * (days - pd.Timestamp("2020-01-01")).days.to_numpy() / 365.25
-    out["solar_temp"] = out["solar"] * w["temperature"].to_numpy() / 100.0
-    return out
+    columns["solar_trend"] = solar * (days - pd.Timestamp("2020-01-01")).days.to_numpy() / 365.25
+    columns["solar_temp"] = solar * temperature / 100.0
+    return pd.DataFrame(columns, index=days)[list(calendar.columns)]
 
 
 def _fund_fit(features: np.ndarray, target: np.ndarray, rows: np.ndarray, as_of: int, half_life: float,
@@ -4458,6 +4536,7 @@ def power_fundamentals(zone: str, table: pd.DataFrame, weather: pd.DataFrame, en
         difference = difference - difference.groupby(level="date").transform("mean")
         tail = days[max(0, last - 5):]
         base = weather.reindex(tail)
+        calendar = fund_design(tail, base, zone, shares=shares)
         for member, part in difference.groupby(level="member"):
             part = part.droplevel("member").reindex(tail).fillna(0.0)
             varied = base.copy()
@@ -4465,7 +4544,7 @@ def power_fundamentals(zone: str, table: pd.DataFrame, weather: pd.DataFrame, en
                 varied[field] = base[field] + part[field]
             varied[["wind_land", "wind_sea"]] = varied[["wind_land", "wind_sea"]].clip(0.0, 1.0)
             varied["solar"] = varied["solar"].clip(lower=0.0)
-            member_design = fund_design(tail, varied, zone, shares=shares)
+            member_design = with_weather(calendar, varied)
             member_designs[member] = member_design
             for name, values in project(member_design.reindex(days[ahead])).items():
                 members.setdefault(name, []).append(values)
@@ -4499,6 +4578,8 @@ def power_fundamentals(zone: str, table: pd.DataFrame, weather: pd.DataFrame, en
             "has_nuclear": bool(has_nuclear), "nuclear_now": float(nuclear_known.iloc[last]) if has_nuclear else 0.0, "gas_ready": bool(gas_ready),
             "operator_better": operator_better, "scenarios": scenario_count if scenario_count >= FUND_MIN_MEMBERS else 0,
             "tested_days": int(tested.sum()), "has_sea": bool(has_sea), "level": now,
+            "tested_span": (days[tested.to_numpy()].min().date(), days[tested.to_numpy()].max().date()) if bool(tested.any()) else None,
+            "nuclear_span": (days[max(last - 6, 0)].date(), days[last].date()),
             "member_designs": member_designs if scenario_count >= FUND_MIN_MEMBERS else {},
             "sources": source, "nuclear_from": nuclear_from, "holidays_used": bool(design[["school", "part_hol"]].abs().sum().sum() > 0),
             "member_gas": deviations.get("gas") if gas_ready else None}
@@ -4617,6 +4698,7 @@ def gas_demand_model(consumption: Optional[pd.DataFrame], weather: pd.DataFrame,
     return {"ready": True, "outlook": outlook, "tests": pd.DataFrame(tests), "recent": recent, "with_power": bool(with_power),
             "gas_per_power": per_power, "per_cold_degree": per_cold_degree, "last_small": days[last_small].date(), "last_large": days[last_large].date(),
             "tested_days": int(tested.sum()), "scenarios": len(member_designs) if spreads is not None else 0,
+            "tested_span": (days[tested.to_numpy()].min().date(), days[tested.to_numpy()].max().date()) if bool(tested.any()) else None,
             "power_from_model": bool(with_power and power and power.get("ready") and power.get("gas_ready"))}
 
 
@@ -4810,6 +4892,11 @@ class DeskStore:
             else:
                 conn.execute("DELETE FROM curve_snapshots")
 
+    def touch_live_item(self, key: str, fetched_at: str) -> None:
+        """Record a new fetch time for a dataset that came back unchanged, without rewriting it."""
+        with self._connect() as conn:
+            conn.execute("UPDATE live_data SET fetched_at=? WHERE key=?", (str(fetched_at), key))
+
     def save_live_item(self, key: str, item: dict) -> bool:
         """Save a fetched dataset. Very large frames stay in the session only."""
         frame = item.get("data")
@@ -4958,14 +5045,152 @@ def data_version(*names: str) -> tuple:
     return tuple(versions.get(name, 0) for name in names)
 
 
+_LIVE_VERSIONS = itertools.count(1)
+_READ_LOG = threading.local()
+_SPECIAL_READS = {"*": "any_version", "#keys": "keyset_version", "#fetched": "fetch_version"}
+
+
+def _note_read(live: "LiveData", key: str) -> None:
+    """Record, for every result being built, which fetched dataset it read and in which version."""
+    for reads in getattr(_READ_LOG, "stack", ()):
+        if key in _SPECIAL_READS:
+            reads[key] = getattr(live, _SPECIAL_READS[key])
+        elif key not in reads:
+            reads[key] = live.versions.get(key) if dict.__contains__(live, key) else None
+
+
+class LiveData(dict):
+    """The fetched datasets, each with its own version.
+
+    A result built from them remembers exactly which datasets it read, so an update that brings new storage figures
+    recomputes what uses storage and nothing else. Before, any new dataset recomputed every page. Versions come from one
+    counter for the whole app, so a new set of datasets can never be mistaken for an old one."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.versions = {key: next(_LIVE_VERSIONS) for key in dict.keys(self)}
+        self.any_version = next(_LIVE_VERSIONS)
+        self.fetch_version = next(_LIVE_VERSIONS)
+        self.keyset_version = next(_LIVE_VERSIONS)
+
+    def _changed(self, key, keyset: bool = False) -> None:
+        self.versions[key] = next(_LIVE_VERSIONS)
+        self.any_version = self.fetch_version = next(_LIVE_VERSIONS)
+        if keyset:
+            self.keyset_version = self.any_version
+
+    def touch(self, key) -> None:
+        """Fetched again, nothing new: only the fetch time changed."""
+        self.fetch_version = next(_LIVE_VERSIONS)
+
+    def __setitem__(self, key, value) -> None:
+        new = not dict.__contains__(self, key)
+        super().__setitem__(key, value)
+        self._changed(key, new)
+
+    def __delitem__(self, key) -> None:
+        super().__delitem__(key)
+        self._changed(key, True)
+
+    def pop(self, key, *default):
+        had = dict.__contains__(self, key)
+        value = super().pop(key, *default)
+        if had:
+            self._changed(key, True)
+        return value
+
+    def setdefault(self, key, default=None):
+        if not dict.__contains__(self, key):
+            self[key] = default
+        return self[key]
+
+    def update(self, *args, **kwargs) -> None:
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+    def clear(self) -> None:
+        keys = list(dict.keys(self))
+        super().clear()
+        for key in keys:
+            self._changed(key, True)
+
+    def __getitem__(self, key):
+        _note_read(self, key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        _note_read(self, key)
+        return super().get(key, default)
+
+    def __contains__(self, key) -> bool:
+        _note_read(self, key)
+        return super().__contains__(key)
+
+    def keys(self):
+        _note_read(self, "*")
+        return super().keys()
+
+    def items(self):
+        _note_read(self, "*")
+        return super().items()
+
+    def values(self):
+        _note_read(self, "*")
+        return super().values()
+
+    def __iter__(self):
+        _note_read(self, "*")
+        return super().__iter__()
+
+    def __len__(self) -> int:
+        _note_read(self, "*")
+        return super().__len__()
+
+
+def live_items() -> "LiveData":
+    """The session's fetched datasets, tracked so derived results know what they depend on."""
+    items = st.session_state.get("live_data")
+    if not isinstance(items, LiveData):
+        items = LiveData(items or {})
+        st.session_state["live_data"] = items
+    return items
+
+
+def _reads_still_valid(live: "LiveData", reads: dict) -> bool:
+    for key, version in reads.items():
+        if key in _SPECIAL_READS:
+            if getattr(live, _SPECIAL_READS[key]) != version:
+                return False
+        elif (live.versions.get(key) if dict.__contains__(live, key) else None) != version:
+            return False
+    return True
+
+
 def session_memo(name: str, key: object, build: Callable[[], object]) -> object:
-    """Keep one derived result per name until its key changes. Callers must not modify it."""
+    """Keep one derived result per name until its key changes, or until a fetched dataset it read changes. Callers must not modify it."""
     memo = st.session_state.setdefault("derived_memo", {})
+    live = st.session_state.get("live_data")
+    if not isinstance(live, LiveData):
+        return build()   # data swapped in for a check: nothing is kept
     held = memo.get(name)
-    if held is not None and held[0] == key:
+    if held is not None and len(held) == 3 and held[0] == key and _reads_still_valid(live, held[2]):
+        for reads in getattr(_READ_LOG, "stack", ()):
+            for read_key, version in held[2].items():
+                reads.setdefault(read_key, version)
         return held[1]
-    value = build()
-    memo[name] = (key, value)
+    stack = getattr(_READ_LOG, "stack", None)
+    if stack is None:
+        stack = _READ_LOG.stack = []
+    reads: dict = {}
+    stack.append(reads)
+    try:
+        value = build()
+    finally:
+        stack.pop()
+    for outer in stack:
+        for read_key, version in reads.items():
+            outer.setdefault(read_key, version)
+    memo[name] = (key, value, reads)
     return value
 
 
@@ -5022,6 +5247,7 @@ MAX_API_RESPONSE_BYTES = 20 * 1024 * 1024
 KEYS_FILE_NAME = "meridian_keys.toml"
 ENTSOE_WINDOW_DAYS = 360
 ENTSOE_GENERATION_WINDOW_DAYS = 31
+ENTSOE_PARALLEL_WINDOWS = 4
 ENTSOE_FALLBACK_WINDOW_DAYS = 30
 RETRY_HTTP_CODES = {429, 500, 502, 503, 504}
 RETRY_WAIT_SECONDS = 1.5
@@ -5481,6 +5707,32 @@ def fetch_open_meteo_market_pack(
         return name, hourly_frame, daily_frame
 
     hourly_results, daily_results, failures = {}, {}, []
+    if _fetch_fn is None and len(selected) > 1:
+        # One request for every location: Open-Meteo answers a list of coordinates, each in its own time zone, in about 0.3 s,
+        # where one request per location took six times the calls and ran into the per-minute limit during an update.
+        try:
+            locations = [WEATHER_LOCATIONS[name] for name in selected]
+            endpoint = OPEN_METEO_CUSTOMER_BASE if commercial_endpoint else OPEN_METEO_FORECAST_BASE
+            params = {"latitude": ",".join(str(loc["latitude"]) for loc in locations), "longitude": ",".join(str(loc["longitude"]) for loc in locations),
+                      "hourly": "temperature_2m,wind_speed_10m,wind_speed_100m,shortwave_radiation,precipitation,cloud_cover",
+                      "past_days": int(past_days), "forecast_days": int(forecast_days), "timezone": ",".join(loc["timezone"] for loc in locations), "timeformat": "unixtime"}
+            if commercial_endpoint and api_key.strip():
+                params["apikey"] = api_key.strip()
+            answers = _json_get(endpoint, params=params)
+            answers = answers if isinstance(answers, list) else [answers]
+            if len(answers) == len(selected):
+                def from_answer(name, loc, past, ahead, key, commercial, answer):
+                    return fetch_open_meteo(loc["latitude"], loc["longitude"], loc["timezone"], past_days=past, forecast_days=ahead,
+                                            api_key=key, commercial_endpoint=commercial, _json_get_fn=lambda *_, **__: answer)
+                by_name = dict(zip(selected, answers))
+                return fetch_open_meteo_market_pack(selected, past_days, forecast_days, api_key, commercial_endpoint,
+                                                    _fetch_fn=lambda name, loc, past, ahead, key, commercial: from_answer(name, loc, past, ahead, key, commercial, by_name[name]))
+        except ProviderHTTPError as exc:
+            if getattr(exc, "status", None) == 429:
+                # A rate limit: one request per location would only hit it six more times.
+                return pd.DataFrame(), pd.DataFrame(), [f"All locations: {exc}"]
+        except Exception:
+            pass   # one request per location below, as before
     # Concurrent I/O keeps a six-zone refresh responsive; the user still controls refresh cadence.
     with ThreadPoolExecutor(max_workers=min(4, len(selected))) as executor:
         future_map = {executor.submit(fetch_one, name): name for name in selected}
@@ -5745,10 +5997,15 @@ def build_live_snapshot() -> dict[str, dict]:
                 if code_col: aggregate_mask |= hist[code_col].astype(str).str.casefold().isin({"eu", "europe"})
                 if aggregate_mask.any(): hist = hist.loc[aggregate_mask]
             hist = hist.dropna(subset=["_day", "_storage"]).sort_values("_day")
+            change_from = change_to = None
             if len(hist) >= 8:
                 change = float(hist.iloc[-1]["_storage"] - hist.iloc[-8]["_storage"])
+                change_from, change_to = hist.iloc[-8]["_day"].date(), hist.iloc[-1]["_day"].date()
+        else:
+            change_from = change_to = None
         snapshot["storage"] = {"fill_pct": full, "inventory_twh": storage, "capacity_twh": capacity,
                                "date": date_label, "scope": scope, "change_7_reports_twh": change,
+                               "change_from": change_from, "change_to": change_to,
                                "fetched_at": _live_item_fetched_at("gie_agsi")}
 
     # GIE ALSI+ LNG fields have different units: inventory is commonly 10^3 m3 LNG, send-out GWh/d.
@@ -6078,22 +6335,40 @@ def fetch_entsoe_series(token: str, series_kind: str, zone_name: str,
             return None, str(exc)
 
     windows = split(start_date, end_date_exclusive, span)
-    frames, no_data = [], ""
-    for index, (window_start, window_end) in enumerate(windows):
+
+    def one_window(window: tuple[date, date]) -> list:
+        window_start, window_end = window
         try:
-            results = [request(window_start, window_end)]
+            return [request(window_start, window_end)]
         except RuntimeError:
             # If a long window is refused, ask again in month-sized pieces before giving up.
             if (window_end - window_start).days <= ENTSOE_FALLBACK_WINDOW_DAYS:
                 raise
-            results = [request(a, b) for a, b in split(window_start, window_end, ENTSOE_FALLBACK_WINDOW_DAYS)]
+            return [request(a, b) for a, b in split(window_start, window_end, ENTSOE_FALLBACK_WINDOW_DAYS)]
+
+    frames, no_data = [], ""
+    if len(windows) > 1 and _http_fn is None:
+        # A first fetch of a long history asks for its windows four at a time (ENTSO-E allows 400 requests a minute),
+        # instead of one after another: a year and a half of generation is 19 windows.
+        with ThreadPoolExecutor(max_workers=ENTSOE_PARALLEL_WINDOWS) as pool:
+            futures = [pool.submit(one_window, window) for window in windows]
+            outcomes = []
+            for index, future in enumerate(futures):
+                outcomes.append(future.result())
+                if progress is not None:
+                    progress((index + 1) / len(windows))
+    else:
+        outcomes = []
+        for index, window in enumerate(windows):
+            outcomes.append(one_window(window))
+            if progress is not None:
+                progress((index + 1) / len(windows))
+    for results in outcomes:
         for frame, message in results:
             if frame is not None:
                 frames.append(frame)
             elif message:
                 no_data = message
-        if progress is not None:
-            progress((index + 1) / len(windows))
     if not frames:
         raise RuntimeError(no_data or "ENTSO-E returned no usable observations for this selection.")
     frame = (pd.concat(frames, ignore_index=True)
@@ -6117,6 +6392,24 @@ def fetch_ecb_rate(quote_currency: str, _http_fn=None) -> tuple[float, str]:
     if not math.isfinite(rate) or rate <= 0:
         raise RuntimeError(f"ECB returned an invalid {code} reference rate.")
     return rate, str(frame["TIME_PERIOD"].iloc[-1]) if "TIME_PERIOD" in frame.columns else ""
+
+
+def fetch_ecb_rates(codes: Sequence[str] = ("GBP", "USD"), _http_fn=None) -> dict:
+    """Several ECB reference rates in one request: {code: (units per 1 EUR, date)}."""
+    wanted = [str(c).strip().upper() for c in codes]
+    if not wanted or any(len(c) != 3 or not c.isalpha() for c in wanted):
+        raise ValueError("Use three-letter currency codes.")
+    body, _ = (_http_fn or _http_get_bytes)(f"{ECB_FX_BASE}/D.{'+'.join(wanted)}.EUR.SP00.A", params={"lastNObservations": 1, "format": "csvdata"},
+                                             headers={"Accept": "text/csv"})
+    frame = pd.read_csv(io.BytesIO(body))
+    out = {}
+    for code in wanted:
+        rows = frame.loc[frame["CURRENCY"].astype(str).eq(code)] if "CURRENCY" in frame.columns else frame.iloc[0:0]
+        rate = float(rows["OBS_VALUE"].iloc[-1]) if not rows.empty else float("nan")
+        if not math.isfinite(rate) or rate <= 0:
+            raise RuntimeError(f"ECB returned no valid {code} reference rate.")
+        out[code] = (rate, str(rows["TIME_PERIOD"].iloc[-1]) if "TIME_PERIOD" in rows.columns else "")
+    return out
 
 
 def fetch_weather_archive(location_names: Sequence[str], years: int = 10, _json_get_fn=None) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
@@ -6561,9 +6854,13 @@ def _http_get_bytes(url: str, params: Optional[dict] = None, headers: Optional[d
                     raise RuntimeError("API response exceeded the 20 MB safety limit. Narrow the requested dates or filters.")
                 return (_gunzip_limited(body) if encoding == "gzip" else body), content_type
         except HTTPError as exc:
-            # Busy or briefly failing servers often recover, so these get one more try.
+            # Busy or briefly failing servers often recover, so these get one more try. Open-Meteo's limit is per minute:
+            # a retry within the minute fails too, and waiting the minute out would hold up the whole update, so it isn't retried.
+            if exc.code == 429 and (target.hostname or "").endswith("open-meteo.com"):
+                raise ProviderHTTPError("Open-Meteo's per-minute request limit was reached. The weather already held is kept; "
+                                        "select Update market data again in a minute.", 429, b"") from None
             if attempt == 1 and exc.code in RETRY_HTTP_CODES:
-                sleep(RETRY_WAIT_SECONDS)
+                sleep(_retry_wait(exc, target.hostname or ""))
                 continue
             # The address is left out because some providers take the token in it.
             try:
@@ -6585,6 +6882,23 @@ def _http_get_bytes(url: str, params: Optional[dict] = None, headers: Optional[d
                 continue
             raise RuntimeError("The data provider timed out. Try a shorter date range.") from None
     raise RuntimeError("The data provider could not be reached.")
+
+
+RATE_LIMIT_WAIT_SECONDS = 61.0   # Open-Meteo counts requests per minute: a refused request succeeds once the minute has passed
+
+
+def _retry_wait(exc: HTTPError, host: str) -> float:
+    """How long to wait before the one retry. A rate limit (429) from a provider other than Open-Meteo is waited out as
+    the provider asks, but only in the background update: on the page itself a freeze would be worse than the error."""
+    if exc.code != 429 or threading.current_thread() is threading.main_thread():
+        return RETRY_WAIT_SECONDS
+    try:
+        asked = float(exc.headers.get("Retry-After", "")) if exc.headers else float("nan")
+    except (TypeError, ValueError):
+        asked = float("nan")
+    if math.isfinite(asked) and asked > 0:
+        return min(asked, 90.0)
+    return RATE_LIMIT_WAIT_SECONDS if host.endswith("open-meteo.com") else RETRY_WAIT_SECONDS * 4
 
 
 def scrub_secrets(text: str, secrets: Sequence[str]) -> str:
@@ -6701,6 +7015,85 @@ def _tradingview_months(spec: dict, first: date, today: date, near_only: bool = 
     return [m for m in months if m < soon or (m < two_years and m.month in (3, 6, 8, 9, 12)) or m.month == 12]
 
 
+TRADINGVIEW_BATCH = 25                # contracts asked for together on one connection
+TRADINGVIEW_BATCH_TIMEOUT = 25.0
+TRADINGVIEW_SOCKET = "wss://data.tradingview.com/socket.io/websocket"
+
+
+def _tv_frame(function: str, args: list) -> str:
+    body = json.dumps({"m": function, "p": args}, separators=(",", ":"))
+    return f"~m~{len(body)}~m~{body}"
+
+
+def _tv_parts(raw: str) -> list[str]:
+    """Split one socket message into its framed parts."""
+    parts, at = [], 0
+    while raw.startswith("~m~", at):
+        end = raw.index("~m~", at + 3)
+        size = int(raw[at + 3:end])
+        parts.append(raw[end + 3:end + 3 + size])
+        at = end + 3 + size
+    return parts
+
+
+def tradingview_batch(client, items: Sequence[tuple[str, str]], n_bars: int, interval: str = "1D", at_once: int = TRADINGVIEW_BATCH,
+                      timeout: float = TRADINGVIEW_BATCH_TIMEOUT, _connect=None) -> dict:
+    """Daily bars for many contracts over one connection: {(symbol, exchange): bars or None}.
+
+    The library opens a new connection for every contract, which is most of the time a curve takes (about 0.5 s of 0.8 s each).
+    Here every contract of a batch is asked for at once, each in its own chart session, and read as the answers arrive:
+    25 contracts take about 1 s instead of 20. A contract TradingView doesn't list comes back as None."""
+    if _connect is None:
+        from websocket import create_connection
+        _connect = lambda: create_connection(TRADINGVIEW_SOCKET, headers=getattr(client, "_TvDatafeed__ws_headers", None), timeout=timeout)
+    make_frame = getattr(client, "_TvDatafeed__create_df")
+    socket_ = _connect()
+    send = lambda function, args: socket_.send(_tv_frame(function, args))
+    results: dict = {}
+    try:
+        send("set_auth_token", [client.token])
+        for start in range(0, len(items), max(int(at_once), 1)):
+            sessions = {}
+            for symbol, exchange in items[start:start + at_once]:
+                session = "cs_" + "".join(random.choice(string.ascii_lowercase) for _ in range(12))
+                sessions[session] = (symbol, exchange)
+                send("chart_create_session", [session, ""])
+                send("resolve_symbol", [session, "symbol_1", '={"symbol":"' + f"{exchange}:{symbol}" + '","adjustment":"splits","session":"regular"}'])
+                send("create_series", [session, "s1", "s1", "symbol_1", interval, int(n_bars)])
+            raw, done, deadline = {s: "" for s in sessions}, set(), monotonic() + timeout
+            while len(done) < len(sessions) and monotonic() < deadline:
+                for part in _tv_parts(socket_.recv()):
+                    if part.startswith("~h~"):
+                        socket_.send(f"~m~{len(part)}~m~{part}")   # heartbeat: answered, or the server closes the connection
+                        continue
+                    try:
+                        message = json.loads(part)
+                    except ValueError:
+                        continue
+                    args = message.get("p") or []
+                    session = args[0] if args and isinstance(args[0], str) else None
+                    if session in raw:
+                        raw[session] += part + "\n"
+                        if message.get("m") in ("series_completed", "symbol_error", "series_error", "critical_error"):
+                            done.add(session)
+            for session, (symbol, exchange) in sessions.items():
+                try:
+                    bars = make_frame(raw[session], f"{exchange}:{symbol}") if session in done else None
+                except Exception:
+                    bars = None
+                results[(symbol, exchange)] = bars if bars is not None and len(bars) and "close" in getattr(bars, "columns", []) else None
+                try:
+                    send("chart_delete_session", [session])
+                except Exception:
+                    pass
+    finally:
+        try:
+            socket_.close()
+        except Exception:
+            pass
+    return results
+
+
 def fetch_tradingview_curve(product: str, today: date, n_bars: int, username: str = "", password: str = "", _client=None, near_only: bool = False) -> pd.DataFrame:
     """Daily closes of each month contract, one row per day and delivery month, ready for parse_curve_table.
 
@@ -6720,14 +7113,29 @@ def fetch_tradingview_curve(product: str, today: date, n_bars: int, username: st
     # With history, start from contracts that were the front month at the start of that history.
     first = _add_months(date(today.year, today.month, 1), (0 if in_delivery else 1) - history)
     closes, misses, failures = {}, 0, 0
+    wanted = _tradingview_months(spec, first, today, near_only)
+    batched: dict = {}
+    if _client is None:
+        # Every contract over one connection; anything the batch can't do falls back to one request per contract below.
+        try:
+            symbols = [(tradingview_symbol(spec["root"], m), spec["exchange"]) for m in wanted]
+            got = tradingview_batch(client, symbols, n_bars)
+            retry = [key for key, m in zip(symbols, wanted) if got.get(key) is None and m > today]
+            if retry:
+                got.update({k: v for k, v in tradingview_batch(client, retry, n_bars).items() if v is not None})
+            batched = {m: got.get(key) for key, m in zip(symbols, wanted)}
+        except Exception:
+            batched = {}
     def ask(month: date):
+        if month in batched:
+            return batched[month]
         return client.get_hist(symbol=tradingview_symbol(spec["root"], month), exchange=spec["exchange"], interval=interval, n_bars=int(n_bars))
 
     empty = lambda bars: bars is None or len(bars) == 0 or "close" not in getattr(bars, "columns", [])
-    for month in _tradingview_months(spec, first, today, near_only):
+    for month in wanted:
         try:
             bars = ask(month)
-            if empty(bars) and month > today:
+            if empty(bars) and month > today and month not in batched:
                 # TradingView sometimes drops a request when busy. Ask once more before reading it as "not listed".
                 sleep(TRADINGVIEW_RETRY_SECONDS if _client is None else 0.0)
                 bars = ask(month)
@@ -6813,15 +7221,34 @@ def _stored_live_item(source_key: str, label: str, data, metadata: Optional[dict
         # Fetched data belongs to the live desk. Kept out of the demo, so demo and live never mix.
         st.session_state["flash_message"] = "Fetched data isn't added to the demo. Switch to Live in the sidebar to fetch and keep data."
         return
+    fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    items = live_items()
+    held = dict.get(items, source_key)
+    if isinstance(held, dict) and _same_data(held.get("data"), data) and held.get("metadata", {}) == (metadata or {}) and held.get("label") == label:
+        # Asked again and nothing new came back: keep every result built from it, and only record when it was checked.
+        held["fetched_at"] = fetched_at
+        items.touch(source_key)
+        _save(lambda store: store.touch_live_item(source_key, fetched_at))
+        return
     item = {
         "label": label,
         "data": data,
-        "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "fetched_at": fetched_at,
         "metadata": metadata or {},
     }
-    st.session_state.setdefault("live_data", {})[source_key] = item
+    items[source_key] = item
     bump("live")
     _save(lambda store: store.save_live_item(source_key, item))
+
+
+def _same_data(old, new) -> bool:
+    """True when a refetch returned exactly what is held: same columns, types and values."""
+    if not isinstance(old, pd.DataFrame) or not isinstance(new, pd.DataFrame) or old.shape != new.shape:
+        return False
+    try:
+        return list(old.columns) == list(new.columns) and old.dtypes.astype(str).tolist() == new.dtypes.astype(str).tolist() and old.reset_index(drop=True).equals(new.reset_index(drop=True))
+    except Exception:
+        return False
 
 
 def _resolve_live_key(key: str) -> str:
@@ -6829,14 +7256,23 @@ def _resolve_live_key(key: str) -> str:
     items = st.session_state.get("live_data", {})
     if key in items:
         return key
-    variants = [k for k in items if k.startswith(f"{key}|")]
-    return max(variants, key=lambda k: str(items[k].get("fetched_at", ""))) if variants else key
+    variants = [k for k in dict.keys(items) if k.startswith(f"{key}|")]
+    if isinstance(items, LiveData):
+        # Which zone counts as latest depends on the set of zones and, when there are several, on when each was fetched.
+        for name in ("#keys", "#fetched") if len(variants) > 1 else ("#keys",):
+            _note_read(items, name)
+    return max(variants, key=lambda k: str(dict.__getitem__(items, k).get("fetched_at", ""))) if variants else key
 
 
 def _live_variants(key: str) -> dict:
     """{zone or variant: stored item} for one dataset name."""
     items = st.session_state.get("live_data", {})
-    return {k.split("|", 1)[1]: v for k, v in items.items() if k.startswith(f"{key}|")}
+    found = {k: v for k, v in dict.items(items) if k.startswith(f"{key}|")}
+    if isinstance(items, LiveData):
+        _note_read(items, "#keys")
+        for k in found:
+            _note_read(items, k)
+    return {k.split("|", 1)[1]: v for k, v in found.items()}
 
 
 def _live_dataset_frame(key: str) -> pd.DataFrame:
@@ -7017,6 +7453,9 @@ hr {{ border-color:{BORDER}; margin:0.6rem 0; }}
 .head-row {{ display:flex; gap:0.7rem; align-items:baseline; flex-wrap:wrap; }}
 .stApp h1.page-title {{ font-size:1.35rem; padding-left:0.6rem !important; border-left:4px solid var(--accent); font-weight:600; line-height:1.3; color:{TEXT}; margin:0; padding:0; }}
 .page-sub {{ color:{GRAY}; font-size:0.86rem !important; margin:0; }}
+.byline {{ color:{TEXT}; font-size:0.8rem !important; margin:0.15rem 0 0 0.85rem; letter-spacing:0.01em; opacity:0.85; }}
+.byline b {{ font-weight:600; }}
+.page-foot {{ color:{GRAY}; font-size:0.78rem; text-align:center; margin:2.2rem 0 0.4rem 0; padding-top:0.7rem; border-top:1px solid {BORDER}; }}
 .pill {{ display:inline-flex; align-items:center; gap:6px; padding:2px 8px; border:var(--line); border-radius:3px; font-size:0.78rem; color:{TEXT}; white-space:nowrap; background:{PANEL}; }}
 .pill i {{ width:7px; height:7px; border-radius:50%; display:inline-block; background:{GRAY}; }}
 .pill.good i {{ background:{GAIN}; }} .pill.warn i {{ background:{SODIUM}; }}
@@ -7369,7 +7808,8 @@ def render_header(title: str, subtitle: str) -> None:
     if demo_mode():
         st.markdown(demo_banner_html(), unsafe_allow_html=True)
     with st.container(key="page_head"):
-        st.markdown(f'<div class="head-row"><h1 class="page-title">{html.escape(title)}</h1><p class="page-sub">{html.escape(subtitle)}</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="head-row"><h1 class="page-title">{html.escape(title)}</h1><p class="page-sub">{html.escape(subtitle)}</p></div>'
+                    f'<p class="byline">by <b>{AUTHOR}</b></p>', unsafe_allow_html=True)
         sources = page_sources_html(current_page_name())
         if sources:
             st.markdown(sources, unsafe_allow_html=True)
@@ -7460,7 +7900,7 @@ def render_sidebar() -> str:
     current = st.session_state.nav_page
     with st.sidebar:
         st.markdown('<div class="brand"><div class="mark"><span aria-hidden="true">bolt</span></div>'
-                    '<div class="name">Meridian<small>European gas and power desk</small></div></div>', unsafe_allow_html=True)
+                    f'<div class="name">Meridian<small>European gas and power desk</small><small>by {AUTHOR}</small></div></div>', unsafe_allow_html=True)
         st.markdown('<div style="height:0.4rem"></div>', unsafe_allow_html=True)
         for index, (section, items) in enumerate(NAV_SECTIONS.items()):
             key = f"navsec_{section}"
@@ -7502,7 +7942,7 @@ def init_session() -> None:
             st.session_state.desk_store_error = f"{type(exc).__name__}: {exc}"
     st.session_state.custom_curves = custom
     st.session_state.curve_metadata = metadata
-    st.session_state.live_data = live
+    st.session_state.live_data = LiveData(live)
     st.session_state.settings = settings
     if not demo_mode():
         try:
@@ -7565,11 +8005,11 @@ def executed_buckets() -> pd.DataFrame:
 def zone_prices(zone: str) -> pd.DataFrame:
     """A zone's day-ahead prices, cleaned once until new data arrives."""
     timezone_name = ENTSOE_ZONES[zone]["timezone"]
-    return session_memo(f"spot|{zone}", data_version("live"), lambda: spot_series(_live_dataset_frame(f"entsoe_price|{zone}"), timezone_name))
+    return session_memo(f"spot|{zone}", (), lambda: spot_series(_live_dataset_frame(f"entsoe_price|{zone}"), timezone_name))
 
 
 def live_snapshot() -> dict:
-    return session_memo("live_snapshot", data_version("live"), build_live_snapshot)
+    return session_memo("live_snapshot", (), build_live_snapshot)
 
 
 def reference_mark(product: str, start: date, end: date, profile: str) -> float:
@@ -7645,6 +8085,20 @@ ZONE_WEATHER_HISTORY_DAYS = 430
 STALE_HOURS = {"tradingview": 1.0, "prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0, "ensemble": 6.0, "holidays": 24.0 * 7}
 KEEP_DAYS = {"prices": 400, "load": 90, "generation": 90, "lng": 400}
 MAX_UPDATE_WORKERS = 8          # the providers allow far more; this keeps the first update short
+OPEN_METEO_WORKERS = 2          # weather gets its own lane: Open-Meteo counts requests per minute
+# When each source publishes something new, in Brussels time. A source fetched after its latest publication is skipped,
+# even on "Update market data", because nothing new can have appeared: (times, weekdays only).
+PUBLICATION_TIMES = {
+    "prices": ((time(12, 50), time(13, 30)), False),        # day-ahead auction results for the next day
+    "load_forecast": ((time(10, 45),), False),               # day-ahead load forecast
+    "renewable_forecast": ((time(18, 30),), False),          # day-ahead wind and solar forecast
+    "gie": ((time(18, 15), time(19, 45)), False),            # AGSI+ and ALSI: first release, then the update
+    "ecb": ((time(16, 15),), True),                          # reference rates, working days
+    "auctions": ((time(11, 30), time(14, 0)), True),         # EEX primary auction results
+    "daily_output": ((time(6, 0), time(12, 0), time(18, 0)), False),   # Energy-Charts: yesterday's totals settle during the day
+}
+PUBLICATION_ZONE = "Europe/Brussels"
+TRADING_SESSION = (time(7, 0), time(20, 30))   # Amsterdam time, weekdays: delayed futures prices and settlements move only then
 TRADINGVIEW_WORKERS = 2         # TradingView gets its own small lane: asked too fast, it drops requests
 
 
@@ -7721,6 +8175,60 @@ def _needs_update(key: str, kind: str, force: bool) -> bool:
     return force or age is None or age >= STALE_HOURS[kind]
 
 
+def _fetched_at(key: str) -> Optional[datetime]:
+    stamp = st.session_state.get("live_data", {}).get(key, {}).get("fetched_at", "") if isinstance(st.session_state.get("live_data", {}).get(key), dict) else ""
+    try:
+        return pd.Timestamp(stamp).to_pydatetime() if stamp else None
+    except Exception:
+        return None
+
+
+def published_since(moment: Optional[datetime], schedule: str, now: Optional[datetime] = None) -> bool:
+    """Whether the source can have published anything after moment: True if one of its publication times falls in between."""
+    if moment is None:
+        return True
+    times, working_days = PUBLICATION_TIMES[schedule]
+    zone = ZoneInfo(PUBLICATION_ZONE)
+    now = (now or datetime.now(timezone.utc)).astimezone(zone)
+    start = moment.astimezone(zone)
+    day = start.date()
+    while day <= now.date():
+        if not working_days or day.weekday() < 5:
+            for clock in times:
+                stamp = datetime.combine(day, clock, tzinfo=zone)
+                if start < stamp <= now:
+                    return True
+        day += timedelta(days=1)
+    return False
+
+
+def traded_since(moment: Optional[datetime], now: Optional[datetime] = None) -> bool:
+    """Whether a trading session (weekdays 07:00 to 20:30 Amsterdam time) overlapped the time since moment."""
+    if moment is None:
+        return True
+    zone = ZoneInfo("Europe/Amsterdam")
+    now = (now or datetime.now(timezone.utc)).astimezone(zone)
+    start = moment.astimezone(zone)
+    day = start.date()
+    while day <= now.date():
+        if day.weekday() < 5:
+            opens, closes = (datetime.combine(day, clock, tzinfo=zone) for clock in TRADING_SESSION)
+            if start < closes and now > opens:
+                return True
+        day += timedelta(days=1)
+    return False
+
+
+def _nothing_new(key: str, schedule: str, force) -> bool:
+    """Skip a source fetched after its latest publication. 'all' asks every source again regardless."""
+    skip = force != "all" and not published_since(_fetched_at(key), schedule)
+    if skip:
+        fetched = _fetched_at(key)
+        st.session_state.setdefault("update_skipped", []).append(
+            (st.session_state.get("live_data", {}).get(key, {}).get("label", key), f"fetched {fetched.astimezone(ZoneInfo(PUBLICATION_ZONE)):%d %b %H:%M} Brussels time, nothing published since" if fetched else ""))
+    return skip
+
+
 def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[UpdateTask]:
     """Forward curves from TradingView, the default source of marks for every product it lists. Refreshed hourly."""
     today = today or date.today()
@@ -7730,11 +8238,25 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[
         return [UpdateTask("Forward curves from TradingView", missing, lambda _: "")]
     if not _needs_update("tradingview_curves", "tradingview", force):
         return []
+    curve_meta = st.session_state.get("curve_metadata", {})
+    def quiet(product: str) -> bool:
+        """Fetched whole since the market last traded: nothing can have moved."""
+        meta = curve_meta.get(product, {}) if product in st.session_state.get("custom_curves", {}) else {}
+        if force == "all" or meta.get("source_type") != "TradingView" or not meta.get("full_fetch_day"):
+            return False
+        try:
+            moment = pd.Timestamp(meta.get("imported_at_utc", "")).to_pydatetime()
+        except Exception:
+            return False
+        return not traded_since(moment)
     keys = resolved_credentials()
     login = (keys["tradingview_user"], keys["tradingview_password"])
     metadata = st.session_state.get("curve_metadata", {})
     tasks = []
     for tv_product in TRADINGVIEW_CURVES:
+        if quiet(tv_product):
+            st.session_state.setdefault("update_skipped", []).append((f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", "no trading session since the last full fetch"))
+            continue
         held = metadata.get(tv_product, {}) if tv_product in st.session_state.get("custom_curves", {}) else {}
         from_tv = held.get("source_type") == "TradingView"
         bars = TRADINGVIEW_UPDATE_BARS if from_tv else TRADINGVIEW_HISTORY_BARS
@@ -7748,6 +8270,8 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[
             return apply_tradingview_curve(product, raw, near_only)
         tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv, lane="tradingview"))
     held_front = _held_frame("tradingview_gas_front")
+    if held_front is not None and len(held_front) >= 200 and force != "all" and not traded_since(_fetched_at("tradingview_gas_front")):
+        return tasks
     front_bars = TRADINGVIEW_FRONT_HISTORY_BARS if held_front is None or len(held_front) < 200 else 10
     def fetch_front() -> pd.DataFrame:
         return fetch_tradingview_front("TTF Natural Gas", front_bars, *login)
@@ -7758,10 +8282,12 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[
     return tasks
 
 
-def plan_update(force: bool = True, today: Optional[date] = None) -> list[UpdateTask]:
-    """Decide what to request. force ignores recent fetches, except for slow-moving normals."""
+def plan_update(force=True, today: Optional[date] = None) -> list[UpdateTask]:
+    """Decide what to request. force ignores recent fetches, except for slow-moving normals and sources that
+    haven't published since they were fetched. force="all" asks every source again."""
     today = today or date.today()
     keys = resolved_credentials()
+    st.session_state["update_skipped"] = []
     tasks: list[UpdateTask] = tradingview_tasks(force, today)   # first, so the TTF marks come in first
 
     def keyed(kind: str, fetch: Callable[[], object]) -> Callable[[], object]:
@@ -7778,6 +8304,9 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
         name = variant or zone
         full_key = f"{store_key}|{name}"
         if not _needs_update(full_key, kind, force):
+            return
+        schedule = {"entsoe_price": "prices", "entsoe_load_forecast": "load_forecast", "entsoe_renewable_forecast": "renewable_forecast"}.get(store_key)
+        if schedule and _held_frame(full_key) is not None and _nothing_new(full_key, schedule, force):
             return
         held = _held_frame(full_key)
         start = incremental_start(held, "timestamp", first_days, 2, today)
@@ -7813,7 +8342,7 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             entsoe_task("prices", "entsoe_flow", "Physical flow", "Physical flow", meta["source_zone"], KEEP_DAYS["load"], 30, today + timedelta(days=1),
                         meta["source_zone"], meta["target_zone"], variant)
 
-    if _needs_update("gie_agsi_history", "fundamentals", force):
+    if _needs_update("gie_agsi_history", "fundamentals", force) and not (_held_frame("gie_agsi_history") is not None and _nothing_new("gie_agsi_history", "gie", force)):
         held = _held_frame("gie_agsi_history")
         # Providers revise recent gas days, so each update reloads the last 45.
         start = incremental_start(held, "gasDayStart", 0, 45, today) if held is not None else date(today.year - 5, 1, 1)
@@ -7823,7 +8352,7 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             _stored_live_item("gie_agsi", "AGSI gas storage", merged.tail(40).reset_index(drop=True), meta)
             return f"{len(frame):,} new rows, {len(merged):,} held"
         tasks.append(UpdateTask("EU gas storage", keyed("gie", lambda: fetch_gie_history("AGSI", keys["gie"], "Europe / EU datasets", start, today)), apply_storage, start))
-    if _needs_update("gie_alsi", "fundamentals", force):
+    if _needs_update("gie_alsi", "fundamentals", force) and not (_held_frame("gie_alsi") is not None and _nothing_new("gie_alsi", "gie", force)):
         held = _held_frame("gie_alsi")
         lng_start = incremental_start(held, "gasDayStart", 60, 30, today)
         def apply_lng(frame: pd.DataFrame) -> str:
@@ -7850,7 +8379,7 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             _stored_live_item("weather_daily", "Open-Meteo daily weather", daily, meta)
             st.session_state["weather_fetch_failures"] = failures
             return f"{daily['location'].nunique()} of {len(WEATHER_LOCATIONS)} locations"
-        tasks.append(UpdateTask("Weather forecast", fetch_weather, apply_weather))
+        tasks.append(UpdateTask("Weather forecast", fetch_weather, apply_weather, lane="open_meteo"))
     if _needs_update("weather_normals", "normals", False) or _needs_update("weather_archive", "normals", False):
         def apply_archive(outcome: tuple) -> str:
             archive, normals, failures = outcome
@@ -7859,7 +8388,7 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             _stored_live_item("weather_normals", "Open-Meteo temperature normals", normals, {"years": 10})
             _stored_live_item("weather_archive", "Open-Meteo daily temperature history", archive, {"years": 10})
             return f"{normals['location'].nunique()} of {len(WEATHER_LOCATIONS)} locations"
-        tasks.append(UpdateTask("Weather history", lambda: fetch_weather_archive(list(WEATHER_LOCATIONS)), apply_archive))
+        tasks.append(UpdateTask("Weather history", lambda: fetch_weather_archive(list(WEATHER_LOCATIONS)), apply_archive, lane="open_meteo"))
     power_zones = [z for z in dict.fromkeys(list(UPDATE_DEFAULT_ZONES) + list(_live_variants("entsoe_price"))) if z in ZONE_WEATHER]
     grid_zones = [z for z in power_zones if z in ZONE_WEATHER_POINTS]
     if grid_zones and _needs_update("zone_weather_history", "power_weather", False):
@@ -7883,8 +8412,10 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
                 raise RuntimeError("; ".join(failures))
             merged = store_observations("zone_weather_history", "Open-Meteo weather across each zone", frame, {"zones": grid_zones}, ("date", "zone"), "date", ZONE_WEATHER_HISTORY_DAYS + 20) if not frame.empty else held_grid
             return f"{len(frame):,} new days, {0 if merged is None else len(merged):,} held" + (f". Failed: {'; '.join(failures)}" if failures else "")
-        tasks.append(UpdateTask("Weather across each power zone", fetch_grid_history, apply_grid_history))
-    if grid_zones and _needs_update("zone_weather_forecast", "weather", force):
+        tasks.append(UpdateTask("Weather across each power zone", fetch_grid_history, apply_grid_history, lane="open_meteo"))
+    outlook_zones = [z for z in grid_zones if z in FUND_SEA_POINTS]
+    shared_forecast = bool(grid_zones) and set(grid_zones) <= set(outlook_zones) and _needs_update("fund_weather_forecast", "weather", force)
+    if grid_zones and _needs_update("zone_weather_forecast", "weather", force) and not shared_forecast:
         open_meteo_key = keys["open_meteo"]
         def fetch_grid_forecast() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
@@ -7903,7 +8434,7 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             if kept is not None:
                 _stored_live_item("zone_weather_vintage", "Weather forecasts as they stood the day before", kept, {"zones": grid_zones})
             return f"{frame['zone'].nunique()} of {len(grid_zones)} zones"
-        tasks.append(UpdateTask("Weather forecast across each power zone", fetch_grid_forecast, apply_grid_forecast))
+        tasks.append(UpdateTask("Weather forecast across each power zone", fetch_grid_forecast, apply_grid_forecast, lane="open_meteo"))
     # Zones with points across them use those; the single reference city is kept for the others.
     power_zones = [z for z in power_zones if z not in ZONE_WEATHER_POINTS]
     if power_zones and _needs_update("weather_power_history", "power_weather", False):
@@ -7913,18 +8444,22 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
                 raise RuntimeError(f"All {len(failures) or len(power_zones)} locations failed.")
             _stored_live_item("weather_power_history", "Open-Meteo wind and solar history", frame, {"days": 430})
             return f"{frame['location'].nunique()} of {len(power_zones)} locations"
-        tasks.append(UpdateTask("Wind and solar history", lambda: fetch_power_weather([ZONE_WEATHER[z] for z in power_zones]), apply_power_weather))
-    tasks.extend(fundamentals_tasks(force, today, keys, grid_zones))
+        tasks.append(UpdateTask("Wind and solar history", lambda: fetch_power_weather([ZONE_WEATHER[z] for z in power_zones]), apply_power_weather, lane="open_meteo"))
+    tasks.extend(fundamentals_tasks(force, today, keys, grid_zones, shared_forecast))
     held_auctions = _live_dataset_frame("eex_eua_auctions")
     auction_age = (today - pd.Timestamp(held_auctions["date"].iloc[-1]).date()).days if not held_auctions.empty and "date" in held_auctions.columns else None
-    if force or auction_age is None or (auction_age >= 1 and _needs_update("eex_eua_auctions", "prices", False)):
+    if (force and not (auction_age is not None and _nothing_new("eex_eua_auctions", "auctions", force))) or auction_age is None or (auction_age >= 1 and _needs_update("eex_eua_auctions", "prices", False)):
         def apply_auctions(frame: pd.DataFrame) -> str:
             _stored_live_item("eex_eua_auctions", "EEX EUA primary auction prices", frame, {"source": "EEX public auction report"})
             last = frame.iloc[-1]
             return f"{pd.Timestamp(last['date']):%d %b}: €{float(last['price']):.2f}/t"
         tasks.append(UpdateTask("EUA auction prices", lambda: fetch_eua_auctions(today), apply_auctions))
     fx_age = st.session_state.get("fx_updated_at")
-    if force or fx_age is None or (datetime.now(timezone.utc) - fx_age).total_seconds() / 3600.0 >= STALE_HOURS["fx"]:
+    fx_new = force == "all" or fx_age is None or published_since(fx_age, "ecb")
+    if force and not fx_new:
+        st.session_state.setdefault("update_skipped", []).append(
+            ("ECB FX rates", f"fetched {fx_age.astimezone(ZoneInfo(PUBLICATION_ZONE)):%d %b %H:%M} Brussels time, next rates after 16:15 on a working day"))
+    if (force and fx_new) or fx_age is None or ((datetime.now(timezone.utc) - fx_age).total_seconds() / 3600.0 >= STALE_HOURS["fx"] and fx_new):
         def apply_fx(outcome: tuple) -> str:
             (gbp_per_eur, _), (usd_per_eur, _) = outcome
             set_fx_rate("eur_per_gbp", 1.0 / gbp_per_eur, ecb=True)
@@ -7934,11 +8469,17 @@ def plan_update(force: bool = True, today: Optional[date] = None) -> list[Update
             for widget in ("risk_gbp", "risk_usd", "spread_gbp", "spread_usd", "pnl_fx", "data_fx"):
                 st.session_state.pop(widget, None)
             return f"EUR/GBP {gbp_per_eur:.4f}, EUR/USD {usd_per_eur:.4f}"
-        tasks.append(UpdateTask("ECB FX rates", lambda: (fetch_ecb_rate("GBP"), fetch_ecb_rate("USD")), apply_fx))
+        def fetch_fx() -> tuple:
+            try:
+                rates = fetch_ecb_rates(("GBP", "USD"))
+                return rates["GBP"], rates["USD"]
+            except Exception:
+                return fetch_ecb_rate("GBP"), fetch_ecb_rate("USD")
+        tasks.append(UpdateTask("ECB FX rates", fetch_fx, apply_fx))
     return tasks
 
 
-def start_update(force: bool = True, tasks: Optional[list[UpdateTask]] = None) -> int:
+def start_update(force=True, tasks: Optional[list[UpdateTask]] = None) -> int:
     """Start fetching in the background so the app stays usable. Returns the number of sources. Nothing is fetched in demo."""
     if demo_mode() or st.session_state.get("update_job"):
         return 0
@@ -7947,10 +8488,20 @@ def start_update(force: bool = True, tasks: Optional[list[UpdateTask]] = None) -
     planned = plan_update(force) if tasks is None else tasks
     if not planned:
         return 0
-    executors = {"main": ThreadPoolExecutor(max_workers=MAX_UPDATE_WORKERS), "tradingview": ThreadPoolExecutor(max_workers=TRADINGVIEW_WORKERS)}
-    st.session_state.update_job = {"tasks": planned, "futures": [executors.get(task.lane, executors["main"]).submit(task.fetch) for task in planned],
-                                   "executors": executors, "results": {}}
+    executors = {"main": ThreadPoolExecutor(max_workers=MAX_UPDATE_WORKERS), "tradingview": ThreadPoolExecutor(max_workers=TRADINGVIEW_WORKERS),
+                 "open_meteo": ThreadPoolExecutor(max_workers=OPEN_METEO_WORKERS)}
+    st.session_state.update_job = {"tasks": planned, "futures": [executors.get(task.lane, executors["main"]).submit(_timed_fetch, task.fetch) for task in planned],
+                                   "executors": executors, "results": {}, "started": perf_counter()}
     return len(planned)
+
+
+def _timed_fetch(fetch: Callable[[], object]) -> tuple:
+    """Run one fetch and measure it, so the update report says how long each source took."""
+    started = perf_counter()
+    try:
+        return True, fetch(), perf_counter() - started
+    except Exception as exc:
+        return False, exc, perf_counter() - started
 
 
 def update_progress() -> tuple[int, int]:
@@ -7970,10 +8521,15 @@ def collect_update() -> bool:
     for index, (task, future) in enumerate(zip(job["tasks"], job["futures"])):
         if index in job["results"] or not future.done():
             continue
+        took = ""
         try:
-            job["results"][index] = (task.name, True, task.apply(future.result()))
+            fetched, outcome, seconds = future.result()
+            took = f" ({seconds:.1f} s)"
+            if not fetched:
+                raise outcome
+            job["results"][index] = (task.name, True, task.apply(outcome) + took)
         except Exception as exc:
-            job["results"][index] = (task.name, False, scrub_secrets(str(exc).split(" Check your internet")[0], secrets))
+            job["results"][index] = (task.name, False, scrub_secrets(str(exc).split(" Check your internet")[0], secrets) + took)
     if len(job["results"]) < len(job["tasks"]):
         return False
     for executor in job["executors"].values():
@@ -7981,6 +8537,7 @@ def collect_update() -> bool:
     st.session_state.update_job = None
     st.session_state.update_results = [job["results"][index] for index in range(len(job["tasks"]))]
     st.session_state.update_finished_at = datetime.now(timezone.utc)
+    st.session_state.update_seconds = perf_counter() - job.get("started", perf_counter())
     st.session_state.reads_recorded = False
     return True
 
@@ -8038,6 +8595,7 @@ def _update_panel() -> None:
         count = start_update(force=True)
         if count:
             st.rerun()
+        _nothing_to_fetch_note()
     latest = _latest_fetch()
     results = st.session_state.get("update_results") or []
     failed = [r for r in results if not r[1]]
@@ -8061,10 +8619,14 @@ def update_report() -> str:
     import platform
     results = st.session_state.get("update_results") or []
     finished = st.session_state.get("update_finished_at")
-    lines = [f"Meridian update report, {finished:%Y-%m-%d %H:%M} UTC" if finished else "Meridian update report (no update has run in this session)",
+    took = st.session_state.get("update_seconds")
+    lines = [(f"Meridian update report, {finished:%Y-%m-%d %H:%M} UTC" + (f", whole update {took:.0f} s" if took else "")) if finished else "Meridian update report (no update has run in this session)",
              f"Python {platform.python_version()}, pandas {pd.__version__}, Streamlit {st.__version__}, TradingView library {'installed' if tradingview_available() else 'not installed'}",
              f"Keys present: {', '.join(name for name, value in resolved_credentials().items() if value) or 'none'}", "", "Sources"]
     lines += [f"  {'OK    ' if good else 'FAILED'} {name}: {detail}" for name, good, detail in results] or ["  none"]
+    skipped = st.session_state.get("update_skipped") or []
+    if skipped:
+        lines += ["", "Skipped, nothing new could have been published"] + [f"  {name}: {why}" for name, why in skipped]
     lines += ["", "Datasets held"]
     for key, item in sorted(st.session_state.get("live_data", {}).items()):
         frame = item.get("data") if isinstance(item, dict) else None
@@ -8095,6 +8657,12 @@ def render_update_panel() -> None:
         st.rerun()
 
 
+def _nothing_to_fetch_note() -> None:
+    skipped = st.session_state.get("update_skipped") or []
+    if skipped:
+        st.toast(f"Nothing new to fetch: {len(skipped)} sources haven't published since they were last fetched. Live data lists them.", icon=":material/check_circle:")
+
+
 def update_button(key: str, label: str = "Update market data") -> None:
     """The same update, offered where the data is used."""
     if demo_mode():
@@ -8106,6 +8674,7 @@ def update_button(key: str, label: str = "Update market data") -> None:
     elif st.button(label, type="primary", key=key):
         if start_update(force=True):
             st.rerun()
+        _nothing_to_fetch_note()
 
 
 # =============================================================================
@@ -8273,7 +8842,7 @@ def track_paths() -> dict:
             if series is not None and not series.empty:
                 paths[market] = spot_path(series)
         return paths
-    return session_memo("track_paths", data_version("live", "snapshots"), build)
+    return session_memo("track_paths", data_version("snapshots"), build)
 
 
 def ensure_replayed_reads() -> None:
@@ -8296,16 +8865,41 @@ def ensure_replayed_reads() -> None:
             _save(lambda s: s.save_reads(rows))
             bump("reads")
         return len(rows)
-    session_memo("replay_done", data_version("live", "snapshots"), run)
+    session_memo("replay_done", data_version("snapshots"), run)
 
 
 def winter_outlook() -> dict:
-    return session_memo("winter_outlook", (data_version("live"), valuation_date),
+    return session_memo("winter_outlook", (valuation_date,),
                         lambda: project_winter(_live_dataset_frame("gie_agsi_history"), _live_dataset_frame("weather_archive"),
                                                _live_dataset_frame("weather_daily"), valuation_date))
 
 
-def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str]) -> list[UpdateTask]:
+def store_zone_forecast(frame: pd.DataFrame, zones: Sequence[str]) -> None:
+    """The short forecast the next-day estimate uses, and the vintage kept for testing it."""
+    _stored_live_item("zone_weather_forecast", "Open-Meteo forecast across each zone", frame, {"zones": list(zones)})
+    kept = keep_weather_vintage(_held_frame("zone_weather_vintage"), frame, datetime.now(timezone.utc))
+    if kept is not None:
+        _stored_live_item("zone_weather_vintage", "Weather forecasts as they stood the day before", kept, {"zones": list(zones)})
+
+
+def fetch_zone_forecasts(zone: str, api_key: str = "", commercial_endpoint: bool = False, _json_get_fn=None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """One request gives both forecasts: the 16-day one over every point for the outlook, and the 3-day one over the land
+    points for the next-day estimate. The land points come first in the request, so they are the same answers."""
+    caught: dict = {}
+    def get(url, params=None, headers=None):
+        caught["payload"] = (_json_get_fn or _json_get)(url, params=params) if headers is None else (_json_get_fn or _json_get)(url, params=params, headers=headers)
+        return caught["payload"]
+    outlook = fetch_zone_weather(zone, forecast=True, api_key=api_key, commercial_endpoint=commercial_endpoint, _json_get_fn=get,
+                                 forecast_days=FUND_OUTLOOK_DAYS + 1, with_sea=True, extended=True)
+    payload = caught.get("payload")
+    answers = payload if isinstance(payload, list) else [payload]
+    land = len(ZONE_WEATHER_POINTS[zone])
+    short = fetch_zone_weather(zone, forecast=True, api_key=api_key, commercial_endpoint=commercial_endpoint, _json_get_fn=lambda *_, **__: answers[:land])
+    last_day = pd.Timestamp(datetime.now(ZoneInfo(ENTSOE_ZONES[zone]["timezone"])).date() + timedelta(days=2))
+    return outlook, short.loc[short["date"] <= last_day].reset_index(drop=True)
+
+
+def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str], shared_forecast: bool = False) -> list[UpdateTask]:
     """What the fundamentals outlook needs beyond the price estimate's data: a year of daily output,
     weather as the forecast models saw it, 16 days ahead, ECMWF's scenarios and German gas use."""
     tasks: list[UpdateTask] = []
@@ -8314,6 +8908,8 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
     for zone in zones:
         key = f"fund_daily|{zone}"
         if not _needs_update(key, "fundamentals", force):
+            continue
+        if not keys["entsoe"] and _held_frame(key) is not None and _nothing_new(key, "daily_output", force):
             continue
         summary, load, generation = _held_frame(key), _held_frame(f"entsoe_load|{zone}"), _held_frame(f"entsoe_generation|{zone}")
         span = fund_history_span(summary, load, today)
@@ -8364,24 +8960,33 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
             merged = store_observations("fund_weather_history", "Past weather as the forecast models saw it", frame, {"zones": zones, "version": FUND_WEATHER_VERSION},
                                         ("date", "zone"), "date", GAS_DEMAND_HISTORY_DAYS + 30) if not frame.empty else held
             return f"{len(frame):,} new days, {0 if merged is None else len(merged):,} held" + (f". Failed: {'; '.join(failures)}" if failures else "")
-        tasks.append(UpdateTask("Weather history for the outlook", fetch_weather_history, apply_weather_history))
+        tasks.append(UpdateTask("Weather history for the outlook", fetch_weather_history, apply_weather_history, lane="open_meteo"))
     if zones and _needs_update("fund_weather_forecast", "weather", force):
-        def fetch_weather_ahead() -> tuple[pd.DataFrame, list[str]]:
-            frames, failures = [], []
+        def fetch_weather_ahead() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+            frames, short, failures = [], [], []
             for zone in zones:
                 try:
-                    frames.append(fetch_zone_weather(zone, forecast=True, api_key=open_meteo_key, commercial_endpoint=bool(open_meteo_key),
-                                                     forecast_days=FUND_OUTLOOK_DAYS + 1, with_sea=True, extended=True))
+                    if shared_forecast:
+                        outlook_part, short_part = fetch_zone_forecasts(zone, open_meteo_key, bool(open_meteo_key))
+                        frames.append(outlook_part)
+                        short.append(short_part)
+                    else:
+                        frames.append(fetch_zone_weather(zone, forecast=True, api_key=open_meteo_key, commercial_endpoint=bool(open_meteo_key),
+                                                         forecast_days=FUND_OUTLOOK_DAYS + 1, with_sea=True, extended=True))
                 except Exception as exc:
                     failures.append(f"{zone}: {exc}")
-            return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), failures
+            joined = lambda parts: pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+            return joined(frames), joined(short), failures
         def apply_weather_ahead(outcome: tuple) -> str:
-            frame, failures = outcome
+            frame, short, failures = outcome
             if frame.empty:
                 raise RuntimeError("; ".join(failures) or "No zone returned a forecast.")
             _stored_live_item("fund_weather_forecast", "16-day weather forecast across each zone", frame, {"zones": zones})
-            return f"{frame['zone'].nunique()} of {len(zones)} zones, to {pd.Timestamp(frame['date'].max()):%d %b}"
-        tasks.append(UpdateTask("16-day weather forecast", fetch_weather_ahead, apply_weather_ahead))
+            if not short.empty:
+                store_zone_forecast(short, list(short["zone"].unique()))
+            return (f"{frame['zone'].nunique()} of {len(zones)} zones, to {pd.Timestamp(frame['date'].max()):%d %b}"
+                    + (", also giving the short forecast for the price estimate" if not short.empty else ""))
+        tasks.append(UpdateTask("Weather forecast across each zone" if shared_forecast else "16-day weather forecast", fetch_weather_ahead, apply_weather_ahead, lane="open_meteo"))
     if zones and _needs_update("fund_weather_ensemble", "ensemble", False):
         def fetch_scenarios() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
@@ -8397,7 +9002,7 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
                 raise RuntimeError("; ".join(failures) or "No zone returned weather scenarios.")
             _stored_live_item("fund_weather_ensemble", "ECMWF weather scenarios", frame, {"zones": zones, "model": OPEN_METEO_ENSEMBLE_MODEL})
             return f"{frame['member'].nunique()} scenarios" + (f". Failed: {'; '.join(failures)}" if failures else "")
-        tasks.append(UpdateTask("Weather scenarios", fetch_scenarios, apply_scenarios))
+        tasks.append(UpdateTask("Weather scenarios", fetch_scenarios, apply_scenarios, lane="open_meteo"))
     for zone in [z for z in zones if z in FUND_NUCLEAR_FIT]:
         key = f"entsoe_outages|{zone}"
         if not _needs_update(key, "fundamentals", force):
@@ -8415,7 +9020,7 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
             return f"{nuclear['mrid'].nunique():,} notices for {nuclear['unit'].nunique()} units"
         tasks.append(UpdateTask(f"Nuclear outage notices, {zone}", fetch_outages, apply_outages))
     countries = sorted({FUND_COUNTRY[z] for z in zones if z in FUND_COUNTRY})
-    if countries and _needs_update("holidays", "holidays", force):
+    if countries and _needs_update("holidays", "holidays", force == "all"):
         def fetch_holidays() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
             for country in countries:
@@ -8516,7 +9121,7 @@ def composed_curves() -> tuple[dict, dict]:
         if demo_mode():
             sources = {product: {month: SOURCE_DEMO for month in months} for product, months in sources.items()}
         return curves_, sources
-    return session_memo("composed_curves", (data_version("live", "curves", "trades"), valuation_date, demo_allowed()), build)
+    return session_memo("composed_curves", (data_version("curves", "trades"), valuation_date, demo_allowed()), build)
 
 
 def curve_sources() -> dict:
@@ -8727,7 +9332,7 @@ SOURCE_LABELS = {"real": "Real", "part": "Part real", "demo": "Demo", "old": "Ol
 
 def page_sources_html(page: str) -> str:
     settings = st.session_state.get("settings", {})
-    key = (data_version("live", "curves", "trades", "snapshots"), valuation_date, settings.get("fx_ecb_epoch"), demo_mode())
+    key = (data_version("curves", "trades", "snapshots"), live_items().fetch_version, valuation_date, settings.get("fx_ecb_epoch"), demo_mode())
     return session_memo(f"sources|{page}", key, lambda: _page_sources_html(page))
 
 
@@ -11132,7 +11737,12 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
                 "weather_normals": {"data": pd.DataFrame({"x": [1]}), "fetched_at": now, "metadata": {}},
                 "weather_archive": {"data": pd.DataFrame({"x": [1]}), "fetched_at": now, "metadata": {}},
             }
-            again = {t.name: t for t in plan_update(force=True, today=today)}
+            forced = {t.name for t in plan_update(force=True, today=today)}
+            if "Day-ahead price, France" in forced or "EU gas storage" in forced:
+                raise AssertionError("A source fetched after its latest publication must be skipped, even on Update market data.")
+            if not any(name.startswith("AGSI") or name == "gie_agsi_history" for name, _ in st.session_state.get("update_skipped", [])):
+                raise AssertionError(f"Skipped sources must be listed: {st.session_state.get('update_skipped')}")
+            again = {t.name: t for t in plan_update(force="all", today=today)}
             if again["Day-ahead price, France"].start != date(2026, 11, 1):
                 raise AssertionError(f"Only new days should be requested: {again['Day-ahead price, France'].start}")
             if again["EU gas storage"].start != date(2026, 9, 19):
@@ -11144,11 +11754,117 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             quiet = {t.name for t in plan_update(force=False, today=today)}
             if "Day-ahead price, France" in quiet or "Day-ahead price, Spain" not in quiet:
                 raise AssertionError("Opening the app must skip recent data and fetch stale data.")
-            return "A first update fetches full windows, later ones only new days, and opening the app skips anything recent."
+            return ("A first update fetches full windows, later ones only new days; a source with nothing published since its last fetch is skipped "
+                    "even when forced, unless every source is asked again; opening the app skips anything recent.")
         finally:
             st.session_state.live_data = previous
             if previous_fx is not None:
                 st.session_state.fx_updated_at = previous_fx
+
+    def check_publication_calendar() -> str:
+        zone = ZoneInfo(PUBLICATION_ZONE)
+        at = lambda y, mo, d, h, mi: datetime(y, mo, d, h, mi, tzinfo=zone)
+        # Day-ahead prices: fetched at 13:45 Tuesday, nothing new until 12:50 Wednesday.
+        if published_since(at(2026, 11, 17, 13, 45), "prices", at(2026, 11, 18, 10, 0)):
+            raise AssertionError("Prices fetched after the auction results can't have changed before the next auction.")
+        if not published_since(at(2026, 11, 17, 13, 45), "prices", at(2026, 11, 18, 13, 0)):
+            raise AssertionError("The next auction's results must be fetched.")
+        # ECB rates: none at weekends.
+        if published_since(at(2026, 11, 13, 17, 0), "ecb", at(2026, 11, 16, 9, 0)):
+            raise AssertionError("ECB publishes no rates at weekends.")
+        if published_since(None, "gie") is not True:
+            raise AssertionError("A source never fetched must be fetched.")
+        # Futures: Friday 21:00 to Monday 06:00 has no session; Monday 08:00 has.
+        if traded_since(datetime(2026, 11, 13, 21, 0, tzinfo=ZoneInfo("Europe/Amsterdam")), datetime(2026, 11, 16, 6, 0, tzinfo=ZoneInfo("Europe/Amsterdam"))):
+            raise AssertionError("No trading session runs over a weekend.")
+        if not traded_since(datetime(2026, 11, 13, 21, 0, tzinfo=ZoneInfo("Europe/Amsterdam")), datetime(2026, 11, 16, 8, 0, tzinfo=ZoneInfo("Europe/Amsterdam"))):
+            raise AssertionError("Monday's session must be noticed.")
+        return "Prices fetched after the auction wait for the next one, ECB rates skip weekends, and futures curves aren't asked for between Friday evening and Monday morning."
+
+    def check_tradingview_batch() -> str:
+        class FakeSocket:
+            def __init__(self):
+                self.sent, self.queue = [], []
+            def send(self, text):
+                self.sent.append(text)
+                for part in _tv_parts(text):
+                    if part.startswith("~h~"):
+                        continue
+                    message = json.loads(part)
+                    if message["m"] == "create_series":
+                        session = message["p"][0]
+                        symbol = next(json.loads(_tv_parts(s)[0])["p"][2] for s in self.sent if '"resolve_symbol"' in s and session in s)
+                        if "NOPE" in symbol:
+                            self.queue.append(_tv_frame("symbol_error", [session, "symbol_1", "invalid symbol"]))
+                        else:
+                            self.queue.append("~m~4~m~~h~1")
+                            self.queue.append(_tv_frame("timescale_update", [session, {"s1": {"s": [{"i": 0, "v": [1793400000, 1, 2, 0.5, 1.5, 10]}]}}]))
+                            self.queue.append(_tv_frame("series_completed", [session, "s1", "streaming"]))
+            def recv(self):
+                return self.queue.pop(0)
+            def close(self):
+                pass
+        class FakeClient:
+            token = "unauthorized_user_token"
+            @staticmethod
+            def _TvDatafeed__create_df(raw, symbol):
+                found = re.search(r'"s":\[(.+?)\}\]', raw)
+                if not found:
+                    return None
+                values = json.loads("[" + found.group(1) + "}]")[0]["v"]
+                return pd.DataFrame({"close": [values[4]]}, index=[pd.Timestamp(values[0], unit="s")])
+        sock = FakeSocket()
+        got = tradingview_batch(FakeClient(), [("TTFF2027", "NYMEX"), ("NOPE1", "NYMEX"), ("TTFG2027", "NYMEX")], 7, _connect=lambda: sock)
+        if got[("NOPE1", "NYMEX")] is not None or float(got[("TTFF2027", "NYMEX")]["close"].iloc[0]) != 1.5 or got[("TTFG2027", "NYMEX")] is None:
+            raise AssertionError(f"Batch results are wrong: {got}")
+        if not any(s == "~m~4~m~~h~1" for s in sock.sent):
+            raise AssertionError("Heartbeats must be answered, or TradingView closes the connection.")
+        if sum('"set_auth_token"' in s for s in sock.sent) != 1:
+            raise AssertionError("One connection, one sign-in, for every contract.")
+        return "Three contracts over one connection: two priced, the unlisted one reported missing, heartbeats answered, one sign-in."
+
+    def check_dependency_tracking() -> str:
+        saved_live, saved_memo = st.session_state.get("live_data"), st.session_state.get("derived_memo")
+        try:
+            frame = lambda value: pd.DataFrame({"date": [pd.Timestamp("2026-11-16")], "value": [value]})
+            st.session_state.live_data = LiveData({"a": {"data": frame(1.0), "fetched_at": "", "metadata": {}, "label": "a"},
+                                                   "b": {"data": frame(2.0), "fetched_at": "", "metadata": {}, "label": "b"}})
+            st.session_state.derived_memo = {}
+            built = []
+            def result():
+                built.append(1)
+                return float(_live_dataset_frame("a")["value"].iloc[0])
+            session_memo("t", (), result)
+            session_memo("t", (), result)
+            items = st.session_state.live_data
+            items["b"] = {"data": frame(3.0), "fetched_at": "", "metadata": {}, "label": "b"}
+            session_memo("t", (), result)
+            if len(built) != 1:
+                raise AssertionError("A result must not be rebuilt when only data it never read changed.")
+            items["a"] = {"data": frame(5.0), "fetched_at": "", "metadata": {}, "label": "a"}
+            if session_memo("t", (), result) != 5.0 or len(built) != 2:
+                raise AssertionError("A result must be rebuilt when data it read changed.")
+            version = items.versions["a"]
+            _stored_live_item("a", "a", frame(5.0), {})
+            if items.versions["a"] != version or len(built) != 2 or session_memo("t", (), result) != 5.0 or len(built) != 2:
+                raise AssertionError("A refetch that brings nothing new must keep every result built from it.")
+            return "Results rebuild when data they read changes, not when other data changes, and an unchanged refetch rebuilds nothing."
+        finally:
+            st.session_state.live_data = saved_live
+            st.session_state.derived_memo = saved_memo if saved_memo is not None else {}
+
+    def check_scenario_designs() -> str:
+        days = pd.date_range("2026-11-10", periods=12, freq="D")
+        rng = np.random.default_rng(3)
+        weather = pd.DataFrame({"temperature": rng.normal(6, 4, 12), "wind_land": rng.uniform(0, 1, 12), "wind_sea": rng.uniform(0, 1, 12),
+                                "solar": rng.uniform(0, 120, 12)}, index=days)
+        weather.iloc[3, 0] = np.nan
+        full = fund_design(days, weather, "Germany-Luxembourg")
+        varied = weather.assign(temperature=weather["temperature"] - 2.0, solar=weather["solar"] * 0.5)
+        fast, slow = with_weather(full, varied), fund_design(days, varied, "Germany-Luxembourg")
+        if list(fast.columns) != list(slow.columns) or not np.allclose(fast.to_numpy(float), slow.to_numpy(float), equal_nan=True, rtol=0, atol=1e-12):
+            raise AssertionError("A scenario's inputs must match a full rebuild exactly.")
+        return "Each weather scenario's inputs, built from the shared calendar, match a full rebuild to the last digit, gaps included."
 
     def check_update_job_lifecycle() -> str:
         saved_job = st.session_state.get("update_job")
@@ -11167,7 +11883,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             if update_progress() != (3, 3) or not collect_update():
                 raise AssertionError("A finished update was not collected.")
             results = {name: (good, detail) for name, good, detail in st.session_state.update_results}
-            if applied != [5] or not results["Good"][0] or results["Bad"] != (False, "provider down.") or results["Bad apply"][0]:
+            if applied != [5] or not results["Good"][0] or (results["Bad"][0] or not re.fullmatch(r"provider down\. \(\d+\.\d s\)", results["Bad"][1])) or results["Bad apply"][0]:
                 raise AssertionError(f"One failure must not affect the others: {results}")
             if collect_update() or st.session_state.update_job is not None:
                 raise AssertionError("The job must clear once collected.")
@@ -12749,6 +13465,10 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Market read: power evidence by hand", "Market Read", check_power_read_by_hand),
         ("Update: merge keeps revisions and trims", "Market data updates", check_merge_observations),
         ("Update: requests only what's missing", "Market data updates", check_update_plan_is_incremental),
+        ("Update: skips sources with nothing new", "Market data updates", check_publication_calendar),
+        ("TradingView: many contracts over one connection", "Market data updates", check_tradingview_batch),
+        ("Pages rebuild only what changed", "Market data updates", check_dependency_tracking),
+        ("Outlook: weather scenarios share the calendar", "Fundamentals outlook", check_scenario_designs),
         ("Update: background run and failure isolation", "Market data updates", check_update_job_lifecycle),
         ("Fast P&L history matches day-by-day explain", "P&L", check_pnl_history_matches_explain),
         ("Compact saved format and earlier saves", "Saved data", check_saved_format_compatibility),
@@ -12836,7 +13556,8 @@ def contract_picker(prefix: str, product: str) -> tuple[date, date, str, str]:
     return start, end, instrument, label
 
 
-def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float], reads: Sequence[tuple] = (), outlook: str = "") -> str:
+def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float], reads: Sequence[tuple] = (), outlook: str = "",
+                   pnl_days: Optional[tuple] = None) -> str:
     """The morning note as short bullets, written from whatever is actually loaded. Missing data stays unsaid."""
     today_items = []
     total = metrics["eur_total"]
@@ -12844,7 +13565,8 @@ def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float], re
         trades = "trade" if metrics["executed"] == 1 else "trades"
         item = f'Book: <b class="{tone_of(total)}">{fmt_money(total)}</b> across {metrics["executed"]} executed {trades}'
         if pnl_today is not None:
-            item += f', <b class="{tone_of(pnl_today)}">{fmt_money(pnl_today)}</b> on the day'
+            item += (f', <b class="{tone_of(pnl_today)}">{fmt_money(pnl_today)}</b> from the {day_text(pnl_days[0])} curves to the {day_text(pnl_days[1])} curves'
+                     if pnl_days else f', <b class="{tone_of(pnl_today)}">{fmt_money(pnl_today)}</b> since the previous saved curves')
         held = executed_buckets()
         state = {product_price_state(p) for p in held["product"].unique()} if not held.empty else set()
         if state & {"Demo", "Old"}:
@@ -12859,10 +13581,11 @@ def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float], re
     has_market = False
     storage = snapshot.get("storage", {})
     if storage.get("fill_pct") is not None:
-        item = f'EU gas storage: <b>{storage["fill_pct"]:.1f}%</b> full'
+        item = f'EU gas storage: <b>{storage["fill_pct"]:.1f}%</b> full' + (f' on gas day {day_text(storage["change_to"])}' if storage.get("change_to") else "")
         change = storage.get("change_7_reports_twh")
         if change is not None:
-            item += f', {"down" if change < 0 else "up"} {abs(change):.1f} TWh in a week'
+            item += (f', {"down" if change < 0 else "up"} {abs(change):.1f} TWh from gas day {day_text(storage["change_from"])} to {day_text(storage["change_to"])}'
+                     if storage.get("change_from") else f', {"down" if change < 0 else "up"} {abs(change):.1f} TWh over the last seven reports')
         today_items.append(item)
         has_market = True
     for zone, label in (("France", "French"), ("Germany-Luxembourg", "German")):
@@ -12871,7 +13594,7 @@ def desk_note_html(metrics: dict, snapshot: dict, pnl_today: Optional[float], re
             today_local = datetime.now(ZoneInfo(ENTSOE_ZONES[zone]["timezone"])).date()
             current = series.loc[series["local"].dt.date.eq(today_local)]
             if not current.empty:
-                today_items.append(f'{label} day-ahead: <b>{spot_kpis(current)["base"]:.1f} €/MWh</b> average today')
+                today_items.append(f'{label} day-ahead: <b>{spot_kpis(current)["base"]:.1f} €/MWh</b> average for delivery today, {day_text(today_local)}')
                 has_market = True
     parts = ["<ul>" + "".join(f"<li>{item}</li>" for item in today_items) + "</ul>"]
     read_items = [f"{html.escape(market)}: {html.escape(reading.lower())}" for market, reading in reads]
@@ -12891,7 +13614,8 @@ def _outlook_line() -> str:
     outlook = winter_outlook()
     if not outlook.get("ready") or outlook.get("basis") != "weather":
         return ""
-    return f"EU storage at the end of March: about <b>{outlook['scenarios'][outlook['central']]['end']:.0f}%</b> with normal weather"
+    return (f"EU storage on {day_text(outlook['end'])}: about <b>{outlook['scenarios'][outlook['central']]['end']:.0f}%</b> with normal weather, "
+            f"from {outlook['start_fill']:.1f}% on gas day {day_text(outlook['start'])}")
 
 
 def page_market_overview():
@@ -12910,13 +13634,14 @@ def page_market_overview():
     trend = session_memo("overview_trend", (data_version("trades", "snapshots"), eur_per_gbp),
                          lambda: pnl_history(executed_buckets(), {d: lookups[d] for d in recent_days}, eur_per_gbp))
     pnl_today = float(trend["pnl_eur"].iloc[-1]) if not trend.empty and not executed_buckets().empty else None
+    pnl_days = (recent_days[-2], recent_days[-1]) if pnl_today is not None and len(recent_days) >= 2 else None
 
     snapshot = live_snapshot()
     hero = st.container(key="hero")
     note_col, chart_col = hero.columns([1, 1.05], gap="large")
     with note_col:
         reads = [(name, read["summary"]["reading"]) for name, read in market_reads().items() if read["summary"]["confidence"] != "None"]
-        st.markdown(desk_note_html(metrics, snapshot, pnl_today, reads, _outlook_line()), unsafe_allow_html=True)
+        st.markdown(desk_note_html(metrics, snapshot, pnl_today, reads, _outlook_line(), pnl_days), unsafe_allow_html=True)
         update_button("overview_refresh")
     with chart_col:
         names = ["TTF Natural Gas", "French Power Base", "German Power Base"]
@@ -12934,7 +13659,9 @@ def page_market_overview():
     c1, c2, c3, c4 = st.columns(4)
     kpi(c1, "Open MtM, EUR trades", fmt_money(eur_mtm), tone=tone_of(eur_mtm), accent=BLUE)
     kpi(c2, "Open MtM, GBP trades", fmt_money(gbp_mtm, "GBP"), tone=tone_of(gbp_mtm), accent=TEAL)
-    kpi(c3, "Total in EUR", fmt_money(metrics["eur_total"]), "Last 30 saved days" if mtm_trend else f"At {eur_per_gbp:.4f} EUR per GBP", tone=tone_of(metrics["eur_total"]), spark=mtm_trend)
+    kpi(c3, "Total in EUR", fmt_money(metrics["eur_total"]),
+        f"Trend over saved days {period_text(trend['date'].iloc[0], trend['date'].iloc[-1])}" if mtm_trend else f"At {eur_per_gbp:.4f} EUR per GBP",
+        tone=tone_of(metrics["eur_total"]), spark=mtm_trend)
     kpi(c4, "Trades needing a price", f"{unmarked}", "All marked" if not unmarked else "See Trading Book", accent=GAIN if not unmarked else LOSS)
 
     st.subheader("Market")
@@ -12944,21 +13671,25 @@ def page_market_overview():
     france = zone_prices("France")
     m1, m2, m3, m4 = st.columns(4)
     kpi(m1, "EU gas storage", f"{storage['fill_pct']:.1f}%" if storage.get("fill_pct") is not None else "Not loaded",
-        f"{storage['inventory_twh']:.0f} TWh in store" if storage.get("inventory_twh") is not None else "",
+        (f"{storage['inventory_twh']:.0f} TWh in store" + (f", gas day {day_text(storage['change_to'])}" if storage.get("change_to") else "")) if storage.get("inventory_twh") is not None else "",
         accent=ENTITY_COLORS["TTF Natural Gas"], meter=storage.get("fill_pct"))
     kpi(m2, "LNG send-out", f"{lng['sendout']:,.0f} GWh/d" if lng.get("sendout") is not None else "Not loaded", accent="#17A891",
         spark=_number_series(alsi[send_col]).tail(30).tolist() if send_col else None)
-    kpi(m3, "French day-ahead", f"{spot_kpis(france.tail(24))['base']:.1f} €/MWh" if not france.empty else "Not loaded", "Last 24 hours" if not france.empty else "", accent=SODIUM,
+    france_day = france.loc[france["local"] > france["local"].max() - pd.Timedelta(hours=24)] if not france.empty else france
+    kpi(m3, "French day-ahead", f"{spot_kpis(france_day)['base']:.1f} €/MWh" if not france.empty else "Not loaded",
+        (f"Last 24 published hours, {france_day['local'].min():%d %b %H:%M} to {france['local'].max() + pd.Timedelta(hours=float(france['hours'].iloc[-1])):%d %b %H:%M}"
+         if "hours" in france.columns else "Last 24 published hours") if not france.empty else "", accent=SODIUM,
         spark=spot_hourly(france)["value"].tail(72).tolist() if not france.empty else None)
     kpi(m4, "Actual power load", f"{load['value'] / 1000:.1f} GW" if load.get("value") is not None else "Not loaded", str(load.get("zone") or ""), accent="#9180EE")
 
     st.markdown('<div style="height:0.9rem"></div>', unsafe_allow_html=True)
     weather_daily = _live_dataset_frame("weather_daily")
     normals = _live_dataset_frame("weather_normals")
-    anomaly = session_memo("hdd_anomaly", data_version("live"), lambda: hdd_vs_normal(weather_daily, normals))
+    anomaly = session_memo("hdd_anomaly", (), lambda: hdd_vs_normal(_live_dataset_frame("weather_daily"), _live_dataset_frame("weather_normals")))
     if not anomaly.empty:
         fig = px.bar(anomaly.sort_values("hdd_vs_normal"), x="hdd_vs_normal", y="location", orientation="h",
-                     title="Heating demand over the next 7 days against normal, degree days",
+                     title=(f"Heating demand forecast for {period_text(anomaly['first'].min(), anomaly['last'].max())} against the 10-year normal, degree days"
+                            if anomaly["first"].notna().any() else "Heating demand over the next 7 days against normal, degree days"),
                      labels={"hdd_vs_normal": "", "location": ""})
         fig.update_traces(marker_color=BLUE)
         chart(fig, 280)
@@ -13183,7 +13914,7 @@ def page_spreads():
                     entry["French clean spark"] = base[target] - gas[target] / eta - carbon[target] * factor / eta
                 rows.append(entry)
             data = pd.DataFrame(rows).melt(id_vars="date", var_name="spread", value_name="eur_mwh").dropna()
-            fig = px.line(data, x="date", y="eur_mwh", color="spread", title="Front-month spreads over saved days, EUR/MWh",
+            fig = px.line(data, x="date", y="eur_mwh", color="spread", title=f"Front-month spreads on each saved day, {period_text(min(lookups), max(lookups))}, EUR/MWh (front month = the month after each saved day)",
                           labels={"date": "", "eur_mwh": "", "spread": ""})
             chart(fig, 400)
             sources = set(history["source"])
@@ -13207,18 +13938,23 @@ def page_forward_curves():
         after_current = curve.loc[curve["delivery_month"] > pd.Timestamp(valuation_date.replace(day=1))]
         first = after_current.iloc[0] if not after_current.empty else curve.iloc[0]
         c1, c2, c3, c4 = st.columns(4)
-        kpi(c1, f"Front month, {first['delivery_month']:%b %Y}", f"{float(first['price']):,.2f}", spec["unit"])
+        kpi(c1, f"Front month, {first['delivery_month']:%b %Y}", f"{float(first['price']):,.2f}", spec["unit"] + (f", marks of {day_text(st.session_state['curve_metadata'][selected]['curve_date'])}"
+            if selected in st.session_state.get("custom_curves", {}) and st.session_state.get("curve_metadata", {}).get(selected, {}).get("curve_date") else ""))
         kpi(c2, "Curve average", f"{curve['price'].mean():,.2f}", spec["unit"])
         kpi(c3, "Low", f"{curve['price'].min():,.2f}", spec["unit"])
         kpi(c4, "High", f"{curve['price'].max():,.2f}", spec["unit"])
 
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=curve["delivery_month"], y=curve["price"], mode="lines+markers", name="Today", line=dict(color=ENTITY_COLORS.get(selected, BLUE), width=2)))
+        marks_day = st.session_state.get("curve_metadata", {}).get(selected, {}).get("curve_date") if selected in st.session_state.get("custom_curves", {}) else None
+        now_label = f"Marks of {day_text(marks_day)}" if marks_day else f"Curve used on {day_text(valuation_date)}"
+        fig.add_trace(go.Scatter(x=curve["delivery_month"], y=curve["price"], mode="lines+markers", name=now_label, line=dict(color=ENTITY_COLORS.get(selected, BLUE), width=2)))
+        title = f"{selected}, {spec['unit']}"
         if previous:
             earlier = history.loc[history["product"].eq(selected) & history["snapshot_date"].eq(previous[-1])].copy()
             earlier["delivery_month"] = pd.to_datetime(earlier["delivery_month"])
-            fig.add_trace(go.Scatter(x=earlier["delivery_month"], y=earlier["price"], mode="lines", name=f"Saved {previous[-1]}", line=dict(color=GRAY, width=1.5, dash="dot")))
-        fig.update_layout(title=f"{selected}, {spec['unit']}", yaxis_title="")
+            fig.add_trace(go.Scatter(x=earlier["delivery_month"], y=earlier["price"], mode="lines", name=f"Saved on {day_text(previous[-1])}", line=dict(color=GRAY, width=1.5, dash="dot")))
+            title += f": {now_label.lower()} against the curve saved on {day_text(previous[-1])}"
+        fig.update_layout(title=title, yaxis_title="")
         chart(fig, 400)
 
     sources_here = curve_sources().get(selected, {})
@@ -13272,7 +14008,8 @@ def page_forward_curves():
             earlier_lookup = dict(zip(pd.to_datetime(earlier["delivery_month"]).dt.date, earlier["price"]))
             display_curve["change"] = [p - earlier_lookup[m] if m in earlier_lookup else float("nan") for m, p in zip(display_curve["delivery_month"], display_curve["price"])]
         display_curve["source"] = [sources_here.get(m, "") for m in display_curve["delivery_month"]]
-        table(display_curve[[c for c in display_curve.columns if c in ("delivery_month", "price", "change", "unit", "source")]], height=320)
+        change_label = f"change since the curve saved on {day_text(previous[-1])}" if previous else "change"
+        table(display_curve[[c for c in display_curve.columns if c in ("delivery_month", "price", "change", "unit", "source")]].rename(columns={"change": change_label}), height=320)
         st.download_button("Download this curve as CSV", data=display_curve.to_csv(index=False).encode("utf-8"),
                            file_name=f"{selected.lower().replace(' ', '_')}_forward_curve.csv", mime="text/csv")
     if tab_status:
@@ -13519,7 +14256,7 @@ def page_trading_book_mtm():
 
 
 def page_daily_pnl():
-    title_block("Daily P&L", "What changed between two saved days of curves, and why.")
+    title_block("Daily P&L", "What changed between two saved days of curves, and why. Both dates are chosen below and named on every figure.")
     history = saved_snapshots()
     lookups = saved_lookups()
     days = sorted(lookups)
@@ -13546,20 +14283,22 @@ def page_daily_pnl():
     factor = step["currency"].map({"EUR": 1.0, "GBP": eur_per_gbp})
     total = {col: float((step[col] * factor).sum()) for col in ("new_trade", "price_move", "first_mark", "to_delivery", "previous_mtm", "current_mtm", "total_pnl")}
     k1, k2, k3, k4 = st.columns(4)
-    kpi(k1, "P&L for the period", fmt_money(total["total_pnl"]), tone=tone_of(total["total_pnl"]))
-    kpi(k2, "From price moves", fmt_money(total["price_move"]), tone=tone_of(total["price_move"]))
-    kpi(k3, "From new trades", fmt_money(total["new_trade"]), tone=tone_of(total["new_trade"]))
-    kpi(k4, "Open MtM now", fmt_money(total["current_mtm"]), tone=tone_of(total["current_mtm"]))
-    drivers = render_pnl_drivers(step, factor)
+    period = (previous_day, current_day)
+    span = f"{previous_day:%d %b} → {current_day:%d %b %Y}"
+    kpi(k1, f"P&L, {span}", fmt_money(total["total_pnl"]), tone=tone_of(total["total_pnl"]))
+    kpi(k2, "From price moves", fmt_money(total["price_move"]), f"Marks of {previous_day:%d %b} against {current_day:%d %b}", tone=tone_of(total["price_move"]))
+    kpi(k3, "From new trades", fmt_money(total["new_trade"]), f"Traded after {previous_day:%d %b}", tone=tone_of(total["new_trade"]))
+    kpi(k4, f"Open MtM, {current_day:%d %b %Y}", fmt_money(total["current_mtm"]), f"{fmt_money(total['previous_mtm'])} on {previous_day:%d %b %Y}", tone=tone_of(total["current_mtm"]))
+    drivers = render_pnl_drivers(step, factor, period)
     left, right = st.columns(2, gap="large")
     with left:
         fig = go.Figure(go.Waterfall(
-            x=["Open MtM<br>before", "New<br>trades", "Price<br>moves", "First<br>marks", "To<br>delivery", "Open MtM<br>now"],
+            x=[f"Open MtM<br>{previous_day:%d %b}", "New<br>trades", "Price<br>moves", "First<br>marks", "To<br>delivery", f"Open MtM<br>{current_day:%d %b}"],
             y=[total["previous_mtm"], total["new_trade"], total["price_move"], total["first_mark"], -total["to_delivery"], total["current_mtm"]],
             measure=["absolute", "relative", "relative", "relative", "relative", "total"],
             increasing=dict(marker=dict(color=GAIN)), decreasing=dict(marker=dict(color=LOSS)), totals=dict(marker=dict(color=BLUE)),
             connector=dict(line=dict(color=BORDER, width=1)), hovertemplate="€%{y:,.0f}<extra></extra>"))
-        fig.update_layout(title="How open MtM moved, EUR", yaxis_title="", hovermode="closest")
+        fig.update_layout(title=f"How open MtM moved, {span}, EUR", yaxis_title="", hovermode="closest")
         fig.update_xaxes(tickangle=0)
         chart(fig, 360)
     with right:
@@ -13567,24 +14306,26 @@ def page_daily_pnl():
         fig = go.Figure(go.Bar(x=by_product["pnl_eur"], y=by_product["product"], orientation="h",
                                marker=dict(color=[GAIN if v >= 0 else LOSS for v in by_product["pnl_eur"]]),
                                hovertemplate="%{y}: €%{x:,.0f}<extra></extra>"))
-        fig.update_layout(title="P&L by product, EUR", hovermode="closest", yaxis_title="")
+        fig.update_layout(title=f"P&L by product, {span}, EUR", hovermode="closest", yaxis_title="")
         chart(fig, 360)
     series = session_memo("pnl_series", (data_version("trades", "snapshots"), eur_per_gbp), lambda: pnl_history(buckets, lookups, eur_per_gbp))
     if len(series) >= 2:
         left, right = st.columns(2, gap="large")
         with left:
             fig = go.Figure(go.Bar(x=series["date"], y=series["pnl_eur"], marker=dict(color=[GAIN if v >= 0 else LOSS for v in series["pnl_eur"]]), hovertemplate="%{x}: €%{y:,.0f}<extra></extra>"))
-            fig.update_layout(title="Daily P&L, EUR", hovermode="closest")
+            fig.update_layout(title=f"Daily P&L, each saved day against the one before, {series['date'].iloc[0]:%d %b} to {series['date'].iloc[-1]:%d %b %Y}, EUR" if hasattr(series['date'].iloc[0], 'strftime') else "Daily P&L, each saved day against the one before, EUR", hovermode="closest")
             chart(fig, 300)
         with right:
-            fig = px.line(series, x="date", y="cumulative_pnl_eur", title="Cumulative P&L, EUR", labels={"date": "", "cumulative_pnl_eur": ""})
+            fig = px.line(series, x="date", y="cumulative_pnl_eur", labels={"date": "", "cumulative_pnl_eur": ""},
+                          title=f"Cumulative P&L since {pd.Timestamp(days[0]):%d %b %Y}, EUR")
             fig.update_traces(line_color=BLUE)
             chart(fig, 300)
         st.caption("Trades enter the history from their trade date. Status changes aren't replayed, so a trade cancelled today is left out of past days too.")
-    render_driver_table(drivers)
-    with st.expander("P&L by trade and delivery month"):
+    render_driver_table(drivers, period)
+    with st.expander(f"P&L by trade and delivery month, {span}"):
         table(step.drop(columns=["previous_mtm"]))
-    st.caption("New trade: today's value of trades done since the first date. Price move: volume times the change in mark. To delivery: a month that left the curve; its value moves from open MtM to realised, so it doesn't change P&L.")
+    st.caption(f"New trade: the value on the {day_text(current_day)} curves of trades done after {day_text(previous_day)}. Price move: volume times the change in mark "
+               f"from the {day_text(previous_day)} curves to the {day_text(current_day)} curves. To delivery: a month that left the curve between the two dates; its value moves from open MtM to realised, so it doesn't change P&L.")
 
 
 def seed_demo_history() -> None:
@@ -13671,12 +14412,12 @@ def page_risk_exposure():
             chart(fig, 360)
             if outcome["uncovered"]:
                 st.warning(f"No saved history for {', '.join(outcome['uncovered'])}, so these products aren't in the figures.")
-            st.caption("Historical simulation: each saved daily move is applied to today's position at the same distance from delivery. Results depend entirely on the days saved, and don't cover liquidity or basis risks those days didn't contain.")
+            st.caption(f"Historical simulation: each saved daily move is applied to the book of {day_text(valuation_date)} at the same distance from delivery. Results depend entirely on the days saved, and don't cover liquidity or basis risks those days didn't contain.")
 
 
 def market_reads() -> dict:
     """Readings for gas and each covered power zone, reused while their inputs are unchanged."""
-    return session_memo("market_reads", (data_version("live", "curves"), valuation_date), _build_market_reads)
+    return session_memo("market_reads", (data_version("curves"), valuation_date), _build_market_reads)
 
 
 def _build_market_reads() -> dict:
@@ -13725,7 +14466,7 @@ def _evidence_row(signal: dict) -> str:
 
 
 def page_market_read():
-    title_block("Market read", "What the evidence says for each market, how sure it is, and what would change the view.")
+    title_block("Market read", f"Read of {day_text(valuation_date)}: what the evidence says for each market, how sure it is, and what would change the view. Each comparison names its own dates.")
     reads = market_reads()
     columns = st.columns(min(len(reads), 3))
     for index, (name, read) in enumerate(list(reads.items())[:3]):
@@ -13838,8 +14579,8 @@ def page_hedge_advisor():
             joined = actions[0] if len(actions) == 1 else ", ".join(actions[:-1]) + " and " + actions[-1]
             cut = (1.0 - plan["hedged_var"] / plan["base_var"]) * 100.0 if plan["base_var"] else 0.0
             text = (f'<p>To cut risk the most, {joined}.</p>'
-                    f'<p>That would take your one-day VaR from <b>{fmt_money(plan["base_var"], signed=False)}</b> to '
-                    f'<b class="gain">{fmt_money(plan["hedged_var"], signed=False)}</b>, a {cut:.0f}% reduction, for about <b>{fmt_money(plan["total_cost"], signed=False)}</b> in spread.</p>')
+                    f'<p>For the book of {day_text(valuation_date)}, measured on {plan["observations"]} saved days of price moves, that would take your one-day VaR from <b>{fmt_money(plan["base_var"], signed=False)}</b> without these hedges to '
+                    f'<b class="gain">{fmt_money(plan["hedged_var"], signed=False)}</b> with them, a {cut:.0f}% reduction, for about <b>{fmt_money(plan["total_cost"], signed=False)}</b> in spread.</p>')
         else:
             text = (f'<p>No standard contract would cut your one-day VaR of <b>{fmt_money(plan["base_var"], signed=False)}</b> by at least 5%.</p>'
                     '<p class="soft">Your book may already be well balanced, or its risk may sit in products you can allow by unticking the option above.</p>')
@@ -13865,12 +14606,12 @@ def page_hedge_advisor():
         chart(fig, 300)
 
     k1, k2, k3, k4 = st.columns(4)
-    kpi(k1, f"VaR now, {level}", fmt_money(plan["base_var"], signed=False), f"Expected shortfall {fmt_money(plan['base_es'], signed=False)}", accent=AMBER)
+    kpi(k1, f"VaR, book of {valuation_date:%d %b}, {level}", fmt_money(plan["base_var"], signed=False), f"Expected shortfall {fmt_money(plan['base_es'], signed=False)}", accent=AMBER)
     kpi(k2, f"VaR with hedges, {level}", fmt_money(plan["hedged_var"], signed=False), f"Expected shortfall {fmt_money(plan['hedged_es'], signed=False)}", accent=BLUE)
     kpi(k3, "Risk removed", fmt_money(plan["base_var"] - plan["hedged_var"], signed=False), tone="gain" if hedges else "")
     kpi(k4, "Estimated spread cost", fmt_money(plan["total_cost"], signed=False), f"Assumed half-spreads on {plan['observations']} saved days")
 
-    tab_plan, tab_drivers, tab_ladder, tab_own, tab_trust = view_tabs(["The hedges", "What drives the risk", "Positions before and after", "Test your own hedge", "How far to trust this"])
+    tab_plan, tab_drivers, tab_ladder, tab_own, tab_trust = view_tabs(["The hedges", "What drives the risk", "Positions without and with the hedges", "Test your own hedge", "How far to trust this"])
     if tab_plan:
         if hedges:
             rows = [{"Action": h["action"], "Product": h["product"], "Contract": h["contract"], "MW": abs(h["mw"]), "Energy, MWh": h["mwh"],
@@ -13916,9 +14657,9 @@ def page_hedge_advisor():
         after = hedge_ladder_rows(buckets, hedges)
         limit = float(max(before["net_mwh"].abs().max(), after["net_mwh"].abs().max())) or 1.0
         height = max(240, 90 + 40 * max(before["product"].nunique(), after["product"].nunique()))
-        chart(_ladder_figure(before, "Before, net MWh by delivery month", limit), height)
+        chart(_ladder_figure(before, f"Book of {day_text(valuation_date)} without the hedges, net MWh by delivery month", limit), height)
         if hedges:
-            chart(_ladder_figure(after, "After, net MWh by delivery month", limit), height)
+            chart(_ladder_figure(after, f"Book of {day_text(valuation_date)} with the proposed hedges, net MWh by delivery month", limit), height)
             st.caption("Blue is long and red is short. The hedges cut total risk, which isn't always the same as flattening every month, because some months offset others.")
     if tab_own:
         c1, c2, c3, c4 = st.columns(4, vertical_alignment="bottom")
@@ -13932,14 +14673,16 @@ def page_hedge_advisor():
         else:
             change = effect["after"] - effect["before"]
             r1, r2, r3 = st.columns(3)
-            kpi(r1, f"VaR now, {level}", fmt_money(effect["before"], signed=False))
+            kpi(r1, f"VaR, book of {valuation_date:%d %b}, {level}", fmt_money(effect["before"], signed=False))
             kpi(r2, "VaR with this trade", fmt_money(effect["after"], signed=False))
             kpi(r3, "Change in VaR", fmt_money(change), "This trade lowers risk" if change < 0 else "This trade adds risk" if change > 0 else "No change", tone="gain" if change < 0 else "loss" if change > 0 else "")
     if tab_trust:
         test = plan["out_of_sample"]
         if test:
             reduction = (1.0 - test["hedged_std"] / test["unhedged_std"]) * 100.0 if test["unhedged_std"] else 0.0
-            st.write(f"**Test on unseen days.** A hedge chosen using only the first {test['train_days']} days ({', '.join(test['contracts'])}) was then applied to the last {test['test_days']} days, which it had never seen.")
+            spans = (f" ({period_text(*test['train_span'])})", f" ({period_text(*test['test_span'])})") if test.get("train_span") else ("", "")
+            st.write(f"**Test on unseen days.** A hedge chosen using only the first {test['train_days']} saved days{spans[0]} ({', '.join(test['contracts'])}) "
+                     f"was then applied to the last {test['test_days']} saved days{spans[1]}, which it had never seen.")
             t1, t2, t3 = st.columns(3)
             kpi(t1, "Daily volatility on those days", f"{reduction:+.0f}%" if reduction < 0 else f"−{reduction:.0f}%", f"{fmt_money(test['unhedged_std'], signed=False)} down to {fmt_money(test['hedged_std'], signed=False)}" if reduction >= 0 else "The hedge added volatility", tone="gain" if reduction > 0 else "loss")
             kpi(t2, "Worst day unhedged", fmt_money(test["unhedged_worst"]), tone="loss" if test["unhedged_worst"] < 0 else "")
@@ -14131,8 +14874,9 @@ def render_winter_outlook() -> None:
     band_end = outlook["band_end"]
     comparison = lambda level: f", {versus_range(level, band_end)}" if band_end else ""
     weather_based = outlook["basis"] == "weather"
-    first = (f"With normal weather, EU storage ends March at about <b>{central['end']:.0f}%</b>{comparison(central['end'])}."
-             if weather_based else f"If storage falls as it has on average, it ends March at about <b>{central['end']:.0f}%</b>{comparison(central['end'])}.")
+    starting = f"From {outlook['start_fill']:.1f}% on gas day {day_text(outlook['start'])}"
+    first = (f"{starting}, with normal weather, EU storage ends {day_text(outlook['end'])} at about <b>{central['end']:.0f}%</b>{comparison(central['end'])}."
+             if weather_based else f"{starting}, if storage falls as it has on average, it ends {day_text(outlook['end'])} at about <b>{central['end']:.0f}%</b>{comparison(central['end'])}.")
     if weather_based:
         second = (f"The coldest winter of the past {len(outlook['years'])} would take it to <b>{scenarios[0]['end']:.0f}%</b>{comparison(scenarios[0]['end'])}, "
                   f"and the mildest to <b>{scenarios[2]['end']:.0f}%</b>{comparison(scenarios[2]['end'])}.")
@@ -14189,7 +14933,7 @@ def render_winter_outlook() -> None:
 # Next-day estimate, P&L drivers, crisis replay, VaR check and morning brief
 # -----------------------------------------------------------------------------
 def zone_estimate(zone: str) -> dict:
-    return session_memo(f"estimate|{zone}", data_version("live"),
+    return session_memo(f"estimate|{zone}", (),
                         lambda: next_day_estimate(zone, zone_prices(zone), _live_dataset_frame("weather_power_history"), _live_dataset_frame("weather_daily"),
                                                   _live_dataset_frame(f"entsoe_load_forecast|{zone}"), _live_dataset_frame(f"entsoe_renewable_forecast|{zone}"),
                                                   _live_dataset_frame("zone_weather_history"), _live_dataset_frame("zone_weather_forecast"),
@@ -14251,7 +14995,7 @@ def render_next_day(zones: Sequence[str]) -> None:
             f'with an 80% chance of landing between <b>€{result["low"]:.0f} and €{result["high"]:.0f}</b>. {html.escape(basis)}</p>'
             f'<p>The latest published day, {result["latest_day"]:%a %d %b}, came in at €{result["latest_actual"]:.0f}, {against} {check_basis}. '
             f'{"That is an unusually large gap, so check for something the method can&#39;t see." if result["unusual"] else "That is within the usual range of error."}</p>'
-            f'<p class="soft">Over the last {result["n"]} days, each estimated only from earlier days, it missed by €{result["error"]:.1f} on average, '
+            f'<p class="soft">Over {result["n"]} delivery days to {day_text(result["latest_day"])}, each estimated only from earlier days, it missed by €{result["error"]:.1f} on average, '
             f'{abs(result["skill"]) * 100:.0f}% {"less" if beat else "more"} than the best simple method (€{min(result["error_same_type"], result["error_last_week"], result["error_yesterday"]):.1f}).{held}{trend} '
             f'{"" if beat else "It has not beaten the simple methods, so don&#39;t rely on it over them."}</p></div>', unsafe_allow_html=True)
     test = result["test"].tail(90)
@@ -14350,23 +15094,24 @@ def render_next_day(zones: Sequence[str]) -> None:
                     + "Neither method knows about carbon prices, plant outages, interconnector limits or the auction itself.")
 
 
-def render_pnl_drivers(step: pd.DataFrame, factor: pd.Series) -> pd.DataFrame:
+def render_pnl_drivers(step: pd.DataFrame, factor: pd.Series, period: Optional[tuple] = None) -> pd.DataFrame:
     drivers = pnl_drivers(step, factor)
     with st.container(key="hero"):
-        st.markdown(f'<div class="desk-note"><p>{html.escape(pnl_sentence(drivers))}</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="desk-note"><p>{html.escape(pnl_sentence(drivers, period))}</p></div>', unsafe_allow_html=True)
     return drivers
 
 
-def render_driver_table(drivers: pd.DataFrame) -> None:
+def render_driver_table(drivers: pd.DataFrame, period: Optional[tuple] = None) -> None:
     if drivers.empty:
         return
-    st.subheader("What drove it, by delivery month")
+    st.subheader("What drove it, by delivery month" + (f", {period[0]:%d %b} → {period[1]:%d %b %Y}" if period else ""))
+    before_label, now_label = (f"Mark {period[0]:%d %b}", f"Mark {period[1]:%d %b}") if period else ("Mark before", "Mark now")
     sources = curve_sources()
     drivers = drivers.assign(prices=[{SOURCE_DEMO: "Demo"}.get(sources.get(p, {}).get(m, ""), sources.get(p, {}).get(m, "")) for p, m in zip(drivers["product"], drivers["delivery_month"])])
     shown = drivers.assign(delivery_month=drivers["delivery_month"].map(month_contract_label)).rename(columns={"prices": "Prices now",
-        "product": "Product", "delivery_month": "Month", "net_mwh": "Net MWh", "previous_mark": "Mark before", "current_mark": "Mark now", "mark_change": "Change",
+        "product": "Product", "delivery_month": "Month", "net_mwh": "Net MWh", "previous_mark": before_label, "current_mark": now_label, "mark_change": "Change",
         "price_move": "Price move, EUR", "new_trades": "New trades, EUR", "first_marks": "First marks, EUR", "total": "Total, EUR"})
-    table(shown.round({"Net MWh": 0, "Mark before": 2, "Mark now": 2, "Change": 2, "Price move, EUR": 0, "New trades, EUR": 0, "First marks, EUR": 0, "Total, EUR": 0}))
+    table(shown.round({"Net MWh": 0, before_label: 2, now_label: 2, "Change": 2, "Price move, EUR": 0, "New trades, EUR": 0, "First marks, EUR": 0, "Total, EUR": 0}))
 
 
 def render_crisis_replay(buckets: pd.DataFrame, eur_per_gbp: float, outcome: dict) -> None:
@@ -14437,40 +15182,46 @@ def render_var_check(outcome: dict) -> None:
 BRIEF_METRICS = ("EU storage fill", "Winter outlook, normal weather", "TTF nearest month", "French day-ahead base", "German day-ahead base", "Daily P&L", "1-day VaR, 95%")
 
 
-def _base_pair(zone: str) -> tuple[Optional[float], Optional[float], Optional[date]]:
+def _base_pair(zone: str) -> tuple[Optional[float], Optional[float], Optional[date], Optional[date]]:
+    """The last two delivery days' base prices, with their dates."""
     base = daily_base_prices(zone_prices(zone))
     if len(base) < 2:
-        return None, None, None
-    return float(base.iloc[-1]), float(base.iloc[-2]), base.index[-1].date()
+        return None, None, None, None
+    return float(base.iloc[-1]), float(base.iloc[-2]), base.index[-1].date(), base.index[-2].date()
 
 
 def brief_metrics() -> dict:
     metrics: dict = {}
     fill = _storage_daily(_live_dataset_frame("gie_agsi_history"))
     if len(fill) >= 2:
-        metrics["EU storage fill"] = {"now": float(fill["fill"].iloc[-1]), "before": float(fill["fill"].iloc[-2]), "unit": "%", "as_of": fill["day"].iloc[-1].date()}
+        metrics["EU storage fill"] = {"now": float(fill["fill"].iloc[-1]), "before": float(fill["fill"].iloc[-2]), "unit": "%", "as_of": fill["day"].iloc[-1].date(),
+                                      "before_as_of": fill["day"].iloc[-2].date(), "basis": "gas day"}
     outlook = winter_outlook()
     if outlook.get("ready") and outlook.get("basis") == "weather":
-        metrics["Winter outlook, normal weather"] = {"now": outlook["scenarios"][outlook["central"]]["end"], "before": None, "unit": "%", "as_of": outlook["start"]}
+        metrics["Winter outlook, normal weather"] = {"now": outlook["scenarios"][outlook["central"]]["end"], "before": None, "unit": "%", "as_of": outlook["start"],
+                                                     "basis": "projected from gas day"}
     marks = marks_path(saved_snapshots(), "TTF Natural Gas")
     if len(marks["days"]) >= 2:
         last, previous = marks["days"][-1], marks["days"][-2]
         months = sorted(m for m in marks["table"][last] if m > date(last.year, last.month, 1) and m in marks["table"][previous])
         if months:
-            metrics["TTF nearest month"] = {"now": marks["table"][last][months[0]], "before": marks["table"][previous][months[0]], "unit": "EUR/MWh", "as_of": last}
+            metrics["TTF nearest month"] = {"now": marks["table"][last][months[0]], "before": marks["table"][previous][months[0]], "unit": "EUR/MWh", "as_of": last,
+                                            "before_as_of": previous, "basis": f"{months[0]:%b-%y} contract, curve of"}
     for name, zone in (("French day-ahead base", "France"), ("German day-ahead base", "Germany-Luxembourg")):
-        now, before, day = _base_pair(zone)
+        now, before, day, before_day = _base_pair(zone)
         if now is not None:
-            metrics[name] = {"now": now, "before": before, "unit": "EUR/MWh", "as_of": day}
+            metrics[name] = {"now": now, "before": before, "unit": "EUR/MWh", "as_of": day, "before_as_of": before_day, "basis": "delivery day"}
     lookups, buckets = saved_lookups(), executed_buckets()
     days = sorted(lookups)
     if len(days) >= 2 and not buckets.empty:
         series = session_memo("pnl_series", (data_version("trades", "snapshots"), fx_rate("eur_per_gbp")), lambda: pnl_history(buckets, lookups, fx_rate("eur_per_gbp")))
         if len(series) >= 1:
-            metrics["Daily P&L"] = {"now": float(series["pnl_eur"].iloc[-1]), "before": float(series["pnl_eur"].iloc[-2]) if len(series) >= 2 else None, "unit": "EUR", "as_of": days[-1]}
+            metrics["Daily P&L"] = {"now": float(series["pnl_eur"].iloc[-1]), "before": float(series["pnl_eur"].iloc[-2]) if len(series) >= 2 else None, "unit": "EUR", "as_of": days[-1],
+                                    "now_text": f"curves {days[-2]:%d %b} to {days[-1]:%d %b %Y}",
+                                    "before_text": f"curves {days[-3]:%d %b} to {days[-2]:%d %b %Y}" if len(series) >= 2 and len(days) >= 3 else ""}
         outcome = session_memo("var", (data_version("trades", "snapshots"), fx_rate("eur_per_gbp")), lambda: historical_var(buckets, saved_snapshots(), fx_rate("eur_per_gbp"), prepared=saved_moves()))
         if outcome["observations"] >= 20:
-            metrics["1-day VaR, 95%"] = {"now": outcome["var"][0.95], "before": None, "unit": "EUR at risk", "as_of": days[-1]}
+            metrics["1-day VaR, 95%"] = {"now": outcome["var"][0.95], "before": None, "unit": "EUR at risk", "as_of": days[-1], "basis": "book and curves of"}
     return metrics
 
 
@@ -14490,18 +15241,22 @@ def build_brief() -> dict:
         reading = metrics.get(name)
         if reading:
             change = reading["now"] - reading["before"] if reading.get("before") is not None else None
-            changes.append({"Item": name, "Now": _metric_text(reading["now"], reading["unit"]),
-                            "Before": _metric_text(reading.get("before"), reading["unit"]),
-                            "Change": ("" if change is None else f"{change:+.1f} pts" if reading["unit"] == "%" else fmt_money(change) if reading["unit"] == "EUR" else f"{change:+.2f}"),
-                            "Date": f"{reading['as_of']:%d %b}"})
+            basis = reading.get("basis", "")
+            now_when = reading.get("now_text") or f"{basis} {reading['as_of']:%d %b %Y}".strip()
+            before_when = reading.get("before_text") or (f"{basis} {reading['before_as_of']:%d %b %Y}".strip() if reading.get("before_as_of") and reading.get("before") is not None else "")
+            changes.append({"Item": name, "Now": _metric_text(reading["now"], reading["unit"]), "Now, as of": now_when,
+                            "Before": _metric_text(reading.get("before"), reading["unit"]), "Before, as of": before_when,
+                            "Change": ("" if change is None else f"{change:+.1f} pts" if reading["unit"] == "%" else fmt_money(change) if reading["unit"] == "EUR" else f"{change:+.2f}")})
     held = saved_reads()
     earlier = held.loc[held["source"].eq("Recorded") & held["read_date"].lt(valuation_date.isoformat())] if not held.empty else held
     reads = []
     for market, read in market_reads().items():
         previous = earlier.loc[earlier["market"].eq(market)] if not earlier.empty else earlier
         before = previous["reading"].iloc[-1] if not previous.empty else ""
+        before_day = f" ({day_text(previous['read_date'].iloc[-1])})" if not previous.empty else ""
         summary = read["summary"]
-        reads.append({"Market": market, "Read": summary["reading"], "Confidence": summary["confidence"], "Previous": before or "None saved", "Changed": bool(before) and before != summary["reading"]})
+        reads.append({"Market": market, f"Read, {valuation_date:%d %b %Y}": summary["reading"], "Confidence": summary["confidence"],
+                      "Previous read": (before + before_day) if before else "None saved", "Changed": bool(before) and before != summary["reading"]})
     pnl_text, drivers = "", pd.DataFrame()
     lookups, buckets = saved_lookups(), executed_buckets()
     days = sorted(lookups)
@@ -14509,18 +15264,19 @@ def build_brief() -> dict:
         step = pnl_explain(buckets, lookups[days[-2]], lookups[days[-1]], days[-2], days[-1])
         if not step.empty:
             drivers = pnl_drivers(step, step["currency"].map({"EUR": 1.0, "GBP": fx_rate("eur_per_gbp")}))
-            pnl_text = pnl_sentence(drivers)
+            pnl_text = pnl_sentence(drivers, (days[-2], days[-1]))
     estimates = []
     for zone in ("France", "Germany-Luxembourg"):
         if zone in _live_variants("entsoe_price"):
             result = zone_estimate(zone)
             if result["ready"]:
-                estimates.append({"Zone": zone, "Day": f"{result['day']:%a %d %b}", "Estimate": f"€{result['estimate']:.0f}", "80% range": f"€{result['low']:.0f} to €{result['high']:.0f}", "Latest day": "Unusually large gap" if result["unusual"] else "Within usual error"})
+                estimates.append({"Zone": zone, "Day": f"{result['day']:%a %d %b %Y}", "Estimate": f"€{result['estimate']:.0f}", "80% range": f"€{result['low']:.0f} to €{result['high']:.0f}", "Latest published day": f"{result['latest_day']:%d %b}: " + ("unusually large gap to its estimate" if result["unusual"] else "within usual error of its estimate")})
     outlook = winter_outlook()
     outlook_text = ""
     if outlook.get("ready") and outlook.get("basis") == "weather":
         scenarios = outlook["scenarios"]
-        outlook_text = f"EU storage ends March at about {scenarios[1]['end']:.0f}% with normal weather, {scenarios[0]['end']:.0f}% in the coldest past winter and {scenarios[2]['end']:.0f}% in the mildest."
+        outlook_text = (f"From {outlook['start_fill']:.1f}% on gas day {day_text(outlook['start'])}, EU storage ends {day_text(outlook['end'])} at about {scenarios[1]['end']:.0f}% with normal weather, "
+                        f"{scenarios[0]['end']:.0f}% with the weather of the coldest past winter and {scenarios[2]['end']:.0f}% with the mildest.")
     warnings_ = []
     held_products = sorted(buckets["product"].unique()) if not buckets.empty else []
     marks_note = price_warning(held_products)
@@ -14535,7 +15291,7 @@ def build_brief() -> dict:
 
 def brief_pdf(brief: dict) -> bytes:
     blocks: list[tuple] = [("title", "Morning brief" + (" (demo data)" if demo_mode() else "")),
-                           ("subtitle", f"Meridian, {valuation_date:%A %d %B %Y}. Screening analysis, not investment advice."
+                           ("subtitle", f"Meridian, by {AUTHOR}. {valuation_date:%A %d %B %Y}. Screening analysis, not investment advice."
                                         + (f" Demo market built from real closes of {DEMO_ANCHOR_DAY:%d %b %Y}: no price here is live." if demo_mode() else ""))]
     if brief["warnings"]:
         blocks += [("note", w) for w in brief["warnings"]]
@@ -14544,17 +15300,17 @@ def brief_pdf(brief: dict) -> bytes:
         blocks += [("text", f"{a['metric']}: {_metric_text(a['now'], a['unit'])}, {a['condition'].lower()} your level of {_metric_text(a['level'], a['unit'])}" + (". New today." if a["new"] else ".")) for a in brief["alerts"]]
     if brief["changes"]:
         blocks.append(("heading", "What changed"))
-        columns = ["Item", "Now", "Before", "Change", "Date"]
-        blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["changes"]], (0.40, 0.17, 0.17, 0.15, 0.11))))
+        columns = ["Item", "Now", "Now, as of", "Before", "Before, as of", "Change"]
+        blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["changes"]], (0.22, 0.12, 0.22, 0.12, 0.20, 0.12))))
     if brief["reads"]:
         blocks.append(("heading", "Market read"))
-        columns = ["Market", "Read", "Confidence", "Previous"]
-        blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["reads"]], (0.28, 0.28, 0.18, 0.26))))
+        columns = ["Market", f"Read, {valuation_date:%d %b %Y}", "Confidence", "Previous read"]
+        blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["reads"]], (0.24, 0.26, 0.16, 0.34))))
     if brief["pnl_text"]:
         blocks += [("heading", "P&L"), ("text", brief["pnl_text"])]
     if brief["estimates"]:
         blocks.append(("heading", "Next-day power price estimate"))
-        columns = ["Zone", "Day", "Estimate", "80% range", "Latest day"]
+        columns = ["Zone", "Day", "Estimate", "80% range", "Latest published day"]
         blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["estimates"]], (0.28, 0.16, 0.13, 0.19, 0.24))))
     if brief["outlook"]:
         blocks += [("heading", "Winter storage"), ("text", brief["outlook"])]
@@ -14566,7 +15322,7 @@ def brief_pdf(brief: dict) -> bytes:
 
 
 def page_morning_brief() -> None:
-    title_block("Morning brief", f"{valuation_date:%A %d %B %Y}. What changed since the last update, on one page you can save as a PDF.")
+    title_block("Morning brief", f"{valuation_date:%A %d %B %Y}. Each figure against its previous value, with the date of both, on one page you can save as a PDF.")
     brief = build_brief()
     left, right = st.columns([1, 4], vertical_alignment="center")
     with left:
@@ -14795,18 +15551,18 @@ FUND_ZONES = tuple(FUND_SEA_POINTS)
 
 
 def fund_table(zone: str) -> pd.DataFrame:
-    return session_memo(f"fund_table|{zone}", data_version("live"), lambda: fundamentals_table(
+    return session_memo(f"fund_table|{zone}", (), lambda: fundamentals_table(
         fund_daily_rows(_live_dataset_frame(f"fund_daily|{zone}"), _live_dataset_frame(f"entsoe_load|{zone}"), _live_dataset_frame(f"entsoe_generation|{zone}"), zone),
         _live_dataset_frame(f"entsoe_load_forecast|{zone}"), _live_dataset_frame(f"entsoe_renewable_forecast|{zone}"), zone))
 
 
 def fund_weather(zone: str) -> pd.DataFrame:
-    return session_memo(f"fund_weather|{zone}", data_version("live"),
+    return session_memo(f"fund_weather|{zone}", (),
                         lambda: fundamentals_weather(_live_dataset_frame("fund_weather_history"), _live_dataset_frame("fund_weather_forecast"), zone))
 
 
 def fund_power(zone: str, nuclear_shift_mw: float = 0.0) -> dict:
-    return session_memo(f"fund_power|{zone}|{nuclear_shift_mw:.0f}", data_version("live"),
+    return session_memo(f"fund_power|{zone}|{nuclear_shift_mw:.0f}", (),
                         lambda: power_fundamentals(zone, fund_table(zone), fund_weather(zone), _live_dataset_frame("fund_weather_ensemble"), nuclear_shift_mw,
                                                    holidays=_live_dataset_frame("holidays"), outages=_live_dataset_frame(f"entsoe_outages|{zone}")))
 
@@ -14817,7 +15573,7 @@ FUND_SOURCE_PHRASE = {"Operator": "ENTSO-E's forecast", "Combined": "ENTSO-E's f
 
 def fund_gas() -> dict:
     zone = "Germany-Luxembourg"
-    return session_memo("fund_gas", data_version("live"),
+    return session_memo("fund_gas", (),
                         lambda: gas_demand_model(_live_dataset_frame("the_gas_consumption"), fund_weather(zone), fund_table(zone), fund_power(zone)))
 
 
@@ -14886,8 +15642,11 @@ def render_power_balance() -> None:
     first = _first_ahead(outlook)
     day = pd.Timestamp(first["date"])
     week = outlook.head(7)
-    last_week = recent.tail(7)
+    last_week = recent.dropna(subset=["load", "wind", "solar"]).tail(7)
     actual_residual = (last_week["load"] - last_week["wind"] - last_week["solar"]).mean()
+    week_span = period_text(pd.to_datetime(week["date"]).min(), pd.to_datetime(week["date"]).max())
+    last_span = period_text(pd.to_datetime(last_week["date"]).min(), pd.to_datetime(last_week["date"]).max()) if not last_week.empty else "the last week"
+    tested_span = f" ({period_text(*result['tested_span'])})" if result.get("tested_span") else ""
     test_at = lambda name, lead=1, col="share": float(tests.loc[tests["target"].eq(name) & tests["lead"].eq(lead), col].iloc[0]) if ((tests["target"] == name) & (tests["lead"] == lead)).any() else np.nan
     c1, c2, c3, c4 = st.columns(4)
     kpi(c1, f"Residual load, {day:%a %d %b}", _gw(first["residual"]), f"80% range {first['residual_low'] / 1000:,.1f} to {first['residual_high'] / 1000:,.1f} GW", accent=BLUE)
@@ -14904,17 +15663,17 @@ def render_power_balance() -> None:
     left_text = (f"leaving <b>{first['gap'] / 1000:,.1f} GW</b> for other plants and imports" if first["gap"] >= 0 else
                  f"a surplus of <b>{-first['gap'] / 1000:,.1f} GW</b> to export, store or curtail")
     if result["nuclear_from"] == "Outage notices":
-        nuclear_basis = (f" Nuclear is expected at {first['nuclear'] / 1000:,.1f} GW, from the {result['nuclear_now'] / 1000:,.1f} GW of the last week and the "
+        nuclear_basis = (f" Nuclear is expected at {first['nuclear'] / 1000:,.1f} GW, from its {result['nuclear_now'] / 1000:,.1f} GW average on {period_text(*result['nuclear_span'])} and the "
                          f"{first['nuclear_unavailable'] / 1000:,.1f} GW announced as unavailable in ENTSO-E's outage notices")
     else:
-        nuclear_basis = f" Nuclear is taken at {result['nuclear_now'] / 1000:,.1f} GW, its average over the last week, as no outage notices are loaded"
+        nuclear_basis = f" Nuclear is taken at {result['nuclear_now'] / 1000:,.1f} GW, its average on {period_text(*result['nuclear_span'])}, as no outage notices are loaded"
     nuclear_text = (nuclear_basis + (f", {shift / 1000:+,.1f} GW in your scenario" if shift else "") + f", {left_text}." if result["has_nuclear"] else "")
-    gas_text = (f" Gas-fired plants are expected to produce about <b>{week['gas'].mean() / 1000:,.1f} GW</b> on average over the next week." if result["gas_ready"] else "")
+    gas_text = (f" Gas-fired plants are expected to produce about <b>{week['gas'].mean() / 1000:,.1f} GW</b> on average on {week_span}." if result["gas_ready"] else "")
     with st.container(key="hero"):
         st.markdown(
             f'<div class="desk-note"><p>Residual load, the demand left after wind and solar, is expected at <b>{first["residual"] / 1000:,.1f} GW</b> on {day:%a %d %b} in {html.escape(zone)}. '
-            f'Over the next {len(week)} days it averages {week["residual"].mean() / 1000:,.1f} GW, {direction} the {actual_residual / 1000:,.1f} GW of the last week.{nuclear_text}{gas_text}</p>'
-            f'<p class="soft">Tested on {result["tested_days"]} earlier days, each estimated only from the days before it, residual load missed by {test_at("residual") * 100:.1f}% a day ahead '
+            f'On {week_span} it averages {week["residual"].mean() / 1000:,.1f} GW, {direction} the {actual_residual / 1000:,.1f} GW measured on {last_span}.{nuclear_text}{gas_text}</p>'
+            f'<p class="soft">Tested on {result["tested_days"]} earlier days{tested_span}, each estimated only from the days before it, residual load missed by {test_at("residual") * 100:.1f}% a day ahead '
             f'and {test_at("residual", 7) * 100:.1f}% a week ahead, against {test_at("residual", 1, "last_known") * 100:.1f}% for the last known value'
             + (f' and {test_at("residual", 1, "operator") * 100:.1f}% for ENTSO-E\'s own forecasts. Where ENTSO-E has published, combining its forecasts with the models '
                f'missed {test_at("residual", 1, "best") * 100:.1f}%' if pd.notna(test_at("residual", 1, "operator")) and pd.notna(test_at("residual", 1, "best")) else
@@ -15006,22 +15765,25 @@ def render_gas_demand() -> None:
     c1, c2, c3, c4 = st.columns(4)
     kpi(c1, f"German gas use, {day:%a %d %b}", f"{first['total']:,.0f} GWh", f"80% range {first['low']:,.0f} to {first['high']:,.0f} GWh", accent=BLUE)
     kpi(c2, "Heating", f"{first['heating']:,.0f} GWh", "Small users, published by THE" if first["small_source"] == "Published" else "Small users and cold-driven large users", accent=ORANGE)
-    kpi(c3, "Gas for power", f"{first['power']:,.0f} GWh", "From the power outlook" if result["power_from_model"] else "Gas-fired output of the last week", accent=AMBER)
+    kpi(c3, "Gas for power", f"{first['power']:,.0f} GWh", "From the power outlook" if result["power_from_model"] else "Gas-fired output of the last 7 published days", accent=AMBER)
     kpi(c4, "Industry and other", f"{first['industry']:,.0f} GWh", "Large users' steady level", accent=TEAL)
     week = outlook.head(7)
     last_week = recent.dropna(subset=["total"]).tail(7)
+    week_span = period_text(pd.to_datetime(week["date"]).min(), pd.to_datetime(week["date"]).max())
+    last_span = period_text(pd.to_datetime(last_week["date"]).min(), pd.to_datetime(last_week["date"]).max()) if not last_week.empty else "the last published week"
+    tested_span = f" ({period_text(*result['tested_span'])})" if result.get("tested_span") else ""
     test_at = lambda lead, col="share": float(tests.loc[tests["target"].eq("total") & tests["lead"].eq(lead), col].iloc[0])
     efficiency = (f", which means plants turn {100 / result['gas_per_power']:.0f}% of the gas into power" if result["with_power"] and result["gas_per_power"] > 0 else "")
     with st.container(key="hero"):
         st.markdown(
             f'<div class="desk-note"><p>German gas use is expected at <b>{first["total"]:,.0f} GWh</b> on {day:%a %d %b}: {first["heating"]:,.0f} for heating, '
-            f'{first["power"]:,.0f} for power and {first["industry"]:,.0f} for industry and other uses. The next {len(week)} days average {week["total"].mean():,.0f} GWh a day, '
-            f'against {last_week["total"].mean():,.0f} over the last week of published figures.</p>'
+            f'{first["power"]:,.0f} for power and {first["industry"]:,.0f} for industry and other uses. Gas days {week_span} average {week["total"].mean():,.0f} GWh a day, '
+            f'against {last_week["total"].mean():,.0f} published for gas days {last_span}.</p>'
             f'<p>Each degree colder below 15.5°C adds about <b>{result["per_cold_degree"]:,.0f} GWh</b> a day at large users on top of household heating'
             + (f', and each GWh of gas-fired power burns <b>{result["gas_per_power"]:.2f} GWh</b> of gas{efficiency}' if result["with_power"] else "") + '.</p>'
-            f'<p class="soft">Tested on {result["tested_days"]} earlier days, the total missed by {test_at(1) * 100:.1f}% a day ahead and {test_at(7) * 100:.1f}% a week ahead, '
+            f'<p class="soft">Tested on {result["tested_days"]} earlier days{tested_span}, the total missed by {test_at(1) * 100:.1f}% a day ahead and {test_at(7) * 100:.1f}% a week ahead, '
             f'against {test_at(1, "last_known") * 100:.1f}% and {test_at(7, "last_known") * 100:.1f}% for the last published value. '
-            f'Small users are published to {result["last_small"]:%d %b}, large users to {result["last_large"]:%d %b}.</p></div>', unsafe_allow_html=True)
+            f'Small users are published to {day_text(result["last_small"])}, large users to {day_text(result["last_large"])}.</p></div>', unsafe_allow_html=True)
     fig = go.Figure()
     for name, color, label in (("industry", TEAL, "Industry and other"), ("power", AMBER, "Gas for power"), ("heating", ORANGE, "Heating")):
         fig.add_trace(go.Bar(x=recent["date"], y=recent[name], name=label, marker_color=color, opacity=0.55, legendgroup=name))
@@ -15116,8 +15878,10 @@ def page_market_fundamentals():
     d1.metric("Storage fill", f"{storage['fill_pct']:.1f}%" if storage.get("fill_pct") is not None else "Not loaded",
               help=f"GIE AGSI+ · {storage.get('scope', 'selected scope')} · {storage.get('date', 'n/a')}")
     change = storage.get("change_7_reports_twh")
-    d2.metric("Storage change", f"{change:+.2f} TWh" if change is not None else "Not enough history",
-              help="Change across latest and eighth-latest available reporting observations; assumes the same aggregate series and unit.")
+    change_span = (f"{storage['change_from']:%d %b} → {storage['change_to']:%d %b %Y}" if storage.get("change_from") else "")
+    d2.metric("Storage change" + (f", {change_span}" if change_span else ""), f"{change:+.2f} TWh" if change is not None else "Not enough history",
+              help=(f"Gas in storage on gas day {day_text(storage['change_to'])} minus gas day {day_text(storage['change_from'])}: the latest and eighth-latest reports, same aggregate series and unit."
+                    if change_span else "Change across latest and eighth-latest available reporting observations; assumes the same aggregate series and unit."))
     d3.metric("LNG send-out", f"{lng['sendout']:.1f} GWh/d" if lng.get("sendout") is not None else "Not loaded",
               help=f"GIE ALSI+ · {lng.get('date', 'n/a')}")
     d4.metric("Latest day-ahead", f"{power['value']:.2f} €/MWh" if power.get("value") is not None else "Not loaded",
@@ -15133,7 +15897,7 @@ def page_market_fundamentals():
             interpretation = "Observed storage build over the latest seven reporting steps. Check whether the change reflects injections, lower demand or supply flows."
         else:
             interpretation = "Little net inventory change over the selected reporting window."
-        insights.append({"Topic": "Gas storage", "Observation": f"{change:+.2f} TWh versus seven reporting steps ago", "Commercial reading": interpretation})
+        insights.append({"Topic": "Gas storage", "Observation": (f"{change:+.2f} TWh from gas day {day_text(storage['change_from'])} to {day_text(storage['change_to'])}" if storage.get("change_from") else f"{change:+.2f} TWh versus seven reporting steps ago"), "Commercial reading": interpretation})
     if power:
         sample_mean = power.get("sample_mean")
         relative = ""
@@ -15314,7 +16078,8 @@ def page_market_fundamentals():
         if not anomaly.empty:
             view = anomaly.sort_values("hdd_vs_normal")
             fig = go.Figure(go.Bar(x=view["hdd_vs_normal"], y=view["location"], orientation="h", marker=dict(color=BLUE), hovertemplate="%{y}: %{x:+.1f} degree days<extra></extra>"))
-            fig.update_layout(title="Next 7 days: heating degree days above or below normal", hovermode="closest")
+            fig.update_layout(title=(f"Forecast for {period_text(anomaly['first'].min(), anomaly['last'].max())}: heating degree days above or below the 10-year normal"
+                                     if anomaly["first"].notna().any() else "Next 7 days: heating degree days above or below normal"), hovermode="closest")
             chart(fig, 300)
             table(anomaly)
 
@@ -15359,7 +16124,7 @@ def page_market_fundamentals():
         ready = residual_ready_zones()
         if ready:
             residual_zone = st.selectbox("Zone", ready, key="residual_zone")
-            residual = session_memo(f"residual|{residual_zone}", data_version("live"), lambda: _build_residual_load_proxy(residual_zone))
+            residual = session_memo(f"residual|{residual_zone}", (), lambda: _build_residual_load_proxy(residual_zone))
         else:
             residual_zone = None
             residual = _build_residual_load_proxy()
@@ -15445,11 +16210,17 @@ def page_live_data_integrations():
         c1, c2 = st.columns([1, 2.6], vertical_alignment="center")
         with c1:
             update_button("live_update_all", "Update all sources")
+            if not demo_mode() and not st.session_state.get("update_job") and st.button("Ask every source again", key="live_update_everything",
+                                                                                          help="Ignores publication times and asks every source, even those with nothing new since the last fetch."):
+                if start_update(force="all"):
+                    st.rerun()
         c2.caption("Fetches only what's new from ENTSO-E, GIE, Open-Meteo, Energy-Charts, Trading Hub Europe and the ECB. You don't need to enter any key, "
                    "and the Fundamentals Outlook works without one: its daily output comes from Energy-Charts when there's no ENTSO-E key.")
         results = st.session_state.get("update_results") or []
-        if results:
-            table(pd.DataFrame([{"Source": n, "Result": "Updated" if good else "Failed", "Detail": d} for n, good, d in results]))
+        skipped = st.session_state.get("update_skipped") or []
+        if results or skipped:
+            table(pd.DataFrame([{"Source": n, "Result": "Updated" if good else "Failed", "Detail": d} for n, good, d in results]
+                               + [{"Source": n, "Result": "Skipped", "Detail": f"Nothing new: {why}"} for n, why in skipped]))
             with st.expander("Update report, to check or share a live run"):
                 st.caption("Each source's outcome, how fresh each dataset is, and the library versions. It contains no keys. Copy it with the button at the top right of the box.")
                 report = update_report()
@@ -15903,9 +16674,10 @@ def main() -> None:
         st.error(f"This app needs Streamlit {MIN_STREAMLIT_VERSION[0]}.{MIN_STREAMLIT_VERSION[1]} or newer, and {st.__version__} is installed. Run: pip install -U streamlit")
         st.stop()
     _configure_theme()
-    st.set_page_config(page_title="Meridian Energy Desk", page_icon=":material/bolt:", layout="wide", initial_sidebar_state="auto")
+    st.set_page_config(page_title=f"Meridian Energy Desk, by {AUTHOR}", page_icon=":material/bolt:", layout="wide", initial_sidebar_state="auto")
     st.markdown(_CSS, unsafe_allow_html=True)
     init_session()
+    live_items()
     collect_update()
     valuation_date = date.today()
     if not st.session_state.get("curve_folder_checked"):
@@ -15929,6 +16701,7 @@ def main() -> None:
         st.toast(str(flash_message), icon=":material/check_circle:")
     PAGES[page]()
     render_next_step(page)
+    st.markdown(f'<div class="page-foot">Meridian Energy Desk, by {AUTHOR}</div>', unsafe_allow_html=True)
 
 
 def test_model_validation_suite() -> None:
