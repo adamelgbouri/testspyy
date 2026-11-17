@@ -7467,6 +7467,41 @@ hr {{ border-color:{BORDER}; margin:0.6rem 0; }}
 .stApp h1.page-title {{ font-size:1.35rem; padding-left:0.6rem !important; border-left:4px solid var(--accent); font-weight:600; line-height:1.3; color:{TEXT}; margin:0; padding:0; }}
 .page-sub {{ color:{GRAY}; font-size:0.86rem !important; margin:0; }}
 .sig {{ font-weight:600; letter-spacing:0.03em; background:linear-gradient(90deg, #4FB3F6, #34D6B4); -webkit-background-clip:text; background-clip:text; color:transparent; }}
+/* Morning brief: a report sheet */
+.st-key-brief_doc {{ max-width:1120px; padding:26px 32px 20px; border:var(--line); border-radius:8px; background:{PANEL}; box-shadow:0 1px 0 rgba(255,255,255,0.02) inset, 0 12px 32px rgba(0,0,0,0.25); }}
+.rpt {{ color:{TEXT}; }}
+.rpt-mast {{ display:flex; justify-content:space-between; align-items:flex-end; gap:1.5rem; flex-wrap:wrap; padding-bottom:14px; border-bottom:2px solid var(--accent); }}
+.rpt-kicker {{ font-size:0.68rem; font-weight:600; letter-spacing:0.18em; text-transform:uppercase; color:var(--accent); margin-bottom:6px; }}
+.rpt-title {{ font-size:1.6rem; font-weight:600; line-height:1.2; color:{TEXT}; }}
+.rpt-date {{ font-size:0.9rem; color:{GRAY}; margin-top:3px; }}
+.rpt-meta {{ display:grid; grid-template-columns:auto auto; gap:3px 14px; margin:0; font-size:0.78rem; }}
+.stApp .rpt-meta dt {{ color:{GRAY}; text-align:right; font-weight:400; font-size:0.8rem; }}
+.stApp .rpt-meta dd {{ color:{TEXT}; margin:0; font-size:0.8rem; }}
+.rpt-callout {{ margin:12px 0 0; padding:8px 12px; border-left:3px solid {SODIUM}; border-radius:0 4px 4px 0; background:{SODIUM}14; font-size:0.86rem; line-height:1.45; }}
+.rpt-callout.alert {{ border-left-color:{LOSS}; background:{LOSS}14; margin-top:6px; }}
+.rpt-callout b {{ font-weight:600; margin-right:0.3rem; }}
+.rpt .tag {{ display:inline-block; margin-left:0.4rem; padding:0 6px; border-radius:3px; font-size:0.68rem; font-weight:600; letter-spacing:0.05em; text-transform:uppercase; color:var(--accent); border:1px solid color-mix(in srgb, var(--accent) 45%, transparent); vertical-align:1px; }}
+.rpt-sec {{ margin:24px 0 0; }}
+.rpt-h {{ display:flex; align-items:baseline; gap:12px; margin:0 0 8px; padding:0 0 6px; border-bottom:var(--line); font-size:0.98rem; font-weight:600; color:{TEXT}; line-height:1.3; }}
+.rpt-h .num {{ min-width:1.4rem; font-size:0.74rem; font-weight:600; color:var(--accent); letter-spacing:0.06em; }}
+.stApp .rpt-p {{ margin:0; max-width:100ch; font-size:0.92rem; line-height:1.6; }}
+.stApp .rpt-points {{ margin:0; padding:0; list-style:none; }}
+.stApp .rpt-points li {{ display:grid; grid-template-columns:13rem 1fr; gap:1rem; margin:0; padding:6px 0; border-bottom:1px solid {BORDER}80; font-size:0.9rem; line-height:1.5; }}
+.stApp .rpt-points li:last-child {{ border-bottom:0; }}
+.rpt-points li b {{ font-weight:500; color:{GRAY}; }}
+.stApp .rpt-table {{ width:100%; border-collapse:collapse; border:0; margin:0; font-size:0.86rem; background:transparent; }}
+.stApp .rpt-table th, .stApp .rpt-table td {{ border:0; background:transparent; }}
+.rpt-table td:first-child {{ width:26%; }}
+.stApp .rpt-table th {{ padding:6px 14px 6px 0; border-bottom:var(--line); text-align:left; color:{GRAY}; font-size:0.7rem; font-weight:500; letter-spacing:0.08em; text-transform:uppercase; }}
+.stApp .rpt-table td {{ padding:7px 14px 7px 0; border-bottom:1px solid {BORDER}80; vertical-align:top; line-height:1.4; }}
+.stApp .rpt-table tr:last-child td {{ border-bottom:0; }}
+.stApp .rpt-table .num {{ text-align:right; }}
+.rpt-table td .when {{ display:block; color:{GRAY}; font-size:0.74rem; }}
+.rpt-table .when-inline {{ color:{GRAY}; }}
+.rpt-table .gain {{ color:{GAIN}; }} .rpt-table .loss {{ color:{LOSS}; }}
+.rpt-table b {{ font-weight:600; }}
+.rpt-appendix .rpt-table {{ font-size:0.8rem; }}
+.rpt-foot {{ margin-top:24px; padding-top:10px; border-top:var(--line); color:{GRAY}; font-size:0.76rem; line-height:1.55; }}
 .pill {{ display:inline-flex; align-items:center; gap:6px; padding:2px 8px; border:var(--line); border-radius:3px; font-size:0.78rem; color:{TEXT}; white-space:nowrap; background:{PANEL}; }}
 .pill i {{ width:7px; height:7px; border-radius:50%; display:inline-block; background:{GRAY}; }}
 .pill.good i {{ background:{GAIN}; }} .pill.warn i {{ background:{SODIUM}; }}
@@ -15258,7 +15293,8 @@ def build_brief() -> dict:
             before_when = reading.get("before_text") or (f"{basis} {reading['before_as_of']:%d %b %Y}".strip() if reading.get("before_as_of") and reading.get("before") is not None else "")
             changes.append({"Item": name, "Now": _metric_text(reading["now"], reading["unit"]), "Now, as of": now_when,
                             "Before": _metric_text(reading.get("before"), reading["unit"]), "Before, as of": before_when,
-                            "Change": ("" if change is None else f"{change:+.1f} pts" if reading["unit"] == "%" else fmt_money(change) if reading["unit"] == "EUR" else f"{change:+.2f}")})
+                            "Change": ("" if change is None else f"{change:+.1f} pts" if reading["unit"] == "%" else fmt_money(change) if reading["unit"] == "EUR" else f"{change:+.2f}"),
+                            "_change": change, "_unit": reading["unit"]})
     held = saved_reads()
     earlier = held.loc[held["source"].eq("Recorded") & held["read_date"].lt(valuation_date.isoformat())] if not held.empty else held
     reads = []
@@ -15301,82 +15337,161 @@ def build_brief() -> dict:
             "outlook": outlook_text, "warnings": warnings_}
 
 
+BRIEF_BOOK_ITEMS = ("Daily P&L", "1-day VaR, 95%")
+
+
+def _change_words(change: float, unit: str) -> str:
+    size = abs(change)
+    amount = (f"{size:.1f} pts" if unit == "%" else fmt_money(size, signed=False) if unit in ("EUR", "EUR at risk") else f"€{size:.2f}" if unit == "EUR/MWh" else f"{size:,.2f}")
+    return "unchanged" if size < 1e-9 else f"{'up' if change > 0 else 'down'} {amount}"
+
+
+def brief_key_points(brief: dict) -> list[tuple[str, str]]:
+    """The summary at the top of the report: (lead, sentence) pairs written from what the brief holds."""
+    points: list[tuple[str, str]] = []
+    if brief["alerts"]:
+        new = sum(1 for a in brief["alerts"] if a["new"])
+        count = len(brief["alerts"])
+        points.append(("Thresholds", f"{count} of your levels {'is' if count == 1 else 'are'} crossed" + (f", {new} of them new today." if new else ". None is new today.")))
+    market = [row for row in brief["changes"] if row["Item"] not in BRIEF_BOOK_ITEMS]
+    book = [row for row in brief["changes"] if row["Item"] in BRIEF_BOOK_ITEMS]
+    for row in market + book:
+        sentence = f"{row['Now']} ({row['Now, as of']})"
+        if row.get("_change") is not None and row["Before"]:
+            if row["_unit"] == "EUR":
+                sentence += f", against {row['Before']} ({row['Before, as of']})"
+            else:
+                sentence += f", {_change_words(row['_change'], row['_unit'])} from {row['Before']} ({row['Before, as of']})"
+        points.append((row["Item"], sentence + "."))
+    if brief["reads"]:
+        read_key = next(k for k in brief["reads"][0] if k.startswith("Read, "))
+        parts = [f"{r['Market']} {str(r[read_key]).lower()} ({str(r['Confidence']).lower()} confidence" + (", changed" if r["Changed"] else "") + ")" for r in brief["reads"]]
+        points.append(("Market read", "; ".join(parts) + "."))
+    return points
+
+
 def brief_pdf(brief: dict) -> bytes:
     blocks: list[tuple] = [("title", "Morning brief" + (" (demo data)" if demo_mode() else "")),
                            ("subtitle", f"Merit, by {AUTHOR}. {valuation_date:%A %d %B %Y}. Screening analysis, not investment advice."
                                         + (f" Demo market built from real closes of {DEMO_ANCHOR_DAY:%d %b %Y}: no price here is live." if demo_mode() else ""))]
     if brief["warnings"]:
         blocks += [("note", w) for w in brief["warnings"]]
+    number = iter(range(1, 20))
+    heading = lambda text: ("heading", f"{next(number)}. {text}")
+    points = brief_key_points(brief)
+    if points:
+        blocks.append(heading("Summary"))
+        blocks += [("text", f"\u2022 {lead}: {text}") for lead, text in points]
     if brief["alerts"]:
-        blocks.append(("heading", "Thresholds crossed"))
+        blocks.append(heading("Thresholds crossed"))
         blocks += [("text", f"{a['metric']}: {_metric_text(a['now'], a['unit'])}, {a['condition'].lower()} your level of {_metric_text(a['level'], a['unit'])}" + (". New today." if a["new"] else ".")) for a in brief["alerts"]]
     if brief["changes"]:
-        blocks.append(("heading", "What changed"))
+        blocks.append(heading("What changed"))
         columns = ["Item", "Now", "Now, as of", "Before", "Before, as of", "Change"]
         blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["changes"]], (0.22, 0.12, 0.22, 0.12, 0.20, 0.12))))
     if brief["reads"]:
-        blocks.append(("heading", "Market read"))
+        blocks.append(heading("Market read"))
         columns = ["Market", f"Read, {valuation_date:%d %b %Y}", "Confidence", "Previous read"]
         blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["reads"]], (0.24, 0.26, 0.16, 0.34))))
     if brief["pnl_text"]:
-        blocks += [("heading", "P&L"), ("text", brief["pnl_text"])]
+        blocks += [heading("P&L"), ("text", brief["pnl_text"])]
     if brief["estimates"]:
-        blocks.append(("heading", "Next-day power price estimate"))
+        blocks.append(heading("Next-day power price estimate"))
         columns = ["Zone", "Day", "Estimate", "80% range", "Latest published day"]
         blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["estimates"]], (0.28, 0.16, 0.13, 0.19, 0.24))))
     if brief["outlook"]:
-        blocks += [("heading", "Winter storage"), ("text", brief["outlook"])]
-    blocks.append(("heading", "Prices used"))
+        blocks += [heading("Winter storage"), ("text", brief["outlook"])]
+    blocks.append(("heading", "Appendix: prices used"))
     blocks += [("text", f"{product}: {detail}.") for product, detail in brief["prices_used"]]
     blocks += [("text", f"Book: {text}.") for state, text in brief["book_note"] if state == "demo"]
     blocks.append(("note", "Day-ahead, storage, weather and FX figures come from ENTSO-E, GIE, Open-Meteo and the ECB. Reads, estimates and projections are simple models with the limits shown in the app. Check their track record before relying on them."))
     return simple_pdf(blocks, "Merit morning brief")
 
 
+def _rpt_table(columns: Sequence[tuple[str, str]], rows: Sequence[Sequence[str]]) -> str:
+    """A report table. columns are (label, kind) with kind '' for text, 'num' for right-aligned figures. Cells are HTML."""
+    head = "".join(f'<th class="{kind}">{html.escape(label)}</th>' for label, kind in columns)
+    body = "".join("<tr>" + "".join(f'<td class="{kind}">{cell}</td>' for (_, kind), cell in zip(columns, row)) + "</tr>" for row in rows)
+    return f'<table class="rpt-table"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
+
+
+def _rpt_value(value: str, when: str) -> str:
+    return html.escape(value) + (f'<span class="when">{html.escape(when)}</span>' if when else "")
+
+
+def brief_report_html(brief: dict) -> str:
+    """The morning brief laid out as a one-page report: masthead, numbered sections, appendix and notes."""
+    esc = html.escape
+    prepared = datetime.now(ZoneInfo("Europe/Paris"))
+    book = "; ".join(text for _, text in brief["book_note"]) or "No trades"
+    meta = [("Valuation", f"{valuation_date:%a %d %b %Y}"), ("Data", "Demo market" if demo_mode() else "Live"), ("Book", book),
+            ("Prepared", f"{prepared:%d %b %Y, %H:%M} Paris")]
+    parts = ['<div class="rpt">',
+             '<div class="rpt-mast"><div><div class="rpt-kicker">Morning brief</div>'
+             f'<div class="rpt-title">European gas and power</div><div class="rpt-date">{valuation_date:%A %d %B %Y}</div></div>'
+             '<dl class="rpt-meta">' + "".join(f"<dt>{esc(k)}</dt><dd>{esc(v)}</dd>" for k, v in meta) + "</dl></div>"]
+    parts += [f'<div class="rpt-callout">{esc(w)}</div>' for w in brief["warnings"]]
+    sections: list[tuple[str, str]] = []
+    points = brief_key_points(brief)
+    if points:
+        sections.append(("Summary", '<ul class="rpt-points">' + "".join(f"<li><b>{esc(lead)}</b>{esc(text)}</li>" for lead, text in points) + "</ul>"))
+    if brief["alerts"]:
+        sections.append(("Thresholds crossed", "".join(
+            f'<div class="rpt-callout alert"><b>{esc(a["metric"])}</b> {esc(_metric_text(a["now"], a["unit"]))}, {esc(a["condition"].lower())} your level of '
+            f'{esc(_metric_text(a["level"], a["unit"]))}.' + (' <span class="tag">New today</span>' if a["new"] else "") + "</div>" for a in brief["alerts"])))
+    if brief["changes"]:
+        rows = [[esc(r["Item"]), _rpt_value(r["Now"], r["Now, as of"]), _rpt_value(r["Before"], r["Before, as of"]) if r["Before"] else '<span class="when">None</span>',
+                 f'<span class="{tone_of(r["_change"]) if r.get("_change") is not None else ""}">{esc(r["Change"])}</span>'] for r in brief["changes"]]
+        sections.append(("What changed", _rpt_table([("Item", ""), ("Now", "num"), ("Before", "num"), ("Change", "num")], rows)))
+    if brief["reads"]:
+        read_key = next(k for k in brief["reads"][0] if k.startswith("Read, "))
+        rows = [[esc(r["Market"]), f'<b>{esc(str(r[read_key]))}</b>' + (' <span class="tag">Changed</span>' if r["Changed"] else ""), esc(str(r["Confidence"])),
+                 f'<span class="when-inline">{esc(str(r["Previous read"]))}</span>'] for r in brief["reads"]]
+        sections.append(("Market read", _rpt_table([("Market", ""), (read_key, ""), ("Confidence", ""), ("Previous read", "")], rows)))
+    if brief["pnl_text"]:
+        sections.append(("P&L", f'<p class="rpt-p">{esc(brief["pnl_text"])}</p>'))
+    if brief["estimates"]:
+        rows = [[esc(r["Zone"]), esc(r["Day"]), f'<b>{esc(r["Estimate"])}</b>', esc(r["80% range"]), f'<span class="when-inline">{esc(r["Latest published day"])}</span>'] for r in brief["estimates"]]
+        sections.append(("Next-day power price estimate", _rpt_table([("Zone", ""), ("Delivery day", ""), ("Estimate", "num"), ("80% range", "num"), ("Latest published day", "")], rows)))
+    if brief["outlook"]:
+        sections.append(("Winter storage", f'<p class="rpt-p">{esc(brief["outlook"])}</p>'))
+    for number, (title, body) in enumerate(sections, start=1):
+        parts.append(f'<section class="rpt-sec"><div class="rpt-h"><span class="num">{number:02d}</span><span>{esc(title)}</span></div>{body}</section>')
+    prices = _rpt_table([("Product", ""), ("Priced with", "")], [[esc(product), f'<span class="when-inline">{esc(detail)}</span>'] for product, detail in brief["prices_used"]])
+    parts.append(f'<section class="rpt-sec rpt-appendix"><div class="rpt-h"><span class="num">A</span><span>Appendix: prices used</span></div>{prices}</section>')
+    parts.append('<div class="rpt-foot">Day-ahead, storage, weather and FX figures come from ENTSO-E, GIE, Open-Meteo and the ECB. Reads, estimates and projections are simple models '
+                 'with the limits shown in the app; check their track record before relying on them. Screening analysis, not investment advice.'
+                 + (f" Demo market built from real closes of {DEMO_ANCHOR_DAY:%d %b %Y}: no price here is live." if demo_mode() else "") + "</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def page_morning_brief() -> None:
-    title_block("Morning brief", f"{valuation_date:%A %d %B %Y}. Each figure against its previous value, with the date of both, on one page you can save as a PDF.")
+    title_block("Morning brief", f"{valuation_date:%A %d %B %Y}. The day's report on the market and your book, ready to save as a PDF.")
     brief = build_brief()
     left, right = st.columns([1, 4], vertical_alignment="center")
     with left:
         update_button("brief_update")
     with right:
-        st.download_button("Download as PDF", data=brief_pdf(brief), file_name=f"merit_brief_{valuation_date.isoformat()}.pdf", mime="application/pdf", key="brief_pdf")
-    for note in brief["warnings"]:
-        st.warning(note)
-    for alert in brief["alerts"]:
-        st.error(f"{alert['metric']}: {_metric_text(alert['now'], alert['unit'])}, {alert['condition'].lower()} your level of {_metric_text(alert['level'], alert['unit'])}." + (" New today." if alert["new"] else ""), icon=":material/notifications_active:")
-    if brief["changes"]:
-        st.subheader("What changed")
-        table(pd.DataFrame(brief["changes"]))
-    if brief["reads"]:
-        st.subheader("Market read")
-        table(pd.DataFrame(brief["reads"]).assign(Changed=lambda f: f["Changed"].map({True: "Yes", False: ""})))
-    if brief["pnl_text"]:
-        st.subheader("P&L")
-        st.markdown(brief["pnl_text"])
-    if brief["estimates"]:
-        st.subheader("Next-day power price estimate")
-        table(pd.DataFrame(brief["estimates"]))
-    if brief["outlook"]:
-        st.subheader("Winter storage")
-        st.markdown(brief["outlook"])
-    st.subheader("Prices used")
-    table(pd.DataFrame(brief["prices_used"], columns=["Product", "Priced with"]))
-    st.subheader("Your thresholds")
+        st.download_button("Download as PDF", data=brief_pdf(brief), file_name=f"merit_brief_{valuation_date.isoformat()}.pdf", mime="application/pdf", key="brief_pdf",
+                           icon=":material/download:")
+    with st.container(key="brief_doc"):
+        st.markdown(brief_report_html(brief), unsafe_allow_html=True)
     store = desk_store()
-    if store is None:
-        st.caption("Thresholds need the saved desk database, which isn't available in this folder.")
-        return
-    rules = store.load_alerts()
-    edited = st.data_editor(rules, num_rows="dynamic", hide_index=True, key="alert_rules", width="stretch", column_config={
-        "metric": st.column_config.SelectboxColumn("Item", options=list(BRIEF_METRICS), required=True),
-        "condition": st.column_config.SelectboxColumn("Condition", options=["Above", "Below"], required=True),
-        "level": st.column_config.NumberColumn("Level", required=True)})
-    if st.button("Save thresholds", key="save_alerts"):
-        store.save_alerts(edited.dropna())
-        st.session_state["flash_message"] = "Thresholds saved."
-        st.rerun()
-    st.caption("A threshold shows at the top of this page and in the PDF whenever its condition holds. Levels use each item's own unit.")
+    with st.expander("Your thresholds", icon=":material/tune:"):
+        if store is None:
+            st.caption("Thresholds need the saved desk database, which isn't available in this folder.")
+            return
+        rules = store.load_alerts()
+        edited = st.data_editor(rules, num_rows="dynamic", hide_index=True, key="alert_rules", width="stretch", column_config={
+            "metric": st.column_config.SelectboxColumn("Item", options=list(BRIEF_METRICS), required=True),
+            "condition": st.column_config.SelectboxColumn("Condition", options=["Above", "Below"], required=True),
+            "level": st.column_config.NumberColumn("Level", required=True)})
+        if st.button("Save thresholds", key="save_alerts"):
+            store.save_alerts(edited.dropna())
+            st.session_state["flash_message"] = "Thresholds saved."
+            st.rerun()
+        st.caption("A threshold shows in the report and in the PDF whenever its condition holds. Levels use each item's own unit.")
 
 
 # =============================================================================
