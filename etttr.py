@@ -1,4 +1,4 @@
-"""Meridian Energy Desk: European gas and power trading and risk.
+"""Merit Energy Desk: European gas and power trading and risk.
 By Adam El Gbouri.
 
 Run with:   streamlit run etttr.py          (needs Python 3.10+ and: pip install -U streamlit pandas plotly numpy)
@@ -8,7 +8,7 @@ Everything is in this one file, in order:
   1 Calculation engine      units, calendars, curves, trades, valuation
   2 Analytics engine        tenors, curve building, P&L explain, risk, spreads, spot, seasonal,
                             Hedge Advisor and Market Read
-  3 Saved data              SQLite file beside this script (meridian_desk.db)
+  3 Saved data              SQLite file beside this script (merit_desk.db)
   4 Market data connectors  ENTSO-E, GIE, ENTSOG, Open-Meteo, ECB, licensed providers
   5 Design system           colours, styles, chart template, shared components
   6 Navigation, session, updates and demo data
@@ -19,13 +19,13 @@ Everything is in this one file, in order:
 Demo or live: the sidebar switches between two desks that never mix. Demo is a complete simulated
 market for today, built from real closing levels (see Data & Assumptions), with a sample book; it has
 its own database in a temporary folder and is the default when no API keys are set. Live is your desk,
-your trades and the data you fetch, saved in meridian_desk.db. Force one with MERIDIAN_DEMO=1 or 0,
+your trades and the data you fetch, saved in merit_desk.db. Force one with MERIT_DEMO=1 or 0,
 or open the app with ?demo=1. The live desk starts with real daily history for the Fundamentals Outlook
 built into this file, and keeps it current without any key (Energy-Charts, Open-Meteo, Trading Hub Europe).
 
 The sections above the pages import without opening the app. Demo curves and trades are
 synthetic, not market quotes. This is an educational prototype, not a
-production ETRM or valuation system. API keys live in meridian_keys.toml beside this file: never share that one.
+production ETRM or valuation system. API keys live in merit_keys.toml beside this file: never share that one.
 """
 from __future__ import annotations
 
@@ -2223,7 +2223,7 @@ def power_signals(zone: str, prices: pd.DataFrame, load: pd.DataFrame, generatio
 # -----------------------------------------------------------------------------
 # Forward curve files: marks dropped in a folder, with their true date
 # -----------------------------------------------------------------------------
-CURVE_FOLDER_NAME = "meridian_curves"
+CURVE_FOLDER_NAME = "merit_curves"
 CURVE_FILE_TYPES = (".csv", ".xlsx")
 CURVE_STALE_DAYS = 3            # a Friday close is still current on Monday
 CURVE_JUMP_LIMIT = 2.0          # a price this many times the last marks is probably a unit error
@@ -4735,14 +4735,27 @@ def score_outlook_record(record: Optional[pd.DataFrame], table: pd.DataFrame, zo
 # SECTION 3 · SAVED DATA (SQLite)
 # Everything the desk needs tomorrow lives in one local database file.
 # =============================================================================
+def setting_env(name: str) -> str:
+    """An environment setting, MERIT_<name>; the earlier MERIDIAN_<name> still works."""
+    return (os.getenv(f"MERIT_{name}") or os.getenv(f"MERIDIAN_{name}") or "").strip()
+
+
+def beside_app(name: str, earlier: str) -> Path:
+    """A file or folder beside the app. If only the one made under the app's earlier name (Meridian) exists, it is used,
+    so renaming the app loses no saved trades, keys or curves. Rename it yourself whenever you like."""
+    here = Path(__file__).resolve()
+    current, previous = here.with_name(name), here.with_name(earlier)
+    return previous if not current.exists() and previous.exists() else current
+
+
 def default_db_path() -> Path:
-    configured = os.getenv("MERIDIAN_DB_PATH", "").strip()
+    configured = setting_env("DB_PATH")
     if configured:
         return Path(configured)
-    return Path(__file__).resolve().with_name("meridian_desk.db")
+    return beside_app("merit_desk.db", "meridian_desk.db")
 
 
-BACKUP_FOLDER_NAME = "meridian_backups"
+BACKUP_FOLDER_NAME = "merit_backups"
 BACKUPS_KEPT = 7
 
 
@@ -5234,7 +5247,7 @@ def set_fx_rate(key: str, value: float, ecb: bool = False) -> None:
 
 
 DEFAULT_SETTINGS = {"eur_per_gbp": 1.17, "eur_per_usd": 0.92, "auto_update": 1.0, "fx_ecb_epoch": 0.0,
-                    "allow_demo": 1.0 if os.getenv("MERIDIAN_ALLOW_DEMO", "").strip() == "1" else 0.0}   # live prices only unless chosen otherwise
+                    "allow_demo": 1.0 if setting_env("ALLOW_DEMO") == "1" else 0.0}   # live prices only unless chosen otherwise
 
 
 # =============================================================================
@@ -5244,7 +5257,7 @@ DEFAULT_SETTINGS = {"eur_per_gbp": 1.17, "eur_per_usd": 0.92, "auto_update": 1.0
 # =============================================================================
 HTTP_TIMEOUT_SECONDS = 25
 MAX_API_RESPONSE_BYTES = 20 * 1024 * 1024
-KEYS_FILE_NAME = "meridian_keys.toml"
+KEYS_FILE_NAME = "merit_keys.toml"
 ENTSOE_WINDOW_DAYS = 360
 ENTSOE_GENERATION_WINDOW_DAYS = 31
 ENTSOE_PARALLEL_WINDOWS = 4
@@ -5916,8 +5929,8 @@ def _frame_with_time(frame: pd.DataFrame, date_candidates: Optional[Sequence[str
         return frame.copy(), None
     out = frame.copy()
     parsed = pd.to_datetime(out[col], errors="coerce", utc=True)
-    out["_meridian_sort_time"] = parsed
-    out = out.loc[parsed.notna()].sort_values("_meridian_sort_time").reset_index(drop=True)
+    out["_merit_sort_time"] = parsed
+    out = out.loc[parsed.notna()].sort_values("_merit_sort_time").reset_index(drop=True)
     return out, col
 
 
@@ -6840,7 +6853,7 @@ def _http_get_bytes(url: str, params: Optional[dict] = None, headers: Optional[d
     target = urlsplit(final_url)
     if target.scheme != "https" or not target.hostname:
         raise RuntimeError("Only HTTPS addresses are used for market data, so keys and prices can't be read or changed on the way.")
-    req_headers = {"User-Agent": "MERIDIAN-Energy-Desk/2.0", "Accept": "application/json,*/*", "Accept-Encoding": "gzip"}
+    req_headers = {"User-Agent": "Merit-Energy-Desk/2.0", "Accept": "application/json,*/*", "Accept-Encoding": "gzip"}
     if headers:
         req_headers.update({str(k): str(v) for k, v in headers.items() if v is not None})
     request = Request(final_url, headers=req_headers, method="GET")
@@ -7393,8 +7406,8 @@ NOTE_FONT = UI_FONT       # one face throughout
 GRID = "rgba(138,170,190,0.13)"
 
 # Streamlit re-runs this script on every interaction, so the template is built only once.
-if "meridian_desk" not in pio.templates:
-    pio.templates["meridian_desk"] = go.layout.Template(layout=dict(
+if "merit_desk" not in pio.templates:
+    pio.templates["merit_desk"] = go.layout.Template(layout=dict(
     colorway=SERIES,
     font=dict(family=UI_FONT, size=12, color=TEXT),
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
@@ -7410,7 +7423,7 @@ if "meridian_desk" not in pio.templates:
     hoverlabel=dict(bgcolor=PANEL_SOFT, bordercolor=BORDER, font=dict(family=UI_FONT, size=11, color=TEXT)),
     bargap=0.3, barcornerradius=1,
     ))
-px.defaults.template = "meridian_desk"
+px.defaults.template = "merit_desk"
 px.defaults.color_discrete_sequence = SERIES
 
 _CSS = f"""
@@ -7618,7 +7631,7 @@ def _styled(fig: go.Figure, height: Optional[int] = None) -> go.Figure:
     resolved_height = height or fig.layout.height or 360
     has_title = bool(fig.layout.title and fig.layout.title.text)
     # Set here as well as in the template: Streamlit fills any background the figure itself leaves blank.
-    fig.update_layout(template="meridian_desk", height=resolved_height, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    fig.update_layout(template="merit_desk", height=resolved_height, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                       margin=dict(l=10, r=8, t=52 if has_title else 26, b=8),
                       hovermode=fig.layout.hovermode or ("x unified" if any(t.type == "scatter" and "lines" in str(t.mode) for t in fig.data) else "closest"))
     if fig.layout.title and fig.layout.title.text:
@@ -7900,7 +7913,7 @@ def render_sidebar() -> str:
     current = st.session_state.nav_page
     with st.sidebar:
         st.markdown('<div class="brand"><div class="mark"><span aria-hidden="true">bolt</span></div>'
-                    f'<div class="name">Meridian<small>European gas and power desk</small><small>by {AUTHOR}</small></div></div>', unsafe_allow_html=True)
+                    f'<div class="name">Merit<small>European gas and power desk</small><small>by {AUTHOR}</small></div></div>', unsafe_allow_html=True)
         st.markdown('<div style="height:0.4rem"></div>', unsafe_allow_html=True)
         for index, (section, items) in enumerate(NAV_SECTIONS.items()):
             key = f"navsec_{section}"
@@ -8039,8 +8052,8 @@ def curve_source_label(product: str) -> str:
 
 
 def keys_file_path() -> Path:
-    configured = os.getenv("MERIDIAN_KEYS_FILE", "").strip()
-    return Path(configured) if configured else Path(__file__).resolve().with_name(KEYS_FILE_NAME)
+    configured = setting_env("KEYS_FILE")
+    return Path(configured) if configured else beside_app(KEYS_FILE_NAME, "meridian_keys.toml")
 
 
 def keys_from_file(path: Optional[Path] = None) -> dict[str, str]:
@@ -8547,7 +8560,7 @@ def maybe_auto_update() -> None:
     if st.session_state.get("auto_update_checked"):
         return
     st.session_state.auto_update_checked = True
-    if os.getenv("MERIDIAN_NO_AUTO_UPDATE") or demo_mode() or not fx_rate("auto_update"):
+    if setting_env("NO_AUTO_UPDATE") or demo_mode() or not fx_rate("auto_update"):
         return
     start_update(force=False)
 
@@ -8620,7 +8633,7 @@ def update_report() -> str:
     results = st.session_state.get("update_results") or []
     finished = st.session_state.get("update_finished_at")
     took = st.session_state.get("update_seconds")
-    lines = [(f"Meridian update report, {finished:%Y-%m-%d %H:%M} UTC" + (f", whole update {took:.0f} s" if took else "")) if finished else "Meridian update report (no update has run in this session)",
+    lines = [(f"Merit update report, {finished:%Y-%m-%d %H:%M} UTC" + (f", whole update {took:.0f} s" if took else "")) if finished else "Merit update report (no update has run in this session)",
              f"Python {platform.python_version()}, pandas {pd.__version__}, Streamlit {st.__version__}, TradingView library {'installed' if tradingview_available() else 'not installed'}",
              f"Keys present: {', '.join(name for name, value in resolved_credentials().items() if value) or 'none'}", "", "Sources"]
     lines += [f"  {'OK    ' if good else 'FAILED'} {name}: {detail}" for name, good, detail in results] or ["  none"]
@@ -8681,8 +8694,8 @@ def update_button(key: str, label: str = "Update market data") -> None:
 # SECTION 6C · CURVE FILES, READ RECORD AND WINTER OUTLOOK
 # =============================================================================
 def curve_folder() -> Path:
-    configured = os.getenv("MERIDIAN_CURVES_DIR", "").strip()
-    return Path(configured) if configured else Path(__file__).resolve().with_name(CURVE_FOLDER_NAME)
+    configured = setting_env("CURVES_DIR")
+    return Path(configured) if configured else beside_app(CURVE_FOLDER_NAME, "meridian_curves")
 
 
 def _read_curve_bytes(content: bytes, suffix: str) -> pd.DataFrame:
@@ -10298,8 +10311,8 @@ _DEMO_BUILD_LOCK = threading.Lock()
 
 
 def demo_folder() -> Path:
-    configured = os.getenv("MERIDIAN_DEMO_DIR", "").strip()
-    return Path(configured) if configured else Path(tempfile.gettempdir()) / "meridian_demo"
+    configured = setting_env("DEMO_DIR")
+    return Path(configured) if configured else Path(tempfile.gettempdir()) / "merit_demo"
 
 
 def demo_seed_path(today: Optional[date] = None) -> Path:
@@ -10323,7 +10336,7 @@ def demo_seed_path(today: Optional[date] = None) -> Path:
 def demo_mode() -> bool:
     """Demo data, or the live desk. Starts in demo when no keys are set, so the app is complete straight away."""
     if "demo_mode" not in st.session_state:
-        choice = os.getenv("MERIDIAN_DEMO", "").strip()
+        choice = setting_env("DEMO")
         if choice not in ("0", "1"):
             try:
                 choice = str(st.query_params.get("demo", "")).strip()
@@ -12473,7 +12486,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         if "secret-token-123" in message or "pass%2Fword%21" in message or message.count("[hidden]") != 2:
             raise AssertionError(f"A key survived in a message: {message}")
         with tempfile.TemporaryDirectory() as folder:
-            keys = os.path.join(folder, "meridian_keys.toml")
+            keys = os.path.join(folder, "merit_keys.toml")
             open(keys, "w").write('GIE_API_KEY = "x"')
             if os.name == "posix":
                 os.chmod(keys, 0o644)
@@ -12485,7 +12498,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             os.mkdir(os.path.join(folder, ".git"))
             if "gitignore" not in keys_file_git_risk(keys):
                 raise AssertionError("A keys file in a Git folder without an ignore rule must be flagged.")
-            open(os.path.join(folder, ".gitignore"), "w").write("*.db\nmeridian_keys.toml\n")
+            open(os.path.join(folder, ".gitignore"), "w").write("*.db\nmerit_keys.toml\nmeridian_keys.toml\n")
             if keys_file_git_risk(keys):
                 raise AssertionError("An ignored keys file is fine.")
         return ("Plain HTTP and file addresses are refused, a redirect to another site or to HTTP is stopped, a decompression bomb and an XML entity trick are refused, "
@@ -14015,7 +14028,7 @@ def page_forward_curves():
     if tab_status:
         render_curve_status()
     if tab_build:
-        st.caption("Enter the contracts you can see quoted, in any mix of months, quarters, seasons and years. Meridian finds monthly marks that reprice each one exactly while keeping the current curve's shape.")
+        st.caption("Enter the contracts you can see quoted, in any mix of months, quarters, seasons and years. Merit finds monthly marks that reprice each one exactly while keeping the current curve's shape.")
         default_quotes = pd.DataFrame({"Contract": [c for c in contract_choices(valuation_date) if c.startswith(("Q", "Cal"))][:3], "Price": [None, None, None]})
         default_quotes["Price"] = pd.to_numeric(default_quotes["Price"])
         edited = st.data_editor(default_quotes, num_rows="dynamic", hide_index=True, width="stretch", key=f"tenor_quotes_{selected}",
@@ -14836,7 +14849,7 @@ def render_track_record() -> None:
                     "**Gas** compares the same TTF delivery month at both dates, using real marks only.\n\n"
                     "**By chance** is how often you'd be right by making the same mix of calls at random in this period, which allows for a market that mostly rose or fell.\n\n"
                     "**Independent tests** count calls whose outcome windows don't overlap, because reads a day apart are mostly watching the same price move. Consecutive reads also tend to agree, so even this can flatter the result.")
-    st.download_button("Download all saved reads", data=reads.drop(columns=["signals"]).to_csv(index=False).encode("utf-8"), file_name="meridian_read_log.csv", mime="text/csv", key="download_reads")
+    st.download_button("Download all saved reads", data=reads.drop(columns=["signals"]).to_csv(index=False).encode("utf-8"), file_name="merit_read_log.csv", mime="text/csv", key="download_reads")
 
 
 OUTLOOK_COLORS = (BLUE, AMBER, TEAL)
@@ -15291,7 +15304,7 @@ def build_brief() -> dict:
 
 def brief_pdf(brief: dict) -> bytes:
     blocks: list[tuple] = [("title", "Morning brief" + (" (demo data)" if demo_mode() else "")),
-                           ("subtitle", f"Meridian, by {AUTHOR}. {valuation_date:%A %d %B %Y}. Screening analysis, not investment advice."
+                           ("subtitle", f"Merit, by {AUTHOR}. {valuation_date:%A %d %B %Y}. Screening analysis, not investment advice."
                                         + (f" Demo market built from real closes of {DEMO_ANCHOR_DAY:%d %b %Y}: no price here is live." if demo_mode() else ""))]
     if brief["warnings"]:
         blocks += [("note", w) for w in brief["warnings"]]
@@ -15318,7 +15331,7 @@ def brief_pdf(brief: dict) -> bytes:
     blocks += [("text", f"{product}: {detail}.") for product, detail in brief["prices_used"]]
     blocks += [("text", f"Book: {text}.") for state, text in brief["book_note"] if state == "demo"]
     blocks.append(("note", "Day-ahead, storage, weather and FX figures come from ENTSO-E, GIE, Open-Meteo and the ECB. Reads, estimates and projections are simple models with the limits shown in the app. Check their track record before relying on them."))
-    return simple_pdf(blocks, "Meridian morning brief")
+    return simple_pdf(blocks, "Merit morning brief")
 
 
 def page_morning_brief() -> None:
@@ -15328,7 +15341,7 @@ def page_morning_brief() -> None:
     with left:
         update_button("brief_update")
     with right:
-        st.download_button("Download as PDF", data=brief_pdf(brief), file_name=f"meridian_brief_{valuation_date.isoformat()}.pdf", mime="application/pdf", key="brief_pdf")
+        st.download_button("Download as PDF", data=brief_pdf(brief), file_name=f"merit_brief_{valuation_date.isoformat()}.pdf", mime="application/pdf", key="brief_pdf")
     for note in brief["warnings"]:
         st.warning(note)
     for alert in brief["alerts"]:
@@ -16139,7 +16152,7 @@ def page_market_fundamentals():
             chart(scatter, 360)
             corr = residual[["residual_load_proxy_mw", "day_ahead_eur_mwh"]].corr().iloc[0, 1] if len(residual) >= 3 else float("nan")
             st.metric("Correlation in this sample", f"{corr:.3f}" if pd.notna(corr) else "Not enough overlap", help="Describes this sample only. It doesn't show cause and isn't a signal.")
-            st.download_button("Download as CSV", residual.to_csv(index=False).encode("utf-8"), file_name="meridian_power_context.csv", mime="text/csv", key="download_residual_load_context")
+            st.download_button("Download as CSV", residual.to_csv(index=False).encode("utf-8"), file_name="merit_power_context.csv", mime="text/csv", key="download_residual_load_context")
         else:
             need_data_note("Select Update market data in the sidebar. This view needs prices, load and generation for the same zone, and never combines different zones.")
 
@@ -16225,14 +16238,14 @@ def page_live_data_integrations():
                 st.caption("Each source's outcome, how fresh each dataset is, and the library versions. It contains no keys. Copy it with the button at the top right of the box.")
                 report = update_report()
                 st.code(report, language=None)
-                st.download_button("Download the report", report, file_name="meridian_update_report.txt", key="update_report_download")
+                st.download_button("Download the report", report, file_name="merit_update_report.txt", key="update_report_download")
     if demo_mode():
         st.info("In demo, every source holds demo data in the provider's own format, so each page works as it would live. "
                 "Keys, manual fetches and provider imports are on the live desk: choose Live in the sidebar to use them.")
         return
     saved = resolved_credentials()
     with st.expander("Replace an access key", expanded=False):
-        st.caption("You only need this to use a different key. Your saved keys come from the keys file beside the app and are never sent to your browser, so these fields stay empty. A key pasted here lasts for this session. To change one permanently, edit meridian_keys.toml.")
+        st.caption(f"You only need this to use a different key. Your saved keys come from the keys file beside the app and are never sent to your browser, so these fields stay empty. A key pasted here lasts for this session. To change one permanently, edit {keys_file_path().name}.")
         c1, c2, c3 = st.columns(3)
         gie_api_key = c1.text_input("GIE key (AGSI+ and ALSI)", value="", type="password", key="live_gie_api_key", placeholder="Saved key in use" if saved["gie"] else "No key saved")
         entsoe_api_token = c2.text_input("ENTSO-E token", value="", type="password", key="live_entsoe_token", placeholder="Saved token in use" if saved["entsoe"] else "No token saved")
@@ -16674,7 +16687,7 @@ def main() -> None:
         st.error(f"This app needs Streamlit {MIN_STREAMLIT_VERSION[0]}.{MIN_STREAMLIT_VERSION[1]} or newer, and {st.__version__} is installed. Run: pip install -U streamlit")
         st.stop()
     _configure_theme()
-    st.set_page_config(page_title=f"Meridian Energy Desk, by {AUTHOR}", page_icon=":material/bolt:", layout="wide", initial_sidebar_state="auto")
+    st.set_page_config(page_title=f"Merit Energy Desk, by {AUTHOR}", page_icon=":material/bolt:", layout="wide", initial_sidebar_state="auto")
     st.markdown(_CSS, unsafe_allow_html=True)
     init_session()
     live_items()
@@ -16701,7 +16714,7 @@ def main() -> None:
         st.toast(str(flash_message), icon=":material/check_circle:")
     PAGES[page]()
     render_next_step(page)
-    st.markdown(f'<div class="page-foot">Meridian Energy Desk, by {AUTHOR}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="page-foot">Merit Energy Desk, by {AUTHOR}</div>', unsafe_allow_html=True)
 
 
 def test_model_validation_suite() -> None:
