@@ -7466,13 +7466,7 @@ hr {{ border-color:{BORDER}; margin:0.6rem 0; }}
 .head-row {{ display:flex; gap:0.7rem; align-items:baseline; flex-wrap:wrap; }}
 .stApp h1.page-title {{ font-size:1.35rem; padding-left:0.6rem !important; border-left:4px solid var(--accent); font-weight:600; line-height:1.3; color:{TEXT}; margin:0; padding:0; }}
 .page-sub {{ color:{GRAY}; font-size:0.86rem !important; margin:0; }}
-/* Author signature: small-caps "by", a fading accent rule, then the name in the brand-mark gradient */
-.byline {{ display:inline-flex; align-items:center; gap:0.55rem; margin:0.4rem 0 0.6rem 0.85rem !important; padding:3px 11px 3px 9px; border:var(--line); border-radius:999px;
-  background:linear-gradient(90deg, color-mix(in srgb, var(--accent) 10%, {PANEL}) 0%, {PANEL} 100%); font-size:0.8rem !important; line-height:1.3 !important; }}
-.byline .by {{ display:inline-flex; align-items:center; gap:0.45rem; color:{GRAY}; font-size:0.64rem; font-weight:500; text-transform:uppercase; letter-spacing:0.16em; }}
-.byline .by::after {{ content:""; width:16px; height:1px; background:linear-gradient(90deg, var(--accent), transparent); }}
 .sig {{ font-weight:600; letter-spacing:0.03em; background:linear-gradient(90deg, #4FB3F6, #34D6B4); -webkit-background-clip:text; background-clip:text; color:transparent; }}
-.page-foot {{ color:{GRAY}; font-size:0.78rem; text-align:center; margin:2.2rem 0 0.4rem 0; padding-top:0.7rem; border-top:1px solid {BORDER}; }}
 .pill {{ display:inline-flex; align-items:center; gap:6px; padding:2px 8px; border:var(--line); border-radius:3px; font-size:0.78rem; color:{TEXT}; white-space:nowrap; background:{PANEL}; }}
 .pill i {{ width:7px; height:7px; border-radius:50%; display:inline-block; background:{GRAY}; }}
 .pill.good i {{ background:{GAIN}; }} .pill.warn i {{ background:{SODIUM}; }}
@@ -7827,8 +7821,7 @@ def render_header(title: str, subtitle: str) -> None:
     if demo_mode():
         st.markdown(demo_banner_html(), unsafe_allow_html=True)
     with st.container(key="page_head"):
-        st.markdown(f'<div class="head-row"><h1 class="page-title">{html.escape(title)}</h1><p class="page-sub">{html.escape(subtitle)}</p></div>'
-                    f'<p class="byline"><span class="by">by</span><b class="sig">{AUTHOR}</b></p>', unsafe_allow_html=True)
+        st.markdown(f'<div class="head-row"><h1 class="page-title">{html.escape(title)}</h1><p class="page-sub">{html.escape(subtitle)}</p></div>', unsafe_allow_html=True)
         sources = page_sources_html(current_page_name())
         if sources:
             st.markdown(sources, unsafe_allow_html=True)
@@ -16720,7 +16713,6 @@ def main() -> None:
         st.toast(str(flash_message), icon=":material/check_circle:")
     PAGES[page]()
     render_next_step(page)
-    st.markdown(f'<div class="page-foot">Merit Energy Desk &middot; by <b class="sig">{AUTHOR}</b></div>', unsafe_allow_html=True)
 
 
 def test_model_validation_suite() -> None:
