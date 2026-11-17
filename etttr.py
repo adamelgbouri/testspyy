@@ -3592,6 +3592,262 @@ def simple_pdf(blocks: Sequence[tuple], title: str = "") -> bytes:
     return bytes(output)
 
 
+# Helvetica advance widths (per 1000 em) for ASCII 32-126, regular then bold. Anything else counts as 556.
+_HELVETICA_WIDTHS = {
+    False: (278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584),
+    True: (278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 333, 333, 584, 584, 584, 611, 975, 722, 722, 722, 722, 667, 611, 778, 722, 278, 556, 722, 611, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 333, 278, 333, 584, 556, 333, 556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556, 278, 889, 611, 611, 611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500, 389, 280, 389, 584)}
+_HELVETICA_EXTRA = {"•": 350, "—": 1000, "°": 400}
+
+
+class ReportPdf:
+    """A small A4 report writer: a flowing cursor, page breaks, a masthead band, filled boxes, tables and a
+    running header and footer, using only the PDF base fonts. Colours are (r, g, b) in 0 to 1."""
+    W, H, M = 595, 842, 44
+    INK, GRAY, RULE, SOFT = (0.09, 0.13, 0.16), (0.42, 0.47, 0.51), (0.86, 0.89, 0.91), (0.955, 0.965, 0.972)
+    ACCENT, TEAL, BAND = (0.16, 0.55, 0.84), (0.20, 0.84, 0.71), (0.047, 0.078, 0.106)
+    GAIN, LOSS, AMBER = (0.10, 0.58, 0.36), (0.80, 0.24, 0.21), (0.84, 0.58, 0.08)
+
+    def __init__(self, title: str, running: str, footer: str, author: str = "") -> None:
+        self.title, self.running, self.footer, self.author = title, running, footer, author
+        self.pages: list[list[bytes]] = []
+        self.y = 0.0
+        self.new_page()
+
+    # Drawing
+    @staticmethod
+    def width(text: str, size: float, bold: bool = False, spacing: float = 0.0) -> float:
+        text = str(text).replace("−", "-").replace("–", "-").replace("—", "-")
+        table = _HELVETICA_WIDTHS[bold]
+        units = sum(table[ord(c) - 32] if 32 <= ord(c) <= 126 else _HELVETICA_EXTRA.get(c, 556) for c in text)
+        return units * size / 1000.0 + spacing * max(len(text) - 1, 0)
+
+    def _add(self, command: bytes) -> None:
+        self.pages[-1].append(command)
+
+    def rect(self, x: float, y: float, w: float, h: float, color: tuple) -> None:
+        self._add(b"%.3f %.3f %.3f rg %.2f %.2f %.2f %.2f re f\n" % (*color, x, y, w, h))
+
+    def line(self, x1: float, y1: float, x2: float, y2: float, color: tuple = None, width: float = 0.5) -> None:
+        self._add(b"%.3f %.3f %.3f RG %.2f w %.2f %.2f m %.2f %.2f l S\n" % (*(color or self.RULE), width, x1, y1, x2, y2))
+
+    def text(self, x: float, y: float, text: str, size: float, bold: bool = False, color: tuple = None, align: str = "left", spacing: float = 0.0) -> None:
+        if align != "left":
+            w = self.width(text, size, bold, spacing)
+            x = x - w if align == "right" else x - w / 2
+        self._add(b"BT /F%d %.2f Tf %.3f %.3f %.3f rg %.2f Tc %.2f %.2f Td (" % (2 if bold else 1, size, *(color or self.INK), spacing, x, y)
+                  + _pdf_text(text) + b") Tj ET\n")
+
+    def wrap(self, text: str, size: float, width: float, bold: bool = False) -> list[str]:
+        lines, current = [], ""
+        for word in str(text).split():
+            while self.width(word, size, bold) > width and len(word) > 1:      # a word wider than the column breaks where it must
+                cut = 1
+                while cut < len(word) and self.width(word[:cut + 1], size, bold) <= width:
+                    cut += 1
+                if current:
+                    lines.append(current)
+                    current = ""
+                lines.append(word[:cut])
+                word = word[cut:]
+            candidate = f"{current} {word}".strip()
+            if self.width(candidate, size, bold) <= width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        if current or not lines:
+            lines.append(current)
+        return lines
+
+    # Flow
+    def new_page(self) -> None:
+        self.pages.append([])
+        self.y = self.H - self.M
+        if len(self.pages) > 1:
+            self.text(self.M, self.H - 30, "MORNING BRIEF", 6.8, True, self.ACCENT, spacing=1.2)
+            self.text(self.M + self.width("MORNING BRIEF", 6.8, True, 1.2) + 8, self.H - 30, self.running, 7.5, False, self.GRAY)
+            self.line(self.M, self.H - 37, self.W - self.M, self.H - 37)
+            self.y = self.H - 58
+
+    def need(self, height: float) -> None:
+        if self.y - height < 56:
+            self.new_page()
+
+    def gap(self, height: float) -> None:
+        self.y -= height
+
+    # Blocks
+    def masthead(self, kicker: str, title: str, date_text: str, meta: Sequence[tuple[str, str]], badge: str = "") -> None:
+        band = 132
+        self.rect(0, self.H - band, self.W, band, self.BAND)
+        steps = 40
+        for i in range(steps):                      # the brand gradient as a thin strip under the band
+            t = i / (steps - 1)
+            colour = tuple(a + (b - a) * t for a, b in zip((0.31, 0.70, 0.96), self.TEAL))
+            self.rect(self.W * i / steps, self.H - band - 3, self.W / steps + 0.5, 3, colour)
+        top = self.H - 46
+        self.text(self.M, top, kicker.upper(), 7.5, True, (0.31, 0.70, 0.96), spacing=1.8)
+        if badge:
+            x = self.M + self.width(kicker.upper(), 7.5, True, 1.8) + 10
+            w = self.width(badge.upper(), 6.5, True, 0.8) + 10
+            self.rect(x, top - 3.5, w, 12, (0.89, 0.65, 0.18))
+            self.text(x + 5, top - 0.5, badge.upper(), 6.5, True, self.BAND, spacing=0.8)
+        self.text(self.M, top - 30, title, 23, True, (1, 1, 1))
+        self.text(self.M, top - 49, date_text, 10.5, False, (0.63, 0.69, 0.73))
+        label_x, value_x, value_w = self.W - self.M - 148, self.W - self.M - 142, 142
+        row_y = top + 1
+        for label, value in meta:
+            self.text(label_x, row_y, label, 7.5, False, (0.55, 0.61, 0.66), align="right")
+            for piece in self.wrap(value, 8, value_w)[:2]:
+                self.text(value_x, row_y, piece, 8, False, (0.92, 0.94, 0.95))
+                row_y -= 11
+            row_y -= 2
+        self.y = self.H - band - 26
+
+    def callout(self, text: str, color: tuple, fill: tuple, lead: str = "", tag: str = "") -> None:
+        body = (f"{lead}  " if lead else "") + text
+        lines = self.wrap(body, 8.8, self.W - 2 * self.M - 22 - (self.width(tag.upper(), 6.2, True, 0.6) + 18 if tag else 0))
+        height = len(lines) * 12 + 12
+        self.need(height + 6)
+        top = self.y
+        self.rect(self.M, top - height, self.W - 2 * self.M, height, fill)
+        self.rect(self.M, top - height, 2.5, height, color)
+        y = top - 16
+        for index, piece in enumerate(lines):
+            if index == 0 and lead and piece.startswith(lead):
+                self.text(self.M + 12, y, lead, 8.8, True, self.INK)
+                self.text(self.M + 12 + self.width(lead + "  ", 8.8, True), y, piece[len(lead):].strip(), 8.8, False, self.INK)
+            else:
+                self.text(self.M + 12, y, piece, 8.8, False, self.INK)
+            y -= 12
+        if tag:
+            w = self.width(tag.upper(), 6.2, True, 0.6) + 8
+            x = self.W - self.M - 10 - w
+            self.rect(x, top - 18.5, w, 10, color)
+            self.text(x + 4, top - 16, tag.upper(), 6.2, True, (1, 1, 1), spacing=0.6)
+        self.y = top - height - 6
+
+    def section(self, number: str, title: str, room: float = 70) -> None:
+        self.need(room)
+        self.gap(20)
+        self.text(self.M, self.y, number, 9, True, self.ACCENT, spacing=0.6)
+        self.text(self.M + 24, self.y, title, 13, True, self.INK)
+        self.gap(8)
+        self.line(self.M, self.y, self.W - self.M, self.y, self.RULE, 0.7)
+        self.gap(12)
+
+    def paragraph(self, text: str, size: float = 9.5, color: tuple = None, leading: float = 1.45) -> None:
+        for piece in self.wrap(text, size, self.W - 2 * self.M):
+            self.need(size * leading)
+            self.gap(size * leading)
+            self.text(self.M, self.y + size * 0.25, piece, size, False, color or self.INK)
+        self.gap(4)
+
+    def key_points(self, points: Sequence[tuple[str, str]]) -> None:
+        lead_w = 132
+        text_x, text_w = self.M + 12 + lead_w, self.W - 2 * self.M - lead_w - 24
+        self.gap(-4)
+        for index, (lead, text) in enumerate(points):
+            leads, texts = self.wrap(lead, 8, lead_w - 8), self.wrap(text, 9.2, text_w)
+            height = max(len(leads) * 10.5, len(texts) * 12.5) + 11
+            self.need(height)
+            top = self.y
+            self.rect(self.M, top - height, self.W - 2 * self.M, height, self.SOFT)
+            if index:
+                self.line(self.M + 12, top, self.W - self.M - 12, top, (1, 1, 1), 1)
+            y = top - 15
+            for piece in leads:
+                self.text(self.M + 12, y + 0.5, piece, 8, True, self.GRAY)
+                y -= 10.5
+            y = top - 15
+            for piece in texts:
+                self.text(text_x, y, piece, 9.2, False, self.INK)
+                y -= 12.5
+            self.y = top - height
+        self.rect(self.M, self.y - 1, self.W - 2 * self.M, 1.5, self.ACCENT)
+        self.gap(8)
+
+    def table(self, columns: Sequence[tuple[str, float, str]], rows: Sequence[Sequence], size: float = 8.8, heading: Optional[tuple[str, str]] = None) -> None:
+        """columns are (label, share of the width, 'left' or 'right'). A cell is text, or a dict with
+        text, sub (a grey second line), color and bold. heading is a (number, title) section kept with the table."""
+        usable = self.W - 2 * self.M
+        lefts = [self.M + usable * sum(c[1] for c in columns[:i]) for i in range(len(columns))]
+        widths = [usable * c[1] for c in columns]
+        pad = 6
+
+        def header() -> None:
+            self.need(22)
+            self.rect(self.M, self.y - 18, usable, 18, self.SOFT)
+            for (label, _, align), left, w in zip(columns, lefts, widths):
+                x = left + w - pad if align == "right" else left + pad
+                self.text(x, self.y - 12, label.upper(), 6.6, True, self.GRAY, align=align, spacing=0.5)
+            self.gap(18)
+
+        prepared = []
+        for row in rows:
+            cells = [cell if isinstance(cell, dict) else {"text": str(cell)} for cell in row]
+            laid = []
+            for cell, w in zip(cells, widths):
+                main = self.wrap(cell.get("text", ""), size, w - 2 * pad, cell.get("bold", False))
+                sub = self.wrap(cell["sub"], size - 2, w - 2 * pad) if cell.get("sub") else []
+                laid.append((main, sub))
+            prepared.append((cells, laid, max(len(m) * (size + 3) + len(s) * (size + 0.5) for m, s in laid) + 10))
+        whole = 18 + sum(h for _, _, h in prepared) + (52 if heading else 0)
+        self.need(whole + 4 if whole < 360 else 130)   # a short table stays on one page, and a heading never sits alone
+        if heading:
+            self.section(*heading, room=0)
+        header()
+        for cells, laid, height in prepared:
+            if self.y - height < 56:
+                self.new_page()
+                header()
+            top = self.y
+            for (main, sub), cell, (_, _, align), left, w in zip(laid, cells, columns, lefts, widths):
+                x = left + w - pad if align == "right" else left + pad
+                y = top - size - 4
+                for piece in main:
+                    self.text(x, y, piece, size, cell.get("bold", False), cell.get("color", self.INK), align=align)
+                    y -= size + 3
+                for piece in sub:
+                    self.text(x, y + 1, piece, size - 2, False, self.GRAY, align=align)
+                    y -= size + 0.5
+            self.y = top - height
+            self.line(self.M, self.y, self.W - self.M, self.y, self.RULE, 0.5)
+        self.gap(6)
+
+    # Output
+    def build(self) -> bytes:
+        objects = [b"<< /Type /Catalog /Pages 2 0 R >>", None, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+                   b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+                   b"<< /Title (" + _pdf_text(self.title) + b") /Author (" + _pdf_text(self.author) + b") /Producer (Merit desk) >>"]
+        kids = []
+        total = len(self.pages)
+        pages, self.pages = self.pages, []
+        for number, commands in enumerate(pages, start=1):
+            self.pages = [commands]              # the footer is drawn onto this page
+            self.line(self.M, 40, self.W - self.M, 40, self.RULE, 0.5)
+            self.text(self.M, 28, self.footer, 7.2, False, self.GRAY)
+            self.text(self.W - self.M, 28, f"Page {number} of {total}", 7.2, False, self.GRAY, align="right")
+            stream = b"".join(commands)
+            objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"endstream")
+            content_id = len(objects)
+            objects.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents %d 0 R >>" % (self.W, self.H, content_id))
+            kids.append(len(objects))
+        objects[1] = b"<< /Type /Pages /Count %d /Kids [" % len(kids) + b" ".join(b"%d 0 R" % k for k in kids) + b"] >>"
+        output = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        offsets = []
+        for number, body in enumerate(objects, start=1):
+            offsets.append(len(output))
+            output += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+        start = len(output)
+        output += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+        for offset in offsets:
+            output += b"%010d 00000 n \n" % offset
+        output += b"trailer\n<< /Size %d /Root 1 0 R /Info 5 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, start)
+        self.pages = pages
+        return bytes(output)
+
+
 # -----------------------------------------------------------------------------
 # Free real prices for marks, and where every price came from
 # -----------------------------------------------------------------------------
@@ -7468,7 +7724,7 @@ hr {{ border-color:{BORDER}; margin:0.6rem 0; }}
 .page-sub {{ color:{GRAY}; font-size:0.86rem !important; margin:0; }}
 .sig {{ font-weight:600; letter-spacing:0.03em; background:linear-gradient(90deg, #4FB3F6, #34D6B4); -webkit-background-clip:text; background-clip:text; color:transparent; }}
 /* Morning brief: a report sheet */
-.st-key-brief_doc {{ max-width:1120px; padding:26px 32px 20px; border:var(--line); border-radius:8px; background:{PANEL}; box-shadow:0 1px 0 rgba(255,255,255,0.02) inset, 0 12px 32px rgba(0,0,0,0.25); }}
+.st-key-brief_doc {{ padding:26px 32px 20px; border:var(--line); border-radius:8px; background:{PANEL}; box-shadow:0 1px 0 rgba(255,255,255,0.02) inset, 0 12px 32px rgba(0,0,0,0.25); }}
 .rpt {{ color:{TEXT}; }}
 .rpt-mast {{ display:flex; justify-content:space-between; align-items:flex-end; gap:1.5rem; flex-wrap:wrap; padding-bottom:14px; border-bottom:2px solid var(--accent); }}
 .rpt-kicker {{ font-size:0.68rem; font-weight:600; letter-spacing:0.18em; text-transform:uppercase; color:var(--accent); margin-bottom:6px; }}
@@ -7484,7 +7740,7 @@ hr {{ border-color:{BORDER}; margin:0.6rem 0; }}
 .rpt-sec {{ margin:24px 0 0; }}
 .rpt-h {{ display:flex; align-items:baseline; gap:12px; margin:0 0 8px; padding:0 0 6px; border-bottom:var(--line); font-size:0.98rem; font-weight:600; color:{TEXT}; line-height:1.3; }}
 .rpt-h .num {{ min-width:1.4rem; font-size:0.74rem; font-weight:600; color:var(--accent); letter-spacing:0.06em; }}
-.stApp .rpt-p {{ margin:0; max-width:100ch; font-size:0.92rem; line-height:1.6; }}
+.stApp .rpt-p {{ margin:0; font-size:0.92rem; line-height:1.6; }}
 .stApp .rpt-points {{ margin:0; padding:0; list-style:none; }}
 .stApp .rpt-points li {{ display:grid; grid-template-columns:13rem 1fr; gap:1rem; margin:0; padding:6px 0; border-bottom:1px solid {BORDER}80; font-size:0.9rem; line-height:1.5; }}
 .stApp .rpt-points li:last-child {{ border-bottom:0; }}
@@ -12324,7 +12580,17 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         for offset, number in zip(re.findall(rb"(\d{10}) 00000 n", pdf)[:5], range(1, 6)):
             if not pdf[int(offset):].startswith(b"%d 0 obj" % number):
                 raise AssertionError("A PDF object is at the wrong position.")
-        return f"Thresholds fire only when their condition holds and mark what's new. A long PDF has {count} pages with a valid file table, the euro sign and escaped brackets."
+        report = ReportPdf("Test", "Running", "Footer (test)", "Author")
+        report.masthead("Kicker", "Title €", "Date", [("A", "one"), ("B", "a much longer value that has to wrap onto a second line")], badge="Demo")
+        report.key_points([("Lead", "word " * 60)])
+        report.table([("A", 0.5, "left"), ("B", 0.5, "right")], [["one", {"text": "€2", "sub": "as of", "bold": True}]] * 120, heading=("01", "Table"))
+        built = report.build()
+        pages = int(re.search(rb"/Count (\d+)", built)[1])
+        start = int(built[built.rindex(b"startxref") + 10:].split()[0])
+        if pages < 3 or built[start:start + 4] != b"xref" or b"Page 3 of" not in built or b"\\(test\\)" not in built:
+            raise AssertionError("The styled report PDF is malformed.")
+        return (f"Thresholds fire only when their condition holds and mark what's new. A long PDF has {count} pages with a valid file table, the euro sign and escaped brackets, "
+                f"and the styled report runs to {pages} pages with its table header and footer on each.")
 
     def check_signal_themes() -> str:
         storage = [_signal("storage_level", "L", 3.0, 2.0), _signal("storage_pace", "P", 2.0, 2.0), _signal("winter_outlook", "W", 2.0, 2.0), _signal("lng", "G", 1.5)]
@@ -15371,41 +15637,58 @@ def brief_key_points(brief: dict) -> list[tuple[str, str]]:
 
 
 def brief_pdf(brief: dict) -> bytes:
-    blocks: list[tuple] = [("title", "Morning brief" + (" (demo data)" if demo_mode() else "")),
-                           ("subtitle", f"Merit, by {AUTHOR}. {valuation_date:%A %d %B %Y}. Screening analysis, not investment advice."
-                                        + (f" Demo market built from real closes of {DEMO_ANCHOR_DAY:%d %b %Y}: no price here is live." if demo_mode() else ""))]
-    if brief["warnings"]:
-        blocks += [("note", w) for w in brief["warnings"]]
-    number = iter(range(1, 20))
-    heading = lambda text: ("heading", f"{next(number)}. {text}")
+    """The morning brief as a styled A4 report: masthead, summary, numbered sections, appendix and notes."""
+    prepared = datetime.now(ZoneInfo("Europe/Paris"))
+    book = "; ".join(text for _, text in brief["book_note"]) or "No trades"
+    pdf = ReportPdf("Merit morning brief", f"European gas and power, {valuation_date:%d %b %Y}",
+                    f"Merit desk  |  Morning brief  |  {valuation_date:%a %d %b %Y}", AUTHOR)
+    pdf.masthead("Morning brief", "European gas and power", f"{valuation_date:%A %d %B %Y}",
+                 [("Valuation", f"{valuation_date:%a %d %b %Y}"), ("Data", "Demo market" if demo_mode() else "Live"), ("Book", book),
+                  ("Prepared", f"{prepared:%d %b %Y, %H:%M} Paris"), ("By", AUTHOR)], badge="Demo data" if demo_mode() else "")
+    for note in brief["warnings"]:
+        pdf.callout(note, pdf.AMBER, (1.0, 0.965, 0.89))
+    sections = iter(range(1, 20))
+    number = lambda: f"{next(sections):02d}"
     points = brief_key_points(brief)
     if points:
-        blocks.append(heading("Summary"))
-        blocks += [("text", f"\u2022 {lead}: {text}") for lead, text in points]
+        pdf.section(number(), "Summary")
+        pdf.key_points(points)
     if brief["alerts"]:
-        blocks.append(heading("Thresholds crossed"))
-        blocks += [("text", f"{a['metric']}: {_metric_text(a['now'], a['unit'])}, {a['condition'].lower()} your level of {_metric_text(a['level'], a['unit'])}" + (". New today." if a["new"] else ".")) for a in brief["alerts"]]
+        pdf.section(number(), "Thresholds crossed")
+        for a in brief["alerts"]:
+            pdf.callout(f"{_metric_text(a['now'], a['unit'])}, {a['condition'].lower()} your level of {_metric_text(a['level'], a['unit'])}.",
+                        pdf.LOSS, (0.995, 0.93, 0.92), lead=a["metric"], tag="New today" if a["new"] else "")
     if brief["changes"]:
-        blocks.append(heading("What changed"))
-        columns = ["Item", "Now", "Now, as of", "Before", "Before, as of", "Change"]
-        blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["changes"]], (0.22, 0.12, 0.22, 0.12, 0.20, 0.12))))
+        tone = lambda v: pdf.GAIN if v is not None and v > 0 else pdf.LOSS if v is not None and v < 0 else pdf.INK
+        pdf.table([("Item", 0.31, "left"), ("Now", 0.25, "right"), ("Before", 0.25, "right"), ("Change", 0.19, "right")],
+                  [[r["Item"], {"text": r["Now"], "sub": r["Now, as of"], "bold": True},
+                    {"text": r["Before"] or "None", "sub": r["Before, as of"], "color": pdf.INK if r["Before"] else pdf.GRAY},
+                    {"text": r["Change"], "color": tone(r.get("_change")), "bold": True}] for r in brief["changes"]], heading=(number(), "What changed"))
     if brief["reads"]:
-        blocks.append(heading("Market read"))
-        columns = ["Market", f"Read, {valuation_date:%d %b %Y}", "Confidence", "Previous read"]
-        blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["reads"]], (0.24, 0.26, 0.16, 0.34))))
+        read_key = next(k for k in brief["reads"][0] if k.startswith("Read, "))
+        pdf.table([("Market", 0.27, "left"), (read_key, 0.27, "left"), ("Confidence", 0.18, "left"), ("Previous read", 0.28, "left")],
+                  [[r["Market"], {"text": str(r[read_key]) + ("  (changed)" if r["Changed"] else ""), "bold": True}, str(r["Confidence"]),
+                    {"text": str(r["Previous read"]), "color": pdf.GRAY}] for r in brief["reads"]], heading=(number(), "Market read"))
     if brief["pnl_text"]:
-        blocks += [heading("P&L"), ("text", brief["pnl_text"])]
+        pdf.section(number(), "P&L")
+        pdf.paragraph(brief["pnl_text"])
     if brief["estimates"]:
-        blocks.append(heading("Next-day power price estimate"))
-        columns = ["Zone", "Day", "Estimate", "80% range", "Latest published day"]
-        blocks.append(("table", (columns, [[row[c] for c in columns] for row in brief["estimates"]], (0.28, 0.16, 0.13, 0.19, 0.24))))
+        pdf.table([("Zone", 0.22, "left"), ("Delivery day", 0.17, "left"), ("Estimate", 0.12, "right"), ("80% range", 0.17, "right"), ("Latest published day", 0.32, "left")],
+                  [[r["Zone"], r["Day"], {"text": r["Estimate"], "bold": True}, r["80% range"], {"text": r["Latest published day"], "color": pdf.GRAY}] for r in brief["estimates"]],
+                  heading=(number(), "Next-day power price estimate"))
     if brief["outlook"]:
-        blocks += [heading("Winter storage"), ("text", brief["outlook"])]
-    blocks.append(("heading", "Appendix: prices used"))
-    blocks += [("text", f"{product}: {detail}.") for product, detail in brief["prices_used"]]
-    blocks += [("text", f"Book: {text}.") for state, text in brief["book_note"] if state == "demo"]
-    blocks.append(("note", "Day-ahead, storage, weather and FX figures come from ENTSO-E, GIE, Open-Meteo and the ECB. Reads, estimates and projections are simple models with the limits shown in the app. Check their track record before relying on them."))
-    return simple_pdf(blocks, "Merit morning brief")
+        pdf.section(number(), "Winter storage")
+        pdf.paragraph(brief["outlook"])
+    pdf.table([("Product", 0.35, "left"), ("Priced with", 0.65, "left")],
+              [[product, {"text": detail, "color": pdf.GRAY}] for product, detail in brief["prices_used"]], size=8.2, heading=("A", "Appendix: prices used"))
+    pdf.need(60)
+    pdf.gap(10)
+    pdf.line(pdf.M, pdf.y, pdf.W - pdf.M, pdf.y)
+    pdf.gap(4)
+    pdf.paragraph("Day-ahead, storage, weather and FX figures come from ENTSO-E, GIE, Open-Meteo and the ECB. Reads, estimates and projections are simple models "
+                  "with the limits shown in the app; check their track record before relying on them. Screening analysis, not investment advice."
+                  + (f" Demo market built from real closes of {DEMO_ANCHOR_DAY:%d %b %Y}: no price here is live." if demo_mode() else ""), 7.5, pdf.GRAY, 1.5)
+    return pdf.build()
 
 
 def _rpt_table(columns: Sequence[tuple[str, str]], rows: Sequence[Sequence[str]]) -> str:
