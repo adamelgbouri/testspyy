@@ -6789,7 +6789,8 @@ def fetch_power_weather(location_names: Sequence[str], days: int = 430, _json_ge
 OPEN_METEO_HISTORICAL_FORECAST_BASE = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 OPEN_METEO_ENSEMBLE_BASE = "https://ensemble-api.open-meteo.com/v1/ensemble"
 OPEN_METEO_ENSEMBLE_MODEL = "ecmwf_ifs025"     # 51 scenarios, 15 days
-TRADING_HUB_BASE = "https://datenservice.tradinghub.eu/XmlInterface/getXML.ashx"
+# THE's DataExport API, which replaced the datenservice.tradinghub.eu XML interface in August 2026. No key; a User-Agent naming the app is required.
+TRADING_HUB_BASE = "https://api.tradinghub.eu/api/dataexport/xmlexport/"
 
 
 def _zone_points(zone: str, with_sea: bool, extended: bool = False) -> tuple[list, list]:
@@ -7070,7 +7071,9 @@ def parse_the_consumption(content: bytes) -> pd.DataFrame:
     """Trading Hub Europe's aggregated consumption report: German gas use per gas day, in GWh.
 
     Small users are those on standard load profiles (SLP, synthetic and analytic), large users those
-    metered daily (RLM, with and without tolerance). H-gas and L-gas are added. Figures come in kWh."""
+    metered daily (RLM, with and without tolerance). H-gas and L-gas are added. Figures come in kWh.
+    THE lists the latest gas days with large users at 0 until they are published, so a group that is
+    all zero counts as not yet published, not as no gas used."""
     root = _safe_xml_root(content)
     rows = []
     for element in root.iter():
@@ -7081,6 +7084,7 @@ def parse_the_consumption(content: bytes) -> pd.DataFrame:
         values = {k: _the_number(v) for k, v in children.items() if not k.startswith("unit") and ("slp" in k or "rlm" in k)}
         small = [v for k, v in values.items() if "slp" in k]
         large = [v for k, v in values.items() if "rlm" in k]
+        small, large = [[] if not np.nansum(group) else group for group in (small, large)]
         status = next((children[k] for k in ("status", "state") if k in children), "")
         rows.append({"gas_day": pd.to_datetime(str(day_text)[:10].replace(".", "-").replace("/", "-"), errors="coerce", format="%Y-%m-%d" if re.match(r"\d{4}-", str(day_text)) else "%d-%m-%Y"),
                      "small": np.nansum(small) / 1e6 if small and not np.isnan(small).all() else np.nan,
@@ -7094,8 +7098,10 @@ def parse_the_consumption(content: bytes) -> pd.DataFrame:
 
 
 def fetch_the_consumption(start: date, end: date, _http_fn=None) -> pd.DataFrame:
-    """German gas consumption by gas day from Trading Hub Europe's public XML interface. No key is needed."""
-    body, _ = (_http_fn or _http_get_bytes)(TRADING_HUB_BASE, params={"ReportId": "AggregatedConsumptionData", "Start": start.strftime("%d-%m-%Y"), "End": end.strftime("%d-%m-%Y")},
+    """German gas consumption by gas day from Trading Hub Europe's DataExport API. No key is needed.
+    Dates are gas days (06:00 to 06:00 German time) written yyyy-mm-dd. Any span is allowed in one request."""
+    body, _ = (_http_fn or _http_get_bytes)(TRADING_HUB_BASE + "AggregatedConsumptionData",
+                                             params={"startDate": start.isoformat(), "endDate": end.isoformat()},
                                              headers={"Accept": "application/xml, text/xml, */*"})
     return parse_the_consumption(body)
 
@@ -9415,8 +9421,7 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
             try:
                 return fetch_the_consumption(start, today + timedelta(days=2))
             except Exception as exc:
-                raise RuntimeError("Trading Hub Europe's data interface isn't answering (THE has said it is out of service for now), "
-                                   f"so German gas demand waits until it's back. Detail: {exc}") from None
+                raise RuntimeError(f"Trading Hub Europe's DataExport API didn't answer, so German gas demand keeps the days already held. Detail: {exc}") from None
         tasks.append(UpdateTask("German gas consumption", fetch_gas_use, apply_gas_use, start))
     return tasks
 
@@ -13368,28 +13373,33 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         xml = (b'<?xml version="1.0"?><root xmlns:x="urn:x"><x:row><x:Gasday>2026-11-10</x:Gasday><x:HGasSLPsyn>1000000000</x:HGasSLPsyn><x:UnitHGasSLPsyn>kWh</x:UnitHGasSLPsyn>'
                b'<x:HGasSLPana>500000000</x:HGasSLPana><x:LGasSLPsyn>200000000</x:LGasSLPsyn><x:LGasSLPana>100000000</x:LGasSLPana>'
                b'<x:HGasRLMmT>1500000000</x:HGasRLMmT><x:LGasRLMmT>300000000</x:LGasRLMmT><x:HGasRLMoT>100000000</x:HGasRLMoT><x:LGasRLMoT>50000000</x:LGasRLMoT><x:Status>final</x:Status></x:row>'
-               b'<x:row><x:Gasday>11.11.2026</x:Gasday><x:HGasSLPsyn>1,100,000,000</x:HGasSLPsyn><x:HGasSLPana>500000000</x:HGasSLPana><x:HGasRLMmT></x:HGasRLMmT><x:Status>preliminary</x:Status></x:row></root>')
+               b'<x:row><x:Gasday>11.11.2026</x:Gasday><x:HGasSLPsyn>1,100,000,000</x:HGasSLPsyn><x:HGasSLPana>500000000</x:HGasSLPana><x:HGasRLMmT></x:HGasRLMmT><x:Status>preliminary</x:Status></x:row>'
+               b'<x:row><x:Gasday>2026-11-12</x:Gasday><x:HGasSLPsyn>900000000</x:HGasSLPsyn><x:HGasRLMmT>0</x:HGasRLMmT><x:LGasRLMmT>0</x:LGasRLMmT>'
+               b'<x:HGasRLMoT>0</x:HGasRLMoT><x:LGasRLMoT>0</x:LGasRLMoT><x:Status>preliminary</x:Status></x:row></root>')
         frame = parse_the_consumption(xml)
-        if list(frame["gas_day"].dt.date) != [date(2026, 11, 10), date(2026, 11, 11)]:
+        if list(frame["gas_day"].dt.date) != [date(2026, 11, 10), date(2026, 11, 11), date(2026, 11, 12)]:
             raise AssertionError("Both date styles must be read.")
         assert_close(float(frame["small"].iloc[0]), 1800.0)
         assert_close(float(frame["large"].iloc[0]), 1950.0)
         assert_close(float(frame["small"].iloc[1]), 1600.0)
         if not np.isnan(frame["large"].iloc[1]) or frame["status"].iloc[1] != "preliminary":
             raise AssertionError("Large users not yet published must stay empty, not zero.")
+        if not np.isnan(frame["large"].iloc[2]) or abs(float(frame["small"].iloc[2]) - 900.0) > 1e-9:
+            raise AssertionError("THE's zeros for large users not yet published must stay empty, not count as no gas used.")
         seen = []
         def fake_http(url, params=None, headers=None):
             seen.append(params)
             return xml, "text/xml"
         fetch_the_consumption(date(2026, 11, 1), date(2026, 11, 12), _http_fn=fake_http)
-        if seen[-1] != {"ReportId": "AggregatedConsumptionData", "Start": "01-11-2026", "End": "12-11-2026"}:
-            raise AssertionError(f"The request must follow THE's interface: {seen[-1]}")
+        if seen[-1] != {"startDate": "2026-11-01", "endDate": "2026-11-12"}:
+            raise AssertionError(f"The request must follow THE's DataExport API: {seen[-1]}")
         try:
             parse_the_consumption(b"<!DOCTYPE x [<!ENTITY a 'b'>]><root/>")
             raise AssertionError("Declared entities must be refused.")
         except (ValueError, RuntimeError):
             pass
-        return "Small and large users are added across H- and L-gas and turned from kWh into GWh, both date styles are read, unpublished figures stay empty, and the request uses THE's date format."
+        return ("Small and large users are added across H- and L-gas and turned from kWh into GWh, both date styles are read, unpublished figures "
+                "(empty or listed as 0) stay empty, and the request uses the DataExport API's address and dates.")
 
     def _fund_synthetic(days: int = 520, nuclear: float = 0.0, seed: int = 3):
         rng = np.random.default_rng(seed)
