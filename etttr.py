@@ -2942,7 +2942,12 @@ def daily_base_prices(series: pd.DataFrame) -> pd.Series:
     """Average day-ahead price by delivery day, leaving out days with few published prices."""
     if series is None or series.empty:
         return pd.Series(dtype=float)
-    data = series.assign(day=pd.to_datetime(series["local"].dt.date), weighted=series["value"] * series["hours"])
+    local = series["local"]
+    wall = local.dt.tz_localize(None) if getattr(local.dt, "tz", None) is not None else local
+    # One Python date per distinct day rather than per price (about 24 times fewer), giving the same days and dtype.
+    codes, uniques = pd.factorize(wall.dt.normalize())
+    day = pd.to_datetime(pd.DatetimeIndex(uniques).date)[codes] if len(uniques) and (codes >= 0).all() else pd.to_datetime(local.dt.date)
+    data = series.assign(day=np.asarray(day), weighted=series["value"] * series["hours"])
     grouped = data.groupby("day")
     hours = grouped["hours"].sum()
     # Judged by hours covered, so a change of resolution can't hide a whole period.
@@ -3140,8 +3145,9 @@ def estimate_range(errors: np.ndarray) -> dict:
         return {"low": float(np.quantile(errors, low_q)), "high": float(np.quantile(errors, high_q)), "held": None, "held_days": 0, "adaptive": False}
     now = float(scale.iloc[-1])
     hits = []
-    for i in np.flatnonzero(usable):
-        past = scaled[:i][usable[:i]]
+    compact = scaled[usable]          # the usable misses in order: those before the k-th are compact[:k], a view, not a copy
+    for k, i in enumerate(np.flatnonzero(usable)):
+        past = compact[:k]
         if len(past) >= ESTIMATE_RANGE_MIN_ERRORS:
             low, high = np.quantile(past, [low_q, high_q]) * before[i]
             hits.append(low <= errors[i] <= high)
@@ -3177,8 +3183,9 @@ def estimate_distribution(errors: np.ndarray, simple_errors: Optional[np.ndarray
         if usable.sum() < ESTIMATE_RANGE_MIN_ERRORS:
             return None
         scores, below = [], []
-        for i in np.flatnonzero(usable):
-            past = scaled[:i][usable[:i]]
+        compact = scaled[usable]
+        for k, i in enumerate(np.flatnonzero(usable)):
+            past = compact[:k]
             if len(past) >= ESTIMATE_RANGE_MIN_ERRORS:
                 predicted = np.quantile(past, levels) * before[i]
                 scores.append(_pinball(levels, predicted, values[i]))
@@ -3218,8 +3225,11 @@ def _weather_for_estimate(zone: str, history: pd.DataFrame, daily: pd.DataFrame,
 def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, daily: pd.DataFrame,
                       load_forecast: Optional[pd.DataFrame] = None, renewable_forecast: Optional[pd.DataFrame] = None,
                       grid_history: Optional[pd.DataFrame] = None, grid_forecast: Optional[pd.DataFrame] = None,
-                      gas: Optional[pd.DataFrame] = None, weather_vintage: Optional[pd.DataFrame] = None) -> dict:
+                      gas: Optional[pd.DataFrame] = None, weather_vintage: Optional[pd.DataFrame] = None,
+                      published: Optional[pd.DataFrame] = None) -> dict:
     """Estimate the next unpublished delivery day, and test the methods one day at a time.
+
+    published is entsoe_forecast_days of the two forecasts, for callers that estimate many days from the same ones.
 
     The weather method can run before the auction. ENTSO-E's wind and solar forecast is usually
     published after it, so that method mainly checks published prices, and sets the estimate only
@@ -3242,7 +3252,8 @@ def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, da
     final = _fit_estimate(known, ESTIMATE_COLUMNS, target)
     # Extra inputs: each is tested on the same days with and without it, on top of what has already earned its place.
     tz = ENTSOE_ZONES[zone]["timezone"]
-    published = entsoe_forecast_days(load_forecast, renewable_forecast, tz)
+    if published is None:
+        published = entsoe_forecast_days(load_forecast, renewable_forecast, tz)
     frame = frame.join(gas_at_auction(gas, frame.index))
     load_fc = published["load_gw"].reindex(frame.index) if not published.empty else pd.Series(np.nan, index=frame.index)
     frame["load_fc"], frame["load_fc_before"] = load_fc, load_fc.shift(1)
@@ -4541,12 +4552,19 @@ def _level(estimate: pd.Series, actual: pd.Series, days: int, limits: tuple) -> 
 
 
 def _fund_score(actual: pd.Series, estimate: pd.Series, rows: pd.Series) -> dict:
-    rows = rows & actual.notna() & estimate.notna()
-    if not rows.any():
+    """Mean absolute miss on the given rows, and that miss as a share of the mean absolute actual.
+    Called over a thousand times per outlook, so it works on the arrays when the series share one index."""
+    if not (actual.index is estimate.index or actual.index.equals(estimate.index)) or not (rows.index is actual.index or rows.index.equals(actual.index)):
+        actual, estimate = actual.align(estimate)
+        rows = rows.reindex(actual.index, fill_value=False)
+    a, e = actual.to_numpy(float), estimate.to_numpy(float)
+    keep = rows.to_numpy(bool) & ~np.isnan(a) & ~np.isnan(e)
+    count = int(keep.sum())
+    if not count:
         return {"n": 0, "mae": np.nan, "share": np.nan}
-    miss = float((actual - estimate)[rows].abs().mean())
-    mean = float(actual[rows].abs().mean())
-    return {"n": int(rows.sum()), "mae": miss, "share": miss / mean if mean > 0 else np.nan}
+    miss = float(np.abs(a[keep] - e[keep]).mean())
+    mean = float(np.abs(a[keep]).mean())
+    return {"n": count, "mae": miss, "share": miss / mean if mean > 0 else np.nan}
 
 
 def _hinges(values, knots: Sequence[float]) -> np.ndarray:
@@ -9882,21 +9900,28 @@ def _demo_paths(rng: np.random.Generator, today: date) -> dict:
     return out
 
 
-def _demo_curve_on(paths: dict, product: str, day: date, months: int = DEMO_CURVE_MONTHS) -> pd.DataFrame:
-    """The product's curve on a day: the anchor-day shape moved by the market's level, near months moving most."""
+def _demo_curve_rows(paths: dict, product: str, day: date, months: int = DEMO_CURVE_MONTHS) -> tuple[list, list]:
+    """The product's curve on a day as (delivery months, prices): the anchor-day shape moved by the market's level,
+    near months moving most."""
     shape = _demo_shapes()[product]
     i = min(int(np.searchsorted(paths["days"], pd.Timestamp(day))), len(paths["days"]) - 1)
     level = float(paths["level"][product][i])
     first = date(day.year, day.month, 1)   # the month in delivery too, as exchanges list it
-    rows = []
+    furthest = shape[max(shape)]
+    month_list, prices = [], []
     for k in range(months):
         month = _add_months(first, k)
         weight = 0.35 + 0.65 * math.exp(-max(k - 1, 0) / 6.0)
-        price = shape.get(month, shape[max(shape)]) * level ** weight
-        rows.append((month, round(price, 3)))
+        month_list.append(month)
+        prices.append(round(shape.get(month, furthest) * level ** weight, 3))
+    return month_list, prices
+
+
+def _demo_curve_on(paths: dict, product: str, day: date, months: int = DEMO_CURVE_MONTHS) -> pd.DataFrame:
+    """The product's curve on a day, as a curve frame."""
+    month_list, prices = _demo_curve_rows(paths, product, day, months)
     spec = CURVE_PRODUCTS[product]
-    return pd.DataFrame({"delivery_month": [r[0] for r in rows], "product": product, "price": [r[1] for r in rows],
-                         "currency": spec["currency"], "unit": spec["unit"]})
+    return pd.DataFrame({"delivery_month": month_list, "product": product, "price": prices, "currency": spec["currency"], "unit": spec["unit"]})
 
 
 def _front_price(paths: dict, product: str, day: date) -> float:
@@ -10580,6 +10605,7 @@ def _demo_records(live: dict, rng: np.random.Generator, today: date) -> tuple[pd
         # Next-day estimates, made two days before delivery with the prices then published.
         series = spot_series(frame(f"entsoe_price|{zone}"), ENTSOE_ZONES[zone]["timezone"])
         vintage = frame("zone_weather_vintage")
+        published = entsoe_forecast_days(frame(f"entsoe_load_forecast|{zone}"), frame(f"entsoe_renewable_forecast|{zone}"), ENTSOE_ZONES[zone]["timezone"])
         for back in range(12, -2, -1):
             target = today - timedelta(days=back)
             made = target - timedelta(days=2)
@@ -10592,7 +10618,7 @@ def _demo_records(live: dict, rng: np.random.Generator, today: date) -> tuple[pd
             gas = frame("tradingview_gas_front")
             try:
                 result = next_day_estimate(zone, known_prices, pd.DataFrame(), pd.DataFrame(), frame(f"entsoe_load_forecast|{zone}"), frame(f"entsoe_renewable_forecast|{zone}"),
-                                           grid_hist, grid_fc, gas.loc[gas["date"] < pd.Timestamp(made)], old)
+                                           grid_hist, grid_fc, gas.loc[gas["date"] < pd.Timestamp(made)], old, published=published)
             except Exception:
                 continue
             if result.get("ready") and result["day"] == target:
@@ -10622,13 +10648,15 @@ def build_demo_desk(path: Path, today: date) -> None:
         store.save_custom_curve(product, curve, {"source_label": "Demo marks", "source_type": "Demo", "curve_date": today.isoformat(), "imported_at_utc": made,
                                                  "full_fetch_day": today.isoformat()})
     # Price history: every working day of the last six months, each day's curve as it stood.
-    rows = []
+    columns = {"snapshot_date": [], "product": [], "delivery_month": [], "price": []}
     for day in pd.bdate_range(today - timedelta(days=190), today).date:
         for product in CURVE_PRODUCTS:
-            curve = _demo_curve_on(paths, product, day)
-            rows.append(pd.DataFrame({"snapshot_date": day.isoformat(), "product": product, "delivery_month": [m.isoformat() for m in curve["delivery_month"]],
-                                      "price": curve["price"], "source": "Demo marks"}))
-    store.add_snapshot_rows(pd.concat(rows, ignore_index=True), replace=True)
+            month_list, prices = _demo_curve_rows(paths, product, day)
+            columns["snapshot_date"] += [day.isoformat()] * len(prices)
+            columns["product"] += [product] * len(prices)
+            columns["delivery_month"] += [m.isoformat() for m in month_list]
+            columns["price"] += prices
+    store.add_snapshot_rows(pd.DataFrame({**columns, "source": "Demo marks"}), replace=True)
     trades = _demo_trades(paths, today)
     store.save_table("trades", trades)
     store.save_table("physical_ops", _demo_ops(trades, today))
@@ -10687,7 +10715,7 @@ def demo_store() -> Optional[DeskStore]:
         try:
             seed = demo_folder() / f"seed_{today.isoformat()}_v{DEMO_VERSION}.db"
             if not seed.is_file():
-                with st.spinner("Building today's demo market. This takes about fifteen seconds, once a day."):
+                with st.spinner("Building today's demo market. This takes about ten seconds, once a day."):
                     seed = demo_seed_path(today)
             else:
                 seed = demo_seed_path(today)
