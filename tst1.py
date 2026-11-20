@@ -1,4 +1,4 @@
-import 
+import n
 
 def portfolio_var(returns, weights, confidence=0.95, n_simulations=10000):
     """
