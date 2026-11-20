@@ -1,8 +1,8 @@
 """Merit Energy Desk: European gas and power trading and risk.
 By Adam El Gbouri.
 
-Run with:   streamlit run etttr.py          (needs Python 3.10+ and: pip install -U streamlit pandas plotly numpy)
-Test with:  pytest etttr.py
+Run with:   streamlit run merit.py          (needs Python 3.10+ and: pip install -U streamlit pandas plotly numpy)
+Test with:  pytest merit.py
 
 Everything is in this one file, in order:
   1 Calculation engine      units, calendars, curves, trades, valuation
@@ -51,7 +51,6 @@ import random
 import shutil
 import sqlite3
 import string
-import textwrap
 import tempfile
 import threading
 import uuid
@@ -125,12 +124,6 @@ def mwh_to_mmbtu(energy_mwh: float) -> float:
     if not math.isfinite(energy_mwh):
         raise ValueError("Energy must be finite.")
     return energy_mwh * MMBTU_PER_MWH
-
-
-def mmbtu_to_mwh(energy_mmbtu: float) -> float:
-    if not math.isfinite(energy_mmbtu):
-        raise ValueError("Energy must be finite.")
-    return energy_mmbtu / MMBTU_PER_MWH
 
 
 def price_eur_mwh_to_gbp_therm(price_eur_mwh: float, eur_per_gbp: float) -> float:
@@ -2369,6 +2362,7 @@ TRACK_MIN_INDEPENDENT = 20
 CALL_THRESHOLD = 0.15
 SIGNAL_THRESHOLD = 0.10
 REPLAY_LOOKBACK_DAYS = 40
+REPLAY_DAYS = 400
 MARKET_ZONES = {"French power": "France", "German power": "Germany-Luxembourg", "Dutch power": "Netherlands",
                 "Belgian power": "Belgium", "Spanish power": "Spain", "British power": "Great Britain"}
 REAL_MARK_EXCLUSIONS = ("Demo marks", "Part real marks", SYNTHETIC_HISTORY_SOURCE)
@@ -2537,7 +2531,7 @@ def replay_power_reads(market: str, zone: str, prices: pd.DataFrame, load: pd.Da
             frame = frame.assign(timestamp=frame["timestamp"].dt.floor("h")).groupby(["timestamp", "series"], as_index=False)["value"].mean()
         frames.append((frame, frame["timestamp"]))
     rows = []
-    for day in days[28:-1]:
+    for day in days[max(28, len(days) - REPLAY_DAYS):-1]:   # the price test holds four years: reads replay the last one
         if day.weekday() >= 5 or (day.isoformat(), market) in skip or day >= today:
             continue
         end = pd.Timestamp(day + timedelta(days=1), tz=tz).tz_convert("UTC")
@@ -2867,27 +2861,8 @@ def outlook_signal(outlook: Optional[dict]) -> Optional[dict]:
 
 
 # -----------------------------------------------------------------------------
-# Next-day power price estimate
+# Calendars and weather points shared by the price forecast and the fundamentals outlook
 # -----------------------------------------------------------------------------
-ESTIMATE_TRAIN_DAYS = 365
-ESTIMATE_HALF_LIFE_DAYS = 120          # recent days count more: a day 120 days back weighs half as much
-ESTIMATE_MIN_DAYS = 60
-ESTIMATE_TEST_DAYS = 180
-ESTIMATE_REFIT_EVERY = 5
-ESTIMATE_RANGE = (0.1, 0.9)            # an 80% range
-ESTIMATE_RANGE_HALF_LIFE_DAYS = 10     # how fast the range follows recent accuracy
-ESTIMATE_RANGE_MIN_ERRORS = 30
-CALENDAR_COLUMNS = ("same", "work", "lag1", "avg7", "lag7", "saturday", "sunday", "after_off")
-WEATHER_COLUMNS = ("hdd", "wind", "solar", "hdd_before", "wind_before", "solar_before")
-ESTIMATE_COLUMNS = CALENDAR_COLUMNS + WEATHER_COLUMNS
-FORECAST_COLUMNS = CALENDAR_COLUMNS + ("load_gw", "wind_gw", "solar_gw")
-GAS_COLUMNS = ("gas", "gas_before")
-GAS_MIN_GAIN = 0.02                    # an extra input is used only when it cuts the tested average miss by at least 2%, so noise can't win by luck
-COOLING_BASE_C = 21.0                  # daily mean temperature above which cooling demand starts
-COOLING_MIN_DAYS = 15                  # cooling is only tested once the history holds this many warm days
-# Extra inputs, each tested on the user's own history and added only when it clearly helps.
-EXTRA_INPUTS = (("gas", "the TTF front-month price", GAS_COLUMNS), ("load", "ENTSO-E's load forecast", ("load_fc", "load_fc_before")),
-                ("cooling", "cooling demand on hot days", ("cdd", "cdd_before")))
 # Points spread across each zone, latitude and longitude. Wind in one city says little about a whole
 # country's wind output: on real German prices and forecasts, a dozen points cut the average miss by about a sixth.
 ZONE_WEATHER_POINTS = {
@@ -2952,377 +2927,6 @@ def daily_base_prices(series: pd.DataFrame) -> pd.Series:
     hours = grouped["hours"].sum()
     # Judged by hours covered, so a change of resolution can't hide a whole period.
     return (grouped["weighted"].sum() / hours).loc[hours >= 19.0].sort_index()
-
-
-def power_weather(history: pd.DataFrame, daily: pd.DataFrame, location: str) -> pd.DataFrame:
-    """Heating demand, wind and solar by day for one city. Recent and forecast days replace the archive."""
-    names = {"temperature_mean_c": "temperature", "wind_speed_100m_mean_kmh": "wind", "solar_radiation_mean_wm2": "solar"}
-    frames = []
-    for frame in (history, daily):
-        if frame is not None and not frame.empty and {"date", "location", *names}.issubset(frame.columns):
-            part = frame.loc[frame["location"].eq(location), ["date", *names]].rename(columns=names)
-            part = part.assign(date=pd.to_datetime(part["date"], errors="coerce")).dropna(subset=["date"])
-            frames.append(part)
-    if not frames:
-        return pd.DataFrame(columns=["hdd", "wind", "solar"])
-    joined = pd.concat(frames, ignore_index=True).drop_duplicates("date", keep="last").set_index("date").sort_index().astype(float)
-    return pd.DataFrame({"hdd": (18.0 - joined["temperature"]).clip(lower=0), "wind": joined["wind"], "solar": joined["solar"],
-                         "cdd": (joined["temperature"] - COOLING_BASE_C).clip(lower=0)})
-
-
-def zone_weather(history: pd.DataFrame, forecast: pd.DataFrame, zone: str, vintage: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    """Heating demand, wind, solar and cooling demand by day, averaged over the zone's points.
-
-    Forecast days replace the archive. For past days, a forecast kept from the day before replaces what
-    happened, so the estimate is fitted and tested on what was known at the auction. Those days are marked kept.
-    """
-    needed = ["date", "hdd", "wind", "solar"]
-    usable = lambda f: f is not None and not f.empty and {"zone", *needed}.issubset(f.columns)
-    frames = [f.loc[f["zone"].eq(zone), needed + (["temperature"] if "temperature" in f.columns else [])] for f in (history, forecast) if usable(f)]
-    if not frames:
-        return pd.DataFrame(columns=["hdd", "wind", "solar"])
-    tidy = lambda f: f.assign(date=pd.to_datetime(f["date"], errors="coerce")).dropna(subset=["date"]).drop_duplicates("date", keep="last").set_index("date").sort_index().astype(float)
-    joined = tidy(pd.concat(frames, ignore_index=True)).assign(kept=0.0)
-    if usable(vintage):
-        saved = tidy(vintage.loc[vintage["zone"].eq(zone), [c for c in joined.columns if c in vintage.columns] + ["date"]]).assign(kept=1.0)
-        saved = saved.loc[saved.index.isin(joined.index)]
-        joined.loc[saved.index, saved.columns] = saved
-    if "temperature" in joined.columns:
-        joined["cdd"] = (joined.pop("temperature") - COOLING_BASE_C).clip(lower=0)
-    return joined
-
-
-WEATHER_VINTAGE_DAYS = 800
-
-
-def keep_weather_vintage(held: Optional[pd.DataFrame], forecast: pd.DataFrame, now_utc: datetime) -> Optional[pd.DataFrame]:
-    """Keep tomorrow's forecast as it stands today, by zone, so later tests can use what was known at the auction.
-
-    A forecast fetched before noon local time, when the auction closes, is never replaced by a later one.
-    """
-    if forecast is None or forecast.empty:
-        return None
-    rows = []
-    for zone, part in forecast.groupby("zone"):
-        local = now_utc.astimezone(ZoneInfo(ENTSOE_ZONES[zone]["timezone"]))
-        tomorrow = part.loc[pd.to_datetime(part["date"]).dt.date.eq(local.date() + timedelta(days=1))]
-        if not tomorrow.empty:
-            rows.append(tomorrow.assign(made_at=now_utc.isoformat(timespec="seconds"), before_auction=local.hour < 12))
-    if not rows:
-        return held
-    new = pd.concat(rows, ignore_index=True)
-    new["date"] = pd.to_datetime(new["date"])
-    if held is None or held.empty:
-        return new
-    held = held.assign(date=pd.to_datetime(held["date"]))
-    locked = held.loc[held["before_auction"].astype(bool)].merge(new.loc[~new["before_auction"], ["zone", "date"]], on=["zone", "date"])
-    new = new.merge(locked[["zone", "date"]].assign(_locked=True), on=["zone", "date"], how="left")
-    new = new.loc[new["_locked"].isna()].drop(columns="_locked")
-    merged = pd.concat([held, new], ignore_index=True).drop_duplicates(["zone", "date"], keep="last").sort_values(["zone", "date"])
-    return merged.loc[merged["date"] >= merged["date"].max() - pd.Timedelta(days=WEATHER_VINTAGE_DAYS)].reset_index(drop=True)
-
-
-def estimate_features(base: pd.Series, weather: pd.DataFrame, last_day: pd.Timestamp, zone: str = "") -> pd.DataFrame:
-    """One row per delivery day. Prices come only from earlier days, as at auction time.
-
-    same is the latest earlier day of the same kind (working day, Saturday, Sunday or holiday), and work the
-    latest earlier working day, so a Monday starts from Friday rather than from a quiet Sunday.
-    """
-    days = pd.date_range(base.index.min(), last_day, freq="D")
-    prices = base.reindex(days)
-    values, classes = prices.to_numpy(float), day_classes(days, zone)
-    same, work, latest = np.full(len(days), np.nan), np.full(len(days), np.nan), [np.nan, np.nan, np.nan]
-    for i, kind in enumerate(classes):
-        same[i], work[i] = latest[kind], latest[0]
-        if not np.isnan(values[i]):
-            latest[kind] = values[i]
-    frame = pd.DataFrame({"base": prices, "same": same, "work": work, "lag1": prices.shift(1),
-                          "avg7": prices.shift(1).rolling(7, min_periods=5).mean(), "lag7": prices.shift(7)}, index=days)
-    frame["saturday"], frame["sunday"] = (classes == 1).astype(float), (classes == 2).astype(float)
-    frame["after_off"] = ((classes == 0) & (np.r_[0, classes[:-1]] == 2)).astype(float)
-    weather = weather.reindex(days) if weather is not None and not weather.empty else pd.DataFrame(index=days)
-    for column in ("hdd", "wind", "solar", "cdd"):
-        frame[column] = weather[column] if column in weather.columns else np.nan
-        # The day before's weather explains part of the day before's price, which the fit starts from.
-        frame[f"{column}_before"] = frame[column].shift(1)
-    return frame
-
-
-def gas_at_auction(gas: Optional[pd.DataFrame], days: pd.DatetimeIndex) -> pd.DataFrame:
-    """Front-month TTF as known at each delivery day's auction: the last close two days or more before delivery,
-    since the auction runs at noon the day before. gas_before is the same for the previous delivery day."""
-    if gas is None or gas.empty or not {"date", "close"}.issubset(gas.columns):
-        return pd.DataFrame({"gas": np.nan, "gas_before": np.nan}, index=days)
-    closes = gas.assign(date=pd.to_datetime(gas["date"]).dt.tz_localize(None).dt.normalize()).dropna(subset=["close"]).sort_values("date")
-    closes = closes.drop_duplicates("date", keep="last")[["date", "close"]]
-    asked = pd.DataFrame({"cutoff": days - pd.Timedelta(days=2)}).sort_values("cutoff")
-    matched = pd.merge_asof(asked, closes, left_on="cutoff", right_on="date", direction="backward")
-    known = pd.Series(matched["close"].to_numpy(float), index=days)
-    # A close more than a week before isn't what the market knew at the auction.
-    stale = (asked["cutoff"].to_numpy() - matched["date"].to_numpy()) > np.timedelta64(7, "D")
-    known[stale] = np.nan
-    return pd.DataFrame({"gas": known, "gas_before": known.shift(1)}, index=days)
-
-
-def entsoe_forecast_days(load_forecast: pd.DataFrame, renewable_forecast: pd.DataFrame, tz: str) -> pd.DataFrame:
-    """ENTSO-E's day-ahead forecasts by delivery day, in GW. A day needs at least 20 hours to count."""
-    columns = ["load_gw", "wind_gw", "solar_gw"]
-    needed = {"timestamp", "value"}
-    if load_forecast is None or load_forecast.empty or renewable_forecast is None or renewable_forecast.empty or not needed.issubset(load_forecast.columns) or not {"series", *needed}.issubset(renewable_forecast.columns):
-        return pd.DataFrame(columns=columns)
-
-    def daily(frame: pd.DataFrame) -> pd.Series:
-        hours = pd.to_datetime(frame["timestamp"], errors="coerce", utc=True).dt.floor("h")
-        parts = pd.DataFrame({"hour": hours, "series": frame["series"].astype(str) if "series" in frame.columns else "x", "mw": _number_series(frame["value"])}).dropna()
-        if parts.empty:
-            return pd.Series(dtype=float)
-        total = parts.groupby(["hour", "series"], as_index=False)["mw"].mean().groupby("hour")["mw"].sum()
-        days = pd.DatetimeIndex(total.index).tz_convert(tz).tz_localize(None).normalize()
-        grouped = total.groupby(days)
-        return (grouped.mean() / 1000.0).loc[grouped.count() >= 20]
-
-    labels = renewable_forecast["series"].astype(str).str.casefold()
-    wind, solar = daily(renewable_forecast.loc[labels.str.contains("wind")]), daily(renewable_forecast.loc[labels.str.contains("solar")])
-    table_ = pd.DataFrame({"load_gw": daily(load_forecast), "wind_gw": wind, "solar_gw": solar})
-    # A zone that publishes no solar or wind forecast at all has none to count.
-    for column, series in (("wind_gw", wind), ("solar_gw", solar)):
-        if series.empty:
-            table_[column] = 0.0
-    return table_
-
-
-def _weighted_beta(features: np.ndarray, target: np.ndarray, ages: np.ndarray) -> np.ndarray:
-    """Least squares where a day ESTIMATE_HALF_LIFE_DAYS older counts half as much."""
-    root = np.sqrt(0.5 ** (ages / ESTIMATE_HALF_LIFE_DAYS))
-    return np.linalg.lstsq(features * root[:, None], target * root, rcond=None)[0]
-
-
-def _design(frame: pd.DataFrame, columns: Sequence[str]) -> np.ndarray:
-    return np.column_stack([np.ones(len(frame)), frame[list(columns)].to_numpy(float)])
-
-
-def _fit_estimate(frame: pd.DataFrame, columns: Sequence[str] = ESTIMATE_COLUMNS, as_of: Optional[pd.Timestamp] = None) -> np.ndarray:
-    as_of = as_of if as_of is not None else frame.index.max() + pd.Timedelta(days=1)
-    kept = frame.loc[frame.index >= as_of - pd.Timedelta(days=ESTIMATE_TRAIN_DAYS)]
-    return _weighted_beta(_design(kept, columns), kept["base"].to_numpy(float), (as_of - kept.index).days.to_numpy(float))
-
-
-def _apply_estimate(beta: np.ndarray, frame: pd.DataFrame, columns: Sequence[str] = ESTIMATE_COLUMNS) -> np.ndarray:
-    return _design(frame, columns) @ beta
-
-
-def _walk_forward(known: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
-    """Estimate each past day from earlier days only, refitting regularly."""
-    first = max(ESTIMATE_MIN_DAYS, len(known) - ESTIMATE_TEST_DAYS)
-    features, target = _design(known, columns), known["base"].to_numpy(float)
-    day_number = ((known.index - known.index[0]).days).to_numpy(float)
-    estimates = np.empty(max(len(known) - first, 0))
-    # Refit every few days on earlier days only, then apply that fit to the next block in one step.
-    for block_start in range(first, len(known), ESTIMATE_REFIT_EVERY):
-        train = np.flatnonzero((day_number < day_number[block_start]) & (day_number >= day_number[block_start] - ESTIMATE_TRAIN_DAYS))
-        beta = _weighted_beta(features[train], target[train], day_number[block_start] - day_number[train])
-        block = slice(block_start, min(block_start + ESTIMATE_REFIT_EVERY, len(known)))
-        estimates[block.start - first:block.stop - first] = features[block] @ beta
-    test = known.iloc[first:]
-    return pd.DataFrame({"day": test.index, "actual": target[first:], "estimate": estimates, "same_type": test["same"].to_numpy(float),
-                         "last_week": test["lag7"].to_numpy(float), "yesterday": test["lag1"].to_numpy(float)})
-
-
-def estimate_range(errors: np.ndarray) -> dict:
-    """An 80% range for the next day from past misses, widened or narrowed by how accurate recent days were.
-
-    Misses are divided by the recent typical miss before taking quantiles, so a calm spell gives a narrower
-    range and a volatile one a wider range. held is the share of tested days whose price landed inside the
-    range built only from earlier days.
-    """
-    errors = np.asarray(errors, float)
-    scale = pd.Series(np.abs(errors)).ewm(halflife=ESTIMATE_RANGE_HALF_LIFE_DAYS, min_periods=5).mean()
-    before = scale.shift(1).to_numpy()
-    scaled = errors / before
-    usable = ~np.isnan(scaled)
-    low_q, high_q = ESTIMATE_RANGE
-    if usable.sum() < ESTIMATE_RANGE_MIN_ERRORS:
-        return {"low": float(np.quantile(errors, low_q)), "high": float(np.quantile(errors, high_q)), "held": None, "held_days": 0, "adaptive": False}
-    now = float(scale.iloc[-1])
-    hits = []
-    compact = scaled[usable]          # the usable misses in order: those before the k-th are compact[:k], a view, not a copy
-    for k, i in enumerate(np.flatnonzero(usable)):
-        past = compact[:k]
-        if len(past) >= ESTIMATE_RANGE_MIN_ERRORS:
-            low, high = np.quantile(past, [low_q, high_q]) * before[i]
-            hits.append(low <= errors[i] <= high)
-    low, high = np.quantile(scaled[usable], [low_q, high_q]) * now
-    return {"low": float(low), "high": float(high), "held": float(np.mean(hits)) if hits else None, "held_days": len(hits), "adaptive": True}
-
-
-PROBABILITY_LEVELS = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
-
-
-def _pinball(levels: np.ndarray, predicted: np.ndarray, actual: float) -> float:
-    """The standard score for a set of quantiles: lower is better, and it rewards being both sharp and right."""
-    gap = actual - predicted
-    return float(np.where(gap >= 0, levels * gap, (levels - 1.0) * gap).mean())
-
-
-def estimate_distribution(errors: np.ndarray, simple_errors: Optional[np.ndarray] = None) -> Optional[dict]:
-    """The whole spread of likely misses for the next day, not only an 80% range.
-
-    Built like estimate_range: past misses divided by the recent typical miss, then scaled back by today's.
-    On real German prices this scored better and was better calibrated than quantile regression.
-    Each tested day is scored against quantiles built only from earlier days. simple_errors are the misses
-    of the simple method, scored the same way as the yardstick.
-    """
-    levels = np.array(PROBABILITY_LEVELS)
-
-    def build(values: np.ndarray) -> Optional[dict]:
-        values = np.asarray(values, float)
-        scale = pd.Series(np.abs(values)).ewm(halflife=ESTIMATE_RANGE_HALF_LIFE_DAYS, min_periods=5).mean()
-        before = scale.shift(1).to_numpy()
-        scaled = values / before
-        usable = ~np.isnan(scaled)
-        if usable.sum() < ESTIMATE_RANGE_MIN_ERRORS:
-            return None
-        scores, below = [], []
-        compact = scaled[usable]
-        for k, i in enumerate(np.flatnonzero(usable)):
-            past = compact[:k]
-            if len(past) >= ESTIMATE_RANGE_MIN_ERRORS:
-                predicted = np.quantile(past, levels) * before[i]
-                scores.append(_pinball(levels, predicted, values[i]))
-                below.append(values[i] <= predicted)
-        if not scores:
-            return None
-        return {"offsets": np.sort(scaled[usable]) * float(scale.iloc[-1]), "score": float(np.mean(scores)), "days": len(scores),
-                "below": np.mean(below, axis=0)}
-
-    own = build(errors)
-    if own is None:
-        return None
-    simple = build(simple_errors) if simple_errors is not None else None
-    return {"offsets": own["offsets"], "levels": levels, "quantiles": np.quantile(own["offsets"], levels), "score": own["score"], "days": own["days"],
-            "below": own["below"], "simple_score": simple["score"] if simple else None}
-
-
-def chance_above(distribution: dict, estimate: float, level: float) -> float:
-    """Share of the likely outcomes above a price level."""
-    return float(np.mean(estimate + distribution["offsets"] > level))
-
-
-def _weather_for_estimate(zone: str, history: pd.DataFrame, daily: pd.DataFrame, grid_history: Optional[pd.DataFrame], grid_forecast: Optional[pd.DataFrame],
-                          target: pd.Timestamp, vintage: Optional[pd.DataFrame] = None) -> tuple[pd.DataFrame, str]:
-    """Weather across the zone's points when held, otherwise the one reference city."""
-    location = ZONE_WEATHER.get(zone)
-    options = []
-    if zone in ZONE_WEATHER_POINTS:
-        options.append((zone_weather(grid_history, grid_forecast, zone, vintage), f"{len(ZONE_WEATHER_POINTS[zone])} points across the zone"))
-    if location:
-        options.append((power_weather(history, daily, location), location.split(" / ")[0]))
-    enough = [(w, name) for w, name in options if not w.empty and w["wind"].notna().sum() >= ESTIMATE_MIN_DAYS]
-    ready = [(w, name) for w, name in enough if target in w.index and not w.loc[[target], ["hdd", "wind", "solar"]].isna().any(axis=None)]
-    return (ready or enough or [(pd.DataFrame(columns=["hdd", "wind", "solar"]), "")])[0]
-
-
-def next_day_estimate(zone: str, series: pd.DataFrame, history: pd.DataFrame, daily: pd.DataFrame,
-                      load_forecast: Optional[pd.DataFrame] = None, renewable_forecast: Optional[pd.DataFrame] = None,
-                      grid_history: Optional[pd.DataFrame] = None, grid_forecast: Optional[pd.DataFrame] = None,
-                      gas: Optional[pd.DataFrame] = None, weather_vintage: Optional[pd.DataFrame] = None,
-                      published: Optional[pd.DataFrame] = None) -> dict:
-    """Estimate the next unpublished delivery day, and test the methods one day at a time.
-
-    published is entsoe_forecast_days of the two forecasts, for callers that estimate many days from the same ones.
-
-    The weather method can run before the auction. ENTSO-E's wind and solar forecast is usually
-    published after it, so that method mainly checks published prices, and sets the estimate only
-    when the forecast for the target day already exists and it has tested at least as well.
-    """
-    base = daily_base_prices(series)
-    if zone not in ZONE_WEATHER or len(base) < ESTIMATE_MIN_DAYS + 20:
-        return {"ready": False, "reason": f"This needs at least {ESTIMATE_MIN_DAYS + 20} days of day-ahead prices. Select Update market data."}
-    target = base.index[-1] + pd.Timedelta(days=1)
-    weather, basis = _weather_for_estimate(zone, history, daily, grid_history, grid_forecast, target, weather_vintage)
-    if weather.empty:
-        return {"ready": False, "reason": "This needs the wind and solar history. Select Update market data."}
-    frame = estimate_features(base, weather, target, zone)
-    known = frame.iloc[:-1].dropna(subset=["base", *ESTIMATE_COLUMNS])
-    ahead = frame.iloc[[-1]]
-    weather_ready = not ahead[list(ESTIMATE_COLUMNS)].isna().any(axis=None)
-    if len(known) < ESTIMATE_MIN_DAYS + 10:
-        return {"ready": False, "reason": "Prices and weather overlap on too few days so far."}
-    test = _walk_forward(known, ESTIMATE_COLUMNS)
-    final = _fit_estimate(known, ESTIMATE_COLUMNS, target)
-    # Extra inputs: each is tested on the same days with and without it, on top of what has already earned its place.
-    tz = ENTSOE_ZONES[zone]["timezone"]
-    if published is None:
-        published = entsoe_forecast_days(load_forecast, renewable_forecast, tz)
-    frame = frame.join(gas_at_auction(gas, frame.index))
-    load_fc = published["load_gw"].reindex(frame.index) if not published.empty else pd.Series(np.nan, index=frame.index)
-    frame["load_fc"], frame["load_fc_before"] = load_fc, load_fc.shift(1)
-    weather_columns, extras = ESTIMATE_COLUMNS, {}
-    for name, label, columns in EXTRA_INPUTS:
-        candidate = weather_columns + columns
-        with_known = frame.iloc[:-1].dropna(subset=["base", *candidate])
-        if len(with_known) < ESTIMATE_MIN_DAYS + 30 or (name == "cooling" and int((with_known["cdd"] > 0).sum()) < COOLING_MIN_DAYS):
-            continue
-        with_test = _walk_forward(with_known, candidate)
-        shared = test.merge(with_test[["day", "estimate"]].rename(columns={"estimate": "with_input"}), on="day")
-        if len(shared) < 30:
-            continue
-        without, with_input = float((shared["actual"] - shared["estimate"]).abs().mean()), float((shared["actual"] - shared["with_input"]).abs().mean())
-        ready = not frame.iloc[[-1]][list(columns)].isna().any(axis=None)
-        extras[name] = {"label": label, "days": len(shared), "without": without, "with": with_input, "ready": ready, "effect": None,
-                        "used": ready and with_input <= (1.0 - GAS_MIN_GAIN) * without}
-        if extras[name]["used"]:
-            weather_columns, test = candidate, with_test
-            final = _fit_estimate(with_known, weather_columns, target)
-            extras[name]["effect"] = float(final[weather_columns.index(columns[0]) + 1])
-    gas_check = extras.get("gas")
-    ahead = frame.iloc[[-1]]
-
-    forecast_frame = frame[["base", *CALENDAR_COLUMNS]].join(published.reindex(frame.index)) if not published.empty else None
-    forecast_known = forecast_frame.iloc[:-1].dropna() if forecast_frame is not None else pd.DataFrame()
-    forecast_test, forecast_final = pd.DataFrame(), None
-    if len(forecast_known) >= ESTIMATE_MIN_DAYS + 30:
-        forecast_test = _walk_forward(forecast_known, FORECAST_COLUMNS)
-        forecast_final = _fit_estimate(forecast_known, FORECAST_COLUMNS, target)
-    comparison = None
-    if not forecast_test.empty:
-        shared = test.merge(forecast_test[["day", "estimate"]].rename(columns={"estimate": "forecast_estimate"}), on="day")
-        if len(shared) >= 20:
-            miss = lambda column: float((shared["actual"] - shared[column]).abs().mean())
-            comparison = {"days": len(shared), "weather": miss("estimate"), "forecasts": miss("forecast_estimate"),
-                          "same_type": miss("same_type"), "last_week": miss("last_week"), "yesterday": miss("yesterday")}
-    target_has_forecast = forecast_final is not None and not forecast_frame.iloc[[-1]][list(FORECAST_COLUMNS)].isna().any(axis=None)
-    use_forecasts = target_has_forecast and comparison is not None and comparison["forecasts"] <= comparison["weather"]
-    if not use_forecasts and not weather_ready:
-        return {"ready": False, "reason": f"There's no weather forecast for {target:%d %b}. Select Update market data."}
-    chosen = forecast_test if use_forecasts else test
-    errors = (chosen["actual"] - chosen["estimate"]).to_numpy(float)
-    value = float(_apply_estimate(forecast_final, forecast_frame.iloc[[-1]], FORECAST_COLUMNS)[0]) if use_forecasts else float(_apply_estimate(final, ahead, weather_columns)[0])
-    spread = estimate_range(errors)
-    distribution = estimate_distribution(errors, (chosen["actual"] - chosen["same_type"]).to_numpy(float))
-    # Judge the latest published price with ENTSO-E's forecasts when they exist for that day.
-    checker = forecast_test if not forecast_test.empty and forecast_test["day"].iloc[-1] == base.index[-1] else test
-    latest = checker.iloc[-1]
-    gap = float(latest["actual"] - latest["estimate"])
-    check_errors = (checker["actual"] - checker["estimate"]).abs()
-    miss = lambda column: float((chosen["actual"] - chosen[column]).abs().mean())
-    result = {"ready": True, "reason": "", "zone": zone, "day": target.date(), "estimate": value, "method": "ENTSO-E forecasts" if use_forecasts else "Weather",
-              "weather_basis": basis, "low": value + spread["low"], "high": value + spread["high"], "held": spread["held"], "held_days": spread["held_days"],
-              "adaptive_range": spread["adaptive"], "test": chosen, "n": len(chosen), "error": float(np.abs(errors).mean()),
-              "error_same_type": miss("same_type"), "error_last_week": miss("last_week"), "error_yesterday": miss("yesterday"),
-              "recent_error": float(np.abs(errors[-30:]).mean()),
-              "latest_day": latest["day"].date(), "latest_actual": float(latest["actual"]), "latest_estimate": float(latest["estimate"]),
-              "latest_gap": gap, "unusual": abs(gap) > float(check_errors.quantile(0.9)), "check_method": "ENTSO-E forecasts" if checker is forecast_test else "Weather",
-              "comparison": comparison, "target_has_forecast": target_has_forecast, "forecast_days": int(published.dropna().shape[0]),
-              "wind_effect": float(final[ESTIMATE_COLUMNS.index("wind") + 1]), "hdd_effect": float(final[ESTIMATE_COLUMNS.index("hdd") + 1]),
-              "solar_effect": float(final[ESTIMATE_COLUMNS.index("solar") + 1]), "forecast_effects": None, "gas": gas_check, "extras": extras, "distribution": distribution,
-              "kept_forecast_days": int(weather["kept"].reindex(pd.DatetimeIndex(chosen["day"])).fillna(0).sum()) if "kept" in weather.columns and not use_forecasts else 0}
-    best_simple = min(result["error_same_type"], result["error_last_week"], result["error_yesterday"])
-    result["skill"] = 1.0 - result["error"] / best_simple if best_simple > 0 else 0.0
-    if forecast_final is not None:
-        result["forecast_effects"] = {"load": float(forecast_final[FORECAST_COLUMNS.index("load_gw") + 1]), "wind": float(forecast_final[FORECAST_COLUMNS.index("wind_gw") + 1]),
-                                      "solar": float(forecast_final[FORECAST_COLUMNS.index("solar_gw") + 1])}
-    return result
 
 
 def score_recorded_estimates(log: pd.DataFrame, base: pd.Series) -> dict:
@@ -3534,89 +3138,6 @@ def _excel_engine(content: bytes) -> Optional[str]:
 def _pdf_text(text: object) -> bytes:
     raw = str(text).replace("−", "-").replace("–", "-").replace("—", "-").encode("cp1252", "replace")
     return raw.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
-
-
-def simple_pdf(blocks: Sequence[tuple], title: str = "") -> bytes:
-    """Build an A4 PDF from (kind, content) blocks: title, subtitle, heading, text, note, table."""
-    width, height, margin = 595, 842, 48
-    usable = width - 2 * margin
-    pages: list[list[bytes]] = [[]]
-    y = height - margin
-
-    def line(text: object, size: float, bold: bool = False, x: float = margin, color: str = "0.10 0.17 0.20") -> None:
-        pages[-1].append(b"BT /F%d %s Tf %s rg %s %s Td (" % (2 if bold else 1, str(size).encode(), color.encode(), str(x).encode(), f"{y:.1f}".encode()) + _pdf_text(text) + b") Tj ET\n")
-
-    def room(needed: float) -> None:
-        nonlocal y
-        if y - needed < margin:
-            pages.append([])
-            y = height - margin
-
-    def wrapped(text: str, size: float, bold: bool = False, color: str = "0.10 0.17 0.20", gap: float = 1.35) -> None:
-        nonlocal y
-        for piece in textwrap.wrap(str(text), max(int(usable / (size * 0.50)), 10)) or [""]:
-            room(size * gap)
-            y -= size * gap
-            line(piece, size, bold, color=color)
-
-    for kind, content in blocks:
-        if kind == "title":
-            wrapped(content, 20, True, "0.05 0.25 0.30")
-            y -= 2
-        elif kind == "subtitle":
-            wrapped(content, 10, False, "0.35 0.42 0.45")
-            y -= 6
-        elif kind == "heading":
-            room(44)
-            y -= 10
-            wrapped(content, 12, True, "0.05 0.25 0.30")
-            y -= 3
-            pages[-1].append(b"0.75 0.82 0.84 RG 0.6 w %d %.1f m %d %.1f l S\n" % (margin, y, width - margin, y))
-            y -= 2
-        elif kind == "text":
-            wrapped(content, 10)
-            y -= 3
-        elif kind == "note":
-            wrapped(content, 8.5, False, "0.35 0.42 0.45")
-            y -= 2
-        elif kind == "table":
-            columns, rows, shares = content
-            offsets = [margin + usable * sum(shares[:i]) for i in range(len(shares))]
-            for index, row in enumerate([columns] + [list(r) for r in rows]):
-                cells = [textwrap.wrap(str(cell), max(int(usable * share / (9 * 0.50)) - 1, 4)) or [""] for cell, share in zip(row, shares)]
-                depth = max(len(c) for c in cells)
-                room(depth * 12.5 + 3)
-                top = y
-                for depth_index in range(depth):
-                    y = top - 12.5 * (depth_index + 1)
-                    for cell, offset in zip(cells, offsets):
-                        if depth_index < len(cell):
-                            line(cell[depth_index], 9, index == 0, x=round(offset, 1), color="0.05 0.25 0.30" if index == 0 else "0.10 0.17 0.20")
-                y -= 3
-                pages[-1].append(b"0.88 0.91 0.92 RG 0.4 w %d %.1f m %d %.1f l S\n" % (margin, y, width - margin, y))
-            y -= 6
-    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", None, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
-               b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>", b"<< /Title (" + _pdf_text(title) + b") /Author (" + _pdf_text(AUTHOR) + b") >>"]
-    kids = []
-    for number, commands in enumerate(pages, start=1):
-        footer = b"BT /F1 8 Tf 0.45 0.50 0.52 rg %d 28 Td (" % margin + _pdf_text(f"Page {number} of {len(pages)}") + b") Tj ET\n"
-        stream = b"".join(commands) + footer
-        objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"endstream")
-        content_id = len(objects)
-        objects.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents %d 0 R >>" % (width, height, content_id))
-        kids.append(len(objects))
-    objects[1] = b"<< /Type /Pages /Count %d /Kids [" % len(kids) + b" ".join(b"%d 0 R" % k for k in kids) + b"] >>"
-    output = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-    offsets = []
-    for number, body in enumerate(objects, start=1):
-        offsets.append(len(output))
-        output += b"%d 0 obj\n" % number + body + b"\nendobj\n"
-    start = len(output)
-    output += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
-    for offset in offsets:
-        output += b"%010d 00000 n \n" % offset
-    output += b"trailer\n<< /Size %d /Root 1 0 R /Info 5 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, start)
-    return bytes(output)
 
 
 # Helvetica advance widths (per 1000 em) for ASCII 32-126, regular then bold. Anything else counts as 556.
@@ -4009,12 +3530,12 @@ def parse_eua_auctions(content: bytes) -> pd.DataFrame:
     return out.groupby(out["date"].dt.date, as_index=False)["price"].mean().rename(columns={"date": "date"}).sort_values("date").reset_index(drop=True)
 
 
-def fetch_eua_auctions(today: Optional[date] = None, _http_fn=None) -> pd.DataFrame:
-    """EEX's public EUA primary auction results for this year, and last year's in January."""
+def fetch_eua_auctions(today: Optional[date] = None, _http_fn=None, first_year: Optional[int] = None) -> pd.DataFrame:
+    """EEX's public EUA primary auction results for this year, and last year's in January, or every year from first_year."""
     today = today or date.today()
     get = _http_fn or _http_get_bytes
     frames, errors = [], []
-    for year in ([today.year, today.year - 1] if today.month == 1 else [today.year]):
+    for year in (range(first_year, today.year + 1) if first_year else [today.year, today.year - 1] if today.month == 1 else [today.year]):
         try:
             content, _ = get(EUA_AUCTION_URL.format(year=year))
             frames.append(parse_eua_auctions(content))
@@ -5022,6 +4543,273 @@ def score_outlook_record(record: Optional[pd.DataFrame], table: pd.DataFrame, zo
 
 
 # =============================================================================
+# SECTION 2H · DAY-AHEAD PRICE FORECAST: AN HONEST TEST
+# Each delivery day is forecast from what its auction could see at noon the day before: prices up to that day and
+# forecasts published for the delivery day. Every model is refitted at every day (rolling origin). TEST is the 52
+# weeks to EPF_TEST_END, frozen on 20 Nov 2026 and sealed until the models are final: nothing is chosen on it.
+# Models are chosen on the 52 weeks before it, VALIDATION. Days after TEST are the live record. Prices go negative,
+# so there is no MAPE.
+# =============================================================================
+EPF_TEST_START, EPF_TEST_END = pd.Timestamp("2025-11-17"), pd.Timestamp("2026-11-16")
+EPF_VALID_START = EPF_TEST_START - pd.Timedelta(weeks=52)
+EPF_TEST_SEALED = False         # opened once, on 21 Nov 2026, after the models were final
+EPF_HISTORY_DAYS = 1480         # two years before VALIDATION, for the longest calibration window
+EPF_LEVELS = np.array([0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95])
+EPF_RESIDUAL_DAYS = 182         # a point forecast's quantiles come from its misses over this many earlier days
+
+
+def epf_period(days: pd.DatetimeIndex) -> np.ndarray:
+    return np.select([days < EPF_VALID_START, days < EPF_TEST_START, days < EPF_TEST_END], ["Warm-up", "Validation", "Test"], "Live")
+
+
+def hourly_matrix(series: pd.DataFrame) -> pd.DataFrame:
+    """Day-ahead prices as one row per local delivery day and 24 hourly columns, quarter-hours averaged. The hour
+    skipped in spring repeats the one before; the doubled autumn hour is averaged. A day needs 20 hours to count."""
+    if series is None or series.empty:
+        return pd.DataFrame(columns=range(24), dtype=float)
+    wall = series["local"].dt.tz_localize(None)
+    table = series["value"].groupby([wall.dt.normalize().rename("day"), wall.dt.hour.rename("hour")]).mean().unstack().reindex(columns=range(24))
+    table = table.loc[table.notna().sum(axis=1) >= 20].ffill(axis=1).bfill(axis=1)
+    return table.reindex(pd.date_range(table.index.min(), table.index.max())).rename_axis(index=None, columns=None)
+
+
+def epf_baselines(prices: pd.DataFrame) -> dict:
+    """The yardsticks, each one row longer than prices for the next delivery day. The seasonal naive takes the same
+    hour the day before on Tuesday to Friday, and a week before on Monday, Saturday and Sunday."""
+    full = prices.reindex(pd.date_range(prices.index.min(), prices.index.max() + pd.Timedelta(days=1)))
+    weekly = np.broadcast_to(full.index.dayofweek.isin([0, 5, 6])[:, None], full.shape)
+    return {"Seasonal naive": full.shift(1).where(~weekly, full.shift(7)), "Day before": full.shift(1), "Week before": full.shift(7)}
+
+
+def walk_forward(model: Callable, prices: pd.DataFrame, inputs: Optional[pd.DataFrame], days: Sequence) -> pd.DataFrame:
+    """Forecast each delivery day with the model refitted on what its auction could see: prices up to the day before,
+    and inputs dated up to the delivery day (forecasts published for it). model(prices, inputs, day) gives 24 prices."""
+    one = pd.Timedelta(days=1)
+    rows = [model(prices.loc[:day - one], None if inputs is None else inputs.loc[:day], day) for day in days]
+    return pd.DataFrame(np.vstack(rows), index=pd.DatetimeIndex(days), columns=range(24))
+
+
+def forecast_matrix(frame: Optional[pd.DataFrame], tz: str, pattern: str = "") -> pd.DataFrame:
+    """An ENTSO-E forecast as days × 24 local hours, in MW, summing the series whose names match pattern."""
+    if frame is None or frame.empty or not {"timestamp", "value"} <= set(frame.columns):
+        return pd.DataFrame(columns=range(24), dtype=float)
+    part = frame.loc[frame["series"].astype(str).str.contains(pattern, case=False)] if pattern and "series" in frame.columns else frame
+    total = pd.to_numeric(part["value"], errors="coerce").groupby(pd.to_datetime(part["timestamp"], utc=True)).sum(min_count=1).dropna()
+    return hourly_matrix(pd.DataFrame({"local": total.index.tz_convert(tz), "value": total.to_numpy()})) if len(total) else pd.DataFrame(columns=range(24), dtype=float)
+
+
+def known_before(frame: Optional[pd.DataFrame], column: str, days: pd.DatetimeIndex, lag: int = 2, stale: int = 10) -> np.ndarray:
+    """For each delivery day, the last value dated at least lag days before it: a close or an auction its auction could see."""
+    if frame is None or frame.empty or not {"date", column} <= set(frame.columns):
+        return np.full(len(days), np.nan)
+    data = pd.DataFrame({"date": pd.to_datetime(frame["date"]).dt.tz_localize(None).dt.normalize().astype("datetime64[ns]"), "v": pd.to_numeric(frame[column], errors="coerce")})
+    data = data.dropna().sort_values("date").drop_duplicates("date", keep="last")
+    got = pd.merge_asof(pd.DataFrame({"cut": (days - pd.Timedelta(days=lag)).astype("datetime64[ns]")}), data, left_on="cut", right_on="date")
+    return np.where((got["cut"] - got["date"]).dt.days <= stale, got["v"], np.nan)
+
+
+def epf_inputs(zone: str, load_fc: Optional[pd.DataFrame], weather: Optional[pd.DataFrame], gas: Optional[pd.DataFrame], carbon: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """What the auction knows about each delivery day, as (input, hour) columns: ENTSO-E's load forecast for it, due two hours
+    before the auction; the zone's wind power index, sunshine and temperature as forecast EPF_WEATHER_LEAD days before each hour;
+    the TTF front-month close and EUA auction price from two days or more before. ENTSO-E's wind and solar forecast is left out:
+    the one it publishes is the forecast as it stood at 18:00, after the auction."""
+    tz = ENTSOE_ZONES[zone]["timezone"]
+    parts = {"load": forecast_matrix(load_fc, tz)}
+    here = weather.loc[weather["zone"].eq(zone)] if weather is not None and not weather.empty and "zone" in weather.columns else pd.DataFrame()
+    for name, column in (("wind_wx", "wind"), ("solar_wx", "solar"), ("temp_wx", "temperature")):
+        parts[name] = hourly_matrix(pd.DataFrame({"local": pd.to_datetime(here["time"]), "value": pd.to_numeric(here[column], errors="coerce")})) if len(here) else pd.DataFrame()
+    parts = {name: part for name, part in parts.items() if part.notna().any().any()}
+    inputs = pd.concat(parts, axis=1) if parts else pd.DataFrame(index=pd.DatetimeIndex([]))
+    for name, frame, column in (("gas", gas, "close"), ("carbon", carbon, "price")):
+        inputs[(name, 0)] = known_before(frame, column, inputs.index)
+    return inputs
+
+
+# Chosen on VALIDATION: averaging windows of 84, 364 and 728 days didn't help significantly; weighting a day 90 days back
+# by half did (60 and 45 days didn't help further). Averaging LEAR's daily level with level_forecast helped in France only.
+LEAR_WINDOW, LEAR_HALF_LIFE = 728, 90.0
+LEAR_MAX_STEPS = 40                 # AIC keeps 8 to 25 inputs per hour, so the path stops well before 40
+EPF_LEVEL_WEIGHT = {"France": 0.5}
+
+
+def lear_design(prices: pd.DataFrame, inputs: Optional[pd.DataFrame], days: pd.DatetimeIndex, zone: str) -> np.ndarray:
+    """LEAR's inputs for each of a run of days: every hour's price 1, 2, 3 and 7 days before, each hourly forecast for the
+    day, the day before and a week before, fuel and carbon, and the kind of day (holidays count as Sundays)."""
+    idx = pd.date_range(days[0] - pd.Timedelta(days=7), days[-1])
+    P = prices.reindex(idx)
+    blocks = [P.shift(k) for k in (1, 2, 3, 7)]
+    if inputs is not None and not inputs.empty:
+        X = inputs.reindex(idx)
+        for name in X.columns.get_level_values(0).unique():
+            blocks += [X[name].shift(k) for k in (0, 1, 7)] if X[name].shape[1] == 24 else [X[name]]
+    weekday = np.where(day_classes(idx, zone) == 2, 6, idx.dayofweek)
+    blocks.append(pd.DataFrame(np.eye(7)[weekday], index=idx))
+    return np.hstack([b.to_numpy(float) for b in blocks])[7:]
+
+
+def lear_forecast(prices: pd.DataFrame, inputs: Optional[pd.DataFrame], day: pd.Timestamp, zone: str = "", window: int = LEAR_WINDOW,
+                  half_life: float = LEAR_HALF_LIFE) -> np.ndarray:
+    """LEAR (Lago et al., 2021): for each hour a LASSO on asinh-scaled inputs, its penalty chosen by AIC along the LARS path,
+    fitted afresh on the window of days before the forecast day, a day half_life days older counting half."""
+    from sklearn.linear_model import lars_path_gram
+    days = pd.date_range(max(prices.index[0] + pd.Timedelta(days=7), day - pd.Timedelta(days=window)), day)
+    F, Y = lear_design(prices, inputs, days, zone), prices.reindex(days).to_numpy(float)
+    F = F[:, np.isfinite(F[-1])]            # an input not published for this day is left out of today's fit
+    rows = np.flatnonzero(np.isfinite(F[:-1]).all(axis=1) & np.isfinite(Y[:-1]).all(axis=1))
+    if len(rows) < 28:
+        return np.full(24, np.nan)
+    scale = lambda A: (np.median(A, axis=0), np.maximum(np.median(np.abs(A - np.median(A, axis=0)), axis=0) * 1.4826, 1e-3))
+    (mx, sx), (my, sy) = scale(F[rows]), scale(Y[rows])
+    Xs, x0, Ys = np.arcsinh((F[rows] - mx) / sx), np.arcsinh((F[-1] - mx) / sx), np.arcsinh((Y[rows] - my) / sy)
+    weight = 0.5 ** ((len(days) - 1 - rows) / half_life)
+    xm, ym, root = weight @ Xs / weight.sum(), weight @ Ys / weight.sum(), np.sqrt(weight)[:, None]
+    Xc, Yc, n = (Xs - xm) * root, (Ys - ym) * root, len(rows)
+    G, XY, yy = Xc.T @ Xc, Xc.T @ Yc, (Yc ** 2).sum(axis=0)
+    point = np.empty(24)
+    for h in range(24):
+        coefs = lars_path_gram(XY[:, h], G, n_samples=n, method="lasso", max_iter=LEAR_MAX_STEPS)[2]
+        rss = yy[h] - 2 * XY[:, h] @ coefs + ((G @ coefs) * coefs).sum(axis=0)
+        # AIC as LassoLarsIC had it when LEAR was published: n RSS / sum of squares + 2 x active inputs. It works with fewer days than inputs.
+        point[h] = ym[h] + (x0 - xm) @ coefs[:, np.argmin(n * rss / max(yy[h], 1e-12) + 2 * (coefs != 0).sum(axis=0))]
+    return np.sinh(point) * sy + my
+
+
+def level_forecast(prices: pd.DataFrame, inputs: Optional[pd.DataFrame], day: pd.Timestamp, zone: str = "", window: int = 365, half_life: float = 120.0) -> np.ndarray:
+    """The day's average price by weighted least squares, the app's earlier next-day method: the latest day of the same kind
+    (working day, Saturday, Sunday or holiday), the latest working day, the day before, the week's average, a week before, the
+    kind of day, and the zone's heating demand, wind and sun for the day and the day before. Flat over the 24 hours."""
+    days = pd.date_range(day - pd.Timedelta(days=window + 8), day)
+    base, kind = prices.reindex(days).mean(axis=1), day_classes(days, zone)
+    columns = {"same": base.groupby(kind).shift(1).groupby(kind).ffill(), "work": base.where(kind == 0).shift(1).ffill(), "lag1": base.shift(1),
+               "avg7": base.shift(1).rolling(7, min_periods=5).mean(), "lag7": base.shift(7), "sat": kind == 1, "sun": kind == 2,
+               "after_off": (kind == 0) & (np.r_[0, kind[:-1]] == 2)}
+    if inputs is not None and {"temp_wx", "wind_wx", "solar_wx"} <= set(inputs.columns.get_level_values(0)):
+        X = inputs.reindex(days)
+        weather = {"hdd": (18.0 - X["temp_wx"].mean(axis=1)).clip(lower=0), "wind": X["wind_wx"].mean(axis=1), "solar": X["solar_wx"].mean(axis=1)}
+        columns.update({**weather, **{f"{name}_before": series.shift(1) for name, series in weather.items()}})
+    A = np.column_stack([np.ones(len(days))] + [np.asarray(v, float) for v in columns.values()])[8:]
+    y, ages = base.to_numpy(float)[8:], np.arange(len(days) - 9, -1, -1, dtype=float)
+    rows = np.flatnonzero(np.isfinite(A[:-1]).all(axis=1) & np.isfinite(y[:-1]))
+    if len(rows) < 60 or not np.isfinite(A[-1]).all():
+        return np.full(24, np.nan)
+    root = np.sqrt(0.5 ** (ages[rows] / half_life))
+    return np.full(24, float(A[-1] @ np.linalg.lstsq(A[rows] * root[:, None], y[rows] * root, rcond=None)[0]))
+
+
+def lgbm_quantiles(point: pd.DataFrame, prices: pd.DataFrame, inputs: pd.DataFrame, zone: str = "", train_days: int = 364, first: int = 0) -> np.ndarray:
+    """LightGBM quantile regression of a point forecast's miss, by hour, from the kind of day, the forecasts for the day and
+    how large recent misses were. Refitted each week on the misses of the previous train_days, all known by then. Weeks
+    before row first are left empty, so only new weeks are fitted. Shape (levels, days, 24)."""
+    import lightgbm as lgb
+    days = point.index
+    miss = prices.reindex(days) - point
+    recent = miss.abs().shift(1).rolling(7, min_periods=3).mean()
+    X = inputs.reindex(days)
+    features = [np.broadcast_to(np.arange(24), (len(days), 24)), np.broadcast_to(np.where(day_classes(days, zone) == 2, 6, days.dayofweek)[:, None], (len(days), 24)),
+                point.to_numpy(), recent.to_numpy(), np.broadcast_to(recent.mean(axis=1).to_numpy()[:, None], (len(days), 24))]
+    features += [X[name].to_numpy(float) for name in ("load", "wind_wx", "solar_wx") if name in X.columns.get_level_values(0)]
+    F = np.stack(features, axis=-1).reshape(len(days) * 24, -1)
+    y = miss.to_numpy().ravel()
+    out = np.full((len(EPF_LEVELS), len(days), 24), np.nan)
+    for start in range(first // 7 * 7, len(days), 7):
+        train = np.arange(max(0, start - train_days) * 24, start * 24)
+        train = train[np.isfinite(y[train]) & np.isfinite(F[train]).all(axis=1)]
+        if len(train) < 24 * 120:
+            continue
+        rows = slice(start * 24, min(start + 7, len(days)) * 24)
+        for k, level in enumerate(EPF_LEVELS):
+            model = lgb.LGBMRegressor(objective="quantile", alpha=level, n_estimators=200, learning_rate=0.05, num_leaves=15,
+                                      min_child_samples=200, subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1)
+            out[k].reshape(-1)[rows] = model.fit(F[train], y[train]).predict(F[rows])
+    return point.to_numpy()[None] + np.sort(out, axis=0)
+
+
+def calibrate(quantiles: np.ndarray, prices: pd.DataFrame, days: pd.DatetimeIndex, window: int = EPF_RESIDUAL_DAYS) -> np.ndarray:
+    """Conformal calibration: each quantile moved by the same quantile of its own misses, by hour, over the earlier window
+    (each known at the auction). days must run one a day. On LightGBM's quantiles it brought 73% coverage of the 80% range to 80%."""
+    actual = prices.reindex(days).to_numpy()
+    shift = np.stack([pd.DataFrame(actual - quantiles[k]).shift(1).rolling(window, min_periods=60).quantile(level).to_numpy() for k, level in enumerate(EPF_LEVELS)])
+    return np.sort(quantiles + shift, axis=0)
+
+
+def residual_quantiles(point: pd.DataFrame, prices: pd.DataFrame, window: int = EPF_RESIDUAL_DAYS) -> np.ndarray:
+    """A point forecast's quantiles: the forecast plus that hour's past misses, the same calibration applied to the point."""
+    return calibrate(np.repeat(point.to_numpy()[None], len(EPF_LEVELS), axis=0), prices, point.index, window)
+
+
+def dm_pvalue(loss: np.ndarray, base_loss: np.ndarray) -> float:
+    """One-sided Diebold-Mariano p-value that a model's losses (days × hours) are smaller than the baseline's. Each day's
+    losses are averaged first, so a day is one observation (Lago et al., 2021), with the Harvey-Leybourne-Newbold correction."""
+    d = np.asarray(loss).mean(axis=1) - np.asarray(base_loss).mean(axis=1)
+    n = len(d)
+    if n < 10 or not d.std() > 0:
+        return float("nan")
+    from scipy.stats import t
+    return float(t.cdf(d.mean() / d.std(ddof=1) * math.sqrt(n - 1), n - 1))
+
+
+def epf_scorecard(prices: pd.DataFrame, forecasts: dict, baselines: Sequence[str], periods: Sequence[str] = ("Validation", "Test", "Live")) -> pd.DataFrame:
+    """Each model by period, on the days every model covers. forecasts maps a name to (point, quantiles or None); the
+    first baseline is the seasonal naive behind rMAE. DM p tests each model against the period's best other baseline."""
+    days = prices.dropna().index
+    for point, quantiles in forecasts.values():
+        days = days.intersection(point.dropna().index if quantiles is None else point.index[np.isfinite(quantiles).all(axis=(0, 2))])
+    rows = []
+    for period in periods:
+        held = days[epf_period(days) == period]
+        if len(held) < 7:
+            continue
+        actual = prices.loc[held].to_numpy(float)
+        errors = {name: actual - point.loc[held].to_numpy(float) for name, (point, _) in forecasts.items()}
+        mae = {name: float(np.abs(e).mean()) for name, e in errors.items()}
+        for name, (point, quantiles) in forecasts.items():
+            e, others = errors[name], [b for b in baselines if b != name]
+            ref = min(others, key=mae.get)
+            row = {"Period": period, "Model": name, "Days": len(held), "MAE": mae[name], "RMSE": float(np.sqrt((e ** 2).mean())),
+                   "rMAE": mae[name] / mae[baselines[0]], "Base MAE": float(np.abs(e.mean(axis=1)).mean()),
+                   "Pinball": np.nan, "Cover 80%": np.nan, "Cover 90%": np.nan, "Against": ref, "DM p": dm_pvalue(np.abs(e), np.abs(errors[ref]))}
+            if quantiles is not None:
+                q = quantiles[:, point.index.get_indexer(held)]
+                gap = actual[None] - q
+                row.update({"Pinball": float(np.maximum(EPF_LEVELS[:, None, None] * gap, (EPF_LEVELS[:, None, None] - 1.0) * gap).mean()),
+                            "Cover 80%": float(((actual >= q[1]) & (actual <= q[5])).mean()), "Cover 90%": float(((actual >= q[0]) & (actual <= q[6])).mean())})
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def leaks(model: Callable, build: Callable, prices: pd.DataFrame, day: pd.Timestamp) -> bool:
+    """True when the forecast for day moves once every price from day on is scrambled: something saw the future.
+    build(prices) makes the inputs, so an input derived from later prices is caught as well as a model that peeks."""
+    scrambled = prices.copy()
+    later = scrambled.index >= day
+    scrambled.loc[later] = np.random.default_rng(0).permutation(scrambled.loc[later].to_numpy().ravel()).reshape(int(later.sum()), -1) + 100.0
+    first, second = (walk_forward(model, p, build(p), [day]).to_numpy() for p in (prices, scrambled))
+    return not np.allclose(first, second, equal_nan=True)
+
+
+def epf_self_checks() -> str:
+    """The price forecast on a synthetic market with a known answer, and the leakage check. Raises when either fails."""
+    rng = np.random.default_rng(7)
+    days = pd.date_range("2024-01-01", periods=420)
+    load, noise = pd.DataFrame(rng.uniform(40000, 70000, (len(days), 24)), index=days), rng.normal(0, 2.0, (len(days), 24))
+    P = np.full((len(days), 24), 60.0)
+    for i in range(1, len(days)):     # price = 20 + 0.6 x the same hour yesterday + 1 per GW of load + noise
+        P[i] = 20 + 0.6 * P[i - 1] + 0.001 * load.iloc[i].to_numpy() + noise[i]
+    prices, test = pd.DataFrame(P, index=days), days[-10:]
+    model = lambda p, x, d: lear_forecast(p, x, d, window=364, half_life=1e6)
+    forecast = walk_forward(model, prices, pd.concat({"load": load}, axis=1), test)
+    mae, naive = float((prices.loc[test] - forecast).abs().to_numpy().mean()), float((prices.loc[test] - prices.shift(1).loc[test]).abs().to_numpy().mean())
+    if not mae < min(0.5 * naive, 2.5):
+        raise AssertionError(f"On a known rule LEAR should get near the noise (1.6): MAE {mae:.2f}, day before {naive:.2f}.")
+    honest = lambda p: pd.concat({"load": load}, axis=1)
+    peeking = lambda p: pd.concat({"load": load, "next": p.reindex(load.index).shift(-1)}, axis=1)    # tomorrow's price as an input
+    if leaks(model, honest, prices, test[0]) or not leaks(model, peeking, prices, test[0]):
+        raise AssertionError("The leakage check must pass the honest inputs and catch one taken from the future.")
+    return (f"On a synthetic market with a known rule, LEAR misses by {mae:.2f} (the noise alone is 1.60), against {naive:.2f} for the day before. "
+            "Scrambling every later price leaves its forecast unchanged, and an input built from tomorrow's price is caught.")
+
+
+# =============================================================================
 # SECTION 3 · SAVED DATA (SQLite)
 # Everything the desk needs tomorrow lives in one local database file.
 # =============================================================================
@@ -5076,7 +4864,7 @@ def backup_database(path, today: Optional[date] = None, folder=None) -> str:
 class DeskStore:
     """Small persistence layer. Holds no credentials and is safe to back up as one file."""
 
-    MAX_LIVE_ROWS = 400_000
+    MAX_LIVE_ROWS = 1_500_000      # four years of quarter-hourly wind and solar forecasts
 
     def __init__(self, path) -> None:
         self.path = str(path)
@@ -5562,7 +5350,7 @@ ENTSOE_PARALLEL_WINDOWS = 4
 ENTSOE_FALLBACK_WINDOW_DAYS = 30
 RETRY_HTTP_CODES = {429, 500, 502, 503, 504}
 RETRY_WAIT_SECONDS = 1.5
-ENTSOE_MAX_DAYS = 1096
+ENTSOE_MAX_DAYS = 1530
 ECB_FX_BASE = "https://data-api.ecb.europa.eu/service/data/EXR"
 OPEN_METEO_ARCHIVE_BASE = "https://archive-api.open-meteo.com/v1/archive"
 GIE_AGSI_BASE = "https://agsi.gie.eu/api"
@@ -6613,8 +6401,10 @@ def fetch_entsoe_series(token: str, series_kind: str, zone_name: str,
     # ENTSO-E expects UTC period boundaries in yyyyMMddHHmm format.
     zone = ZoneInfo(ENTSOE_ZONES.get(zone_name, {}).get("timezone", "Europe/Paris"))
     request_http = _http_fn or _http_get_bytes
-    # ENTSO-E serves up to a year per request. Generation holds many series, so it uses shorter windows.
-    span = ENTSOE_GENERATION_WINDOW_DAYS if parser_kind == "generation" and document_type == "A75" else ENTSOE_WINDOW_DAYS
+    # ENTSO-E serves up to a year per request. Generation holds many series, so it uses shorter windows, and a year of
+    # RTE's load forecast times out, so it is asked for by quarter.
+    span = (ENTSOE_GENERATION_WINDOW_DAYS if parser_kind == "generation" and document_type == "A75" else
+            90 if series_kind == "Day-ahead load forecast" else ENTSOE_WINDOW_DAYS)
 
     def split(first: date, last: date, days: int) -> list[tuple[date, date]]:
         parts, cursor = [], first
@@ -6758,34 +6548,6 @@ def fetch_weather_archive(location_names: Sequence[str], years: int = 10, _json_
             pd.concat(normals, ignore_index=True) if normals else pd.DataFrame(), failures)
 
 
-def fetch_power_weather(location_names: Sequence[str], days: int = 430, _json_get_fn=None) -> tuple[pd.DataFrame, list[str]]:
-    """Daily temperature, wind at 100 m and solar radiation from Open-Meteo's archive, for the price estimate."""
-    request_json = _json_get_fn or _json_get
-    end = date.today() - timedelta(days=5)
-    start = end - timedelta(days=int(days))
-    def fetch_one(name: str) -> pd.DataFrame:
-        loc = WEATHER_LOCATIONS[name]
-        payload = request_json(OPEN_METEO_ARCHIVE_BASE, params={
-            "latitude": loc["latitude"], "longitude": loc["longitude"], "start_date": start.isoformat(), "end_date": end.isoformat(),
-            "hourly": "temperature_2m,wind_speed_100m,shortwave_radiation", "timezone": loc["timezone"]})
-        hourly = payload.get("hourly", {}) if isinstance(payload, dict) else {}
-        if not hourly.get("time"):
-            raise RuntimeError("no archive data returned")
-        frame = pd.DataFrame({"date": [str(t)[:10] for t in hourly["time"]], "temperature_mean_c": pd.to_numeric(pd.Series(hourly.get("temperature_2m", [])), errors="coerce"),
-                              "wind_speed_100m_mean_kmh": pd.to_numeric(pd.Series(hourly.get("wind_speed_100m", [])), errors="coerce"),
-                              "solar_radiation_mean_wm2": pd.to_numeric(pd.Series(hourly.get("shortwave_radiation", [])), errors="coerce")})
-        return frame.groupby("date", as_index=False).mean().assign(location=name)
-    frames, failures = [], []
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        future_map = {executor.submit(fetch_one, name): name for name in location_names}
-        for future in as_completed(future_map):
-            try:
-                frames.append(future.result())
-            except Exception as exc:
-                failures.append(f"{future_map[future]}: {exc}")
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(), failures
-
-
 OPEN_METEO_HISTORICAL_FORECAST_BASE = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 OPEN_METEO_ENSEMBLE_BASE = "https://ensemble-api.open-meteo.com/v1/ensemble"
 OPEN_METEO_ENSEMBLE_MODEL = "ecmwf_ifs025"     # 51 scenarios, 15 days
@@ -6923,6 +6685,38 @@ def fetch_zone_ensemble(zone: str, api_key: str = "", _json_get_fn=None) -> pd.D
     out = pd.concat(frames, ignore_index=True)
     out["date"] = pd.to_datetime(out["date"])
     return out.assign(zone=zone)[["zone", "member", "date", "temperature", "wind_land", "wind_sea", "solar"]]
+
+
+OPEN_METEO_PREVIOUS_RUNS_BASE = "https://previous-runs-api.open-meteo.com/v1/forecast"
+EPF_WEATHER_LEAD = 2                   # days between a forecast and the hour it is for: one made two days before always precedes the noon auction
+EPF_WEATHER_START = date(2024, 1, 1)   # Open-Meteo keeps earlier model runs from January 2024
+
+
+def fetch_epf_weather(zone: str, start: date, end: date, _json_get_fn=None, wait: Callable[[float], None] = sleep) -> pd.DataFrame:
+    """Hourly wind power index, sunshine and temperature over the zone's points, as forecast EPF_WEATHER_LEAD days before each
+    hour, from start to end (tomorrow included). Past days and tomorrow share the lead, so the price forecast learns from
+    forecasts as good as the one it is given."""
+    points, suffix, frames, cursor = ZONE_WEATHER_POINTS[zone], f"_previous_day{EPF_WEATHER_LEAD}", [], start
+    while cursor <= end:
+        stop = min(cursor + timedelta(days=119), end)
+        if frames:
+            wait(20.0)                 # Open-Meteo counts requests per minute, weighted by points and days
+        payload = (_json_get_fn or _json_get)(OPEN_METEO_PREVIOUS_RUNS_BASE, params={
+            "latitude": ",".join(f"{lat:.2f}" for lat, _ in points), "longitude": ",".join(f"{lon:.2f}" for _, lon in points),
+            "hourly": ",".join(v + suffix for v in ("temperature_2m", "wind_speed_100m", "shortwave_radiation")),
+            "timezone": ENTSOE_ZONES[zone]["timezone"], "start_date": cursor.isoformat(), "end_date": stop.isoformat()})
+        for answer in payload if isinstance(payload, list) else [payload]:
+            hourly = answer.get("hourly", {}) if isinstance(answer, dict) else {}
+            if hourly.get("time"):
+                frames.append(_hourly_frame(hourly, suffix).assign(time=pd.to_datetime(hourly["time"])))
+        cursor = stop + timedelta(days=1)
+    if not frames:
+        raise RuntimeError("Open-Meteo returned no earlier forecasts for this zone.")
+    data = pd.concat(frames, ignore_index=True)
+    data["wind"] = wind_power_index(data["wind"].to_numpy(float))
+    grouped = data.groupby("time")[["wind", "solar", "temperature"]]
+    out = grouped.mean().loc[grouped.count().min(axis=1) >= len(points) // 2]     # most points, or the hour doesn't count
+    return out.reset_index().assign(zone=zone)[["zone", "time", "wind", "solar", "temperature"]]
 
 
 ENTSOE_OUTAGE_PAGE = 200          # ENTSO-E serves outage notices 200 at a time
@@ -7507,7 +7301,7 @@ def fetch_tradingview_curve(product: str, today: date, n_bars: int, username: st
                          "curve_date": [pd.Timestamp(d).date() for d in rows["curve_date"]], "price": rows["price"].to_numpy(float)})
 
 
-TRADINGVIEW_FRONT_HISTORY_BARS = 520   # about two years of front-month TTF, for testing gas in the next-day estimate
+TRADINGVIEW_FRONT_HISTORY_BARS = 1050  # about four years of front-month TTF, for the price forecast and its test
 
 
 def fetch_tradingview_front(product: str, n_bars: int, username: str = "", password: str = "", _client=None) -> pd.DataFrame:
@@ -7528,11 +7322,6 @@ def fetch_tradingview_front(product: str, n_bars: int, username: str = "", passw
     out = pd.DataFrame({"date": days, "product": product, "close": close}).dropna()
     return out.loc[out["close"] > 0].drop_duplicates("date", keep="last").reset_index(drop=True)
 
-
-def fetch_temperature_normals(location_names: Sequence[str], years: int = 10, _json_get_fn=None) -> tuple[pd.DataFrame, list[str]]:
-    """Calendar-day temperature and degree-day normals from Open-Meteo's historical archive."""
-    _, normals, failures = fetch_weather_archive(location_names, years, _json_get_fn)
-    return normals, failures
 
 def _stored_live_item(source_key: str, label: str, data, metadata: Optional[dict] = None) -> None:
     if demo_mode():
@@ -8390,11 +8179,6 @@ def month_start(offset: int = 1) -> date:
     return _add_months(valuation_date, offset)
 
 
-def month_end_exclusive(start: date, months: int) -> date:
-    """Delivery end for a tenor counted in months: 15 Dec plus 3 months ends on 15 Mar."""
-    return (pd.Timestamp(start) + pd.DateOffset(months=int(months))).date()
-
-
 def get_marked_trades() -> pd.DataFrame:
     """Mark the book, reusing the result while trades and curves are unchanged."""
     key = (data_version("trades", "curves"), valuation_date)
@@ -8433,7 +8217,7 @@ def resolved_credentials() -> dict[str, str]:
     from_file = keys_from_file()
     def pick(name: str, secret: str) -> str:
         return overrides.get(name) or _secret_or_env(secret, secret) or from_file.get(secret, "")
-    return {"gie": pick("gie", "GIE_API_KEY"), "entsoe": pick("entsoe", "ENTSOE_API_TOKEN"), "open_meteo": pick("open_meteo", "OPEN_METEO_API_KEY"),
+    return {"gie": pick("gie", "GIE_API_KEY"), "entsoe": pick("entsoe", "ENTSOE_API_TOKEN") or pick("entsoe", "ENTSOE_API_KEY"), "open_meteo": pick("open_meteo", "OPEN_METEO_API_KEY"),
             "tradingview_user": pick("tradingview_user", "TRADINGVIEW_USERNAME"), "tradingview_password": pick("tradingview_password", "TRADINGVIEW_PASSWORD")}
 
 
@@ -8448,12 +8232,10 @@ def missing_keys_text() -> str:
 # Saved keys, background fetching, and requests only for what isn't held yet.
 # =============================================================================
 UPDATE_DEFAULT_ZONES = ("France", "Germany-Luxembourg")
-PRICE_HISTORY_DAYS = 365
-# ENTSO-E's forecasts only need to span the tested days and enough earlier days to fit them.
-FORECAST_HISTORY_DAYS = 300
-ZONE_WEATHER_HISTORY_DAYS = 430
+PRICE_HISTORY_DAYS = EPF_HISTORY_DAYS   # prices and load forecasts: two years before the price forecast's VALIDATION and TEST
+FORECAST_HISTORY_DAYS = 300             # ENTSO-E's wind and solar forecasts, for the fundamentals outlook
 STALE_HOURS = {"tradingview": 1.0, "prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0, "ensemble": 6.0, "holidays": 24.0 * 7}
-KEEP_DAYS = {"prices": 400, "load": 90, "generation": 90, "lng": 400}
+KEEP_DAYS = {"prices": EPF_HISTORY_DAYS + 30, "load": 90, "generation": 90, "lng": 400}
 MAX_UPDATE_WORKERS = 8          # the providers allow far more; this keeps the first update short
 OPEN_METEO_WORKERS = 2          # weather gets its own lane: Open-Meteo counts requests per minute
 # When each source publishes something new, in Brussels time. A source fetched after its latest publication is skipped,
@@ -8640,13 +8422,14 @@ def tradingview_tasks(force: bool = True, today: Optional[date] = None) -> list[
             return apply_tradingview_curve(product, raw, near_only)
         tasks.append(UpdateTask(f"{SHORT_NAMES.get(tv_product, tv_product)} curve from TradingView", fetch_tv, apply_tv, lane="tradingview"))
     held_front = _held_frame("tradingview_gas_front")
-    if held_front is not None and len(held_front) >= 200 and force != "all" and not traded_since(_fetched_at("tradingview_gas_front")):
+    full = held_front is not None and len(held_front) >= TRADINGVIEW_FRONT_HISTORY_BARS - 60
+    if full and force != "all" and not traded_since(_fetched_at("tradingview_gas_front")):
         return tasks
-    front_bars = TRADINGVIEW_FRONT_HISTORY_BARS if held_front is None or len(held_front) < 200 else 10
+    front_bars = 10 if full else TRADINGVIEW_FRONT_HISTORY_BARS
     def fetch_front() -> pd.DataFrame:
         return fetch_tradingview_front("TTF Natural Gas", front_bars, *login)
     def apply_front(frame: pd.DataFrame) -> str:
-        merged = store_observations("tradingview_gas_front", "TradingView TTF front month", frame, {"symbol": "NYMEX:TTF1!"}, ("date", "product"), "date", 800)
+        merged = store_observations("tradingview_gas_front", "TradingView TTF front month", frame, {"symbol": "NYMEX:TTF1!"}, ("date", "product"), "date", EPF_HISTORY_DAYS + 30)
         return f"{len(frame)} days fetched, {len(merged)} held, last close {frame['close'].iloc[-1]:.2f} on {pd.Timestamp(frame['date'].iloc[-1]):%d %b}"
     tasks.append(UpdateTask("TTF front-month history from TradingView", fetch_front, apply_front, lane="tradingview"))
     return tasks
@@ -8680,11 +8463,11 @@ def plan_update(force=True, today: Optional[date] = None) -> list[UpdateTask]:
             return
         held = _held_frame(full_key)
         start = incremental_start(held, "timestamp", first_days, 2, today)
-        # Prices held for less than a year are extended once, so past reads can be scored straight away.
-        if store_key == "entsoe_price" and held is not None:
+        # Prices and load forecasts held for less than the price forecast's test needs are extended once.
+        if store_key in ("entsoe_price", "entsoe_load_forecast") and held is not None:
             earliest = pd.to_datetime(held["timestamp"], errors="coerce", utc=True).min()
-            if pd.notna(earliest) and earliest.date() > today - timedelta(days=PRICE_HISTORY_DAYS - 35):
-                start = today - timedelta(days=PRICE_HISTORY_DAYS)
+            if pd.notna(earliest) and earliest.date() > today - timedelta(days=first_days - 35):
+                start = today - timedelta(days=first_days)
         metadata = {"zone": zone}
         if source:
             metadata.update({"source_zone": source, "target_zone": target, "variant": name})
@@ -8701,11 +8484,10 @@ def plan_update(force=True, today: Optional[date] = None) -> list[UpdateTask]:
                                                 ("entsoe_generation", "Actual generation", "Actual generation by type", KEEP_DAYS["generation"])):
         for zone in dict.fromkeys(list(UPDATE_DEFAULT_ZONES) + [z for z in _live_variants(store_key) if z in ENTSOE_ZONES]):
             entsoe_task("prices", store_key, label, series_kind, zone, keep, 30, today + timedelta(days=1))
-    for store_key, label, series_kind in (("entsoe_load_forecast", "Load forecast", "Day-ahead load forecast"),
-                                          ("entsoe_renewable_forecast", "Wind and solar forecast", "Day-ahead wind and solar forecast")):
+    for store_key, label, series_kind, days in (("entsoe_load_forecast", "Load forecast", "Day-ahead load forecast", PRICE_HISTORY_DAYS),
+                                                ("entsoe_renewable_forecast", "Wind and solar forecast", "Day-ahead wind and solar forecast", FORECAST_HISTORY_DAYS)):
         for zone in price_zones:
-            if zone in ZONE_WEATHER:
-                entsoe_task("prices", store_key, label, series_kind, zone, FORECAST_HISTORY_DAYS, FORECAST_HISTORY_DAYS, today + timedelta(days=2))
+            entsoe_task("prices", store_key, label, series_kind, zone, days, days, today + timedelta(days=2))
     for variant, item in _live_variants("entsoe_flow").items():
         meta = item.get("metadata", {})
         if meta.get("source_zone") in ENTSOE_ZONES and meta.get("target_zone") in ENTSOE_ZONES:
@@ -8759,71 +8541,38 @@ def plan_update(force=True, today: Optional[date] = None) -> list[UpdateTask]:
             _stored_live_item("weather_archive", "Open-Meteo daily temperature history", archive, {"years": 10})
             return f"{normals['location'].nunique()} of {len(WEATHER_LOCATIONS)} locations"
         tasks.append(UpdateTask("Weather history", lambda: fetch_weather_archive(list(WEATHER_LOCATIONS)), apply_archive, lane="open_meteo"))
-    power_zones = [z for z in dict.fromkeys(list(UPDATE_DEFAULT_ZONES) + list(_live_variants("entsoe_price"))) if z in ZONE_WEATHER]
-    grid_zones = [z for z in power_zones if z in ZONE_WEATHER_POINTS]
-    if grid_zones and _needs_update("zone_weather_history", "power_weather", False):
-        held_grid = _held_frame("zone_weather_history")
-        archive_end = today - timedelta(days=5)
-        def fetch_grid_history() -> tuple[pd.DataFrame, list[str]]:
+    grid_zones = [z for z in price_zones if z in ZONE_WEATHER_POINTS]
+    if grid_zones and _needs_update("epf_weather", "weather", force):
+        held_weather = _held_frame("epf_weather")
+        def fetch_epf_history() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
             for zone in grid_zones:
-                held_zone = held_grid.loc[held_grid["zone"].eq(zone)] if held_grid is not None and "zone" in held_grid.columns else None
-                start = incremental_start(held_zone if held_zone is not None and not held_zone.empty else None, "date", ZONE_WEATHER_HISTORY_DAYS, 3, today)
-                if start > archive_end:
-                    continue
+                part = held_weather.loc[held_weather["zone"].eq(zone)] if held_weather is not None else None
+                start = max(EPF_WEATHER_START, pd.Timestamp(part["time"].max()).date() - timedelta(days=3)) if part is not None and not part.empty else EPF_WEATHER_START
                 try:
-                    frames.append(fetch_zone_weather(zone, start, archive_end))
+                    frames.append(fetch_epf_weather(zone, start, today + timedelta(days=1)))
                 except Exception as exc:
                     failures.append(f"{zone}: {exc}")
             return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), failures
-        def apply_grid_history(outcome: tuple) -> str:
+        def apply_epf_history(outcome: tuple) -> str:
             frame, failures = outcome
             if frame.empty and failures:
                 raise RuntimeError("; ".join(failures))
-            merged = store_observations("zone_weather_history", "Open-Meteo weather across each zone", frame, {"zones": grid_zones}, ("date", "zone"), "date", ZONE_WEATHER_HISTORY_DAYS + 20) if not frame.empty else held_grid
-            return f"{len(frame):,} new days, {0 if merged is None else len(merged):,} held" + (f". Failed: {'; '.join(failures)}" if failures else "")
-        tasks.append(UpdateTask("Weather across each power zone", fetch_grid_history, apply_grid_history, lane="open_meteo"))
-    outlook_zones = [z for z in grid_zones if z in FUND_SEA_POINTS]
-    shared_forecast = bool(grid_zones) and set(grid_zones) <= set(outlook_zones) and _needs_update("fund_weather_forecast", "weather", force)
-    if grid_zones and _needs_update("zone_weather_forecast", "weather", force) and not shared_forecast:
-        open_meteo_key = keys["open_meteo"]
-        def fetch_grid_forecast() -> tuple[pd.DataFrame, list[str]]:
-            frames, failures = [], []
-            for zone in grid_zones:
-                try:
-                    frames.append(fetch_zone_weather(zone, forecast=True, api_key=open_meteo_key, commercial_endpoint=bool(open_meteo_key)))
-                except Exception as exc:
-                    failures.append(f"{zone}: {exc}")
-            return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), failures
-        def apply_grid_forecast(outcome: tuple) -> str:
-            frame, failures = outcome
-            if frame.empty:
-                raise RuntimeError("; ".join(failures) or "No zone returned a forecast.")
-            _stored_live_item("zone_weather_forecast", "Open-Meteo forecast across each zone", frame, {"zones": grid_zones})
-            kept = keep_weather_vintage(_held_frame("zone_weather_vintage"), frame, datetime.now(timezone.utc))
-            if kept is not None:
-                _stored_live_item("zone_weather_vintage", "Weather forecasts as they stood the day before", kept, {"zones": grid_zones})
-            return f"{frame['zone'].nunique()} of {len(grid_zones)} zones"
-        tasks.append(UpdateTask("Weather forecast across each power zone", fetch_grid_forecast, apply_grid_forecast, lane="open_meteo"))
-    # Zones with points across them use those; the single reference city is kept for the others.
-    power_zones = [z for z in power_zones if z not in ZONE_WEATHER_POINTS]
-    if power_zones and _needs_update("weather_power_history", "power_weather", False):
-        def apply_power_weather(outcome: tuple) -> str:
-            frame, failures = outcome
-            if frame.empty:
-                raise RuntimeError(f"All {len(failures) or len(power_zones)} locations failed.")
-            _stored_live_item("weather_power_history", "Open-Meteo wind and solar history", frame, {"days": 430})
-            return f"{frame['location'].nunique()} of {len(power_zones)} locations"
-        tasks.append(UpdateTask("Wind and solar history", lambda: fetch_power_weather([ZONE_WEATHER[z] for z in power_zones]), apply_power_weather, lane="open_meteo"))
-    tasks.extend(fundamentals_tasks(force, today, keys, grid_zones, shared_forecast))
+            merged = store_observations("epf_weather", "Weather forecast two days ahead, for the price forecast", frame, {"zones": grid_zones, "lead_days": EPF_WEATHER_LEAD},
+                                        ("time", "zone"), "time") if not frame.empty else held_weather
+            return f"{len(frame):,} new hours, {0 if merged is None else len(merged):,} held" + (f". Failed: {'; '.join(failures)}" if failures else "")
+        tasks.append(UpdateTask("Weather for the price forecast", fetch_epf_history, apply_epf_history, lane="open_meteo"))
+    tasks.extend(fundamentals_tasks(force, today, keys, grid_zones))
     held_auctions = _live_dataset_frame("eex_eua_auctions")
     auction_age = (today - pd.Timestamp(held_auctions["date"].iloc[-1]).date()).days if not held_auctions.empty and "date" in held_auctions.columns else None
-    if (force and not (auction_age is not None and _nothing_new("eex_eua_auctions", "auctions", force))) or auction_age is None or (auction_age >= 1 and _needs_update("eex_eua_auctions", "prices", False)):
+    first_year = (today - timedelta(days=EPF_HISTORY_DAYS)).year
+    short = held_auctions.empty or "date" not in held_auctions.columns or pd.Timestamp(held_auctions["date"].min()).year > first_year
+    if short or (force and not (auction_age is not None and _nothing_new("eex_eua_auctions", "auctions", force))) or (auction_age >= 1 and _needs_update("eex_eua_auctions", "prices", False)):
         def apply_auctions(frame: pd.DataFrame) -> str:
-            _stored_live_item("eex_eua_auctions", "EEX EUA primary auction prices", frame, {"source": "EEX public auction report"})
-            last = frame.iloc[-1]
-            return f"{pd.Timestamp(last['date']):%d %b}: €{float(last['price']):.2f}/t"
-        tasks.append(UpdateTask("EUA auction prices", lambda: fetch_eua_auctions(today), apply_auctions))
+            merged = store_observations("eex_eua_auctions", "EEX EUA primary auction prices", frame, {"source": "EEX public auction report"}, ("date",), "date")
+            last = merged.iloc[-1]
+            return f"{pd.Timestamp(last['date']):%d %b}: €{float(last['price']):.2f}/t, {len(merged):,} auctions held"
+        tasks.append(UpdateTask("EUA auction prices", lambda: fetch_eua_auctions(today, first_year=first_year if short else None), apply_auctions))
     fx_age = st.session_state.get("fx_updated_at")
     fx_new = force == "all" or fx_age is None or published_since(fx_age, "ecb")
     if force and not fx_new:
@@ -8859,7 +8608,7 @@ def start_update(force=True, tasks: Optional[list[UpdateTask]] = None) -> int:
     if not planned:
         return 0
     executors = {"main": ThreadPoolExecutor(max_workers=MAX_UPDATE_WORKERS), "tradingview": ThreadPoolExecutor(max_workers=TRADINGVIEW_WORKERS),
-                 "open_meteo": ThreadPoolExecutor(max_workers=OPEN_METEO_WORKERS)}
+                 "open_meteo": ThreadPoolExecutor(max_workers=OPEN_METEO_WORKERS), "forecast": ThreadPoolExecutor(max_workers=1)}
     st.session_state.update_job = {"tasks": planned, "futures": [executors.get(task.lane, executors["main"]).submit(_timed_fetch, task.fetch) for task in planned],
                                    "executors": executors, "results": {}, "started": perf_counter()}
     return len(planned)
@@ -9247,33 +8996,8 @@ def winter_outlook() -> dict:
                                                _live_dataset_frame("weather_daily"), valuation_date))
 
 
-def store_zone_forecast(frame: pd.DataFrame, zones: Sequence[str]) -> None:
-    """The short forecast the next-day estimate uses, and the vintage kept for testing it."""
-    _stored_live_item("zone_weather_forecast", "Open-Meteo forecast across each zone", frame, {"zones": list(zones)})
-    kept = keep_weather_vintage(_held_frame("zone_weather_vintage"), frame, datetime.now(timezone.utc))
-    if kept is not None:
-        _stored_live_item("zone_weather_vintage", "Weather forecasts as they stood the day before", kept, {"zones": list(zones)})
-
-
-def fetch_zone_forecasts(zone: str, api_key: str = "", commercial_endpoint: bool = False, _json_get_fn=None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """One request gives both forecasts: the 16-day one over every point for the outlook, and the 3-day one over the land
-    points for the next-day estimate. The land points come first in the request, so they are the same answers."""
-    caught: dict = {}
-    def get(url, params=None, headers=None):
-        caught["payload"] = (_json_get_fn or _json_get)(url, params=params) if headers is None else (_json_get_fn or _json_get)(url, params=params, headers=headers)
-        return caught["payload"]
-    outlook = fetch_zone_weather(zone, forecast=True, api_key=api_key, commercial_endpoint=commercial_endpoint, _json_get_fn=get,
-                                 forecast_days=FUND_OUTLOOK_DAYS + 1, with_sea=True, extended=True)
-    payload = caught.get("payload")
-    answers = payload if isinstance(payload, list) else [payload]
-    land = len(ZONE_WEATHER_POINTS[zone])
-    short = fetch_zone_weather(zone, forecast=True, api_key=api_key, commercial_endpoint=commercial_endpoint, _json_get_fn=lambda *_, **__: answers[:land])
-    last_day = pd.Timestamp(datetime.now(ZoneInfo(ENTSOE_ZONES[zone]["timezone"])).date() + timedelta(days=2))
-    return outlook, short.loc[short["date"] <= last_day].reset_index(drop=True)
-
-
-def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str], shared_forecast: bool = False) -> list[UpdateTask]:
-    """What the fundamentals outlook needs beyond the price estimate's data: a year of daily output,
+def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str]) -> list[UpdateTask]:
+    """What the fundamentals outlook needs beyond the price forecast's data: a year of daily output,
     weather as the forecast models saw it, 16 days ahead, ECMWF's scenarios and German gas use."""
     tasks: list[UpdateTask] = []
     zones = [z for z in zones if z in FUND_SEA_POINTS]
@@ -9335,31 +9059,22 @@ def fundamentals_tasks(force: bool, today: date, keys: dict, zones: Sequence[str
             return f"{len(frame):,} new days, {0 if merged is None else len(merged):,} held" + (f". Failed: {'; '.join(failures)}" if failures else "")
         tasks.append(UpdateTask("Weather history for the outlook", fetch_weather_history, apply_weather_history, lane="open_meteo"))
     if zones and _needs_update("fund_weather_forecast", "weather", force):
-        def fetch_weather_ahead() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-            frames, short, failures = [], [], []
+        def fetch_weather_ahead() -> tuple[pd.DataFrame, list[str]]:
+            frames, failures = [], []
             for zone in zones:
                 try:
-                    if shared_forecast:
-                        outlook_part, short_part = fetch_zone_forecasts(zone, open_meteo_key, bool(open_meteo_key))
-                        frames.append(outlook_part)
-                        short.append(short_part)
-                    else:
-                        frames.append(fetch_zone_weather(zone, forecast=True, api_key=open_meteo_key, commercial_endpoint=bool(open_meteo_key),
-                                                         forecast_days=FUND_OUTLOOK_DAYS + 1, with_sea=True, extended=True))
+                    frames.append(fetch_zone_weather(zone, forecast=True, api_key=open_meteo_key, commercial_endpoint=bool(open_meteo_key),
+                                                     forecast_days=FUND_OUTLOOK_DAYS + 1, with_sea=True, extended=True))
                 except Exception as exc:
                     failures.append(f"{zone}: {exc}")
-            joined = lambda parts: pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-            return joined(frames), joined(short), failures
+            return (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), failures
         def apply_weather_ahead(outcome: tuple) -> str:
-            frame, short, failures = outcome
+            frame, failures = outcome
             if frame.empty:
                 raise RuntimeError("; ".join(failures) or "No zone returned a forecast.")
             _stored_live_item("fund_weather_forecast", "16-day weather forecast across each zone", frame, {"zones": zones})
-            if not short.empty:
-                store_zone_forecast(short, list(short["zone"].unique()))
-            return (f"{frame['zone'].nunique()} of {len(zones)} zones, to {pd.Timestamp(frame['date'].max()):%d %b}"
-                    + (", also giving the short forecast for the price estimate" if not short.empty else ""))
-        tasks.append(UpdateTask("Weather forecast across each zone" if shared_forecast else "16-day weather forecast", fetch_weather_ahead, apply_weather_ahead, lane="open_meteo"))
+            return f"{frame['zone'].nunique()} of {len(zones)} zones, to {pd.Timestamp(frame['date'].max()):%d %b}"
+        tasks.append(UpdateTask("16-day weather forecast", fetch_weather_ahead, apply_weather_ahead, lane="open_meteo"))
     if zones and _needs_update("fund_weather_ensemble", "ensemble", False):
         def fetch_scenarios() -> tuple[pd.DataFrame, list[str]]:
             frames, failures = [], []
@@ -9684,7 +9399,7 @@ PAGE_SOURCES = {
     "Morning Brief": lambda: src_spot() + src_storage() + src_weather() + src_book() + src_book_curves() + src_history(),
     "Market Read": lambda: src_storage() + src_lng() + src_weather() + src_spot() + src_power_system() + src_read_curves(),
     "Market Fundamentals": lambda: src_storage() + src_lng() + src_weather() + src_spot() + src_power_system() + src_flows(),
-    "Power Spot": lambda: src_spot() + src_weather() + src_forecasts(),
+    "Power Spot": lambda: src_spot() + src_forecasts() + [("real" if not _live_dataset_frame("epf_weather").empty else "missing", "Open-Meteo weather forecast two days ahead")],
     "Fundamentals Outlook": lambda: src_outlook() + src_forecasts(),
     "Spreads & Margins": lambda: src_curves([p for p in CURVE_PRODUCTS if p != "NBP Natural Gas"]) + src_fx(),
     "Forward Curves": lambda: src_curves(ALL_PRICED),
@@ -9745,6 +9460,7 @@ def prices_used_lines(products: Sequence[str]) -> list[tuple[str, str]]:
 # curves follow the same story. It lives in its own database, so it never mixes with or replaces live data.
 # =============================================================================
 DEMO_VERSION = 4
+DEMO_PRICE_DAYS = 365                          # the demo keeps a year of prices and forecasts: the live desk keeps four
 DEMO_ANCHOR_DAY = date(2026, 11, 13)          # the closes the demo market is built from
 DEMO_FX = {"eur_per_usd": 1 / 1.1052, "eur_per_gbp": 1 / 0.8356}   # ECB reference rates of 13 Nov 2026
 DEMO_COUNTERPARTY = " (Demo)"
@@ -9999,11 +9715,6 @@ def _demo_weather(rng: np.random.Generator, today: date) -> dict:
     return out
 
 
-def _zone_wind_kmh(cf: np.ndarray) -> np.ndarray:
-    """The area-average wind speed at 100 m that gives a fleet capacity factor (inverse of the power curve, roughly)."""
-    return 8.0 + 30.0 * np.power(np.clip(cf, 0, 1), 0.65)
-
-
 # ---- power system ---------------------------------------------------------------------
 def _nuclear_schedule(rng: np.random.Generator, days: pd.DatetimeIndex) -> tuple[pd.DataFrame, list]:
     """French reactors: a planned outage each year, mostly from spring to autumn, and short forced outages."""
@@ -10134,7 +9845,7 @@ def _demo_hourly(rng: np.random.Generator, power: dict, weather: dict, paths: di
         return idx
     for zone in ("Germany-Luxembourg", "France"):
         daily = power[zone]
-        first = max(daily.index[0].date(), today - timedelta(days=PRICE_HISTORY_DAYS + 5))
+        first = max(daily.index[0].date(), today - timedelta(days=DEMO_PRICE_DAYS + 5))
         frame = _hour_frame(zone, first, today + timedelta(days=1))
         day_index = frame["day"]
         d = daily.reindex(day_index).reset_index(drop=True)
@@ -10370,14 +10081,6 @@ def _weather_pack(rng: np.random.Generator, weather: dict, today: date) -> tuple
     return pd.concat(hourly_frames, ignore_index=True), pd.DataFrame(daily_rows)
 
 
-def _zone_weather_rows(weather: dict, zone: str, days: pd.DatetimeIndex, rng: Optional[np.random.Generator] = None, error: float = 0.0) -> pd.DataFrame:
-    w = weather[zone].reindex(days)
-    temp = w["temperature"].to_numpy() + (rng.normal(0, error, len(days)) if rng is not None and error else 0.0)
-    wind = _zone_wind_kmh(w["wind_land"].to_numpy()) * (1 + (rng.normal(0, error / 8, len(days)) if rng is not None and error else 0.0))
-    return pd.DataFrame({"zone": zone, "date": days, "temperature": temp, "hdd": np.clip(18.0 - temp, 0, None), "wind": wind,
-                         "solar": w["solar"].to_numpy(), "points": len(ZONE_WEATHER_POINTS.get(zone, ()))})
-
-
 def _fund_weather_rows(weather: dict, zone: str, days: pd.DatetimeIndex, rng: Optional[np.random.Generator] = None, lead: Optional[np.ndarray] = None) -> pd.DataFrame:
     """Weather as the fundamentals models read it. A forecast's error grows with lead time."""
     w = weather[zone].reindex(days)
@@ -10409,7 +10112,7 @@ def _demo_live(rng: np.random.Generator, today: date, paths: dict) -> dict:
     for zone in ("France", "Germany-Luxembourg"):
         h = hourly[zone]["hourly"]
         # Day-ahead prices in quarter hours, through tomorrow (the auction has run).
-        quarters = h.loc[h["day"].dt.date >= today - timedelta(days=PRICE_HISTORY_DAYS)]
+        quarters = h.loc[h["day"].dt.date >= today - timedelta(days=DEMO_PRICE_DAYS)]
         naive = quarters["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None).to_numpy().astype("datetime64[m]")
         q_stamps = (naive[:, None] + np.array([0, 15, 30, 45], dtype="timedelta64[m]")).ravel()
         wiggle = rng.normal(0, 3.0, (len(quarters), 4)) * np.array([1.0, 0.6, 0.6, 1.0])
@@ -10429,7 +10132,7 @@ def _demo_live(rng: np.random.Generator, today: date, paths: dict) -> dict:
         frames += [_entsoe_frame(recent["timestamp"], values + 60 * rng.normal(size=len(recent)), name, code) for name, code, values in extra]
         put(f"entsoe_generation|{zone}", f"Actual generation, {zone}", pd.concat(frames, ignore_index=True).sort_values(["timestamp", "series"]), {"zone": zone})
         # Published forecasts: the outcome plus the day-ahead error each one typically has.
-        fc = h.loc[h["day"].dt.date >= today - timedelta(days=FORECAST_HISTORY_DAYS)]
+        fc = h.loc[h["day"].dt.date >= today - timedelta(days=DEMO_PRICE_DAYS)]
         day_err = pd.Series(_ar1(rng, len(fc["day"].unique()), 0.4, 0.02), index=fc["day"].unique()).reindex(fc["day"]).to_numpy()
         put(f"entsoe_load_forecast|{zone}", f"Load forecast, {zone}",
             _entsoe_frame(fc["timestamp"], fc["load"] * (1 + day_err + 0.006 * rng.normal(size=len(fc))), "Load", ""), {"zone": zone})
@@ -10478,19 +10181,6 @@ def _demo_live(rng: np.random.Generator, today: date, paths: dict) -> dict:
     put("weather_normals", "Open-Meteo temperature normals", normals, {"years": 10})
     put("weather_archive", "Open-Meteo daily temperature history", archive, {"years": 10})
     zones = ["France", "Germany-Luxembourg"]
-    hist_days = pd.date_range(today - timedelta(days=ZONE_WEATHER_HISTORY_DAYS), today - timedelta(days=5), freq="D")
-    put("zone_weather_history", "Open-Meteo weather across each zone", pd.concat([_zone_weather_rows(weather, z, hist_days) for z in zones]).sort_values(["date", "zone"]), {"zones": zones})
-    fc_days = pd.date_range(today - timedelta(days=4), today + timedelta(days=10), freq="D")
-    truth_days = pd.date_range(today - timedelta(days=ZONE_WEATHER_HISTORY_DAYS), today, freq="D")
-    items["_zone_weather_truth"] = {"data": pd.concat([_zone_weather_rows(weather, z, truth_days) for z in zones], ignore_index=True)}
-    put("zone_weather_forecast", "Open-Meteo forecast across each zone", pd.concat([_zone_weather_rows(weather, z, fc_days, rng, 0.3) for z in zones]), {"zones": zones})
-    vintage = []
-    for i in range(60, 0, -1):
-        day = today - timedelta(days=i - 1)
-        made = datetime.combine(day - timedelta(days=1), time(9, 30), tzinfo=timezone.utc)
-        rows = pd.concat([_zone_weather_rows(weather, z, pd.DatetimeIndex([pd.Timestamp(day)]), rng, 0.9) for z in zones])
-        vintage.append(rows.assign(made_at=made.isoformat(timespec="seconds"), before_auction=True))
-    put("zone_weather_vintage", "Weather forecasts as they stood the day before", pd.concat(vintage), {"zones": zones})
     f_hist = pd.date_range(today - timedelta(days=FUND_KEEP_DAYS), today - timedelta(days=1), freq="D")
     put("fund_weather_history", "Weather across each zone for the outlook", pd.concat([_fund_weather_rows(weather, z, f_hist) for z in zones]), {"version": FUND_WEATHER_VERSION})
     f_fc = pd.date_range(today - timedelta(days=3), today + timedelta(days=FUND_OUTLOOK_DAYS), freq="D")
@@ -10578,11 +10268,11 @@ def _demo_ops(trades: pd.DataFrame, today: date) -> pd.DataFrame:
     return ops
 
 
-def _demo_records(live: dict, rng: np.random.Generator, today: date) -> tuple[pd.DataFrame, list]:
-    """Two weeks of outlooks and next-day estimates, each made by the app's own models from what was known that day:
-    output to the day before, forecasts with the errors forecasts have, and notices as they stood. They are scored like any saved record."""
+def _demo_records(live: dict, rng: np.random.Generator, today: date) -> pd.DataFrame:
+    """Two weeks of outlooks, each made by the app's own models from what was known that day: output to the day before,
+    forecasts with the errors forecasts have, and notices as they stood. They are scored like any saved record."""
     frame = lambda key: live[key]["data"] if key in live else pd.DataFrame()
-    record, estimates = None, []
+    record = None
     history, forecast = frame("fund_weather_history"), frame("fund_weather_forecast")
     for zone in ("France", "Germany-Luxembourg"):
         table = fundamentals_table(fund_daily_rows(frame(f"fund_daily|{zone}"), frame(f"entsoe_load|{zone}"), frame(f"entsoe_generation|{zone}"), zone),
@@ -10607,28 +10297,7 @@ def _demo_records(live: dict, rng: np.random.Generator, today: date) -> tuple[pd
             if result.get("ready"):
                 kept = record_outlook(record, result["outlook"], zone, made)
                 record = kept if kept is not None else record
-        # Next-day estimates, made two days before delivery with the prices then published.
-        series = spot_series(frame(f"entsoe_price|{zone}"), ENTSOE_ZONES[zone]["timezone"])
-        vintage = frame("zone_weather_vintage")
-        published = entsoe_forecast_days(frame(f"entsoe_load_forecast|{zone}"), frame(f"entsoe_renewable_forecast|{zone}"), ENTSOE_ZONES[zone]["timezone"])
-        for back in range(12, -2, -1):
-            target = today - timedelta(days=back)
-            made = target - timedelta(days=2)
-            known_prices = series.loc[series["local"].dt.date < target]
-            truth = frame("_zone_weather_truth")
-            recent = truth.loc[(truth["date"] >= pd.Timestamp(made - timedelta(days=4))) & (truth["date"] < pd.Timestamp(target))]
-            grid_fc = pd.concat([recent, vintage.loc[vintage["date"].eq(pd.Timestamp(target)), recent.columns]], ignore_index=True)
-            grid_hist = truth.loc[truth["date"] < pd.Timestamp(made - timedelta(days=4))]
-            old = vintage.loc[vintage["date"] < pd.Timestamp(target)]
-            gas = frame("tradingview_gas_front")
-            try:
-                result = next_day_estimate(zone, known_prices, pd.DataFrame(), pd.DataFrame(), frame(f"entsoe_load_forecast|{zone}"), frame(f"entsoe_renewable_forecast|{zone}"),
-                                           grid_hist, grid_fc, gas.loc[gas["date"] < pd.Timestamp(made)], old, published=published)
-            except Exception:
-                continue
-            if result.get("ready") and result["day"] == target:
-                estimates.append((target.isoformat(), zone, result["estimate"], result["low"], result["high"], made.isoformat(), result["method"]))
-    return (record if record is not None else pd.DataFrame()), estimates
+    return record if record is not None else pd.DataFrame()
 
 
 def build_demo_desk(path: Path, today: date) -> None:
@@ -10637,16 +10306,13 @@ def build_demo_desk(path: Path, today: date) -> None:
     paths = _demo_paths(rng, today)
     store = DeskStore(path)
     live = _demo_live(rng, today, paths)
-    record, estimates = _demo_records(live, rng, today)
-    live.pop("_zone_weather_truth", None)
+    record = _demo_records(live, rng, today)
     if not record.empty:
         live["fund_outlook_record"] = {"label": "Fundamentals outlooks as made each day", "data": record, "metadata": {"demo": True},
                                        "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     for key, item in live.items():
         if not store.save_live_item(key, item):
             raise RuntimeError(f"Demo dataset {key} could not be saved.")
-    if estimates:
-        store.save_price_estimates(estimates)
     made = datetime.now(timezone.utc).isoformat(timespec="seconds")
     for product in CURVE_PRODUCTS:
         curve = validate_curve(_demo_curve_on(paths, product, today))
@@ -10960,7 +10626,7 @@ def build_builtin_history(today: Optional[date] = None, zones: Sequence[str] = (
 
 
 def write_builtin_history(path: Path) -> str:
-    """Fetch the history and write it into this file, so every copy of the app starts with it. Run: python etttr.py --build-history"""
+    """Fetch the history and write it into this file, so every copy of the app starts with it. Run: python merit.py --build-history"""
     items = build_builtin_history()
     blob = encode_builtin_history(items)
     made = date.today().isoformat()
@@ -11018,8 +10684,8 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
 
     def check_energy_conversion() -> str:
         for mwh in (0.0, 1.0, 1234.567, 1_000_000.0):
-            assert_close(mmbtu_to_mwh(mwh_to_mmbtu(mwh)), mwh, 1e-10)
-        return "MWh ⇄ MMBtu round-trip passed for four test magnitudes."
+            assert_close(mwh_to_mmbtu(mwh) / 3.412141633, mwh, 1e-10)
+        return "MWh to MMBtu matches 3.412141633 MMBtu a MWh for four test magnitudes."
 
     def check_gas_price_conversion() -> str:
         assert_close(price_eur_mwh_to_gbp_therm(THERM_PER_MWH, 1.0), 1.0, 1e-10)
@@ -11676,8 +11342,6 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             raise AssertionError("Season window is wrong.")
         if contract_window("Cal-27") != (date(2027, 1, 1), date(2028, 1, 1)) or contract_window("Dec-26") != (date(2026, 12, 1), date(2027, 1, 1)):
             raise AssertionError("Year or month window is wrong.")
-        if month_end_exclusive(date(2026, 12, 15), 3) != date(2027, 3, 15):
-            raise AssertionError("A 3-month tenor from 15 December must end on 15 March.")
         expected_rejection(lambda: contract_window("Spring-27"), "unknown contract")
         choices = contract_choices(date(2026, 11, 4))
         if choices[0] != "Dec-26" or any(contract_window(c)[0] < date(2026, 12, 1) for c in choices):
@@ -11872,7 +11536,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             raise AssertionError("ECB request or date is wrong.")
         def fake_archive(url, params=None, headers=None):
             return {"daily": {"time": ["2024-01-01", "2025-01-01"], "temperature_2m_mean": [2.0, 4.0]}}
-        normals, failures = fetch_temperature_normals(["Paris / French power proxy"], _json_get_fn=fake_archive)
+        _, normals, failures = fetch_weather_archive(["Paris / French power proxy"], _json_get_fn=fake_archive)
         if failures or normals.empty:
             raise AssertionError(f"Archive parsing failed: {failures}")
         assert_close(float(normals.iloc[0]["normal_temperature_c"]), 3.0)
@@ -12111,7 +11775,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             now = datetime.now(timezone.utc).isoformat()
             stamp = pd.Timestamp("2026-11-03T22:00:00Z")
             st.session_state.live_data = {
-                "entsoe_price|France": {"data": pd.DataFrame({"timestamp": [stamp - pd.Timedelta(days=360), stamp], "value": [1.0, 1.0], "series": ["P", "P"]}), "fetched_at": now, "metadata": {}},
+                "entsoe_price|France": {"data": pd.DataFrame({"timestamp": [stamp - pd.Timedelta(days=PRICE_HISTORY_DAYS - 5), stamp], "value": [1.0, 1.0], "series": ["P", "P"]}), "fetched_at": now, "metadata": {}},
                 "entsoe_price|Spain": {"data": pd.DataFrame({"timestamp": [stamp], "value": [1.0], "series": ["P"]}), "fetched_at": "2026-11-01T00:00:00+00:00", "metadata": {}},
                 "gie_agsi_history": {"data": pd.DataFrame({"gasDayStart": ["2026-11-03"], "full": [80.0]}), "fetched_at": now, "metadata": {}},
                 "weather_normals": {"data": pd.DataFrame({"x": [1]}), "fetched_at": now, "metadata": {}},
@@ -12529,46 +12193,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             raise AssertionError("Missing data should show as a signal waiting for data.")
         return f"Cold {cold:.0f}% is below normal {normal:.0f}%, below mild {mild:.0f}%. The past-winter test beats assuming an average winter, and the projection falls back or stops when it should."
 
-    # ---- Next-day estimate, drivers, crisis replay, VaR check, thresholds and PDF ----
-    def check_next_day_estimate() -> str:
-        rng = np.random.default_rng(21)
-        days = pd.date_range("2025-10-01", periods=300, freq="D")
-        wind = rng.uniform(5, 40, len(days))
-        hdd = np.clip(10 + 8 * np.cos(2 * np.pi * days.day_of_year.to_numpy() / 365.25) + rng.normal(0, 2, len(days)), 0, None)
-        solar = rng.uniform(20, 250, len(days))
-        price = np.empty(len(days))
-        price[0] = 70.0
-        for i in range(1, len(days)):
-            price[i] = 25 + 0.6 * price[i - 1] - 0.5 * wind[i] + 0.8 * hdd[i] - 0.02 * solar[i] - 12.0 * (days[i].day_of_week >= 5) + rng.normal(0, 1.0)
-        hourly = pd.DataFrame({"local": days.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(days)), unit="h"), "value": price.repeat(24), "hours": 1.0})
-        location = ZONE_WEATHER["France"]
-        weather = pd.DataFrame({"date": days, "location": location, "temperature_mean_c": 18.0 - hdd, "wind_speed_100m_mean_kmh": wind, "solar_radiation_mean_wm2": solar})
-        forecast = weather.tail(1).assign(date=days[-1] + pd.Timedelta(days=1), wind_speed_100m_mean_kmh=20.0, temperature_mean_c=10.0, solar_radiation_mean_wm2=100.0)
-        result = next_day_estimate("France", hourly, weather, forecast)
-        if not result["ready"]:
-            raise AssertionError(result["reason"])
-        assert_close(result["wind_effect"], -0.5, 0.06)
-        assert_close(result["hdd_effect"], 0.8, 0.15)
-        if not result["error"] < min(result["error_last_week"], result["error_yesterday"]) or not result["low"] < result["estimate"] < result["high"]:
-            raise AssertionError("On a clean rule the estimate should beat simple methods and sit inside its range.")
-        if result["day"] != (days[-1] + pd.Timedelta(days=1)).date():
-            raise AssertionError("The estimate must be for the first unpublished day.")
-        changed = hourly.copy()
-        changed.loc[changed["local"] >= days[-1], "value"] = 900.0
-        again = next_day_estimate("France", changed, weather, forecast)
-        if abs(float(again["test"].iloc[-2]["estimate"]) - float(result["test"].iloc[-2]["estimate"])) > 1e-9:
-            raise AssertionError("A later price changed an earlier estimate.")
-        short = next_day_estimate("France", hourly.head(24 * 30), weather, forecast)
-        no_forecast = next_day_estimate("France", hourly, weather, pd.DataFrame())
-        if short["ready"] or no_forecast["ready"]:
-            raise AssertionError("Without enough prices or a forecast there should be no estimate.")
-        log = pd.DataFrame({"delivery_date": [days[-1].date().isoformat(), "2030-01-01"], "estimate": [price[-1] + 2.0, 1.0]})
-        score = score_recorded_estimates(log, pd.Series(price, index=days))
-        if score["n"] != 1:
-            raise AssertionError("Only estimates with a published price can be scored.")
-        assert_close(score["error"], 2.0)
-        return "On prices built from a known rule, the fit recovers the wind and heating effects and beats simple methods. Later prices never change earlier estimates."
-
+    # ---- Drivers, crisis replay, VaR check, thresholds and PDF ----
     def check_pnl_drivers() -> str:
         month, other = date(2026, 12, 1), date(2027, 1, 1)
         buckets = pd.DataFrame([{"trade_id": "A", "product": "TTF Natural Gas", "currency": "EUR", "delivery_month": month, "net_mwh": 1000.0, "trade_price": 30.0, "trade_date": date(2026, 11, 1)},
@@ -12656,31 +12281,20 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         fired = threshold_alerts(rules, {"A": {"now": 12.0, "before": 9.0, "unit": "%"}, "B": {"now": 4.0, "before": 4.5, "unit": "EUR"}})
         if [(a["metric"], a["condition"], a["new"]) for a in fired] != [("A", "Above", True), ("B", "Below", False)]:
             raise AssertionError(f"Wrong thresholds fired: {fired}")
-        blocks = [("title", "Morning brief (test)"), ("subtitle", "Ünïcode, € and back\\slash"), ("heading", "Section"), ("text", "word " * 400),
-                  ("table", (["A", "B"], [["one", "two"]] * 90, (0.5, 0.5))), ("note", "End")]
-        pdf = simple_pdf(blocks, "Test")
-        if not pdf.startswith(b"%PDF-1.4") or not pdf.rstrip().endswith(b"%%EOF"):
-            raise AssertionError("The file isn't a complete PDF.")
-        start = int(pdf[pdf.rindex(b"startxref") + 10:].split()[0])
-        if pdf[start:start + 4] != b"xref":
-            raise AssertionError("The PDF's file table is in the wrong place.")
-        count = int(re.search(rb"/Count (\d+)", pdf)[1])
-        if count < 3 or b"\x80" not in pdf or b"\\(test\\)" not in pdf:
-            raise AssertionError("Paging, the euro sign or brackets went wrong.")
-        for offset, number in zip(re.findall(rb"(\d{10}) 00000 n", pdf)[:5], range(1, 6)):
-            if not pdf[int(offset):].startswith(b"%d 0 obj" % number):
-                raise AssertionError("A PDF object is at the wrong position.")
-        report = ReportPdf("Test", "Running", "Footer (test)", "Author")
+        report =ReportPdf("Test", "Running", "Footer (test)", "Author")
         report.masthead("Kicker", "Title €", "Date", [("A", "one"), ("B", "a much longer value that has to wrap onto a second line")], badge="Demo")
         report.key_points([("Lead", "word " * 60)])
         report.table([("A", 0.5, "left"), ("B", 0.5, "right")], [["one", {"text": "€2", "sub": "as of", "bold": True}]] * 120, heading=("01", "Table"))
         built = report.build()
         pages = int(re.search(rb"/Count (\d+)", built)[1])
         start = int(built[built.rindex(b"startxref") + 10:].split()[0])
-        if pages < 3 or built[start:start + 4] != b"xref" or b"Page 3 of" not in built or b"\\(test\\)" not in built:
+        if pages < 3 or built[start:start + 4] != b"xref" or b"Page 3 of" not in built or b"\\(test\\)" not in built or not built.rstrip().endswith(b"%%EOF"):
             raise AssertionError("The styled report PDF is malformed.")
-        return (f"Thresholds fire only when their condition holds and mark what's new. A long PDF has {count} pages with a valid file table, the euro sign and escaped brackets, "
-                f"and the styled report runs to {pages} pages with its table header and footer on each.")
+        for offset, number in zip(re.findall(rb"(\d{10}) 00000 n", built)[:5], range(1, 6)):
+            if not built[int(offset):].startswith(b"%d 0 obj" % number):
+                raise AssertionError("A PDF object is at the wrong position.")
+        return (f"Thresholds fire only when their condition holds and mark what's new. The report runs to {pages} pages with a valid file table, escaped brackets, "
+                "and its table header and footer on each.")
 
     def check_signal_themes() -> str:
         storage = [_signal("storage_level", "L", 3.0, 2.0), _signal("storage_pace", "P", 2.0, 2.0), _signal("winter_outlook", "W", 2.0, 2.0), _signal("lng", "G", 1.5)]
@@ -12720,61 +12334,6 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             raise AssertionError("Old output must not count as current evidence.")
         return "Falling nuclear output is bullish and rising is bearish. Consumption rows are ignored, zones with little nuclear get no signal, and old data doesn't count."
 
-    def check_entsoe_forecast_method() -> str:
-        calls = []
-        def fake(url, params=None, **kwargs):
-            calls.append(dict(params))
-            return b'<Doc><TimeSeries><Period><timeInterval><start>2026-01-01T00:00Z</start><end>2026-01-01T01:00Z</end></timeInterval><resolution>PT60M</resolution><Point><position>1</position><quantity>5</quantity></Point></Period></TimeSeries></Doc>', "text/xml"
-        for kind, document, process, area in (("Day-ahead load forecast", "A65", "A01", "outBiddingZone_Domain"), ("Day-ahead wind and solar forecast", "A69", "A01", "in_Domain")):
-            calls.clear()
-            fetch_entsoe_series("t", kind, "France", date(2026, 1, 1), date(2026, 1, 2), _http_fn=fake)
-            sent = calls[0]
-            if sent["documentType"] != document or sent["processType"] != process or area not in sent:
-                raise AssertionError(f"Wrong request for {kind}: {sent}")
-        rng = np.random.default_rng(31)
-        days = pd.date_range("2025-08-01", periods=320, freq="D")
-        wind_gw, load_gw, solar_gw = rng.uniform(1, 15, len(days)), rng.uniform(40, 70, len(days)), rng.uniform(0, 6, len(days))
-        price = np.empty(len(days))
-        price[0] = 70.0
-        for i in range(1, len(days)):
-            price[i] = 0.3 * price[i - 1] + 1.5 * load_gw[i] - 2.5 * wind_gw[i] - 1.0 * solar_gw[i] - 10.0 * (days[i].day_of_week >= 5) + rng.normal(0, 1.0)
-        hourly = pd.DataFrame({"local": days.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(days)), unit="h"), "value": price.repeat(24), "hours": 1.0})
-        location = ZONE_WEATHER["France"]
-        weather = pd.DataFrame({"date": days, "location": location, "temperature_mean_c": rng.normal(10, 5, len(days)), "wind_speed_100m_mean_kmh": rng.uniform(5, 40, len(days)), "solar_radiation_mean_wm2": rng.uniform(20, 250, len(days))})
-        ahead = weather.tail(1).assign(date=days[-1] + pd.Timedelta(days=1))
-        stamps = (days.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(days)), unit="h")).tz_localize("Europe/Paris", ambiguous=True, nonexistent="shift_forward").tz_convert("UTC")
-        load_fc = pd.DataFrame({"timestamp": stamps, "value": (load_gw * 1000).repeat(24), "series": "Load"})
-        renew = pd.concat([pd.DataFrame({"timestamp": stamps, "value": (wind_gw * 500).repeat(24), "series": name}) for name in ("Wind Onshore", "Wind Offshore")] +
-                          [pd.DataFrame({"timestamp": stamps, "value": (solar_gw * 1000).repeat(24), "series": "Solar"})])
-        late = next_day_estimate("France", hourly, weather, ahead, load_fc, renew)
-        if late["method"] != "Weather" or late["target_has_forecast"] or late["check_method"] != "ENTSO-E forecasts":
-            raise AssertionError(f"Before forecasts exist, weather sets the estimate: {late['method']}, {late['check_method']}.")
-        if not late["comparison"] or late["comparison"]["forecasts"] >= late["comparison"]["weather"]:
-            raise AssertionError(f"On a rule built from forecasts, that method should win: {late['comparison']}")
-        assert_close(late["forecast_effects"]["wind"], -2.5, 0.2)
-        assert_close(late["forecast_effects"]["load"], 1.5, 0.2)
-        next_stamps = pd.date_range(days[-1] + pd.Timedelta(days=1), periods=24, freq="h", tz="Europe/Paris").tz_convert("UTC")
-        early_load = pd.concat([load_fc, pd.DataFrame({"timestamp": next_stamps, "value": 55000.0, "series": "Load"})])
-        early_renew = pd.concat([renew] + [pd.DataFrame({"timestamp": next_stamps, "value": 5000.0, "series": name}) for name in ("Wind Onshore", "Solar")])
-        early = next_day_estimate("France", hourly, weather, ahead, early_load, early_renew)
-        if early["method"] != "ENTSO-E forecasts":
-            raise AssertionError("When the forecast exists and tested better, it should set the estimate.")
-        worse = next_day_estimate("France", hourly, weather, ahead, load_fc.assign(value=rng.uniform(40000, 70000, len(load_fc))), renew.assign(value=rng.uniform(0, 9000, len(renew))))
-        if worse["comparison"]["forecasts"] < worse["comparison"]["weather"] and worse["method"] != "Weather":
-            raise AssertionError("Method choice is inconsistent.")
-        absent = next_day_estimate("France", hourly, weather, ahead)
-        if absent["method"] != "Weather" or absent["comparison"] is not None:
-            raise AssertionError("Without forecasts the weather method should run alone.")
-        changed = hourly.copy()
-        changed.loc[changed["local"] >= days[-1], "value"] = 900.0
-        again = next_day_estimate("France", changed, weather, ahead, load_fc, renew)
-        # The forecast test holds one fewer usable row only if the last day is dropped, so compare by date.
-        one = pd.DataFrame(late["test"]).set_index("day")["estimate"]
-        two = pd.DataFrame(again["test"]).set_index("day")["estimate"]
-        check_day = days[-3]
-        assert_close(float(one.loc[check_day]), float(two.loc[check_day]))
-        return "Requests use A65/A01 and A69/A01. Weather sets the estimate before ENTSO-E's forecast exists, then the forecast takes over only if it tested better. Effects are recovered and later prices change nothing earlier."
-
     def check_tradingview_products() -> str:
         today = date(2026, 11, 9)
         listed = {("DEB", 2026, 11): 242.83, ("DEB", 2026, 12): 198.75, ("DEB", 2027, 1): 211.08, ("UKG", 2026, 12): 240.66, ("UKG", 2027, 1): 242.15,
@@ -12808,46 +12367,6 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         if float(composed.loc[composed["delivery_month"].eq(date(2026, 11, 1)), "price"].iloc[0]) != 242.83 or sources[date(2026, 11, 1)] != SOURCE_IMPORTED:
             raise AssertionError("A market quote for the current month already includes the days delivered, so it must stand as it is.")
         return "German power keeps the month in delivery, NBP converts 240.66 p/therm to £82.12/MWh, EUA asks only for listed months and fills the gaps in a line, and a current-month quote isn't blended again."
-
-    def check_estimate_gas() -> str:
-        days = pd.date_range("2026-01-05", periods=10, freq="D")
-        closes = pd.DataFrame({"date": pd.to_datetime(["2026-01-02", "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09"]), "close": [30.0, 31.0, 32.0, 33.0, 34.0, 35.0]})
-        known = gas_at_auction(closes, days)
-        # Delivery Thu 8 Jan: the auction is Wed 7 at noon, so Tue 6's close is the last one known.
-        # Delivery Mon 12 Jan: two days before is Sat 10, so Fri 9's close. Delivery Mon 5 Jan: Fri 2's.
-        if known.loc["2026-01-08", "gas"] != 32.0 or known.loc["2026-01-12", "gas"] != 35.0 or known.loc["2026-01-08", "gas_before"] != 31.0:
-            raise AssertionError(f"Gas known at the auction is wrong: {known['gas'].tolist()}")
-        if known.loc["2026-01-05", "gas"] != 30.0:
-            raise AssertionError("A Monday's estimate must use the previous Friday's close.")
-        rng = np.random.default_rng(12)
-        span = pd.date_range("2025-08-01", periods=330, freq="D")
-        gas_path = 40 + np.cumsum(rng.normal(0, 1.5, len(span)))
-        gas_frame = pd.DataFrame({"date": span, "close": gas_path})
-        known_gas = gas_at_auction(gas_frame, span)["gas"].to_numpy()
-        wind = rng.uniform(5, 40, len(span))
-        def run(price):
-            hourly = pd.DataFrame({"local": span.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(span)), unit="h"), "value": np.repeat(price, 24), "hours": 1.0})
-            grid = pd.DataFrame({"zone": "France", "date": span, "hdd": 6.0, "wind": wind, "solar": 100.0})
-            ahead = grid.tail(1).assign(date=span[-1] + pd.Timedelta(days=1))
-            return next_day_estimate("France", hourly, pd.DataFrame(), pd.DataFrame(), grid_history=grid, grid_forecast=ahead, gas=gas_frame)
-        follows = np.nan_to_num(2.2 * known_gas, nan=88.0) + 30 - 1.5 * wind + rng.normal(0, 3, len(span))
-        with_gas = run(follows)
-        if not with_gas["gas"] or not with_gas["gas"]["used"]:
-            raise AssertionError(f"When power follows gas, gas should be used: {with_gas['gas']}")
-        assert_close(with_gas["gas"]["effect"], 2.2, 0.5)
-        noise = 120 - 1.5 * wind + rng.normal(0, 3, len(span))
-        without = run(noise)
-        if without["gas"] is None or without["gas"]["used"]:
-            raise AssertionError(f"When power ignores gas, gas shouldn't be used: {without['gas']}")
-        class Front:
-            def get_hist(self, symbol, exchange, interval, n_bars, fut_contract=None):
-                if (symbol, exchange, fut_contract) != ("UKG", "NYMEX", 1):
-                    raise AssertionError("The front month is asked for as a continuous contract.")
-                return pd.DataFrame({"close": [200.0, 210.0]}, index=pd.to_datetime(["2026-11-05 01:00", "2026-11-06 01:00"]))
-        front = fetch_tradingview_front("NBP Natural Gas", 2, _client=Front())
-        assert_close(float(front["close"].iloc[-1]), 210.0 * 0.341214, 0.01)
-        return (f"Gas uses the last close two days before delivery. When power follows gas it's used (miss €{with_gas['gas']['with']:.1f} against €{with_gas['gas']['without']:.1f}, "
-                f"effect {with_gas['gas']['effect']:.2f} for 2.2 set), and when it doesn't, it's left out.")
 
     def check_safe_downloads() -> str:
         def refused(action, words):
@@ -12894,43 +12413,6 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         return ("Plain HTTP and file addresses are refused, a redirect to another site or to HTTP is stopped, a decompression bomb and an XML entity trick are refused, "
                 "keys are removed from messages, the keys file is made private, and a keys file that Git could publish is flagged.")
 
-    def check_estimate_extra_inputs() -> str:
-        rng = np.random.default_rng(21)
-        span = pd.date_range("2025-06-01", periods=330, freq="D")       # summer first, so the history holds warm days
-        wind = rng.uniform(5, 40, len(span))
-        temperature = 14 + 9 * np.cos((span.day_of_year.to_numpy() - 200) / 365 * 2 * np.pi) + rng.normal(0, 2.5, len(span))
-        load = 50 + rng.normal(0, 4, len(span))
-        stamps = (span.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(span)), unit="h")).tz_localize("Europe/Paris", nonexistent="shift_forward", ambiguous="NaT")
-        keep = ~stamps.isna()
-        load_frame = pd.DataFrame({"timestamp": stamps[keep].tz_convert("UTC"), "value": np.repeat(load * 1000.0, 24)[keep]})
-        renewables = pd.concat([load_frame.assign(series="Wind Onshore", value=5000.0), load_frame.assign(series="Solar", value=3000.0)])
-        grid = pd.DataFrame({"zone": "France", "date": span, "temperature": temperature, "hdd": np.clip(18 - temperature, 0, None), "wind": wind, "solar": 100.0})
-        ahead_day = span[-1] + pd.Timedelta(days=1)
-        ahead = grid.tail(1).assign(date=ahead_day)
-        ahead_load = load_frame.tail(24).assign(timestamp=lambda f: f["timestamp"] + pd.Timedelta(days=1))
-        def run(price, with_forecast_ahead=True):
-            hourly = pd.DataFrame({"local": span.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(span)), unit="h"), "value": np.repeat(price, 24), "hours": 1.0})
-            loads = pd.concat([load_frame, ahead_load]) if with_forecast_ahead else load_frame
-            return next_day_estimate("France", hourly, pd.DataFrame(), pd.DataFrame(), loads, renewables, grid_history=grid, grid_forecast=ahead)
-        cooling = np.clip(temperature - COOLING_BASE_C, 0, None)
-        driven = run(60 + 2.5 * (load - 50) + 6.0 * cooling - 1.0 * wind + rng.normal(0, 2, len(span)))
-        extras = driven["extras"]
-        if not extras.get("load", {}).get("used") or not extras.get("cooling", {}).get("used"):
-            raise AssertionError(f"When prices follow the load forecast and hot days, both should be used: {extras}")
-        assert_close(extras["load"]["effect"], 2.5, 0.6)
-        plain = run(90 - 1.0 * wind + rng.normal(0, 2, len(span)))
-        if any(item["used"] for item in plain["extras"].values()):
-            raise AssertionError(f"Inputs that don't help must stay out: {plain['extras']}")
-        late = run(60 + 2.5 * (load - 50) - 1.0 * wind + rng.normal(0, 2, len(span)), with_forecast_ahead=False)
-        if late["extras"]["load"]["used"] or late["extras"]["load"]["ready"] or not late["ready"]:
-            raise AssertionError("Without a load forecast for the day, the estimate must still come out, without that input.")
-        winter = grid.assign(temperature=5.0, hdd=13.0)
-        cold = zone_weather(winter, None, "France")
-        if float(cold["cdd"].sum()) != 0.0:
-            raise AssertionError("A cold history has no cooling demand.")
-        return (f"Load forecast and cooling are used when prices follow them (miss €{extras['load']['without']:.1f} to €{extras['cooling']['with']:.1f}), "
-                "stay out when they don't help, and a missing load forecast for the day doesn't stop the estimate.")
-
     def check_backups_and_kept_forecasts() -> str:
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "desk.db")
@@ -12951,21 +12433,6 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             copy.close()
             if value != 42:
                 raise AssertionError("A backup must hold the data.")
-        morning = datetime(2026, 11, 9, 9, 0, tzinfo=timezone.utc)      # 10:00 in Paris, before the auction
-        row = lambda wind, day="2026-11-10": pd.DataFrame({"zone": "France", "date": pd.to_datetime([day]), "temperature": 9.0, "hdd": 9.0, "wind": wind, "solar": 80.0, "points": 12})
-        held = keep_weather_vintage(None, row(20.0), morning)
-        held = keep_weather_vintage(held, row(35.0), morning.replace(hour=15))   # an afternoon forecast must not replace the morning one
-        if len(held) != 1 or float(held["wind"].iloc[0]) != 20.0:
-            raise AssertionError("The forecast known before the auction must be kept.")
-        held = keep_weather_vintage(held, row(22.0), morning.replace(hour=10))   # a later morning one may
-        if float(held["wind"].iloc[0]) != 22.0:
-            raise AssertionError("A newer forecast from before the auction should replace an older one.")
-        if keep_weather_vintage(held, row(30.0, "2026-11-12"), morning) is not held and len(keep_weather_vintage(held, row(30.0, "2026-11-12"), morning)) != 1:
-            raise AssertionError("Only tomorrow's forecast is kept.")
-        history = pd.DataFrame({"zone": "France", "date": pd.to_datetime(["2026-11-09", "2026-11-10"]), "temperature": 9.0, "hdd": 9.0, "wind": [10.0, 40.0], "solar": 80.0})
-        used = zone_weather(history, None, "France", held)
-        if float(used.loc["2026-11-10", "wind"]) != 22.0 or used["kept"].tolist() != [0.0, 1.0] or float(zone_weather(history, None, "France").loc["2026-11-10", "wind"]) != 40.0:
-            raise AssertionError("A kept forecast should replace what happened for that day, and only that day.")
         asked = []
         class Count:
             def get_hist(self, symbol, exchange, interval, n_bars):
@@ -12974,8 +12441,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         near = fetch_tradingview_curve("TTF Natural Gas", date(2026, 11, 9), 7, _client=Count(), near_only=True)
         if len(asked) != TRADINGVIEW_NEAR_MONTHS or near["contract"].nunique() != TRADINGVIEW_NEAR_MONTHS:
             raise AssertionError(f"An hourly refresh should ask for the near months only: {len(asked)}")
-        return (f"One backup a day and the last {BACKUPS_KEPT} kept. A forecast fetched before the auction is kept and used for that day's test, and a later one can't replace it. "
-                f"An hourly TradingView refresh asks for {TRADINGVIEW_NEAR_MONTHS} contracts instead of the whole curve.")
+        return f"One backup a day and the last {BACKUPS_KEPT} kept. An hourly TradingView refresh asks for {TRADINGVIEW_NEAR_MONTHS} contracts instead of the whole curve."
 
     def check_storage_valuation() -> str:
         days, years = np.full(12, 30.0), np.arange(12) / 12.0
@@ -13054,28 +12520,6 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         return (f"Kirk's formula matches Margrabe's exactly at zero strike and a 400,000-path simulation within 2% (€{kirk:.2f} against €{simulated:.2f}). "
                 f"Zero volatility gives the margin, hedges sell power and buy gas and carbon, and a 50% volatility is measured as {measured['near'] * 100:.0f}%.")
 
-    def check_estimate_chances() -> str:
-        rng = np.random.default_rng(31)
-        misses = rng.normal(0, 10, 500)
-        spread = estimate_distribution(misses, rng.normal(0, 25, 500))
-        if np.abs(spread["below"] - np.array(PROBABILITY_LEVELS)).max() > 0.05:
-            raise AssertionError(f"Each line should have the price below it about as often as it says: {np.round(spread['below'], 2)}")
-        if not spread["score"] < spread["simple_score"]:
-            raise AssertionError("A method with smaller misses must score better.")
-        assert_close(chance_above(spread, 100.0, 100.0), 0.5, 0.06)
-        if not chance_above(spread, 100.0, 60.0) > 0.99 > 0.01 > chance_above(spread, 100.0, 140.0):
-            raise AssertionError("Chances far from the estimate must be near certain or near zero.")
-        assert_close(_pinball(np.array([0.5]), np.array([10.0]), 14.0), 2.0)
-        assert_close(_pinball(np.array([0.9]), np.array([10.0]), 4.0), 0.6)
-        if estimate_distribution(misses[:20]) is not None:
-            raise AssertionError("With few tested days no chances can be given.")
-        jumpy = np.r_[rng.normal(0, 5, 300), rng.normal(0, 25, 40)]
-        wide, calm = estimate_distribution(jumpy), estimate_distribution(jumpy[:300])
-        if not (wide["quantiles"][-1] - wide["quantiles"][0]) > 2.5 * (calm["quantiles"][-1] - calm["quantiles"][0]):
-            raise AssertionError("The spread must widen when recent misses grow.")
-        return (f"Each line has the price below it about as often as it says (largest gap {np.abs(spread['below'] - np.array(PROBABILITY_LEVELS)).max() * 100:.0f} points), "
-                "smaller misses score better, the spread widens after large misses, and too little history gives no chances.")
-
     def check_estimate_calendar() -> str:
         if _easter(2026) != date(2026, 4, 5) or _easter(2027) != date(2027, 3, 28):
             raise AssertionError("Easter date is wrong.")
@@ -13090,15 +12534,7 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         kinds = day_classes(days, "France")
         if kinds[0] != 2 or kinds[1] != 1 or kinds[2] != 2 or kinds[3] != 0 or kinds[13] != 2:
             raise AssertionError(f"Day kinds are wrong: {kinds[:14]}")
-        base = pd.Series(np.arange(len(days), dtype=float) + 100.0, index=days)
-        frame = estimate_features(base, pd.DataFrame(), days[-1] + pd.Timedelta(days=1), "France")
-        monday = frame.loc["2026-05-11"]   # Friday 8 May is a holiday too, so the last working day is Thursday 7 May
-        if monday["work"] != base["2026-05-07"] or monday["same"] != base["2026-05-07"] or monday["lag1"] != base["2026-05-10"] or monday["after_off"] != 1.0:
-            raise AssertionError("A working day after a weekend must start from the last working day.")
-        sunday = frame.loc["2026-05-17"]
-        if sunday["same"] != base["2026-05-14"]:
-            raise AssertionError("A Sunday must start from the last Sunday or holiday.")
-        return "Easter, French, German and British holidays match the calendar. A Monday after a long weekend starts from the last working day, and a Sunday from the last holiday."
+        return "Easter, French, German and British holidays match the calendar, and holidays count as Sundays."
 
     def check_zone_weather_fetch() -> str:
         calls = []
@@ -13132,43 +12568,6 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         if url != OPEN_METEO_FORECAST_BASE or params.get("past_days") != 7 or params.get("forecast_days") != 3:
             raise AssertionError("The forecast request is wrong.")
         return f"{points} German points go in one request, partial days are dropped, wind and heating demand are averaged across points, and an answer for too few points is refused."
-
-    def check_estimate_range() -> str:
-        rng = np.random.default_rng(5)
-        steady = rng.normal(0, 10, 400)
-        out = estimate_range(steady)
-        if out["held"] is None or not 0.72 <= out["held"] <= 0.88:
-            raise AssertionError(f"On steady misses the range should hold about 80% of days: {out['held']}")
-        assert_close(out["high"] - out["low"], 2 * 1.2816 * 10, 6.0)
-        jumpy = np.r_[rng.normal(0, 5, 200), rng.normal(0, 25, 40)]
-        wide = estimate_range(jumpy)
-        if not wide["high"] - wide["low"] > 2.5 * (estimate_range(jumpy[:200])["high"] - estimate_range(jumpy[:200])["low"]):
-            raise AssertionError("After misses grow, the range must widen.")
-        few = estimate_range(rng.normal(0, 10, 20))
-        if few["held"] is not None or few["adaptive"]:
-            raise AssertionError("With few tested days the range can't claim a hit rate.")
-        return f"On steady misses the range held {out['held'] * 100:.0f}% of days for an 80% aim, it widens when misses grow, and with few tested days it claims no hit rate."
-
-    def check_estimate_uses_zone_points() -> str:
-        rng = np.random.default_rng(8)
-        days = pd.date_range("2025-09-01", periods=330, freq="D")
-        zone_wind, city_wind = rng.uniform(5, 40, len(days)), rng.uniform(5, 40, len(days))
-        price = 120 - 2.0 * zone_wind - 15.0 * (days.day_of_week >= 5) + rng.normal(0, 2, len(days))
-        hourly = pd.DataFrame({"local": days.repeat(24) + pd.to_timedelta(np.tile(np.arange(24), len(days)), unit="h"), "value": price.repeat(24), "hours": 1.0})
-        city = pd.DataFrame({"date": days, "location": ZONE_WEATHER["France"], "temperature_mean_c": 12.0, "wind_speed_100m_mean_kmh": city_wind, "solar_radiation_mean_wm2": 100.0})
-        grid = pd.DataFrame({"zone": "France", "date": days, "hdd": 6.0, "wind": zone_wind, "solar": 100.0})
-        ahead = grid.tail(1).assign(date=days[-1] + pd.Timedelta(days=1), wind=30.0)
-        with_grid = next_day_estimate("France", hourly, city, city.tail(1).assign(date=days[-1] + pd.Timedelta(days=1)), grid_history=grid, grid_forecast=ahead)
-        city_only = next_day_estimate("France", hourly, city, city.tail(1).assign(date=days[-1] + pd.Timedelta(days=1)))
-        if "points" not in with_grid["weather_basis"] or city_only["weather_basis"] != "Paris":
-            raise AssertionError(f"Wrong weather source: {with_grid['weather_basis']}, {city_only['weather_basis']}")
-        if not with_grid["error"] < 0.5 * city_only["error"]:
-            raise AssertionError("When prices follow zone-wide wind, the zone points should test far better than one city.")
-        assert_close(with_grid["wind_effect"], -2.0, 0.25)
-        no_ahead = next_day_estimate("France", hourly, city, city.tail(1).assign(date=days[-1] + pd.Timedelta(days=1)), grid_history=grid)
-        if no_ahead["weather_basis"] != "Paris":
-            raise AssertionError("Without a zone forecast for the day, the city forecast should be used.")
-        return f"Zone points are used when they have a forecast for the day (miss €{with_grid['error']:.1f} against €{city_only['error']:.1f} for one city), otherwise the city."
 
     def check_tradingview_curve() -> str:
         today = date(2026, 11, 9)
@@ -13669,8 +13068,8 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             store = DeskStore(path)
             live = store.load_live_items()
             wanted = {"eex_eua_auctions", "entsoe_price", "entsoe_load", "entsoe_generation", "entsoe_load_forecast", "entsoe_renewable_forecast", "entsoe_flow",
-                      "gie_agsi_history", "gie_alsi", "entsog_flow", "weather_daily", "weather_normals", "weather_archive", "zone_weather_history",
-                      "zone_weather_forecast", "tradingview_gas_front", "fund_daily", "fund_weather_history", "fund_weather_forecast",
+                      "gie_agsi_history", "gie_alsi", "entsog_flow", "weather_daily", "weather_normals", "weather_archive",
+                      "tradingview_gas_front", "fund_daily", "fund_weather_history", "fund_weather_forecast",
                       "fund_weather_ensemble", "entsoe_outages", "holidays", "the_gas_consumption", "fund_outlook_record"}
             missing = sorted(n for n in wanted if not any(k == n or k.startswith(n + "|") for k in live))
             if missing:
@@ -13829,14 +13228,10 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Related signals share one weight", "Market Read", check_signal_themes),
         ("Nuclear output signal", "Market Read", check_nuclear_signal),
         ("Demand weights for heating", "Market Read", check_demand_weights),
-        ("ENTSO-E forecast method", "Next-day estimate", check_entsoe_forecast_method),
-        ("Next-day estimate recovers known effects", "Next-day estimate", check_next_day_estimate),
         ("TradingView curve through tvdatafeed", "Live API integration", check_tradingview_curve),
         ("Power, NBP and EUA from TradingView", "Live API integration", check_tradingview_products),
-        ("Gas in the next-day estimate", "Next-day estimate", check_estimate_gas),
         ("Downloads refuse unsafe addresses and content", "Security", check_safe_downloads),
-        ("Load forecast and cooling in the estimate", "Next-day estimate", check_estimate_extra_inputs),
-        ("Backups, kept forecasts and near-month refresh", "Data handling", check_backups_and_kept_forecasts),
+        ("Backups and near-month refresh", "Data handling", check_backups_and_kept_forecasts),
         ("Gas storage valuation", "Asset valuation", check_storage_valuation),
         ("Plant spread option", "Asset valuation", check_plant_option),
         ("Wind output, sea points and weather scenarios", "Fundamentals outlook", check_fund_weather_and_scenarios),
@@ -13848,11 +13243,9 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("School and regional holidays", "Fundamentals outlook", check_holidays),
         ("Published forecasts combined with the models", "Fundamentals outlook", check_combined_forecast),
         ("Wind-farm and solar-park points", "Fundamentals outlook", check_outlook_points),
-        ("Chances for the next day", "Next-day estimate", check_estimate_chances),
-        ("Holidays and kinds of day", "Next-day estimate", check_estimate_calendar),
+        ("Holidays and kinds of day", "Price forecast", check_estimate_calendar),
+        ("Known answer recovered, leakage caught", "Price forecast", epf_self_checks),
         ("Weather across a zone in one request", "Live API integration", check_zone_weather_fetch),
-        ("The 80% range holds about 80%", "Next-day estimate", check_estimate_range),
-        ("Zone weather points beat one city", "Next-day estimate", check_estimate_uses_zone_points),
         ("P&L drivers add up", "Daily P&L", check_pnl_drivers),
         ("Crisis replay by hand", "Risk", check_crisis_replay),
         ("VaR check and Kupiec test", "Risk", check_var_backtest),
@@ -14167,7 +13560,7 @@ def page_power_spot():
     st.caption(f"EUR/MWh. Peak is weekdays 08:00 to 20:00 local time. Averages are weighted by time, so 15-minute and hourly data compare fairly. Showing {min(s['local'].min() for s in active.values()):%d %b %Y} to {max(s['local'].max() for s in active.values()):%d %b %Y}. A zone with less history covers a shorter span.")
     table(pd.DataFrame(rows))
 
-    tabs = view_tabs(["Prices", "Daily shape", "Heatmap", "Duration curve", "Zone spread", "Wind and solar capture", "Next-day estimate"])
+    tabs = view_tabs(["Prices", "Daily shape", "Heatmap", "Duration curve", "Zone spread", "Wind and solar capture", "Next-day forecast"])
     if tabs[6]:
         render_next_day(list(active))
     if tabs[0]:
@@ -15340,168 +14733,201 @@ def render_winter_outlook() -> None:
 
 
 # -----------------------------------------------------------------------------
-# Next-day estimate, P&L drivers, crisis replay, VaR check and morning brief
+# Next-day price forecast, P&L drivers, crisis replay, VaR check and morning brief
 # -----------------------------------------------------------------------------
-def zone_estimate(zone: str) -> dict:
-    return session_memo(f"estimate|{zone}", (),
-                        lambda: next_day_estimate(zone, zone_prices(zone), _live_dataset_frame("weather_power_history"), _live_dataset_frame("weather_daily"),
-                                                  _live_dataset_frame(f"entsoe_load_forecast|{zone}"), _live_dataset_frame(f"entsoe_renewable_forecast|{zone}"),
-                                                  _live_dataset_frame("zone_weather_history"), _live_dataset_frame("zone_weather_forecast"),
-                                                  _live_dataset_frame("tradingview_gas_front"), _live_dataset_frame("zone_weather_vintage")))
+EPF_FIRST_DAY = EPF_VALID_START - pd.Timedelta(days=364)   # LightGBM's ranges learn from a year of misses before VALIDATION
+EPF_MODEL_VERSION = 1          # forecasts kept under an earlier version are made again
+EPF_CHUNK_DAYS = 90
+
+
+def _epf_key(kind: str, zone: str) -> str:
+    return f"epf_{kind}|{zone}|v{EPF_MODEL_VERSION}"
+
+
+def epf_data(zone: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Hourly prices, and what each auction knew, for one zone."""
+    return session_memo(f"epf_data|{zone}", (), lambda: (hourly_matrix(zone_prices(zone)), epf_inputs(
+        zone, _live_dataset_frame(f"entsoe_load_forecast|{zone}"), _live_dataset_frame("epf_weather"),
+        _live_dataset_frame("tradingview_gas_front"), _live_dataset_frame("eex_eua_auctions"))))
+
+
+def epf_point(held: pd.DataFrame, zone: str = "") -> pd.DataFrame:
+    """Kept forecasts as one row a day: LEAR, with its daily level averaged with level_forecast's where that helped."""
+    frame = held.assign(day=pd.to_datetime(held["day"])).drop_duplicates("day", keep="last").set_index("day").sort_index()
+    frame = frame.reindex(pd.date_range(frame.index.min(), frame.index.max()))
+    lear = frame[[f"h{h}" for h in range(24)]].set_axis(range(24), axis=1)
+    weight = EPF_LEVEL_WEIGHT.get(zone, 0.0)
+    return lear.add(weight * (frame["level"] - lear.mean(axis=1)), axis=0) if weight else lear
+
+
+def epf_tasks() -> list[UpdateTask]:
+    """Forecast, in the background, each day not forecast yet, a quarter at a time so each part is kept as it ends, then fit
+    LightGBM's ranges for the weeks that changed. Days after the last published price are made again when an input changes."""
+    tasks, live = [], live_items()
+    for zone in [z for z in _live_variants("entsoe_price") if z in ENTSOE_ZONES]:
+        prices, inputs = epf_data(zone)
+        if prices.dropna().shape[0] < 400:
+            continue
+        seen = tuple(live.versions.get(k) for k in (f"entsoe_price|{zone}", f"entsoe_load_forecast|{zone}", "epf_weather", "tradingview_gas_front", "eex_eua_auctions"))
+        fresh = st.session_state.setdefault("epf_seen", {}).get(zone) != seen
+        st.session_state["epf_seen"][zone] = seen
+        held, held_ranges, last = _held_frame(_epf_key("points", zone)), _held_frame(_epf_key("ranges", zone)), prices.dropna().index[-1]
+        done, ranged = (set(pd.to_datetime(f["day"])) if f is not None else set() for f in (held, held_ranges))
+        todo = [d for d in pd.date_range(max(EPF_FIRST_DAY, prices.index[0] + pd.Timedelta(days=60)), last + pd.Timedelta(days=1)) if d not in done or (fresh and d > last)]
+        made: list = []        # the parts below run one after another, so the ranges task sees every part made before it
+        for part in (todo[i:i + EPF_CHUNK_DAYS] for i in range(0, len(todo), EPF_CHUNK_DAYS)):
+            def run(part=part, zone=zone, prices=prices, inputs=inputs, made=made) -> pd.DataFrame:
+                frame = walk_forward(lambda p, x, d: lear_forecast(p, x, d, zone), prices, inputs, part).add_prefix("h")
+                frame["level"] = walk_forward(lambda p, x, d: level_forecast(p, x, d, zone), prices, inputs, part)[0] if zone in EPF_LEVEL_WEIGHT else np.nan
+                made.append(frame.rename_axis("day").reset_index())
+                return made[-1]
+            keep = lambda frame, zone=zone: f"{len(store_observations(_epf_key('points', zone), f'Price forecasts made by the app, {zone}', frame, {'zone': zone}, ('day',), 'day')):,} days held"
+            tasks.append(UpdateTask(f"Price forecast, {zone}, {part[0]:%d %b %Y} to {part[-1]:%d %b %Y}", run, keep, lane="forecast"))
+        if todo or (held is not None and not done <= ranged):
+            def fit(zone=zone, prices=prices, inputs=inputs, held=held, made=made, ranged=ranged) -> pd.DataFrame:
+                point = epf_point(pd.concat([f for f in (held, *made) if f is not None], ignore_index=True), zone)
+                redo = {pd.Timestamp(d) for f in made for d in f["day"]}
+                first = next((i for i, d in enumerate(point.index) if d not in ranged or d in redo), len(point)) // 7 * 7
+                q = lgbm_quantiles(point, prices, inputs, zone, first=first)
+                return pd.concat([pd.DataFrame(q[k][first:], index=point.index[first:]).add_prefix("h").assign(level=level)
+                                  for k, level in enumerate(EPF_LEVELS)]).rename_axis("day").reset_index()
+            keep = lambda frame, zone=zone: f"{len(store_observations(_epf_key('ranges', zone), f'Price ranges made by the app, {zone}', frame, {'zone': zone}, ('day', 'level'), 'day')):,} rows held"
+            tasks.append(UpdateTask(f"Price ranges, {zone}", fit, keep, lane="forecast"))
+    return tasks
+
+
+def maybe_forecast() -> None:
+    """Start the price forecast in the background when something it uses has changed and nothing else is running."""
+    live = live_items()
+    if demo_mode() or st.session_state.get("update_job") or st.session_state.get("epf_planned") == live.any_version:
+        return
+    st.session_state.epf_planned = live.any_version
+    start_update(tasks=epf_tasks())
+
+
+def epf_forecast(zone: str) -> dict:
+    """The kept forecast with its calibrated ranges, the yardsticks, the scorecard and the next delivery day's forecast."""
+    def build() -> dict:
+        prices, inputs = epf_data(zone)
+        held, held_ranges = _held_frame(_epf_key("points", zone)), _held_frame(_epf_key("ranges", zone))
+        if prices.dropna().shape[0] < 400:
+            return {"ready": False, "reason": f"The price forecast needs about four years of day-ahead prices for {zone}. Select Update market data."}
+        if held is None:
+            return {"ready": False, "reason": "The price forecast is being made for every past day, so it can be tested. This runs once, in the background."}
+        lear, point = epf_point(held), epf_point(held, zone)
+        name, ranges = ("LEAR + daily level" if zone in EPF_LEVEL_WEIGHT else "LEAR"), "the model's misses over the last half-year"
+        quantiles = residual_quantiles(point, prices)
+        if held_ranges is not None:
+            part = held_ranges.assign(day=pd.to_datetime(held_ranges["day"]))
+            raw = np.stack([part.loc[np.isclose(part["level"], level)].set_index("day").reindex(point.index)[[f"h{h}" for h in range(24)]].to_numpy(float) for level in EPF_LEVELS])
+            quantiles, ranges = calibrate(raw, prices, point.index), "LightGBM on the model's misses, calibrated on its own recent misses"
+        forecasts = {k: (v, residual_quantiles(v, prices)) for k, v in epf_baselines(prices).items()}
+        if name != "LEAR":
+            forecasts["LEAR"] = (lear, residual_quantiles(lear, prices))
+        forecasts[name] = (point, quantiles)
+        card = epf_scorecard(prices, forecasts, list(forecasts)[:3], ("Validation", "Live") if EPF_TEST_SEALED else ("Validation", "Test", "Live"))
+        last = prices.dropna().index[-1]
+        day = last + pd.Timedelta(days=1)
+        base = point.mean(axis=1)
+        base_q = residual_quantiles(base.to_frame(), prices.mean(axis=1).to_frame())[:, :, 0]
+        misses = (prices.mean(axis=1) - base).dropna()
+        out = {"ready": True, "zone": zone, "name": name, "ranges": ranges, "card": card, "day": day, "last": last, "point": None,
+               "latest_miss": float(misses.iloc[-1]) if len(misses) else np.nan,
+               "unusual": bool(len(misses) > 60 and abs(misses.iloc[-1]) > misses.iloc[-183:-1].abs().quantile(0.9)),
+               "inputs": [name for name in inputs.columns.get_level_values(0).unique() if day in inputs.index and np.isfinite(inputs.loc[day, name].to_numpy(float)).all()]}
+        if day in point.index and np.isfinite(point.loc[day]).all():
+            k = point.index.get_loc(day)
+            out.update({"point": point.loc[day].to_numpy(), "quantiles": quantiles[:, k], "base": float(base.loc[day]), "base_low": float(base_q[1, k]), "base_high": float(base_q[5, k])})
+        return out
+    return session_memo(f"epf_forecast|{zone}", (), build)
+
+
+def render_epf_scorecard(card: pd.DataFrame) -> None:
+    st.subheader("Honest test, hour by hour")
+    shown = lambda p: "" if not np.isfinite(p) else "< 0.001" if p < 0.001 else f"{p:.3f}"
+    table(card.assign(**{"DM p": card["DM p"].map(shown), "Cover 80%": card["Cover 80%"] * 100, "Cover 90%": card["Cover 90%"] * 100}))
+    st.caption(f"Each delivery day is forecast from what its auction could see at noon the day before, with each model refitted every day. Models were chosen on VALIDATION, "
+               f"{EPF_VALID_START:%d %b %Y} to {EPF_TEST_START - pd.Timedelta(days=1):%d %b %Y}. TEST, {EPF_TEST_START:%d %b %Y} to "
+               f"{EPF_TEST_END - pd.Timedelta(days=1):%d %b %Y}, {'is sealed until the models are final' if EPF_TEST_SEALED else 'was frozen beforehand and scored once'}; "
+               "later days are the live record. rMAE is the MAE over the seasonal naive's. The yardsticks' ranges come from their own past misses. "
+               "DM p is the one-sided Diebold-Mariano p-value against the best other yardstick: below 0.05 means clearly better.")
 
 
 def record_price_estimates() -> None:
-    rows = []
-    store = desk_store()
-    for zone in _live_variants("entsoe_price"):
-        if zone in ZONE_WEATHER:
-            base = daily_base_prices(zone_prices(zone))
-            target = (base.index[-1] + pd.Timedelta(days=1)).date().isoformat() if len(base) else None
-            held = store.load_price_estimates(zone) if store is not None else pd.DataFrame()
-            if target is None or (not held.empty and held["delivery_date"].eq(target).any()):
-                continue   # the first estimate for a day stands, so there's nothing to compute
-            result = zone_estimate(zone)
-            if result["ready"]:
-                rows.append((result["day"].isoformat(), zone, result["estimate"], result["low"], result["high"], valuation_date.isoformat(), result["method"]))
+    """Keep each zone's forecast for the next delivery day as first made, before its price is known: the truest test."""
+    rows, store = [], desk_store()
+    for zone in [z for z in _live_variants("entsoe_price") if z in ENTSOE_ZONES]:
+        held = store.load_price_estimates(zone) if store is not None else pd.DataFrame()
+        result = epf_forecast(zone)
+        if result["ready"] and result["point"] is not None and (held.empty or not held["delivery_date"].eq(result["day"].date().isoformat()).any()):
+            rows.append((result["day"].date().isoformat(), zone, result["base"], result["base_low"], result["base_high"], valuation_date.isoformat(), result["name"]))
     if rows:
         _save(lambda s: s.save_price_estimates(rows))
         bump("estimates")
 
 
 def render_next_day(zones: Sequence[str]) -> None:
-    usable = [z for z in zones if z in ZONE_WEATHER]
+    usable = [z for z in zones if z in ENTSOE_ZONES]
     if not usable:
-        need_data_note("Choose a zone with a weather reference city, such as France or Germany-Luxembourg.")
+        need_data_note("Choose a bidding zone with day-ahead prices.")
         return
     zone = st.selectbox("Zone", usable, key="estimate_zone") if len(usable) > 1 else usable[0]
-    result = zone_estimate(zone)
-    if not result["ready"]:
-        need_data_note(result["reason"])
-        update_button("estimate_update")
+    result = epf_forecast(zone)
+    running = sum(1 for task in (st.session_state.get("update_job") or {}).get("tasks", []) if task.lane == "forecast")
+    if not result["ready"] or result["point"] is None:
+        need_data_note((result["reason"] if not result["ready"] else f"The forecast for {result['day']:%a %d %b} is being made." if running else
+                        f"There's no forecast for {result['day']:%a %d %b} yet: select Update market data once ENTSO-E's load forecast for it is out, by 10:00.")
+                       + (f" {running} parts are running in the background; this page fills in as each one ends." if running else ""))
+        if not running:
+            update_button("estimate_update")
+        if result["ready"]:
+            render_epf_scorecard(result["card"])
         return
-    beat = result["skill"] > 0
-    gap_word = "above" if result["latest_gap"] > 0 else "below"
-    weather_words = f"the weather forecast at {result['weather_basis']}" if "points" in result["weather_basis"] else f"the weather forecast for {result['weather_basis'] or 'one city'}"
-    gas = result.get("gas")
-    extras = result.get("extras") or {}
-    in_use = [item["label"] for item in extras.values() if item["used"]]
-    if in_use:
-        weather_words += ", " + " and ".join(in_use)
-    basis = ("It uses ENTSO-E's published load, wind and solar forecasts for that day." if result["method"] != "Weather" else
-             f"It uses {weather_words}, which has tested better here than ENTSO-E's forecasts." if result["target_has_forecast"] and result["comparison"] else
-             f"It uses {weather_words}, because ENTSO-E's wind and solar forecast is usually published by 18:00 the day before delivery, after the auction.")
-    euros = lambda value: fmt_price(value, signed=True)
-    shown_gap = round(result["latest_actual"]) - round(result["latest_estimate"])   # agrees with the rounded prices shown
-    against = (f"in line with the {fmt_price(result['latest_estimate'], 0)} suggested by" if shown_gap == 0 else
-               f"€{abs(shown_gap):.0f} {gap_word} the {fmt_price(result['latest_estimate'], 0)} suggested by")
-    check_basis = "ENTSO-E's forecasts for that day" if result["check_method"] != "Weather" else "the weather"
-    held = (f" The range is built the same way each day and held the price on <b>{result['held'] * 100:.0f}%</b> of {result['held_days']} tested days, against the 80% it aims for."
-            if result["held"] is not None else " There are too few tested days yet to say how often the range holds.")
-    trend = (" Recent days have been harder than usual, so the range is wider." if result["recent_error"] > 1.25 * result["error"] else
-             " Recent days have been calmer than usual, so the range is narrower." if result["recent_error"] < 0.8 * result["error"] else "")
+    day, q = result["day"], result["quantiles"]
+    names = {"load": "ENTSO-E's load forecast", "wind_wx": "wind", "solar_wx": "sun", "temp_wx": "temperature", "gas": "TTF", "carbon": "EUA"}
+    missing = [label for key, label in names.items() if key not in result["inputs"]]
     with st.container(key="hero"):
-        st.markdown(
-            f'<div class="desk-note"><p>Base price for {result["day"]:%a %d %b} in {html.escape(zone)}: about <b>{fmt_price(result["estimate"], 0)}/MWh</b>, '
-            f'with an 80% chance of landing between <b>{fmt_price(result["low"], 0)} and {fmt_price(result["high"], 0)}</b>. {html.escape(basis)}</p>'
-            f'<p>The latest published day, {result["latest_day"]:%a %d %b}, came in at {fmt_price(result["latest_actual"], 0)}, {against} {check_basis}. '
-            f'{"That is an unusually large gap, so check for something the method can&#39;t see." if result["unusual"] else "That is within the usual range of error."}</p>'
-            f'<p class="soft">Over {result["n"]} delivery days to {day_text(result["latest_day"])}, each estimated only from earlier days, it missed by €{result["error"]:.1f} on average, '
-            f'{abs(result["skill"]) * 100:.0f}% {"less" if beat else "more"} than the best simple method (€{min(result["error_same_type"], result["error_last_week"], result["error_yesterday"]):.1f}).{held}{trend} '
-            f'{"" if beat else "It has not beaten the simple methods, so don&#39;t rely on it over them."}</p></div>', unsafe_allow_html=True)
-    test = result["test"].tail(90)
+        st.markdown(f'<div class="desk-note"><p>{html.escape(zone)}, {day:%a %d %b}: base about <b>{fmt_price(result["base"], 0)}/MWh</b>, with an 80% chance of '
+                    f'<b>{fmt_price(result["base_low"], 0)} to {fmt_price(result["base_high"], 0)}</b>. Model: {html.escape(result["name"])}; ranges from {html.escape(result["ranges"])}.</p>'
+                    f'<p class="soft">Made from prices to {result["last"]:%d %b}, ENTSO-E\'s load forecast, the weather forecast made two days before each hour, and the TTF close and EUA auction '
+                    f'from two days or more before, all published before the noon auction.{" Not in for this day, so left out of its fit: " + html.escape(", ".join(missing)) + "." if missing else ""} '
+                    f'The latest published day missed its forecast by €{abs(result["latest_miss"]):.0f}{", an unusually large gap" if result["unusual"] else ""}.</p></div>', unsafe_allow_html=True)
+    hours = pd.date_range(day, periods=24, freq="h")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=test["day"], y=test["actual"], mode="lines", name="Published price", line=dict(color=TEXT, width=2)))
-    fig.add_trace(go.Scatter(x=test["day"], y=test["estimate"], mode="lines", name="Estimate made the day before", line=dict(color=AMBER, width=2, dash="dash")))
-    fig.add_trace(go.Scatter(x=[pd.Timestamp(result["day"])], y=[result["estimate"]], mode="markers", name="Next day, with 80% range", marker=dict(color=AMBER, size=11, symbol="diamond"),
-                             error_y=dict(type="data", symmetric=False, array=[result["high"] - result["estimate"]], arrayminus=[result["estimate"] - result["low"]], color=AMBER, thickness=2)))
-    fig.update_layout(title=f"{zone}: day-ahead base price, EUR/MWh")
+    for (lo, hi), shade in (((0, 6), 0.12), ((1, 5), 0.2), ((2, 4), 0.3)):
+        fig.add_trace(go.Scatter(x=np.r_[hours, hours[::-1]], y=np.r_[q[hi], q[lo][::-1]], fill="toself", fillcolor=f"rgba(232,163,61,{shade})", line=dict(width=0),
+                                 name=f"{EPF_LEVELS[hi] - EPF_LEVELS[lo]:.0%} range", hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=hours, y=q[3], mode="lines", name="Median", line=dict(color=AMBER, width=2)))
+    fig.add_trace(go.Scatter(x=hours, y=result["point"], mode="lines", name=result["name"], line=dict(color=TEXT, width=1, dash="dot")))
+    fig.update_layout(title=f"{zone}: day-ahead price for {day:%a %d %b}, EUR/MWh")
     chart(fig, 380)
-    spread = result.get("distribution")
-    if spread:
-        st.subheader("The chances")
-        left, right = st.columns([1, 1.25], gap="large")
-        with left:
-            level = st.number_input("A price level, EUR/MWh", value=float(round(result["estimate"])), step=5.0, key=f"chance_level_{zone}")
-            above = chance_above(spread, result["estimate"], level)
-            negative = chance_above(spread, result["estimate"], 0.0)
-            c1, c2 = st.columns(2)
-            kpi(c1, f"Chance above €{level:,.0f}", f"{above * 100:.0f}%", f"{(1 - above) * 100:.0f}% at or below")
-            kpi(c2, "Chance of a negative day", f"{(1 - negative) * 100:.0f}%" if negative < 1 else "Under 1%", "Daily average below zero")
-            table(pd.DataFrame({"Chance of being below": [f"{q * 100:.0f}%" for q in spread["levels"]], "Price, EUR/MWh": (result["estimate"] + spread["quantiles"]).round(1),
-                                "How often it was, on tested days": [f"{b * 100:.0f}%" for b in spread["below"]]}))
-        with right:
-            prices = result["estimate"] + spread["offsets"]
-            curve_ = go.Figure(go.Scatter(x=prices, y=(np.arange(len(prices)) + 0.5) / len(prices) * 100, mode="lines", name="Chance of being below", line=dict(color=AMBER, width=2)))
-            curve_.add_vline(x=level, line=dict(color=GRAY, width=1, dash="dot"))
-            curve_.update_layout(title=f"Chance that {result['day']:%a %d %b} comes in below a price, %", xaxis_title="EUR/MWh", yaxis_title="", showlegend=False)
-            chart(curve_, 330)
-        better = 1.0 - spread["score"] / spread["simple_score"] if spread["simple_score"] else None
-        st.caption(f"Scored on {spread['days']} past days, each using only earlier days. The right-hand column should match the left: a 10% line should have the price below it on about 10% of days. "
-                   f"Pinball loss, the standard score for this kind of forecast (lower is better): {spread['score']:.2f}"
-                   + (f", against {spread['simple_score']:.2f} for the last day of the same kind treated the same way, {abs(better) * 100:.0f}% {'better' if better > 0 else 'worse'}." if better is not None else "."))
-    comparison = result["comparison"]
-    st.subheader("How the methods compare")
-    rows = [{"Method": f"Weather at {result['weather_basis']}" if "points" in result["weather_basis"] else f"Weather in {result['weather_basis'] or 'one city'}", "Average miss, EUR/MWh": round(comparison["weather"] if comparison else result["error"], 2)}]
-    if comparison:
-        rows.insert(0, {"Method": "ENTSO-E forecasts", "Average miss, EUR/MWh": round(comparison["forecasts"], 2)})
-    for item in extras.values():
-        rows.append({"Method": f"Adding {item['label']}: {'in use' if item['used'] else 'not in use'}", "Average miss, EUR/MWh": round(item["with"], 2)})
-        rows.append({"Method": f"The same days without {item['label']}", "Average miss, EUR/MWh": round(item["without"], 2)})
-    source = comparison or {"same_type": result["error_same_type"], "last_week": result["error_last_week"], "yesterday": result["error_yesterday"]}
-    rows += [{"Method": "Last day of the same kind", "Average miss, EUR/MWh": round(source["same_type"], 2)},
-             {"Method": "Same weekday last week", "Average miss, EUR/MWh": round(source["last_week"], 2)}, {"Method": "Previous day", "Average miss, EUR/MWh": round(source["yesterday"], 2)}]
-    table(pd.DataFrame(rows))
-    notes = []
-    for item in extras.values():
-        gain = 1.0 - item["with"] / item["without"] if item["without"] > 0 else 0.0
-        notes.append(f"{item['label'][0].upper()}{item['label'][1:]}, over {item['days']} days: "
-                     + (f"cut the average miss by {gain * 100:.0f}%, so it's in use." if item["used"] else
-                        "not available for this auction yet, so it's left out today." if not item["ready"] and gain >= GAS_MIN_GAIN else
-                        f"changed the average miss by {fmt_signed(-gain * 100, 0)}%, short of the {GAS_MIN_GAIN * 100:.0f}% cut it needs."))
-    missing = [label for name, label, _ in EXTRA_INPUTS if name not in extras]
-    if notes:
-        st.caption("Extra inputs, each tested on your own history and used only when it clearly helps. " + " ".join(notes))
-    if missing:
-        st.caption("Not tested yet for lack of history: " + ", ".join(missing) + ". Gas needs the TradingView front-month history, the load forecast needs ENTSO-E's, and cooling needs at least "
-                   f"{COOLING_MIN_DAYS} warm days in the weather history.")
-    if comparison:
-        st.caption(f"On the same {comparison['days']} days. The ENTSO-E method isn't fully comparable: its wind and solar forecasts are usually published after the auction, so it shows how good the forecast information is, not what you could have estimated beforehand.")
-    else:
-        st.caption(f"Over {result['n']} days. A day of the same kind means a working day, a Saturday, or a Sunday or public holiday. ENTSO-E's forecasts cover {result['forecast_days']} days so far, and comparing with them needs at least {ESTIMATE_MIN_DAYS + 30}.")
+    render_epf_scorecard(result["card"])
     store = desk_store()
     log = store.load_price_estimates(zone) if store is not None else pd.DataFrame()
     live = score_recorded_estimates(log, daily_base_prices(zone_prices(zone)))
-    if live["n"]:
-        st.caption(f"Estimates saved on the day, before prices were known: {live['n']} scored so far, missing by €{live['error']:.1f} on average, against €{live['error_last_week']:.1f} for the same weekday last week."
-                   + (f" Their ranges held the price on {live['held'] * 100:.0f}% of {live['held_n']} days." if live["held"] is not None else "") + " This is the truest test, as nothing here could see the outcome.")
-    else:
-        st.caption("Each estimate is also saved on the day, before the price is known. They're scored here once the prices are published, which is the truest test of the method.")
-    with st.expander("How this estimate works"):
-        effects = result["forecast_effects"]
-        grid = "points" in result["weather_basis"]
-        st.markdown("Each method is a regression on up to a year of days, where recent days count more: a day four months back counts half as much as yesterday. "
-                    "It starts from the last day of the same kind (a working day, a Saturday, or a Sunday or public holiday), the last working day, the previous day, the last 7 days' average and the same weekday last week, "
-                    "so a Monday starts from Friday's price, not Sunday's, and national public holidays are priced like Sundays.\n\n"
-                    + (f"**Weather method.** It adds heating demand, wind at 100 m and solar radiation averaged over {len(ZONE_WEATHER_POINTS.get(zone, ()))} points spread across the zone, for the day and the day before. "
-                       "On real German prices and pre-auction weather forecasts, a dozen points instead of one city cut the average miss by about a sixth. " if grid else
-                       f"**Weather method.** It adds heating demand, wind and solar in {result['weather_basis'] or 'one reference city'}, for the day and the day before. ")
-                    + f"10 km/h more wind changes the price by **{euros(result['wind_effect'] * 10)}**, one more heating degree day by **{euros(result['hdd_effect'])}**, and 10 W/m² more solar radiation by **{euros(result['solar_effect'] * 10)}**. "
-                    f"The app now keeps each day's forecast as it stood before the auction, and tests with it where it has one: **{result.get('kept_forecast_days', 0)} of the {result['n']} tested days** so far. "
-                    "The other days use the weather that actually happened, which flatters the test a little. That share shrinks every day the app is updated before noon.\n\n"
-                    "**The chances.** The same misses, scaled the same way, give the whole spread of outcomes: the chance of landing above any level, and of a negative day. "
-                    "Tested on 1,585 real German days, this scored better and was better calibrated than quantile regression, the usual alternative, so that is not used.\n\n"
-                    "**The range.** It comes from this method's own misses on the tested days, scaled by how large recent misses were, so it widens when the market turns volatile and narrows when it calms. "
-                    "It aims to hold the price on 8 days in 10. After a sudden jump in volatility it takes a week or two to catch up.\n\n"
-                    "**ENTSO-E method.** It adds the system operators' day-ahead forecasts of load, wind and solar for the whole zone, and its test uses those forecasts rather than what happened. "
-                    + (f"1 GW more forecast load changes the price by **{euros(effects['load'])}**, 1 GW more wind by **{euros(effects['wind'])}**, and 1 GW more solar by **{euros(effects['solar'])}**. " if effects else "")
-                    + "The load forecast is due two hours before the auction deadline, but the wind and solar forecast is only due by 18:00 the day before delivery. "
-                    "So it usually can't set the estimate before the auction. Its main use is checking whether a published price looks high or low against those forecasts. It sets the estimate only when the forecast already exists and it has tested at least as well as the weather method.\n\n"
-                    f"ENTSO-E's forecasts cover **{result['forecast_days']} days** for this zone so far, and some operators may revise them after first publishing.\n\n"
-                    "**Extra inputs.** Three more inputs are each tested on top of the weather method, over the same past days with and without them: the front-month TTF price as known at each auction "
-                    "(the last close two days before delivery), ENTSO-E's load forecast for the day, which is due two hours before the auction closes, and cooling demand on days warmer than "
-                    f"{COOLING_BASE_C:.0f} °C. Each is used only when it cuts the tested average miss by at least {GAS_MIN_GAIN * 100:.0f}%, so an input that doesn't help here stays out. "
-                    + (f"Gas is in use: €1/MWh more on gas changes the power estimate by **{euros(gas['effect'])}**. " if gas and gas["used"] and gas["effect"] is not None else "")
-                    + "Neither method knows about carbon prices, plant outages, interconnector limits or the auction itself.")
+    st.caption(f"Forecasts saved before their price was known: {live['n']} scored so far, missing the base by €{live['error']:.1f} on average against €{live['error_last_week']:.1f} for the same weekday a week before"
+               + (f", their 80% ranges holding on {live['held'] * 100:.0f}% of {live['held_n']} days." if live["held"] is not None else ".") if live["n"] else
+               "Each forecast is also saved on the day, before its price is known, and scored here once the price is published: the truest test.")
+    with st.expander("Checks"):
+        if st.button("Run the forecast checks", key="epf_checks"):
+            try:
+                with st.spinner("A synthetic market and a leakage test"):
+                    st.success(epf_self_checks())
+            except AssertionError as exc:
+                st.error(str(exc))
+        st.caption("A synthetic market with a known answer the forecast must recover, and a test that scrambles every later price: the forecast must not move, "
+                   "and an input built from tomorrow's price must be caught. Both also run with the Model Validation checks.")
+    with st.expander("How this forecast works"):
+        st.markdown("**LEAR** (Lago et al., 2021): for each hour, a LASSO regression on every hour's price one, two, three and seven days before, ENTSO-E's load forecast and "
+                    "the zone's wind, sun and temperature forecast for the day, the day before and a week before, the TTF and EUA prices, and the kind of day. It is refitted "
+                    f"each day on the last {LEAR_WINDOW} days, a day {LEAR_HALF_LIFE:.0f} days back counting half. "
+                    + ("**Daily level.** In France its daily average is averaged with a daily regression on the same kind of day, the day before, the week and the weather, which "
+                       "made it clearly more accurate there (not in Germany). " if zone in EPF_LEVEL_WEIGHT else "")
+                    + "**Ranges.** LightGBM learns the spread of the misses from the hour, the kind of day, the forecasts and recent misses, refitted weekly; each range is then moved "
+                    "by its own recent misses (conformal calibration), so an 80% range holds about 80%.\n\n"
+                    "**Only what the auction knew.** ENTSO-E's wind and solar forecast is left out because the one it publishes is the 18:00 snapshot, after the auction. Weather "
+                    "comes from Open-Meteo's archive of past model runs, the run two days before each hour, for past days and tomorrow alike. Each was tested against simpler "
+                    "methods and kept only where clearly better: a merit-order model and averaging several windows were tried and dropped.")
 
 
 def render_pnl_drivers(step: pd.DataFrame, factor: pd.Series, period: Optional[tuple] = None) -> pd.DataFrame:
@@ -15687,9 +15113,9 @@ def build_brief() -> dict:
     estimates = []
     for zone in ("France", "Germany-Luxembourg"):
         if zone in _live_variants("entsoe_price"):
-            result = zone_estimate(zone)
-            if result["ready"]:
-                estimates.append({"Zone": zone, "Day": f"{result['day']:%a %d %b %Y}", "Estimate": fmt_price(result["estimate"], 0), "80% range": f"{fmt_price(result['low'], 0)} to {fmt_price(result['high'], 0)}", "Latest published day": f"{result['latest_day']:%d %b}: " + ("unusually large gap to its estimate" if result["unusual"] else "within usual error of its estimate")})
+            result = epf_forecast(zone)
+            if result["ready"] and result["point"] is not None:
+                estimates.append({"Zone": zone, "Day": f"{result['day']:%a %d %b %Y}", "Estimate": fmt_price(result["base"], 0), "80% range": f"{fmt_price(result['base_low'], 0)} to {fmt_price(result['base_high'], 0)}", "Latest published day": f"{result['last']:%d %b}: " + ("unusually large gap to its forecast" if result["unusual"] else "within usual error of its forecast")})
     outlook = winter_outlook()
     outlook_text = ""
     if outlook.get("ready") and outlook.get("basis") == "weather":
@@ -17132,7 +16558,7 @@ def page_model_validation():
         st.error(f"{failed} check(s) failed. Read the details below before relying on the affected numbers.")
     table(validation)
     st.download_button("Download the report as CSV", data=validation.to_csv(index=False).encode("utf-8"), file_name="energy_model_validation_report.csv", mime="text/csv")
-    st.caption("Run the same suite outside the app with: pytest etttr.py. These checks don't validate real exchange data, holidays, full swap payment schedules, discount curves, accounting policy, collateral, credit adjustments, or provider access.")
+    st.caption("Run the same suite outside the app with: pytest merit.py. These checks don't validate real exchange data, holidays, full swap payment schedules, discount curves, accounting policy, collateral, credit adjustments, or provider access.")
     current_failures = validation.loc[validation["Status"].eq("FAIL") & validation["Area"].eq("Current user data")]
     if not current_failures.empty:
         st.warning("At least one failure concerns your own data rather than the formulas. Check that trade's price in Trading Book.")
@@ -17201,6 +16627,7 @@ def main() -> None:
     curves = build_curves()
     ensure_daily_snapshot()
     maybe_auto_update()
+    maybe_forecast()
     try:
         record_market_reads()
     except Exception as exc:
@@ -17219,7 +16646,7 @@ def main() -> None:
 
 
 def test_model_validation_suite() -> None:
-    """Lets `pytest etttr.py` run the whole check suite without opening the app."""
+    """Lets `pytest merit.py` run the whole check suite without opening the app."""
     day = date.today()
     report = run_model_validation(build_sample_trades(day), {p: make_sample_curve(p, day, DEMO_CURVE_MONTHS) for p in CURVE_PRODUCTS})
     failures = report.loc[report["Status"].eq("FAIL")]
