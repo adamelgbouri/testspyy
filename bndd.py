@@ -28,4 +28,4 @@ def bond_analytics(face, coupon_rate, ytm, n_periods, freq=2):
  
 print("\n7. Bond Duration & Convexity")
 for k, v in bond_analytics(1000, 0.05, 0.06, 10).items():
-    print(f"   {k}: {v}")
+    print(f"   {k}: {v} ")
