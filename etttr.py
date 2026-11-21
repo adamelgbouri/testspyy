@@ -51,16 +51,18 @@ import random
 import shutil
 import sqlite3
 import string
+import sys
 import tempfile
 import threading
 import uuid
+import warnings
 import xml.etree.ElementTree as ET
 import zipfile
 import socket
 import ssl
 import zlib
 from urllib.parse import quote, urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 from urllib.error import HTTPError, URLError
 from typing import Callable, Optional, Sequence
 
@@ -4553,6 +4555,10 @@ def score_outlook_record(record: Optional[pd.DataFrame], table: pd.DataFrame, zo
 EPF_TEST_START, EPF_TEST_END = pd.Timestamp("2025-11-17"), pd.Timestamp("2026-11-16")
 EPF_VALID_START = EPF_TEST_START - pd.Timedelta(weeks=52)
 EPF_TEST_SEALED = False         # opened once, on 21 Nov 2026, after the models were final
+# The 10-year update: TEST is spent, so the days from EPF_HOLDOUT_START are the new untouched holdout, scored once at the end.
+# Research tests each year from EPF_FOLD_YEARS on models tuned only on the years before it.
+EPF_HOLDOUT_START = EPF_TEST_END
+EPF_FOLD_YEARS = tuple(range(2018, 2026))
 EPF_HISTORY_DAYS = 1480         # two years before VALIDATION, for the longest calibration window
 EPF_LEVELS = np.array([0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95])
 EPF_RESIDUAL_DAYS = 182         # a point forecast's quantiles come from its misses over this many earlier days
@@ -4577,7 +4583,7 @@ def epf_baselines(prices: pd.DataFrame) -> dict:
     """The yardsticks, each one row longer than prices for the next delivery day. The seasonal naive takes the same
     hour the day before on Tuesday to Friday, and a week before on Monday, Saturday and Sunday."""
     full = prices.reindex(pd.date_range(prices.index.min(), prices.index.max() + pd.Timedelta(days=1)))
-    weekly = np.broadcast_to(full.index.dayofweek.isin([0, 5, 6])[:, None], full.shape)
+    weekly = np.broadcast_to(full.index.day_of_week.isin([0, 5, 6])[:, None], full.shape)
     return {"Seasonal naive": full.shift(1).where(~weekly, full.shift(7)), "Day before": full.shift(1), "Week before": full.shift(7)}
 
 
@@ -4642,7 +4648,7 @@ def lear_design(prices: pd.DataFrame, inputs: Optional[pd.DataFrame], days: pd.D
         X = inputs.reindex(idx)
         for name in X.columns.get_level_values(0).unique():
             blocks += [X[name].shift(k) for k in (0, 1, 7)] if X[name].shape[1] == 24 else [X[name]]
-    weekday = np.where(day_classes(idx, zone) == 2, 6, idx.dayofweek)
+    weekday = np.where(day_classes(idx, zone) == 2, 6, idx.day_of_week)
     blocks.append(pd.DataFrame(np.eye(7)[weekday], index=idx))
     return np.hstack([b.to_numpy(float) for b in blocks])[7:]
 
@@ -4705,7 +4711,7 @@ def lgbm_quantiles(point: pd.DataFrame, prices: pd.DataFrame, inputs: pd.DataFra
     miss = prices.reindex(days) - point
     recent = miss.abs().shift(1).rolling(7, min_periods=3).mean()
     X = inputs.reindex(days)
-    features = [np.broadcast_to(np.arange(24), (len(days), 24)), np.broadcast_to(np.where(day_classes(days, zone) == 2, 6, days.dayofweek)[:, None], (len(days), 24)),
+    features = [np.broadcast_to(np.arange(24), (len(days), 24)), np.broadcast_to(np.where(day_classes(days, zone) == 2, 6, days.day_of_week)[:, None], (len(days), 24)),
                 point.to_numpy(), recent.to_numpy(), np.broadcast_to(recent.mean(axis=1).to_numpy()[:, None], (len(days), 24))]
     features += [X[name].to_numpy(float) for name in ("load", "wind_wx", "solar_wx") if name in X.columns.get_level_values(0)]
     F = np.stack(features, axis=-1).reshape(len(days) * 24, -1)
@@ -4722,6 +4728,71 @@ def lgbm_quantiles(point: pd.DataFrame, prices: pd.DataFrame, inputs: pd.DataFra
                                       min_child_samples=200, subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1)
             out[k].reshape(-1)[rows] = model.fit(F[train], y[train]).predict(F[rows])
     return point.to_numpy()[None] + np.sort(out, axis=0)
+
+
+# The cross-year model. On yearly folds 2018-2025 of a ten-year archive (each forecast from days before it only), averaged with
+# the method above it beat that method in every year in both zones (DM p < 0.001; Germany -17%, France -13%). The weight was then
+# chosen on VALIDATION. Counting recent years more did no better.
+GBM_REFIT_DAYS, GBM_WEIGHT = 28, 0.6
+GBM_ANCHOR = pd.Timestamp("2015-01-05")        # refits fall on a fixed grid, so a day's forecast never changes with the run
+GBM_INPUTS = ("price", "load_fc", "wind_wx", "solar_wx", "temp_wx", "wind_fc", "solar_fc")
+
+
+def gbm_design(zone: str, history: dict, gas: Optional[pd.DataFrame], carbon: Optional[pd.DataFrame]) -> tuple:
+    """The cross-year model's inputs (days × 24 hours × inputs), its target and each day's scale. Prices are scaled by the median
+    and spread of the 14 days before, so a calm year and a crisis teach the same shapes. Wind and sun become MW through ENTSO-E's
+    own forecasts up to two days before (published by then), following the fleet as it grows; with the load forecast they give the
+    residual load. Fuel enters as a gas plant's running cost from closes two days or more before (gas and carbon: date, close)."""
+    from numpy.lib.stride_tricks import sliding_window_view
+    frames = [f for f in history.values() if len(f)]
+    days = pd.date_range(min(f.index.min() for f in frames), max(f.index.max() for f in frames))
+    n = len(days)
+    P, L, ww, sw, tw, wf, sf = (history.get(name, pd.DataFrame()).reindex(index=days, columns=range(24)).to_numpy(float) for name in GBM_INPUTS)
+    shift = lambda A, k: np.vstack([np.full((k,) + A.shape[1:], np.nan), A[:-k]])
+    daily = lambda A: np.broadcast_to(A[:, None] if A.ndim == 1 else np.nanmean(A, axis=1, keepdims=True), (n, 24))
+    with warnings.catch_warnings():            # days with nothing held give NaN, which LightGBM reads as missing
+        warnings.simplefilter("ignore", RuntimeWarning)
+        win = sliding_window_view(P, (14, 24)).reshape(n - 13, 336)
+        med = np.nanmedian(win, axis=1)
+        lev, spr = np.full(n, np.nan), np.full(n, np.nan)
+        lev[14:], spr[14:] = med[:-1], np.maximum(np.nanmedian(np.abs(win - med[:, None]), axis=1)[:-1] * 1.4826, 2.0)
+        Z = lambda A: (A - lev[:, None]) / spr[:, None]
+        def per_unit(fc: np.ndarray, wx: np.ndarray) -> np.ndarray:     # MW per unit of the weather index over the year to two days before
+            ok = np.isfinite(fc) & np.isfinite(wx)
+            roll = lambda A: pd.Series(np.where(ok, A, 0.0).sum(axis=1)).rolling(365, min_periods=60).sum().shift(2).to_numpy()
+            return roll(fc * wx) / np.where(roll(wx * wx) > 0, roll(wx * wx), np.nan)
+        wind, solar = ww * per_unit(wf, ww)[:, None], sw * per_unit(sf, sw)[:, None]
+        resid, P1 = L - wind - solar, shift(P, 1)
+        srmc = 2.0 * known_before(gas, "close", days) + 0.37 * known_before(carbon, "close", days)     # gas plant, 50% efficient
+        kind = np.where(day_classes(days, zone) == 2, 6, days.day_of_week).astype(float)
+        inputs = [np.broadcast_to(np.arange(24.0), (n, 24)), daily(kind), daily(days.month.to_numpy(float)), Z(P1), Z(shift(P, 2)), Z(shift(P, 7)),
+                  Z(daily(P1)), Z(daily(np.nanmin(P1, axis=1))), Z(daily(np.nanmax(P1, axis=1))), Z(daily(P1[:, 23])), Z(daily(shift(P, 7))),
+                  daily(lev), daily(spr), Z(daily(srmc)), daily(srmc / np.clip(np.abs(lev), 5.0, None)), L, daily(L), L - shift(L, 7),
+                  wind, solar, daily(wind), daily(solar), resid, daily(resid), resid / daily(L), resid - shift(resid, 1),
+                  daily(resid) - daily(shift(resid, 1)), ww, sw, tw, daily(tw)]
+        return days, np.stack([np.asarray(a, float) for a in inputs], axis=-1), Z(P), lev, spr
+
+
+def gbm_forecast(design: tuple, wanted: Sequence) -> pd.DataFrame:
+    """LightGBM (absolute loss) over every hour held, refitted every GBM_REFIT_DAYS days on a fixed grid: each day is forecast by
+    the model fitted on the days before its block began, as tested."""
+    import lightgbm as lgb
+    days, F, Y, lev, spr = design
+    wanted = pd.DatetimeIndex(wanted)
+    out = pd.DataFrame(np.nan, index=wanted, columns=range(24))
+    blocks = GBM_ANCHOR + pd.to_timedelta((wanted - GBM_ANCHOR).days // GBM_REFIT_DAYS * GBM_REFIT_DAYS, unit="D")
+    for start in sorted(set(blocks)):
+        i = int(days.searchsorted(start))
+        X, y = F[:i].reshape(-1, F.shape[2]), Y[:i].ravel()
+        ok = np.isfinite(y)
+        rows = days.get_indexer(wanted[blocks == start])
+        if ok.sum() < 24 * 120 or (rows < 0).all():
+            continue
+        model = lgb.LGBMRegressor(objective="l1", n_estimators=600, learning_rate=0.05, num_leaves=63, min_child_samples=100, subsample=0.8,
+                                  subsample_freq=1, colsample_bytree=0.8, reg_lambda=1.0, random_state=0, verbose=-1).fit(X[ok], y[ok])
+        rows = rows[rows >= 0]
+        out.loc[days[rows]] = lev[rows, None] + spr[rows, None] * model.predict(F[rows].reshape(-1, F.shape[2])).reshape(len(rows), 24)
+    return out
 
 
 def calibrate(quantiles: np.ndarray, prices: pd.DataFrame, days: pd.DatetimeIndex, window: int = EPF_RESIDUAL_DAYS) -> np.ndarray:
@@ -4762,12 +4833,13 @@ def epf_scorecard(prices: pd.DataFrame, forecasts: dict, baselines: Sequence[str
         actual = prices.loc[held].to_numpy(float)
         errors = {name: actual - point.loc[held].to_numpy(float) for name, (point, _) in forecasts.items()}
         mae = {name: float(np.abs(e).mean()) for name, e in errors.items()}
+        best_set = confidence_set({name: np.abs(e) for name, e in errors.items()})
         for name, (point, quantiles) in forecasts.items():
             e, others = errors[name], [b for b in baselines if b != name]
             ref = min(others, key=mae.get)
             row = {"Period": period, "Model": name, "Days": len(held), "MAE": mae[name], "RMSE": float(np.sqrt((e ** 2).mean())),
                    "rMAE": mae[name] / mae[baselines[0]], "Base MAE": float(np.abs(e.mean(axis=1)).mean()),
-                   "Pinball": np.nan, "Cover 80%": np.nan, "Cover 90%": np.nan, "Against": ref, "DM p": dm_pvalue(np.abs(e), np.abs(errors[ref]))}
+                   "Pinball": np.nan, "Cover 80%": np.nan, "Cover 90%": np.nan, "Against": ref, "DM p": dm_pvalue(np.abs(e), np.abs(errors[ref])), "MCS p": best_set[name]}
             if quantiles is not None:
                 q = quantiles[:, point.index.get_indexer(held)]
                 gap = actual[None] - q
@@ -4775,6 +4847,28 @@ def epf_scorecard(prices: pd.DataFrame, forecasts: dict, baselines: Sequence[str
                             "Cover 80%": float(((actual >= q[1]) & (actual <= q[5])).mean()), "Cover 90%": float(((actual >= q[0]) & (actual <= q[6])).mean())})
             rows.append(row)
     return pd.DataFrame(rows)
+
+
+def confidence_set(losses: dict, reps: int = 2000, block: int = 7, seed: int = 0) -> dict:
+    """Model confidence set (Hansen, Lunde and Nason, 2011) on daily losses: each model's p-value of belonging to the set of
+    best models. Comparing many variants crowns a lucky one; a model with p below 0.1 is beaten once that is allowed for.
+    losses maps a name to days × hours; days are resampled in blocks of a week, as errors run in spells."""
+    names = list(losses)
+    L = np.column_stack([np.asarray(losses[name], float).reshape(len(losses[name]), -1).mean(axis=1) for name in names])
+    n, rng = len(L), np.random.default_rng(seed)
+    idx = (rng.integers(0, n - block + 1, (reps, -(-n // block)))[:, :, None] + np.arange(block)).reshape(reps, -1)[:, :n]
+    alive, out, running = list(range(len(names))), {}, 0.0
+    while len(alive) > 1:
+        d = L[:, alive] - L[:, alive].mean(axis=1, keepdims=True)   # each model's loss against the average of those still in
+        mean = d.mean(axis=0)
+        boot = d[idx].mean(axis=1) - mean
+        se = np.maximum(boot.std(axis=0), 1e-12)
+        running = max(running, float(((boot / se).max(axis=1) >= (mean / se).max()).mean()))
+        worst = alive[int(np.argmax(mean / se))]
+        out[names[worst]] = running
+        alive.remove(worst)
+    out[names[alive[0]]] = 1.0
+    return out
 
 
 def leaks(model: Callable, build: Callable, prices: pd.DataFrame, day: pd.Timestamp) -> bool:
@@ -4805,8 +4899,21 @@ def epf_self_checks() -> str:
     peeking = lambda p: pd.concat({"load": load, "next": p.reindex(load.index).shift(-1)}, axis=1)    # tomorrow's price as an input
     if leaks(model, honest, prices, test[0]) or not leaks(model, peeking, prices, test[0]):
         raise AssertionError("The leakage check must pass the honest inputs and catch one taken from the future.")
-    return (f"On a synthetic market with a known rule, LEAR misses by {mae:.2f} (the noise alone is 1.60), against {naive:.2f} for the day before. "
-            "Scrambling every later price leaves its forecast unchanged, and an input built from tomorrow's price is caught.")
+    miss = (prices.loc[test] - forecast).abs().to_numpy()
+    kept = confidence_set({"LEAR": miss, "LEAR, a hair off": miss + rng.normal(0, 0.01, miss.shape), "Day before": (prices.loc[test] - prices.shift(1).loc[test]).abs().to_numpy()})
+    if kept["Day before"] >= 0.1 or min(kept["LEAR"], kept["LEAR, a hair off"]) < 0.1:
+        raise AssertionError(f"The confidence set should keep both versions of LEAR and drop the day before: {kept}")
+    design = gbm_design("", {"price": prices, "load_fc": load}, None, None)
+    cross = float((prices.loc[test] - gbm_forecast(design, test)).abs().to_numpy().mean())
+    if not cross < 0.6 * naive:
+        raise AssertionError(f"On the known rule the cross-year model should beat the day before clearly: MAE {cross:.2f}, day before {naive:.2f}.")
+    wiped = gbm_design("", {"price": prices.loc[:test[0] - pd.Timedelta(days=1)], "load_fc": load.loc[:test[0]]}, None, None)
+    k = len(wiped[0])
+    if len(design[0]) < k or not np.allclose(design[1][:k], wiped[1], equal_nan=True):
+        raise AssertionError("The cross-year model's inputs for a day changed when later prices and forecasts were removed: it saw the future.")
+    return (f"On a synthetic market with a known rule, LEAR misses by {mae:.2f} (the noise alone is 1.60) and the cross-year model by {cross:.2f}, against "
+            f"{naive:.2f} for the day before. Scrambling every later price leaves LEAR's forecast unchanged, an input built from tomorrow's price is caught, "
+            "and the cross-year model's inputs for a day don't change when everything after its auction is removed.")
 
 
 # =============================================================================
@@ -5031,6 +5138,15 @@ class DeskStore:
                 frame[column] = pd.to_datetime(frame[column], errors="coerce")
         return frame
 
+    def load_live_item(self, key: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT label, metadata, fetched_at, payload FROM live_data WHERE key=?", (key,)).fetchone()
+        return None if row is None else {"label": row[0], "data": self._decode_frame(bytes(row[3])), "fetched_at": row[2], "metadata": json.loads(row[1])}
+
+    def delete_live_items(self, prefix: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM live_data WHERE substr(key, 1, ?) = ?", (len(prefix), prefix))
+
     def load_live_items(self) -> dict:
         items = {}
         with self._connect() as conn:
@@ -5144,8 +5260,19 @@ def data_version(*names: str) -> tuple:
     return tuple(versions.get(name, 0) for name in names)
 
 
-_LIVE_VERSIONS = itertools.count(1)
-_READ_LOG = threading.local()
+def _process_wide(name: str, value: object) -> object:
+    """One object for the life of the server. Streamlit runs this file afresh on every rerun, so a class or counter defined here
+    is made anew each time: the session's data then failed isinstance checks, was rewrapped with versions counted from 1 again,
+    and a result cached before an update looked current after it (the forecast page kept showing the day before an update).
+    A change to these objects' code takes effect when the server restarts."""
+    holder = sys.modules.setdefault("_merit_process_state", type(sys)("_merit_process_state"))
+    if not hasattr(holder, name):
+        setattr(holder, name, value)
+    return getattr(holder, name)
+
+
+_LIVE_VERSIONS = _process_wide("live_versions", itertools.count(1))
+_READ_LOG = _process_wide("read_log", threading.local())
 _SPECIAL_READS = {"*": "any_version", "#keys": "keyset_version", "#fetched": "fetch_version"}
 
 
@@ -5244,6 +5371,9 @@ class LiveData(dict):
     def __len__(self) -> int:
         _note_read(self, "*")
         return super().__len__()
+
+
+LiveData = _process_wide("LiveData", LiveData)
 
 
 def live_items() -> "LiveData":
@@ -5347,6 +5477,10 @@ KEYS_FILE_NAME = "merit_keys.toml"
 ENTSOE_WINDOW_DAYS = 360
 ENTSOE_GENERATION_WINDOW_DAYS = 31
 ENTSOE_PARALLEL_WINDOWS = 4
+# ENTSO-E takes 4 to 15 s an answer and serves one key's requests side by side (six at once took 11 s, one after another 70 s),
+# so an update asks for everything together. At most this many at a time across the app, well inside its 400 a minute.
+ENTSOE_MAX_CONCURRENT = 12
+_ENTSOE_SLOTS = _process_wide("entsoe_slots", threading.BoundedSemaphore(ENTSOE_MAX_CONCURRENT))
 ENTSOE_FALLBACK_WINDOW_DAYS = 30
 RETRY_HTTP_CODES = {429, 500, 502, 503, 504}
 RETRY_WAIT_SECONDS = 1.5
@@ -6356,7 +6490,7 @@ def fetch_entsoe_series(token: str, series_kind: str, zone_name: str,
                         start_date: date, end_date_exclusive: date,
                         source_zone: Optional[str] = None,
                         target_zone: Optional[str] = None,
-                        _http_fn=None, progress=None) -> pd.DataFrame:
+                        _http_fn=None, progress=None, eic: Optional[str] = None) -> pd.DataFrame:
     """Fetch ENTSO-E day-ahead prices, actual load, generation or cross-border flow.
 
     Long periods are split into requests of up to 360 days and joined, so up to three years can be
@@ -6380,7 +6514,7 @@ def fetch_entsoe_series(token: str, series_kind: str, zone_name: str,
     else:
         if zone_name not in ENTSOE_ZONES:
             raise ValueError("Select a supported ENTSO-E bidding zone.")
-        eic = ENTSOE_ZONES[zone_name]["eic"]
+        eic = eic or ENTSOE_ZONES[zone_name]["eic"]     # another area for the zone's history, such as Germany before its split from Austria
         if series_kind == "Day-ahead price":
             document_type, parser_kind = "A44", "price"
             base_params = {"in_Domain": eic, "out_Domain": eic, "contract_MarketAgreement.type": "A01"}
@@ -6423,7 +6557,8 @@ def fetch_entsoe_series(token: str, series_kind: str, zone_name: str,
             "securityToken": token.strip(),
         })
         try:
-            body, _ = request_http(ENTSOE_BASE, params=params, headers={"Accept": "application/xml, application/zip, */*"})
+            with _ENTSOE_SLOTS:
+                body, _ = request_http(ENTSOE_BASE, params=params, headers={"Accept": "application/xml, application/zip, */*"})
             return parse_entsoe_xml(body, parser_kind), ""
         except ProviderHTTPError as exc:
             message = _entsoe_error_message(exc)
@@ -6692,18 +6827,25 @@ EPF_WEATHER_LEAD = 2                   # days between a forecast and the hour it
 EPF_WEATHER_START = date(2024, 1, 1)   # Open-Meteo keeps earlier model runs from January 2024
 
 
-def fetch_epf_weather(zone: str, start: date, end: date, _json_get_fn=None, wait: Callable[[float], None] = sleep) -> pd.DataFrame:
+EPF_WEATHER_SOURCES = {  # name: (address, suffix, model). Ranked from what the auction really saw to what it couldn't have.
+    "forecast two days ahead": (OPEN_METEO_PREVIOUS_RUNS_BASE, f"_previous_day{EPF_WEATHER_LEAD}", ""),
+    "early forecast hours": (OPEN_METEO_HISTORICAL_FORECAST_BASE, "", "ecmwf_ifs"),    # from 2017: a little better than the auction saw
+    "reanalysis": (OPEN_METEO_ARCHIVE_BASE, "", "")}                                    # what happened: for training on old years only
+
+
+def fetch_epf_weather(zone: str, start: date, end: date, _json_get_fn=None, wait: Callable[[float], None] = sleep,
+                      source: str = "forecast two days ahead") -> pd.DataFrame:
     """Hourly wind power index, sunshine and temperature over the zone's points, as forecast EPF_WEATHER_LEAD days before each
     hour, from start to end (tomorrow included). Past days and tomorrow share the lead, so the price forecast learns from
-    forecasts as good as the one it is given."""
-    points, suffix, frames, cursor = ZONE_WEATHER_POINTS[zone], f"_previous_day{EPF_WEATHER_LEAD}", [], start
+    forecasts as good as the one it is given. Another source can be asked for, for history before 2024."""
+    (base, suffix, model), points, frames, cursor = EPF_WEATHER_SOURCES[source], ZONE_WEATHER_POINTS[zone], [], start
     while cursor <= end:
         stop = min(cursor + timedelta(days=119), end)
         if frames:
             wait(20.0)                 # Open-Meteo counts requests per minute, weighted by points and days
-        payload = (_json_get_fn or _json_get)(OPEN_METEO_PREVIOUS_RUNS_BASE, params={
+        payload = (_json_get_fn or _json_get)(base, params={
             "latitude": ",".join(f"{lat:.2f}" for lat, _ in points), "longitude": ",".join(f"{lon:.2f}" for _, lon in points),
-            "hourly": ",".join(v + suffix for v in ("temperature_2m", "wind_speed_100m", "shortwave_radiation")),
+            "hourly": ",".join(v + suffix for v in ("temperature_2m", "wind_speed_100m", "shortwave_radiation")), "models": model or None,
             "timezone": ENTSOE_ZONES[zone]["timezone"], "start_date": cursor.isoformat(), "end_date": stop.isoformat()})
         for answer in payload if isinstance(payload, list) else [payload]:
             hourly = answer.get("hourly", {}) if isinstance(answer, dict) else {}
@@ -6722,6 +6864,7 @@ def fetch_epf_weather(zone: str, start: date, end: date, _json_get_fn=None, wait
 ENTSOE_OUTAGE_PAGE = 200          # ENTSO-E serves outage notices 200 at a time
 ENTSOE_OUTAGE_MAX_PAGES = 15
 ENTSOE_OUTAGE_MAX_FILES = 4000
+ENTSOE_OUTAGE_BATCH = 3
 OPEN_HOLIDAYS_BASE = "https://openholidaysapi.org"
 
 
@@ -6792,28 +6935,35 @@ def fetch_entsoe_outages(token: str, zone: str, start: date, end: date, _http_fn
     local = ZoneInfo(ENTSOE_ZONES[zone]["timezone"])
     window = {"periodStart": datetime.combine(start, time.min, tzinfo=local).astimezone(timezone.utc).strftime("%Y%m%d%H%M"),
               "periodEnd": datetime.combine(end, time.min, tzinfo=local).astimezone(timezone.utc).strftime("%Y%m%d%H%M")}
-    for document_type in ("A80", "A77"):
-        frames, read = [], 0
-        for page in range(ENTSOE_OUTAGE_MAX_PAGES):
-            params = dict(window, documentType=document_type, biddingZone_Domain=ENTSOE_ZONES[zone]["eic"], offset=page * ENTSOE_OUTAGE_PAGE,
-                          securityToken=token.strip())
-            try:
+    def page(document_type: str, number: int) -> tuple[pd.DataFrame, int]:
+        params = dict(window, documentType=document_type, biddingZone_Domain=ENTSOE_ZONES[zone]["eic"], offset=number * ENTSOE_OUTAGE_PAGE,
+                      securityToken=token.strip())
+        try:
+            with _ENTSOE_SLOTS:
                 body, _ = request_http(ENTSOE_BASE, params=params, headers={"Accept": "application/zip, application/xml, */*"})
-            except ProviderHTTPError as exc:
-                message = _entsoe_error_message(exc)
-                if "no matching data" in message.casefold():
-                    break
-                raise RuntimeError(message) from None
-            files = 1
-            if body[:2] == b"PK":
-                with zipfile.ZipFile(io.BytesIO(body)) as archive:
-                    files = sum(n.casefold().endswith(".xml") for n in archive.namelist())
-            part = parse_entsoe_outages(body)
-            read += files if not part.empty else 0
-            if not part.empty:
-                frames.append(part)
-            if part.empty or files < ENTSOE_OUTAGE_PAGE:
-                break
+        except ProviderHTTPError as exc:
+            message = _entsoe_error_message(exc)
+            if "no matching data" in message.casefold():
+                return pd.DataFrame(), 0
+            raise RuntimeError(message) from None
+        files = 1
+        if body[:2] == b"PK":
+            with zipfile.ZipFile(io.BytesIO(body)) as archive:
+                files = sum(n.casefold().endswith(".xml") for n in archive.namelist())
+        return parse_entsoe_outages(body), files
+    for document_type in ("A80", "A77"):
+        frames, read, first, ended = [], 0, 0, False
+        # A few pages at once: each takes ENTSO-E about 5 s, and France's notices fill two. Pages after a short one are dropped.
+        with ThreadPoolExecutor(max_workers=ENTSOE_OUTAGE_BATCH) as pool:
+            while not ended and first < ENTSOE_OUTAGE_MAX_PAGES:
+                for part, files in pool.map(lambda number: page(document_type, number), range(first, min(first + ENTSOE_OUTAGE_BATCH, ENTSOE_OUTAGE_MAX_PAGES))):
+                    read += files if not part.empty else 0
+                    if not part.empty:
+                        frames.append(part)
+                    if part.empty or files < ENTSOE_OUTAGE_PAGE:
+                        ended = True
+                        break
+                first += ENTSOE_OUTAGE_BATCH
         frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if not frame.empty and frame["psr"].eq("B14").any() or document_type == "A77":
             return (frame.assign(zone=zone) if not frame.empty else frame), read
@@ -6914,7 +7064,20 @@ class _SameHostRedirect(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_SAFE_OPENER = build_opener(_SameHostRedirect)
+def _https_context() -> ssl.SSLContext:
+    """Certificates are checked against the computer's trusted roots (on a work PC these include the company's proxy) and
+    Mozilla's public list from certifi, which comes with Streamlit. Windows holds only the roots it has needed so far, so a
+    site under a root it hasn't met yet failed: the ECB's (Sectigo E46), which reaches the desk without the proxy."""
+    context = ssl.create_default_context()
+    try:
+        import certifi
+        context.load_verify_locations(certifi.where())
+    except Exception:
+        pass         # without certifi, the computer's own roots alone, as before
+    return context
+
+
+_SAFE_OPENER = build_opener(_SameHostRedirect, HTTPSHandler(context=_https_context()))
 
 
 def _open_url(request, timeout):
@@ -7307,14 +7470,25 @@ TRADINGVIEW_FRONT_HISTORY_BARS = 1050  # about four years of front-month TTF, fo
 def fetch_tradingview_front(product: str, n_bars: int, username: str = "", password: str = "", _client=None) -> pd.DataFrame:
     """Daily closes of the continuous front-month contract (TradingView's 1!), in the app's unit."""
     spec = TRADINGVIEW_CURVES[product]
-    if _client is None:
-        try:
-            client, interval = _tradingview_client(username, password)
-        except ImportError:
-            raise RuntimeError(f"tradingview-datafeed isn't installed. Run: {TRADINGVIEW_INSTALL}") from None
-    else:
-        client, interval = _client, "1D"
-    bars = client.get_hist(symbol=spec["root"], exchange=spec["exchange"], interval=interval, n_bars=int(n_bars), fut_contract=1)
+    for attempt in range(1 if _client is not None else 2):
+        if _client is None:
+            try:
+                client, interval = _tradingview_client(username, password)
+            except ImportError:
+                raise RuntimeError(f"tradingview-datafeed isn't installed. Run: {TRADINGVIEW_INSTALL}") from None
+            # The curves' own connection, which answers TradingView's heartbeats and waits long enough. The library's request
+            # lost its connection whenever the computer was busy, as it is during an update: 0 answers in 8, against 8 in 8.
+            try:
+                bars = tradingview_batch(client, [(f"{spec['root']}1!", spec["exchange"])], int(n_bars)).get((f"{spec['root']}1!", spec["exchange"]))
+            except Exception:
+                bars = None
+            if bars is None:
+                bars = client.get_hist(symbol=spec["root"], exchange=spec["exchange"], interval=interval, n_bars=int(n_bars), fut_contract=1)
+        else:
+            bars = _client.get_hist(symbol=spec["root"], exchange=spec["exchange"], interval="1D", n_bars=int(n_bars), fut_contract=1)
+        if bars is not None and len(bars) and "close" in getattr(bars, "columns", []):
+            break
+        sleep(TRADINGVIEW_RETRY_SECONDS * (attempt + 1))
     if bars is None or len(bars) == 0 or "close" not in getattr(bars, "columns", []):
         raise RuntimeError(f"TradingView returned no front-month prices for {spec['exchange']}:{spec['root']}1!.")
     days = [pd.Timestamp(stamp).normalize() for stamp in bars.index]
@@ -8236,7 +8410,7 @@ PRICE_HISTORY_DAYS = EPF_HISTORY_DAYS   # prices and load forecasts: two years b
 FORECAST_HISTORY_DAYS = 300             # ENTSO-E's wind and solar forecasts, for the fundamentals outlook
 STALE_HOURS = {"tradingview": 1.0, "prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0, "ensemble": 6.0, "holidays": 24.0 * 7}
 KEEP_DAYS = {"prices": EPF_HISTORY_DAYS + 30, "load": 90, "generation": 90, "lng": 400}
-MAX_UPDATE_WORKERS = 8          # the providers allow far more; this keeps the first update short
+MAX_UPDATE_WORKERS = 16         # every source of a morning update starts at once; ENTSO-E is capped on its own (ENTSOE_MAX_CONCURRENT)
 OPEN_METEO_WORKERS = 2          # weather gets its own lane: Open-Meteo counts requests per minute
 # When each source publishes something new, in Brussels time. A source fetched after its latest publication is skipped,
 # even on "Update market data", because nothing new can have appeared: (times, weekdays only).
@@ -8310,6 +8484,17 @@ def incremental_start(held: Optional[pd.DataFrame], time_col: str, first_days: i
     if pd.isna(last):
         return today - timedelta(days=int(first_days))
     return max(last.date() - timedelta(days=int(overlap_days)), today - timedelta(days=ENTSOE_MAX_DAYS))
+
+
+def first_gap_day(held: Optional[pd.DataFrame], time_col: str, days: int = 30) -> Optional[date]:
+    """The day a recent hole in a continuous series begins: ENTSO-E sometimes publishes a day late (in Nov 2026 it served
+    no day-ahead price for some days while later ones were out). Asking again from there fills it once it appears."""
+    if held is None or time_col not in held.columns:
+        return None
+    times = pd.Series(pd.to_datetime(held[time_col], errors="coerce", utc=True).dropna().unique()).sort_values().reset_index(drop=True)
+    times = times[times >= times.max() - pd.Timedelta(days=days)] if len(times) else times
+    jumps = times.diff() > pd.Timedelta(hours=2)
+    return times.shift(1)[jumps].min().date() if jumps.any() else None
 
 
 def _hours_since(key: str) -> Optional[float]:
@@ -8468,6 +8653,7 @@ def plan_update(force=True, today: Optional[date] = None) -> list[UpdateTask]:
             earliest = pd.to_datetime(held["timestamp"], errors="coerce", utc=True).min()
             if pd.notna(earliest) and earliest.date() > today - timedelta(days=first_days - 35):
                 start = today - timedelta(days=first_days)
+            start = min(start, first_gap_day(held, "timestamp") or start)     # and a recent hole is asked for again
         metadata = {"zone": zone}
         if source:
             metadata.update({"source_zone": source, "target_zone": target, "variant": name})
@@ -10640,6 +10826,143 @@ def write_builtin_history(path: Path) -> str:
     return ", ".join(f"{key}: {len(frame):,} rows" for key, (_, _, frame) in items.items()) + f". {len(blob) // 1024:,} KB written into {path.name}."
 
 
+# ---- ten years of history for research on the price forecast ----------------------------------------------
+EPF_ARCHIVE_START = date(2015, 1, 1)
+# Germany priced with Austria and Luxembourg until 1 Oct 2018. ENTSO-E's forecasts for Germany alone run across the split.
+ARCHIVE_AREAS = {"Germany-Luxembourg": {"price_before": ("10Y1001A1001A63L", date(2018, 10, 1)), "forecasts": "10Y1001A1001A83F"}}
+ARCHIVE_WEATHER_FROM = {"reanalysis": EPF_ARCHIVE_START, "early forecast hours": date(2017, 1, 1), "forecast two days ahead": EPF_WEATHER_START}
+ARCHIVE_FUELS = {"ttf": "TTF Natural Gas", "eua": "EUA Carbon", "coal": "API2 Coal"}     # TradingView front months: TTF from Oct 2017, the others 2007
+
+
+def build_epf_archive(zone: str, token: str, end: date, log: Callable = print,
+                      piece: Callable[[str, Callable[[], pd.DataFrame]], pd.DataFrame] = lambda name, fetch: fetch()) -> pd.DataFrame:
+    """One row an hour, local time, from EPF_ARCHIVE_START: price, ENTSO-E's load forecast, its 18:00 wind and solar forecasts
+    (published after the auction, so targets for weather models, never inputs), and weather over the zone's points from the most
+    honest source each day has. wx_source is 0 for the forecast two days ahead (from 2024), 1 for ECMWF's early forecast hours
+    (2017 to 2023, a little better than what the auction saw) and 2 for the reanalysis (2015 and 2016, what happened: training only).
+    Each year-sized piece goes through piece(name, fetch), which may keep it, so a stopped build carries on where it was.
+    Weather (Open-Meteo) is fetched alongside ENTSO-E, since each provider sets its own pace."""
+    tz, areas = ENTSOE_ZONES[zone]["timezone"], ARCHIVE_AREAS.get(zone, {})
+    def pieces(label: str, start: date, stop: date, fetch: Callable[[date, date], pd.DataFrame], days: int, pause: float = 0.0) -> pd.DataFrame:
+        def patient(a: date, b: date) -> pd.DataFrame:
+            sleep(pause)                     # Open-Meteo counts requests per minute
+            for attempt in range(5):         # both providers time out, refuse (ENTSO-E 599, Open-Meteo 429) or drop the line now and then
+                try:
+                    return fetch(a, b)
+                except (RuntimeError, OSError):
+                    if attempt == 4:
+                        raise
+                    sleep(30.0 * (attempt + 1))
+        parts, cursor = [], start
+        while cursor < stop:
+            after = min(cursor + timedelta(days=days), stop)
+            log(f"{zone}: {label}, {cursor:%b %Y}")
+            parts.append(piece(f"{label}|{cursor}|{after}", lambda a=cursor, b=after: patient(a, b)))
+            cursor = after
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    def entsoe(kind: str, start: date, stop: date, eic: Optional[str] = None) -> pd.DataFrame:
+        return pieces(f"{kind}{' ' + eic if eic else ''}", start, stop, lambda a, b: fetch_entsoe_series(token, kind, zone, a, b, eic=eic), 365)
+    def all_weather() -> pd.DataFrame:
+        frames, cuts = [], sorted(ARCHIVE_WEATHER_FROM.items(), key=lambda item: item[1]) + [("", end + timedelta(days=1))]
+        for (source, first), (_, after) in zip(cuts, cuts[1:]):
+            stop = min(after + timedelta(days=90), end + timedelta(days=1))   # overlap: the next source starts patchy
+            frames.append(pieces(f"weather, {source}", first, stop, lambda a, b, s=source: fetch_epf_weather(zone, a, b - timedelta(days=1), source=s), 360, 20.0)
+                          .assign(wx_source=float(list(EPF_WEATHER_SOURCES).index(source))))
+        return pd.concat(frames, ignore_index=True)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        weather = pool.submit(all_weather)
+        before, split = areas.get("price_before", (None, EPF_ARCHIVE_START))
+        prices = pd.concat(([entsoe("Day-ahead price", EPF_ARCHIVE_START, split, before)] if before else []) + [entsoe("Day-ahead price", split, end)], ignore_index=True)
+        load = entsoe("Day-ahead load forecast", EPF_ARCHIVE_START, end, areas.get("forecasts"))
+        renewables = entsoe("Day-ahead wind and solar forecast", EPF_ARCHIVE_START, end, areas.get("forecasts"))
+        weather = weather.result()
+    columns = {"price": hourly_matrix(spot_series(prices, tz)), "load_fc": forecast_matrix(load, tz),
+               "wind_fc": forecast_matrix(renewables, tz, "wind"), "solar_fc": forecast_matrix(renewables, tz, "solar")}
+    # Each hour keeps the most honest source that has it.
+    weather = weather.sort_values("wx_source", kind="stable").drop_duplicates("time")
+    for name, column in (("wind_wx", "wind"), ("solar_wx", "solar"), ("temp_wx", "temperature"), ("wx_source", "wx_source")):
+        columns[name] = hourly_matrix(pd.DataFrame({"local": pd.to_datetime(weather["time"]), "value": weather[column]}))
+    days = pd.date_range(min(c.index.min() for c in columns.values()), max(c.index.max() for c in columns.values()))
+    table = pd.concat({name: c.reindex(days) for name, c in columns.items()}, axis=1).stack(level=1)
+    table.index = table.index.get_level_values(0) + pd.to_timedelta(table.index.get_level_values(1), unit="h")
+    return table.rename_axis("time").reset_index()
+
+
+def archive_quality(table: pd.DataFrame) -> pd.DataFrame:
+    """By year: share of hours held for each column, mean price, share of negative hours, and the weather sources used."""
+    year = pd.to_datetime(table["time"]).dt.year
+    held = table.drop(columns="time").notna().groupby(year).mean().mul(100).round(1).add_suffix(" %")
+    names = list(EPF_WEATHER_SOURCES)
+    return held.assign(**{"mean price": table["price"].groupby(year).mean().round(1), "negative %": table["price"].lt(0).groupby(year).mean().mul(100).round(1),
+                          "weather": table["wx_source"].groupby(year).agg(lambda s: ", ".join(names[int(v)] for v in sorted(s.dropna().unique())))})
+
+
+def archive_piece(store: DeskStore, zone: str, now: str, log: Callable = lambda text: None) -> Callable:
+    """Keeps each piece of a zone's archive as it arrives, so a stopped build carries on where it was."""
+    def piece(name: str, fetch: Callable[[], pd.DataFrame]) -> pd.DataFrame:
+        key = f"epf_archive_part|{zone}|{name}"
+        kept = store.load_live_item(key)
+        if kept is not None:
+            log("  kept from the last run")
+            return kept["data"]
+        frame = fetch()
+        store.save_live_item(key, {"label": f"Piece of the {zone} archive (build under way)", "data": frame, "fetched_at": now, "metadata": {}})
+        kept = store.load_live_item(key)              # read back, so a resumed build joins pieces of one kind
+        return frame if kept is None else kept["data"]
+    return piece
+
+
+def archive_tasks() -> list[UpdateTask]:
+    """The ten-year history, fetched in the background for the zones it was tested on. About an hour the first time."""
+    token, path, end = resolved_credentials()["entsoe"], default_db_path(), date.today() + timedelta(days=1)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    tasks = []
+    for zone in [z for z in UPDATE_DEFAULT_ZONES if z in _live_variants("entsoe_price")]:
+        fetch = lambda zone=zone: build_epf_archive(zone, token, end, piece=archive_piece(DeskStore(path), zone, now))
+        def keep(table: pd.DataFrame, zone: str = zone) -> str:
+            _stored_live_item(f"epf_archive|{zone}", f"Ten years of hourly history, {zone}", table, {"zone": zone})
+            _save(lambda store: store.delete_live_items(f"epf_archive_part|{zone}|"))
+            return f"{len(table):,} hours from {pd.to_datetime(table['time']).min():%b %Y}"
+        tasks.append(UpdateTask(f"Ten-year history, {zone}", fetch, keep, lane="forecast"))
+    return tasks
+
+
+def build_archive_cli() -> str:
+    """python merit.py --build-archive: fetch the ten-year history into the desk database. Takes about an hour (provider limits).
+    Each piece is saved as it arrives, so running it again after a stop carries on. A zone whose archive is up to date is kept."""
+    token, store, now = resolved_credentials()["entsoe"], DeskStore(default_db_path()), datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if not token:
+        raise SystemExit("No ENTSO-E key: put ENTSOE_API_TOKEN (or ENTSOE_API_KEY) in the keys file beside the app or the environment.")
+    reports, end = [], date.today() + timedelta(days=1)
+    for zone in UPDATE_DEFAULT_ZONES:
+        held = store.load_live_item(f"epf_archive|{zone}")
+        if held is not None and pd.to_datetime(held["data"]["time"]).max() >= pd.Timestamp(end - timedelta(days=7)):
+            print(f"{zone}: archive already saved, kept", flush=True)
+            reports.append(f"{zone} (kept)\n{archive_quality(held['data']).to_string()}")
+            continue
+        piece = archive_piece(store, zone, now, log=lambda text: print(text, flush=True))
+        table = build_epf_archive(zone, token, end, log=lambda text: print(text, flush=True), piece=piece)
+        if not store.save_live_item(f"epf_archive|{zone}", {"label": f"Ten years of hourly history, {zone}", "data": table, "fetched_at": now, "metadata": {"zone": zone}}):
+            raise RuntimeError(f"The archive for {zone} could not be saved.")
+        store.delete_live_items(f"epf_archive_part|{zone}|")
+        reports.append(f"{zone}\n{archive_quality(table).to_string()}")
+    fuels = []
+    for name, product in ARCHIVE_FUELS.items():
+        for attempt in range(4):       # TradingView sometimes answers nothing to an anonymous client: wait and ask again
+            try:
+                fuels.append(fetch_tradingview_front(product, 5000)[["date", "close"]].rename(columns={"close": name}).set_index("date")[name])
+                break
+            except Exception as exc:
+                if attempt == 3:
+                    reports.append(f"{product}: not fetched ({exc}). Run --build-archive again later; the price archive is kept.")
+                sleep(60.0)
+    if fuels:
+        joined = pd.concat(fuels, axis=1, sort=True).rename_axis("date").reset_index()
+        store.save_live_item("epf_fuel", {"label": "TTF, EUA and API2 front months, TradingView", "data": joined, "fetched_at": now, "metadata": {}})
+        reports.append(f"Fuels: " + ", ".join(f"{f.name} from {f.dropna().index.min():%d %b %Y}" for f in fuels))
+    return "\n\n".join(reports)
+
+
 # =============================================================================
 # SECTION 7 · MODEL CHECKS
 # =============================================================================
@@ -11798,8 +12121,13 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             quiet = {t.name for t in plan_update(force=False, today=today)}
             if "Day-ahead price, France" in quiet or "Day-ahead price, Spain" not in quiet:
                 raise AssertionError("Opening the app must skip recent data and fetch stale data.")
-            return ("A first update fetches full windows, later ones only new days; a source with nothing published since its last fetch is skipped "
-                    "even when forced, unless every source is asked again; opening the app skips anything recent.")
+            hours = pd.date_range("2026-10-20", "2026-10-31 23:00", freq="h", tz="UTC").append(pd.date_range("2026-11-03", "2026-11-03 22:00", freq="h", tz="UTC"))
+            if first_gap_day(pd.DataFrame({"timestamp": hours}), "timestamp") != date(2026, 10, 31) or first_gap_day(pd.DataFrame({"timestamp": hours[:200]}), "timestamp") is not None:
+                raise AssertionError("A recent hole in held prices must be asked for again from where it begins, and none found where there is none.")
+            if _process_wide("LiveData", dict) is not LiveData:
+                raise AssertionError("The session's data must keep one class across reruns, or cached results outlive the data they came from.")
+            return ("A first update fetches full windows, later ones only new days and any recent hole; a source with nothing published since its last "
+                    "fetch is skipped even when forced, unless every source is asked again; opening the app skips anything recent.")
         finally:
             st.session_state.live_data = previous
             if previous_fx is not None:
@@ -12966,10 +13294,14 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             count = ENTSOE_OUTAGE_PAGE if params["offset"] == 0 else 3
             return _zip([_outage_doc(f"M{params['offset'] + i}", 1, "A05", f"V{i}", "B14", 900, a, b, 0) for i in range(count)]), "application/zip"
         frame, read = fetch_entsoe_outages("token", "France", date(2026, 11, 1), date(2026, 12, 1), _http_fn=fake)
-        if [p["offset"] for p in seen] != [0, ENTSOE_OUTAGE_PAGE] or read != ENTSOE_OUTAGE_PAGE + 3 or seen[0]["documentType"] != "A80" or frame["zone"].iloc[0] != "France":
-            raise AssertionError("Notices must be read page by page until a short page.")
+        offsets = sorted(p["offset"] for p in seen)
+        after = {f"M{2 * ENTSOE_OUTAGE_PAGE + i}" for i in range(3)}      # the page after the short one, asked in the same batch
+        if offsets[:2] != [0, ENTSOE_OUTAGE_PAGE] or len(offsets) > ENTSOE_OUTAGE_BATCH or read != ENTSOE_OUTAGE_PAGE + 3 or after & set(frame["mrid"].astype(str)) \
+                or {p["documentType"] for p in seen} != {"A80"} or frame["zone"].iloc[0] != "France":
+            raise AssertionError("Notices must be read up to the first short page, a few pages at a time, and nothing after it kept.")
         return (f"Revisions, cancellations and other plant types are handled; a 1 GW announced outage lowers expected output by "
-                f"{fit['k'][int(np.clip(row['lead'] - 1, 1, 14)) - 1] * 1000:,.0f} MW on that day, and notices are read in pages of {ENTSOE_OUTAGE_PAGE}.")
+                f"{fit['k'][int(np.clip(row['lead'] - 1, 1, 14)) - 1] * 1000:,.0f} MW on that day, and notices are read in pages of {ENTSOE_OUTAGE_PAGE}, "
+                f"{ENTSOE_OUTAGE_BATCH} at a time.")
 
     def check_holidays() -> str:
         calls = []
@@ -14751,13 +15083,53 @@ def epf_data(zone: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         _live_dataset_frame("tradingview_gas_front"), _live_dataset_frame("eex_eua_auctions"))))
 
 
-def epf_point(held: pd.DataFrame, zone: str = "") -> pd.DataFrame:
-    """Kept forecasts as one row a day: LEAR, with its daily level averaged with level_forecast's where that helped."""
+def _by_day(held: pd.DataFrame) -> pd.DataFrame:
     frame = held.assign(day=pd.to_datetime(held["day"])).drop_duplicates("day", keep="last").set_index("day").sort_index()
-    frame = frame.reindex(pd.date_range(frame.index.min(), frame.index.max()))
+    return frame.reindex(pd.date_range(frame.index.min(), frame.index.max()))
+
+
+def epf_point(held: pd.DataFrame, zone: str = "", cross: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Kept forecasts as one row a day: LEAR, with its daily level averaged with level_forecast's where that helped, then
+    averaged with the cross-year model on the days it has forecast."""
+    frame = _by_day(held)
     lear = frame[[f"h{h}" for h in range(24)]].set_axis(range(24), axis=1)
     weight = EPF_LEVEL_WEIGHT.get(zone, 0.0)
-    return lear.add(weight * (frame["level"] - lear.mean(axis=1)), axis=0) if weight else lear
+    point = lear.add(weight * (frame["level"] - lear.mean(axis=1)), axis=0) if weight else lear
+    if cross is None or cross.empty:
+        return point
+    other = _by_day(cross).reindex(point.index)[[f"h{h}" for h in range(24)]].set_axis(range(24), axis=1)
+    return point.where(other.isna(), (1 - GBM_WEIGHT) * point + GBM_WEIGHT * other)
+
+
+def archive_matrices(table: pd.DataFrame) -> dict:
+    """The ten-year archive as days × 24 frames, one per column."""
+    if table is None or table.empty:
+        return {}
+    time = pd.to_datetime(table["time"])
+    wide = table.assign(day=time.dt.normalize(), hour=time.dt.hour).set_index(["day", "hour"])
+    return {name: wide[name].unstack("hour").reindex(columns=range(24)).rename_axis(index=None, columns=None) for name in GBM_INPUTS if name in wide.columns}
+
+
+def gbm_history(zone: str) -> tuple[dict, pd.DataFrame, pd.DataFrame, bool]:
+    """What the cross-year model learns from: the app's own prices, forecasts and weather, reaching back to 2015 where the
+    ten-year history has been fetched (the app's own data wins where both hold a day). Also says whether the archive was used."""
+    tz, (prices, inputs) = ENTSOE_ZONES[zone]["timezone"], epf_data(zone)
+    part = lambda name: inputs[name] if name in inputs.columns.get_level_values(0) else pd.DataFrame(columns=range(24))
+    res = _live_dataset_frame(f"entsoe_renewable_forecast|{zone}")
+    held = {"price": prices, "load_fc": part("load"), "wind_wx": part("wind_wx"), "solar_wx": part("solar_wx"), "temp_wx": part("temp_wx"),
+            "wind_fc": forecast_matrix(res, tz, "wind"), "solar_fc": forecast_matrix(res, tz, "solar")}
+    old = archive_matrices(_live_dataset_frame(f"epf_archive|{zone}"))
+    held = {name: frame.combine_first(old[name]) if name in old and len(frame) else old.get(name, frame) for name, frame in held.items()}
+    fuel = _live_dataset_frame("epf_fuel")
+    def joined(key: str, column: str, archived: str) -> pd.DataFrame:
+        live = _live_dataset_frame(key)
+        live = live[["date", column]].rename(columns={column: "close"}) if {"date", column} <= set(live.columns) else pd.DataFrame(columns=["date", "close"])
+        early = fuel[["date", archived]].rename(columns={archived: "close"}) if {"date", archived} <= set(fuel.columns) else pd.DataFrame(columns=["date", "close"])
+        both = [f.assign(date=pd.to_datetime(f["date"], utc=True).dt.tz_localize(None)) for f in (early, live) if len(f)]
+        if len(both) == 2:
+            both[0] = both[0].loc[both[0]["date"] < both[1]["date"].min()]
+        return pd.concat(both, ignore_index=True) if both else None
+    return held, joined("tradingview_gas_front", "close", "ttf"), joined("eex_eua_auctions", "price", "eua"), bool(old)
 
 
 def epf_tasks() -> list[UpdateTask]:
@@ -14783,10 +15155,24 @@ def epf_tasks() -> list[UpdateTask]:
                 return made[-1]
             keep = lambda frame, zone=zone: f"{len(store_observations(_epf_key('points', zone), f'Price forecasts made by the app, {zone}', frame, {'zone': zone}, ('day',), 'day')):,} days held"
             tasks.append(UpdateTask(f"Price forecast, {zone}, {part[0]:%d %b %Y} to {part[-1]:%d %b %Y}", run, keep, lane="forecast"))
-        if todo or (held is not None and not done <= ranged):
-            def fit(zone=zone, prices=prices, inputs=inputs, held=held, made=made, ranged=ranged) -> pd.DataFrame:
-                point = epf_point(pd.concat([f for f in (held, *made) if f is not None], ignore_index=True), zone)
-                redo = {pd.Timestamp(d) for f in made for d in f["day"]}
+        # The cross-year model, for the same days. All made again once the ten-year history arrives.
+        history, gas, carbon, archived = gbm_history(zone)
+        held_cross, made_cross = _held_frame(_epf_key("cross", zone)), []
+        if held_cross is not None and _live_item_meta(_epf_key("cross", zone)).get("archive") != archived:
+            held_cross = None
+        crossed = set(pd.to_datetime(held_cross["day"])) if held_cross is not None else set()
+        cross_todo = [d for d in pd.date_range(max(EPF_FIRST_DAY, prices.index[0] + pd.Timedelta(days=60)), last + pd.Timedelta(days=1)) if d not in crossed or (fresh and d > last)]
+        if cross_todo:
+            def cross(zone=zone, history=history, gas=gas, carbon=carbon, todo=cross_todo, made=made_cross) -> pd.DataFrame:
+                made.append(gbm_forecast(gbm_design(zone, history, gas, carbon), todo).add_prefix("h").rename_axis("day").reset_index())
+                return made[-1]
+            keep = lambda frame, zone=zone, archived=archived: f"{len(store_observations(_epf_key('cross', zone), f'Cross-year model forecasts, {zone}', frame, {'zone': zone, 'archive': archived}, ('day',), 'day')):,} days held"
+            tasks.append(UpdateTask(f"Cross-year model, {zone}", cross, keep, lane="forecast"))
+        if todo or cross_todo or (held is not None and not done <= ranged):
+            def fit(zone=zone, prices=prices, inputs=inputs, held=held, made=made, ranged=ranged, held_cross=held_cross, made_cross=made_cross) -> pd.DataFrame:
+                both = [f for f in (held_cross, *made_cross) if f is not None]
+                point = epf_point(pd.concat([f for f in (held, *made) if f is not None], ignore_index=True), zone, pd.concat(both, ignore_index=True) if both else None)
+                redo = {pd.Timestamp(d) for f in (*made, *made_cross) for d in f["day"]}
                 first = next((i for i, d in enumerate(point.index) if d not in ranged or d in redo), len(point)) // 7 * 7
                 q = lgbm_quantiles(point, prices, inputs, zone, first=first)
                 return pd.concat([pd.DataFrame(q[k][first:], index=point.index[first:]).add_prefix("h").assign(level=level)
@@ -14814,16 +15200,19 @@ def epf_forecast(zone: str) -> dict:
             return {"ready": False, "reason": f"The price forecast needs about four years of day-ahead prices for {zone}. Select Update market data."}
         if held is None:
             return {"ready": False, "reason": "The price forecast is being made for every past day, so it can be tested. This runs once, in the background."}
-        lear, point = epf_point(held), epf_point(held, zone)
-        name, ranges = ("LEAR + daily level" if zone in EPF_LEVEL_WEIGHT else "LEAR"), "the model's misses over the last half-year"
+        held_cross = _held_frame(_epf_key("cross", zone))
+        lear, before, point = epf_point(held), epf_point(held, zone), epf_point(held, zone, held_cross)
+        earlier = "LEAR + daily level" if zone in EPF_LEVEL_WEIGHT else "LEAR"
+        name, ranges = earlier + (" + cross-year model" if held_cross is not None else ""), "the model's misses over the last half-year"
         quantiles = residual_quantiles(point, prices)
         if held_ranges is not None:
             part = held_ranges.assign(day=pd.to_datetime(held_ranges["day"]))
             raw = np.stack([part.loc[np.isclose(part["level"], level)].set_index("day").reindex(point.index)[[f"h{h}" for h in range(24)]].to_numpy(float) for level in EPF_LEVELS])
             quantiles, ranges = calibrate(raw, prices, point.index), "LightGBM on the model's misses, calibrated on its own recent misses"
         forecasts = {k: (v, residual_quantiles(v, prices)) for k, v in epf_baselines(prices).items()}
-        if name != "LEAR":
-            forecasts["LEAR"] = (lear, residual_quantiles(lear, prices))
+        for label, frame in (("LEAR", lear), (earlier, before)):     # what each step adds stays in view
+            if label != name and label not in forecasts:
+                forecasts[label] = (frame, residual_quantiles(frame, prices))
         forecasts[name] = (point, quantiles)
         card = epf_scorecard(prices, forecasts, list(forecasts)[:3], ("Validation", "Live") if EPF_TEST_SEALED else ("Validation", "Test", "Live"))
         last = prices.dropna().index[-1]
@@ -14845,12 +15234,13 @@ def epf_forecast(zone: str) -> dict:
 def render_epf_scorecard(card: pd.DataFrame) -> None:
     st.subheader("Honest test, hour by hour")
     shown = lambda p: "" if not np.isfinite(p) else "< 0.001" if p < 0.001 else f"{p:.3f}"
-    table(card.assign(**{"DM p": card["DM p"].map(shown), "Cover 80%": card["Cover 80%"] * 100, "Cover 90%": card["Cover 90%"] * 100}))
+    table(card.assign(**{"DM p": card["DM p"].map(shown), "MCS p": card["MCS p"].map(shown), "Cover 80%": card["Cover 80%"] * 100, "Cover 90%": card["Cover 90%"] * 100}))
     st.caption(f"Each delivery day is forecast from what its auction could see at noon the day before, with each model refitted every day. Models were chosen on VALIDATION, "
                f"{EPF_VALID_START:%d %b %Y} to {EPF_TEST_START - pd.Timedelta(days=1):%d %b %Y}. TEST, {EPF_TEST_START:%d %b %Y} to "
                f"{EPF_TEST_END - pd.Timedelta(days=1):%d %b %Y}, {'is sealed until the models are final' if EPF_TEST_SEALED else 'was frozen beforehand and scored once'}; "
-               "later days are the live record. rMAE is the MAE over the seasonal naive's. The yardsticks' ranges come from their own past misses. "
-               "DM p is the one-sided Diebold-Mariano p-value against the best other yardstick: below 0.05 means clearly better.")
+               f"days from {EPF_HOLDOUT_START:%d %b %Y} are the live record and the next untouched holdout. rMAE is the MAE over the seasonal naive's. The yardsticks' ranges come from their own past misses. "
+               "DM p is the one-sided Diebold-Mariano p-value against the best other yardstick: below 0.05 means clearly better. "
+               "MCS p is the chance the model belongs among the best of all those shown (model confidence set): below 0.1, it is beaten even allowing for luck.")
 
 
 def record_price_estimates() -> None:
@@ -14889,8 +15279,8 @@ def render_next_day(zones: Sequence[str]) -> None:
     with st.container(key="hero"):
         st.markdown(f'<div class="desk-note"><p>{html.escape(zone)}, {day:%a %d %b}: base about <b>{fmt_price(result["base"], 0)}/MWh</b>, with an 80% chance of '
                     f'<b>{fmt_price(result["base_low"], 0)} to {fmt_price(result["base_high"], 0)}</b>. Model: {html.escape(result["name"])}; ranges from {html.escape(result["ranges"])}.</p>'
-                    f'<p class="soft">Made from prices to {result["last"]:%d %b}, ENTSO-E\'s load forecast, the weather forecast made two days before each hour, and the TTF close and EUA auction '
-                    f'from two days or more before, all published before the noon auction.{" Not in for this day, so left out of its fit: " + html.escape(", ".join(missing)) + "." if missing else ""} '
+                    f'<p class="soft">Made from prices to {result["last"]:%d %b}, ENTSO-E\'s load forecast, the weather forecast made two days before each hour, the TTF close and EUA auction '
+                    f'from two days or more before, and ENTSO-E\'s wind and solar forecasts up to two days before, all published before the noon auction.{" Not in for this day, so left out of its fit: " + html.escape(", ".join(missing)) + "." if missing else ""} '
                     f'The latest published day missed its forecast by €{abs(result["latest_miss"]):.0f}{", an unusually large gap" if result["unusual"] else ""}.</p></div>', unsafe_allow_html=True)
     hours = pd.date_range(day, periods=24, freq="h")
     fig = go.Figure()
@@ -14915,19 +15305,47 @@ def render_next_day(zones: Sequence[str]) -> None:
                     st.success(epf_self_checks())
             except AssertionError as exc:
                 st.error(str(exc))
-        st.caption("A synthetic market with a known answer the forecast must recover, and a test that scrambles every later price: the forecast must not move, "
-                   "and an input built from tomorrow's price must be caught. Both also run with the Model Validation checks.")
+        st.caption("A synthetic market with a known answer both models must recover, and tests that scramble or remove everything after the auction: the forecast "
+                   "must not move, and an input built from tomorrow's price must be caught. They also run with the Model Validation checks.")
     with st.expander("How this forecast works"):
         st.markdown("**LEAR** (Lago et al., 2021): for each hour, a LASSO regression on every hour's price one, two, three and seven days before, ENTSO-E's load forecast and "
                     "the zone's wind, sun and temperature forecast for the day, the day before and a week before, the TTF and EUA prices, and the kind of day. It is refitted "
                     f"each day on the last {LEAR_WINDOW} days, a day {LEAR_HALF_LIFE:.0f} days back counting half. "
                     + ("**Daily level.** In France its daily average is averaged with a daily regression on the same kind of day, the day before, the week and the weather, which "
                        "made it clearly more accurate there (not in Germany). " if zone in EPF_LEVEL_WEIGHT else "")
-                    + "**Ranges.** LightGBM learns the spread of the misses from the hour, the kind of day, the forecasts and recent misses, refitted weekly; each range is then moved "
+                    + "**Cross-year model.** LightGBM over every hour the app holds, back to 2015 once the ten-year history is fetched. Prices are scaled by the median and spread "
+                    "of the two weeks before, so a calm year and the 2022 crisis teach the same shapes. It sees the same hour one, two and seven days before, yesterday's average, "
+                    "low, high and last hour, the load forecast, wind and sun turned into MW with ENTSO-E's own forecasts up to two days before (so it follows the growing fleet), "
+                    "the load left for other plants and its change from the day before, a gas plant's running cost from the TTF and EUA prices, and the kind of day. It is "
+                    f"refitted every {GBM_REFIT_DAYS} days and counts {GBM_WEIGHT:.0%} in the average with the method above, which beat that method in every year 2018 to 2025 "
+                    "in both zones (by 17% in Germany and 13% in France).\n\n"
+                    "**Ranges.** LightGBM learns the spread of the misses from the hour, the kind of day, the forecasts and recent misses, refitted weekly; each range is then moved "
                     "by its own recent misses (conformal calibration), so an 80% range holds about 80%.\n\n"
-                    "**Only what the auction knew.** ENTSO-E's wind and solar forecast is left out because the one it publishes is the 18:00 snapshot, after the auction. Weather "
-                    "comes from Open-Meteo's archive of past model runs, the run two days before each hour, for past days and tomorrow alike. Each was tested against simpler "
-                    "methods and kept only where clearly better: a merit-order model and averaging several windows were tried and dropped.")
+                    "**Only what the auction knew.** ENTSO-E's wind and solar forecast for the day itself is left out because the one it publishes is the 18:00 snapshot, after the "
+                    "auction; older days' are used only to turn weather into MW. Weather comes from Open-Meteo's archive of past model runs, the run two days before each hour, for past "
+                    "days and tomorrow alike. Each was tested against simpler methods and kept only where clearly better: a merit-order model, averaging several windows and a "
+                    "four- or eight-year window for LEAR were tried and dropped.")
+        render_archive_control(zone)
+
+
+def render_archive_control(zone: str) -> None:
+    """Fetch the ten-year history on request: the cross-year model then learns from every hour since 2015."""
+    table = _live_dataset_frame(f"epf_archive|{zone}")
+    if len(table):
+        st.caption(f"Ten-year history held for {zone}: {pd.to_datetime(table['time']).min():%b %Y} to {pd.to_datetime(table['time']).max():%b %Y}, "
+                   f"fetched {_live_item_fetched_at(f'epf_archive|{zone}')[:10]}. The cross-year model learns from all of it.")
+        return
+    if demo_mode() or zone not in UPDATE_DEFAULT_ZONES:
+        return
+    st.caption("The cross-year model learns from what the app holds, about four years. Fetching prices, forecasts and weather back to 2015 made it "
+               "more accurate still in tests (France about 2% more). It takes about an hour from ENTSO-E and Open-Meteo, in the background, and resumes if stopped.")
+    if st.button("Fetch the ten-year history", key="epf_archive"):
+        if not resolved_credentials()["entsoe"]:
+            st.error(f"An ENTSO-E key is needed. Put {KEYS_FILE_NAME} in the same folder as this app.")
+        elif start_update(force=True, tasks=archive_tasks()):
+            st.rerun()
+        else:
+            st.info("Another update is running. Try again once it ends.")
 
 
 def render_pnl_drivers(step: pd.DataFrame, factor: pd.Series, period: Optional[tuple] = None) -> pd.DataFrame:
@@ -16659,5 +17077,7 @@ if __name__ == "__main__":
         # Developer step: fetch the Fundamentals Outlook's history from the free sources and build it into this file.
         print("Fetching about 600 days of output, weather, gas use and holidays. Energy-Charts allows two requests a minute, so this takes about ten minutes.")
         print(write_builtin_history(Path(__file__).resolve()))
+    elif "--build-archive" in sys.argv:
+        print(build_archive_cli())
     else:
         main()
