@@ -5810,6 +5810,313 @@ def fetch_entsog_flow(point_direction: str, start_date: date,
     return frame
 
 
+# ---- EU gas balance: what crosses the EU's border, by route ---------------------------------------------
+# Supply is measured at every EU point facing a non-EU country (ENTSOG), LNG send-out and storage come from GIE, domestic
+# production from ENTSOG's aggregates. Demand is what is left (implied): ENTSOG's own deliveries to consumers covered only
+# about 60%, as many countries deliver through networks it doesn't see. Checked against Eurostat's monthly consumption over
+# 45 months from Jan 2023: implied demand ran 4% below it on average, most months 2 to 7%, consistent with gas that never
+# reaches the grid. Without the duplicate rules Norway came out a third too high and summer demand 20% above Eurostat.
+EU_COUNTRIES = frozenset("AT BE BG HR CY CZ DK EE FI FR DE GR HU IE IT LV LT LU MT NL PL PT RO SK SI ES SE".split())
+GAS_BALANCE_START = date(2023, 1, 1)
+GAS_BALANCE_VERSION = 1            # flows kept under an earlier set of rules are fetched again
+GAS_GWH_PER_MCM = 10.55            # about, at the usual calorific value
+# TAP's deliveries are listed with a Swiss neighbour (its operator is registered there) and Medgaz's with a Spanish one.
+GAS_ROUTE_POINTS = {"ITP-00008": "Azerbaijan (TAP)", "ITP-00427": "Azerbaijan (TAP)", "ITP-00275": "Azerbaijan (TAP)", "ITP-00048": "North Africa"}
+GAS_ROUTE_NEIGHBOURS = {"NO": "Norway", "DZ": "North Africa", "TN": "North Africa", "LY": "North Africa", "MA": "North Africa", "UK": "UK", "GB": "UK",
+                        "RU": "Russia, direct", "BY": "Russia, direct", "UA": "Ukraine border"}
+# Dornum GASPOOL repeats the Europipe II gas reported at Dornum / NETRA (daily correlation 1.0, same level, 2025).
+GAS_DUPLICATE_POINTS = frozenset({"ITP-00525"})
+GAS_SUPPLY_LINES = ("Norway", "LNG", "North Africa", "Azerbaijan (TAP)", "TurkStream", "UK", "Russia, direct", "Ukraine border", "Other imports", "Production")
+EUROSTAT_GAS_URL = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/nrg_cb_gasm"
+
+
+def _entsog_pages(path: str, params: dict, _json_get_fn=None, page: int = 2000) -> list[dict]:
+    """Every row of an ENTSOG answer. Asked for everything at once, it leaves out the last rows (93 of 96 in a test), so pages
+    are read until its stated total."""
+    rows, offset = [], 0
+    while True:
+        payload = (_json_get_fn or _json_get)(f"{ENTSOG_BASE}/{path}", params={**params, "limit": str(page), "offset": str(offset)})
+        part = _payload_rows(payload)
+        rows += part
+        offset += len(part)
+        total = (payload.get("meta") or {}).get("total") if isinstance(payload, dict) else None
+        if not part or total is None or offset >= int(total) or offset > 1_000_000:
+            return rows
+
+
+def gas_border_points(catalogue: pd.DataFrame) -> pd.DataFrame:
+    """The EU's border points with the rest of the world, each flow once: the EU operator's side, without points that carry
+    another operator's gas inside its pipe (pipe in pipe) or repeat a flow already reported. Each gets its route."""
+    c = catalogue.copy()
+    for column in ("tSOCountry", "adjacentCountry", "pointKey", "pointLabel", "operatorKey", "directionKey", "pipeInPipeWithTsoLabel", "hasData",
+                   "isVirtualizedOperationally", "virtualizedOperationallySince"):
+        if column not in c.columns:
+            c[column] = None
+    text = lambda column: c[column].fillna("").astype(str).str.strip()
+    guest = text("pipeInPipeWithTsoLabel").replace({"None": "", "nan": ""}).ne("")
+    keep = (c["tSOCountry"].isin(EU_COUNTRIES) & (~c["adjacentCountry"].isin(EU_COUNTRIES) | c["pointKey"].isin(GAS_ROUTE_POINTS))
+            & text("hasData").str.lower().isin(["1", "true"]) & ~guest & ~c["pointKey"].isin(GAS_DUPLICATE_POINTS))
+    c = c.loc[keep].drop_duplicates(["operatorKey", "pointKey", "directionKey"])
+    route = c["pointKey"].map(GAS_ROUTE_POINTS).fillna(c["adjacentCountry"].map(GAS_ROUTE_NEIGHBOURS))
+    route = route.where(~text("pointLabel").loc[c.index].str.contains("Strandzha", case=False), "TurkStream").fillna("Other imports")
+    virtual = text("isVirtualizedOperationally").loc[c.index].str.lower().isin(["true", "1"])
+    since = pd.to_datetime(c["virtualizedOperationallySince"], errors="coerce", utc=True).dt.tz_localize(None).where(virtual)
+    return c.assign(route=np.where(c["directionKey"].eq("exit"), "Exports", route), virtual_since=since)[
+        ["operatorKey", "pointKey", "directionKey", "pointLabel", "adjacentCountry", "route", "virtual_since"]].reset_index(drop=True)
+
+
+def fetch_gas_routes(start: date, end: date, _json_get_fn=None) -> pd.DataFrame:
+    """Daily flows across the EU border by route, and EU production, in GWh/d (exports negative): day, line, GWh."""
+    def windows(days: int) -> list[tuple[date, date]]:
+        out, cursor = [], start
+        while cursor <= end:
+            out.append((cursor, min(cursor + timedelta(days=days - 1), end)))
+            cursor += timedelta(days=days)
+        return out
+    points = gas_border_points(pd.DataFrame(_entsog_pages("operatorpointdirections", {}, _json_get_fn)))
+    if points.empty:
+        raise RuntimeError("ENTSOG listed no border points.")
+    ids = (points["operatorKey"].str.lower() + points["pointKey"].str.lower() + points["directionKey"].str.lower()).unique().tolist()
+    flow = lambda job: _entsog_pages("operationalData", {"pointDirection": ",".join(job[0]), "from": job[1].isoformat(), "to": job[2].isoformat(),
+                                                         "indicator": "Physical Flow", "periodType": "day", "timezone": "CET"}, _json_get_fn)
+    produced = lambda span: _entsog_pages("aggregatedData", {"from": span[0].isoformat(), "to": span[1].isoformat(), "indicator": "Physical Flow",
+                                                             "periodType": "day", "adjacentSystemsKey": "Production"}, _json_get_fn)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        rows = [r for part in pool.map(flow, [(ids[i:i + 25], a, b) for a, b in windows(90) for i in range(0, len(ids), 25)]) for r in part]
+        made = [r for part in pool.map(produced, windows(30)) for r in part]
+    ops = pd.DataFrame(rows)
+    if ops.empty:
+        raise RuntimeError("ENTSOG returned no flows at the EU's border points.")
+    ops = ops.merge(points, on=["operatorKey", "pointKey", "directionKey"], how="inner")
+    ops["day"] = pd.to_datetime(ops["periodFrom"].astype(str).str[:10], errors="coerce")
+    ops = ops.loc[ops["virtual_since"].isna() | (ops["day"] < ops["virtual_since"])]     # a point merged into a virtual one counts until then
+    ops["GWh"] = _number_series(ops["value"]) / 1e6 * np.where(ops["directionKey"].eq("exit"), -1.0, 1.0)
+    lines = [ops.rename(columns={"route": "line"})[["day", "line", "GWh"]]]
+    made = pd.DataFrame(made)
+    if not made.empty:
+        made = made.loc[made["countryKey"].isin(EU_COUNTRIES)]
+        lines.append(pd.DataFrame({"day": pd.to_datetime(made["periodFrom"].astype(str).str[:10], errors="coerce"), "line": "Production",
+                                   "GWh": _number_series(made["value"]) / 1e6 * np.where(made["directionKey"].eq("exit"), -1.0, 1.0)}))
+    out = pd.concat(lines, ignore_index=True).dropna()
+    return out.groupby(["day", "line"], as_index=False)["GWh"].sum()
+
+
+def fetch_eurostat_gas_consumption(since: date, _json_get_fn=None) -> pd.DataFrame:
+    """EU-27 monthly inland gas consumption from Eurostat (nrg_cb_gasm), in GWh: the independent check on implied demand."""
+    payload = (_json_get_fn or _json_get)(EUROSTAT_GAS_URL, params={"geo": "EU27_2020", "nrg_bal": "IC_CAL_MG", "unit": "TJ_GCV", "siec": "G3000",
+                                                                    "format": "JSON", "sinceTimePeriod": f"{since:%Y-%m}"})
+    months = {position: label for label, position in (payload.get("dimension", {}).get("time", {}).get("category", {}).get("index", {}) or {}).items()}
+    rows = [(pd.Timestamp(months[int(i)] + "-01"), float(v) / 3.6) for i, v in (payload.get("value") or {}).items() if int(i) in months and v is not None]
+    if not rows:
+        raise RuntimeError("Eurostat returned no monthly gas consumption.")
+    return pd.DataFrame(rows, columns=["month", "GWh"]).sort_values("month").reset_index(drop=True)
+
+
+def gas_balance(flows: pd.DataFrame, lng: Optional[pd.DataFrame], storage: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Daily EU balance in GWh/d: supply by route, LNG send-out (GIE), production, storage withdrawal (negative when injecting),
+    exports (negative), and implied demand, their sum. Only days where all three sources have reported."""
+    if flows is None or flows.empty:
+        return pd.DataFrame()
+    wide = flows.assign(day=pd.to_datetime(flows["day"])).pivot_table(index="day", columns="line", values="GWh", aggfunc="sum")
+    series = lambda frame, column: (frame.assign(day=pd.to_datetime(frame["gasDayStart"]).dt.normalize()).drop_duplicates("day", keep="last")
+                                    .set_index("day")[column].pipe(_number_series)) if frame is not None and not frame.empty and column in frame.columns else pd.Series(dtype=float)
+    wide["LNG"] = series(lng, "sendOut").reindex(wide.index)
+    wide["Storage withdrawal"] = series(storage, "netWithdrawal").reindex(wide.index)
+    wide = wide.dropna(subset=["LNG", "Storage withdrawal"])
+    lines = [line for line in GAS_SUPPLY_LINES if line in wide.columns] + ["Storage withdrawal"] + (["Exports"] if "Exports" in wide.columns else [])
+    wide = wide[lines].fillna(0.0)
+    wide["Implied demand"] = wide.sum(axis=1)
+    return wide
+
+
+# ---- EU gas demand from the weather, and the next 15 days of the balance --------------------------------
+# Tested 1 to 7 days ahead on 682 days from Jan 2025, with temperatures as forecast at the time (Open-Meteo's archive of
+# earlier runs) and each week fitted only on the days before it: 5.9%, 5.5% and 6.5% of demand at 1, 3 and 7 days, against
+# 9.7%, 11.2% and 12.1% for the best naive yardstick (DM p < 0.0001). The 7-day storage change from it missed by 2.7 TWh
+# on average, half the 5.5 TWh of "as last week".
+# City, latitude, longitude, and its country's gas use (bcm a year, rounded) as weight. Vienna stands for AT, HU, CZ and SK.
+GAS_BASKET = {"Berlin": (52.52, 13.40, 77.0), "Milan": (45.46, 9.19, 62.0), "Paris": (48.86, 2.35, 35.0), "Madrid": (40.42, -3.70, 30.0),
+              "Amsterdam": (52.37, 4.90, 29.0), "Vienna": (48.21, 16.37, 28.0), "Warsaw": (52.23, 21.01, 21.0), "Brussels": (50.85, 4.35, 15.0)}
+GAS_WEATHER_START = date(2022, 12, 1)
+GAS_HORIZON_DAYS = 15
+GAS_DEMAND_HALF_LIFE = 365.0
+GAS_SHOCK_LINES = ("Norway", "LNG", "North Africa", "Azerbaijan (TAP)", "TurkStream", "UK")
+
+
+def _basket_params(**extra) -> dict:
+    return {"latitude": ",".join(f"{v[0]:.2f}" for v in GAS_BASKET.values()), "longitude": ",".join(f"{v[1]:.2f}" for v in GAS_BASKET.values()),
+            "timezone": "Europe/Berlin", **extra}
+
+
+def fetch_gas_basket_weather(start: date, today: date, api_key: str = "", _json_get_fn=None) -> pd.DataFrame:
+    """Daily mean temperature at the basket's cities: what happened (Open-Meteo's archive, about five days behind) from start,
+    then the forecast model's last ten days and next sixteen. date, city, temperature, kind ("actual" or "forecast")."""
+    request = _json_get_fn or _json_get
+    frames = []
+    archive_end = today - timedelta(days=6)
+    if start <= archive_end:
+        payload = request(OPEN_METEO_ARCHIVE_BASE, params=_basket_params(daily="temperature_2m_mean", start_date=start.isoformat(), end_date=archive_end.isoformat()))
+        frames += [(payload, "actual")]
+    extra = {"apikey": api_key.strip()} if api_key.strip() else {}
+    frames += [(request(OPEN_METEO_CUSTOMER_BASE if extra else OPEN_METEO_FORECAST_BASE, params=_basket_params(daily="temperature_2m_mean", past_days=10, forecast_days=16, **extra)), "forecast")]
+    rows = []
+    for payload, kind in frames:
+        for city, answer in zip(GAS_BASKET, payload if isinstance(payload, list) else [payload]):
+            daily = answer.get("daily", {}) if isinstance(answer, dict) else {}
+            rows.append(pd.DataFrame({"date": pd.to_datetime(daily.get("time", [])), "city": city, "temperature": pd.to_numeric(pd.Series(daily.get("temperature_2m_mean", [])), errors="coerce"), "kind": kind}))
+    out = pd.concat(rows, ignore_index=True).dropna(subset=["temperature"])
+    if out.empty:
+        raise RuntimeError("Open-Meteo returned no temperatures for the gas demand cities.")
+    # Where both are held, what happened wins over a forecast.
+    return out.sort_values("kind").drop_duplicates(["date", "city"], keep="first").sort_values(["date", "city"]).reset_index(drop=True)
+
+
+def fetch_gas_basket_ensemble(api_key: str = "", _json_get_fn=None) -> pd.DataFrame:
+    """ECMWF's 51 weather scenarios for the basket's cities, 15 days: date, member, temperature (weighted like the basket)."""
+    params = _basket_params(hourly="temperature_2m", models=OPEN_METEO_ENSEMBLE_MODEL, forecast_days=GAS_HORIZON_DAYS)
+    if api_key.strip():
+        params["apikey"] = api_key.strip()
+    payload = (_json_get_fn or _json_get)(OPEN_METEO_ENSEMBLE_BASE, params=params)
+    frames = []
+    for city, answer in zip(GAS_BASKET, payload if isinstance(payload, list) else [payload]):
+        hourly = answer.get("hourly", {}) if isinstance(answer, dict) else {}
+        members = {k: v for k, v in hourly.items() if re.fullmatch(r"temperature_2m(_member\d+)?", k)}
+        if not members or not hourly.get("time"):
+            continue
+        frame = pd.DataFrame(members).apply(pd.to_numeric, errors="coerce").assign(date=pd.to_datetime(pd.Series(hourly["time"]).str[:10]))
+        daily = frame.groupby("date").mean().stack().rename("temperature").reset_index()
+        frames.append(daily.rename(columns={"level_1": "member"}).assign(city=city))
+    if len(frames) < len(GAS_BASKET):
+        raise RuntimeError("Open-Meteo returned weather scenarios for only some of the gas demand cities.")
+    data = pd.concat(frames, ignore_index=True)
+    weights = data["city"].map({c: v[2] for c, v in GAS_BASKET.items()})
+    basket = (data["temperature"] * weights).groupby([data["date"], data["member"]]).sum() / weights.groupby([data["date"], data["member"]]).sum()
+    return basket.rename("temperature").reset_index()
+
+
+def gas_basket_temperature(weather: Optional[pd.DataFrame]) -> pd.Series:
+    """The basket's temperature by day, weighted by gas use. A day counts only with every city."""
+    if weather is None or weather.empty:
+        return pd.Series(dtype=float)
+    table = weather.assign(date=pd.to_datetime(weather["date"])).pivot_table(index="date", columns="city", values="temperature")
+    weights = pd.Series({city: v[2] for city, v in GAS_BASKET.items()})
+    return ((table.reindex(columns=weights.index) * weights).sum(axis=1, min_count=len(weights)) / weights.sum()).dropna()
+
+
+def gas_demand_design(days: pd.DatetimeIndex, temperature: pd.Series) -> np.ndarray:
+    """Month, weekday, Christmas, heating below 18 and below 10 degrees on the day, heating the two days before (buildings keep
+    their warmth), and cooling above 22 degrees (gas burnt for air conditioning)."""
+    t = lambda lag: temperature.reindex(days - pd.Timedelta(days=lag)).to_numpy(float)
+    hinge = lambda values, base: np.clip(base - values, 0.0, None)
+    month = np.array([days.month == k for k in range(1, 13)], float).T
+    weekday = np.array([days.day_of_week == k for k in range(1, 7)], float).T
+    christmas = (((days.month == 12) & (days.day >= 24)) | ((days.month == 1) & (days.day == 1))).astype(float)[:, None]
+    return np.column_stack([month, weekday, christmas, hinge(t(0), 18.0), hinge(t(0), 10.0), hinge(t(1), 18.0), hinge(t(2), 18.0), np.clip(t(0) - 22.0, 0.0, None)])
+
+
+def fit_gas_demand(demand: pd.Series, temperature: pd.Series, until: Optional[pd.Timestamp] = None) -> Optional[np.ndarray]:
+    """Least squares on every day held up to until, a year back counting half."""
+    days = demand.dropna().index
+    days = days[days <= until] if until is not None else days
+    X, y = gas_demand_design(days, temperature), demand.reindex(days).to_numpy(float)
+    ok = np.isfinite(X).all(axis=1) & np.isfinite(y)
+    if ok.sum() < 365:
+        return None
+    root = np.sqrt(0.5 ** ((days[-1] - days[ok]).days.to_numpy() / GAS_DEMAND_HALF_LIFE))
+    return np.linalg.lstsq(X[ok] * root[:, None], y[ok] * root, rcond=None)[0]
+
+
+def gas_demand_check(demand: pd.Series, temperature: pd.Series, days: int = 364) -> dict:
+    """The last year, each week forecast by a model fitted only on the weeks before it, with the weather as it turned out:
+    average miss against last week's average. (The test with forecast weather is in the notes above GAS_BASKET.)"""
+    held = demand.dropna()
+    if len(held) < 365 + days // 2:
+        return {}
+    errors, naive = [], []
+    for start in pd.date_range(held.index[-1] - pd.Timedelta(days=days - 1), held.index[-1], freq="7D"):
+        beta = fit_gas_demand(held, temperature, until=start - pd.Timedelta(days=1))
+        week = pd.date_range(start, periods=7).intersection(held.index)
+        if beta is None or week.empty:
+            continue
+        errors.append(pd.Series(held.reindex(week).to_numpy() - gas_demand_design(week, temperature) @ beta, index=week))
+        naive += list(np.abs(held.reindex(week).to_numpy() - held.loc[:start - pd.Timedelta(days=1)].iloc[-7:].mean()))
+    errors = pd.concat(errors).dropna() if errors else pd.Series(dtype=float)
+    if len(errors) < 60:
+        return {}
+    phi = float(np.clip(errors.asfreq("D").autocorr(1), 0.0, 0.95)) if len(errors) > 30 else 0.0
+    # errors: the model's own signed misses, day by day, for the ranges; phi: how much of a miss carries to the next day.
+    return {"days": len(errors), "miss": float(errors.abs().mean()), "naive": float(np.nanmean(naive)), "level": float(held.iloc[-days:].mean()),
+            "errors": errors.asfreq("D"), "phi": phi if np.isfinite(phi) else 0.0}
+
+
+def gas_projection(daily: pd.DataFrame, weather: Optional[pd.DataFrame], ensemble: Optional[pd.DataFrame], storage: Optional[pd.DataFrame]) -> dict:
+    """The next days of the balance: demand from the weather forecast (a range from ECMWF's scenarios), supply and exports at
+    their last 14 days' average, and storage taking the difference."""
+    temperature = gas_basket_temperature(weather)
+    if daily is None or daily.empty or temperature.empty:
+        return {"ready": False, "reason": "This needs the gas balance and the temperature forecast for its cities. Select Update market data."}
+    demand = daily["Implied demand"]
+    beta = fit_gas_demand(demand, temperature)
+    if beta is None:
+        return {"ready": False, "reason": "This needs a year of the gas balance with temperatures to fit the demand model."}
+    last = demand.dropna().index[-1]
+    days = pd.date_range(last + pd.Timedelta(days=1), temperature.index.max())[:GAS_HORIZON_DAYS + 3]
+    days = days[np.isfinite(gas_demand_design(days, temperature)).all(axis=1)]
+    if len(days) < 3:
+        return {"ready": False, "reason": "The temperature forecast doesn't reach past the last gas day held yet. Select Update market data."}
+    central = gas_demand_design(days, temperature) @ beta
+    shown = temperature.reindex(days).to_numpy()
+    members, first = [], None
+    if ensemble is not None and not ensemble.empty:
+        scenarios = ensemble.assign(date=pd.to_datetime(ensemble["date"])).pivot_table(index="date", columns="member", values="temperature")
+        first = scenarios.index.min()
+        for member in scenarios.columns:
+            path = scenarios[member].dropna().combine_first(temperature)      # each scenario from its first day; before it, the forecast
+            members.append(gas_demand_design(days, path) @ beta)
+    weather_spread = np.zeros((1, len(days)))
+    if len(members) >= 10:
+        members = np.array(members)
+        mean = members.mean(axis=0)
+        # Beyond a week the scenarios' average beats the single forecast; the weather part of the range is each scenario's distance from it.
+        late = days >= first + pd.Timedelta(days=7)
+        central = np.where(late, mean, central)
+        shown = np.where(late, scenarios.mean(axis=1).reindex(days).to_numpy(), shown)
+        weather_spread = members - mean
+    check = gas_demand_check(demand, temperature)
+    # A miss carries partly into the next days (lag-one correlation about 0.6): the last known day's miss, fading by phi a day.
+    # Tested with temperatures as forecast at the time, it cut the error by 20% a day ahead, 7% at two days and 4% at three.
+    ahead = (days - last).days.to_numpy()
+    phi, errors = check.get("phi", 0.0), check.get("errors", pd.Series(dtype=float))
+    last_miss = float(demand.loc[last] - (gas_demand_design(pd.DatetimeIndex([last]), temperature) @ beta)[0])
+    central = central + (phi ** ahead) * (last_miss if np.isfinite(last_miss) else 0.0)
+    spread = paths = None
+    if len(errors.dropna()) >= 120:
+        # The model's own misses, as the corrected forecast would have made them at each horizon, starting at every day held: they keep
+        # their runs of several days, so the storage range widens as they add up. With the weather scenarios they give the 80% range:
+        # on the test, ranges from the misses alone held 79 to 82% of days up to five days ahead and 73% at seven.
+        e = errors.to_numpy()
+        starts = [s for s in range(1, len(e) - len(days) + 1) if np.isfinite(e[s - 1:s + len(days)]).all()]
+        if len(starts) >= 60:
+            paths = np.array([e[s:s + len(days)] - (phi ** ahead) * e[s - 1] for s in starts])
+            spread = central + weather_spread[:, None, :] + paths[None, :, :]
+    recent = daily.iloc[-14:]
+    supply = {line: float(recent[line].mean()) for line in daily.columns if line not in ("Implied demand", "Storage withdrawal")}
+    net = sum(supply.values())                     # supply less exports
+    held = storage.assign(day=pd.to_datetime(storage["gasDayStart"])).drop_duplicates("day", keep="last").set_index("day").sort_index() if storage is not None and not storage.empty else None
+    stock = float(_number_series(held["gasInStorage"]).loc[:last].dropna().iloc[-1]) if held is not None and "gasInStorage" in held else np.nan
+    volume = float(_number_series(held["workingGasVolume"]).loc[:last].dropna().iloc[-1]) if held is not None and "workingGasVolume" in held else np.nan
+    fill = lambda draws: (stock - np.cumsum(draws, axis=-1) / 1000.0) / volume * 100.0
+    out = {"ready": True, "days": days, "last": last, "demand": central, "temperature": shown, "supply": supply, "net": net,
+           "withdrawal": central - net, "stock": stock, "volume": volume, "fill": fill(central - net), "start_fill": stock / volume * 100.0,
+           "check": check, "recent": demand.iloc[-60:], "beta": beta, "last_miss": last_miss, "phi": phi, "members": len(members)}
+    if spread is not None:
+        flat = spread.reshape(-1, len(days))
+        filled = fill(flat - net)
+        out.update({"low": np.percentile(flat, 10, axis=0), "high": np.percentile(flat, 90, axis=0),
+                    "fill_low": np.percentile(filled, 10, axis=0), "fill_high": np.percentile(filled, 90, axis=0)})
+    return out
+
+
 def fetch_open_meteo(latitude: float, longitude: float, timezone_name: str,
                      past_days: int = 3, forecast_days: int = 7,
                      api_key: str = "", commercial_endpoint: bool = False,
@@ -7775,7 +8082,7 @@ hr {{ border-color:{BORDER}; margin:0.6rem 0; }}
 .pill.good i {{ background:{GAIN}; }} .pill.warn i {{ background:{SODIUM}; }}
 
 /* Notes: the plain-language summary panels */
-.st-key-hero {{ padding:12px 15px 10px; border:var(--line); border-top:2px solid var(--accent); border-radius:6px;
+.st-key-hero, .st-key-hero2 {{ padding:12px 15px 10px; border:var(--line); border-top:2px solid var(--accent); border-radius:6px;
   background:linear-gradient(135deg, color-mix(in srgb, var(--accent) 11%, {PANEL}) 0%, {PANEL} 55%); }}
 .st-key-hero [data-testid="stPlotlyChart"] {{ border:0; background:none; }}
 .desk-note {{ font-size:1rem; line-height:1.45; color:{TEXT}; max-width:110ch; margin:0; }}
@@ -8101,7 +8408,7 @@ def kpi(col, label: str, value: str, sub: str = "", accent: str = "", tone: str 
                  f'<div class="v {tone}">{html.escape(value)}</div>{note}{bar}</div>', unsafe_allow_html=True)
 
 
-STATUS_SOURCES = (("ENTSO-E", ("entsoe_", "fund_daily"), 30.0), ("GIE", ("gie_",), 30.0), ("Open-Meteo", ("weather_", "zone_weather_", "fund_weather_"), 30.0),
+STATUS_SOURCES = (("ENTSO-E", ("entsoe_", "fund_daily"), 30.0), ("GIE", ("gie_",), 30.0), ("ENTSOG", ("gas_balance_", "entsog_"), 30.0),("Open-Meteo", ("weather_", "zone_weather_", "fund_weather_"), 30.0),
                   ("TradingView", ("tradingview_",), 3.0), ("EEX", ("eex_",), 80.0), ("THE", ("the_",), 30.0), ("OpenHolidays", ("holidays",), 24.0 * 10))
 
 
@@ -8409,7 +8716,7 @@ UPDATE_DEFAULT_ZONES = ("France", "Germany-Luxembourg")
 PRICE_HISTORY_DAYS = EPF_HISTORY_DAYS   # prices and load forecasts: two years before the price forecast's VALIDATION and TEST
 FORECAST_HISTORY_DAYS = 300             # ENTSO-E's wind and solar forecasts, for the fundamentals outlook
 STALE_HOURS = {"tradingview": 1.0, "prices": 6.0, "fundamentals": 6.0, "weather": 3.0, "fx": 12.0, "normals": 24.0 * 30.0, "power_weather": 72.0, "ensemble": 6.0, "holidays": 24.0 * 7}
-KEEP_DAYS = {"prices": EPF_HISTORY_DAYS + 30, "load": 90, "generation": 90, "lng": 400}
+KEEP_DAYS = {"prices": EPF_HISTORY_DAYS + 30, "load": 90, "generation": 90, "lng": (date.today() - GAS_BALANCE_START).days + 60}
 MAX_UPDATE_WORKERS = 16         # every source of a morning update starts at once; ENTSO-E is capped on its own (ENTSOE_MAX_CONCURRENT)
 OPEN_METEO_WORKERS = 2          # weather gets its own lane: Open-Meteo counts requests per minute
 # When each source publishes something new, in Brussels time. A source fetched after its latest publication is skipped,
@@ -8690,13 +8997,49 @@ def plan_update(force=True, today: Optional[date] = None) -> list[UpdateTask]:
             _stored_live_item("gie_agsi", "AGSI gas storage", merged.tail(40).reset_index(drop=True), meta)
             return f"{len(frame):,} new rows, {len(merged):,} held"
         tasks.append(UpdateTask("EU gas storage", keyed("gie", lambda: fetch_gie_history("AGSI", keys["gie"], "Europe / EU datasets", start, today)), apply_storage, start))
-    if _needs_update("gie_alsi", "fundamentals", force) and not (_held_frame("gie_alsi") is not None and _nothing_new("gie_alsi", "gie", force)):
-        held = _held_frame("gie_alsi")
-        lng_start = incremental_start(held, "gasDayStart", 60, 30, today)
+    held_lng = _held_frame("gie_alsi")
+    lng_short = held_lng is not None and pd.to_datetime(held_lng["gasDayStart"]).min().date() > GAS_BALANCE_START + timedelta(days=35)
+    if lng_short or (_needs_update("gie_alsi", "fundamentals", force) and not (held_lng is not None and _nothing_new("gie_alsi", "gie", force))):
+        held = held_lng
+        lng_start = incremental_start(held, "gasDayStart", (today - GAS_BALANCE_START).days, 30, today)
+        if held is not None and pd.to_datetime(held["gasDayStart"]).min().date() > GAS_BALANCE_START + timedelta(days=35):
+            lng_start = GAS_BALANCE_START          # the gas balance needs send-out back to its start: extended once
         def apply_lng(frame: pd.DataFrame) -> str:
             merged = store_observations("gie_alsi", "ALSI LNG terminals", frame, {"scope": "Europe / EU datasets", "country": ""}, ("gasDayStart", "name"), "gasDayStart", KEEP_DAYS["lng"])
             return f"{len(frame):,} new rows, {len(merged):,} held"
         tasks.append(UpdateTask("EU LNG terminals", keyed("gie", lambda: fetch_gie_history("ALSI", keys["gie"], "Europe / EU datasets", lng_start, today)), apply_lng, lng_start))
+    if _needs_update("gas_balance_flows", "fundamentals", force):
+        held = _held_frame("gas_balance_flows")
+        fresh = held is None or _live_item_meta("gas_balance_flows").get("version") != GAS_BALANCE_VERSION
+        # ENTSOG revises its provisional figures for some days, so the last ten are read again.
+        routes_start = GAS_BALANCE_START if fresh else max(GAS_BALANCE_START, pd.Timestamp(held["day"].max()).date() - timedelta(days=10))
+        def apply_routes(frame: pd.DataFrame, fresh=fresh) -> str:
+            meta = {"version": GAS_BALANCE_VERSION, "source": "ENTSOG Transparency Platform"}
+            if fresh:
+                _stored_live_item("gas_balance_flows", "EU gas flows by route", frame, meta)
+                merged = frame
+            else:
+                merged = store_observations("gas_balance_flows", "EU gas flows by route", frame, meta, ("day", "line"), "day")
+            return f"{pd.to_datetime(frame['day']).nunique():,} gas days fetched, {pd.to_datetime(merged['day']).nunique():,} held"
+        tasks.append(UpdateTask("EU gas flows by route", lambda: fetch_gas_routes(routes_start, today - timedelta(days=1)), apply_routes, routes_start))
+    if _needs_update("eurostat_gas", "holidays", force == "all"):
+        def apply_eurostat(frame: pd.DataFrame) -> str:
+            _stored_live_item("eurostat_gas", "Eurostat monthly EU gas consumption", frame, {"source": "Eurostat nrg_cb_gasm"})
+            return f"to {pd.Timestamp(frame['month'].max()):%b %Y}"
+        tasks.append(UpdateTask("Eurostat monthly gas consumption", lambda: fetch_eurostat_gas_consumption(GAS_BALANCE_START), apply_eurostat))
+    if _needs_update("gas_basket_weather", "weather", force):
+        held = _held_frame("gas_basket_weather")
+        actual = held.loc[held["kind"].eq("actual"), "date"] if held is not None and "kind" in held.columns else pd.Series(dtype=object)
+        basket_start = GAS_WEATHER_START if actual.empty else max(GAS_WEATHER_START, pd.Timestamp(actual.max()).date() - timedelta(days=3))
+        def apply_basket(frame: pd.DataFrame) -> str:
+            merged = store_observations("gas_basket_weather", "Temperatures for EU gas demand", frame, {"cities": list(GAS_BASKET)}, ("date", "city"), "date")
+            return f"{pd.to_datetime(merged['date']).nunique():,} days held, to {pd.to_datetime(merged['date']).max():%d %b}"
+        tasks.append(UpdateTask("Weather for EU gas demand", lambda: fetch_gas_basket_weather(basket_start, today, keys["open_meteo"]), apply_basket, lane="open_meteo"))
+    if _needs_update("gas_basket_ensemble", "ensemble", force):
+        def apply_basket_ensemble(frame: pd.DataFrame) -> str:
+            _stored_live_item("gas_basket_ensemble", "ECMWF weather scenarios for EU gas demand", frame, {"model": OPEN_METEO_ENSEMBLE_MODEL})
+            return f"{frame['member'].nunique()} scenarios to {pd.to_datetime(frame['date']).max():%d %b}"
+        tasks.append(UpdateTask("Weather scenarios for EU gas demand", lambda: fetch_gas_basket_ensemble(keys["open_meteo"]), apply_basket_ensemble, lane="open_meteo"))
     flow_item = st.session_state.get("live_data", {}).get("entsog_flow")
     if isinstance(flow_item, dict) and flow_item.get("metadata", {}).get("point_direction") and _needs_update("entsog_flow", "fundamentals", force):
         point, indicator = flow_item["metadata"]["point_direction"], flow_item["metadata"].get("indicator", "Physical Flow")
@@ -12493,6 +12836,60 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
             raise AssertionError("Colder weather must leave less in storage.")
         return "On storage built from a known rule, the fit recovers the heating, weekend and fill effects, and colder weather leaves less gas."
 
+    def check_gas_balance() -> str:
+        pages = [{"operationalData": [{"v": i} for i in range(k, min(k + 2, 5))], "meta": {"total": 5}} for k in (0, 2, 4)]
+        asked = []
+        def paged(url, params=None, headers=None):
+            asked.append(int(params["offset"]))
+            return pages[len(asked) - 1]
+        if len(_entsog_pages("operationalData", {}, paged, page=2)) != 5 or asked != [0, 2, 4]:
+            raise AssertionError("ENTSOG answers must be read page by page up to their stated total.")
+        row = lambda key, label, tso, neighbour, direction="entry", **extra: {"operatorKey": f"{tso}-TSO", "pointKey": key, "pointLabel": label, "tSOCountry": tso,
+                                                                               "adjacentCountry": neighbour, "directionKey": direction, "hasData": True, **extra}
+        catalogue = pd.DataFrame([row("P1", "Dornum / NETRA (OGE)", "DE", "NO"), row("P2", "Dornum / NETRA (GUD)", "DE", "NO", pipeInPipeWithTsoLabel="Open Grid Europe"),
+                                  row("ITP-00525", "Dornum GASPOOL", "DE", "NO"), row("ITP-00008", "Melendugno - IT / TAP", "IT", "CH"), row("ITP-00048", "Almería", "ES", "ES"),
+                                  row("P3", "Strandzha 2 (BG) / Malkoclar (TR)", "BG", "TR"), row("P4", "Oberkappel", "AT", "DE"), row("P5", "St. Fergus", "UK", "NO"),
+                                  row("P6", "Wallbach", "DE", "CH", "exit"), row("P7", "Kipi (TR) / Kipi (GR)", "GR", "TR")])
+        points = gas_border_points(catalogue).set_index("pointKey")["route"].to_dict()
+        if points != {"P1": "Norway", "ITP-00008": "Azerbaijan (TAP)", "ITP-00048": "North Africa", "P3": "TurkStream", "P6": "Exports", "P7": "Other imports"}:
+            raise AssertionError(f"Border points or routes are wrong: {points}")
+        days = pd.date_range("2026-01-01", periods=3)
+        flows = pd.DataFrame({"day": np.repeat(days, 2), "line": ["Norway", "Exports"] * 3, "GWh": [3000.0, -500.0] * 3})
+        lng = pd.DataFrame({"gasDayStart": days.strftime("%Y-%m-%d"), "sendOut": [4000.0, 4000.0, 4000.0]})
+        storage = pd.DataFrame({"gasDayStart": days[:2].strftime("%Y-%m-%d"), "netWithdrawal": [1000.0, -2000.0]})
+        balance = gas_balance(flows, lng, storage)
+        if len(balance) != 2 or balance["Implied demand"].tolist() != [7500.0, 4500.0]:
+            raise AssertionError(f"Implied demand must be supply plus storage withdrawal less exports, on days every source covers: {balance}")
+        return ("ENTSOG pages are read to the end; a flow inside another operator's pipe, a repeated point, an intra-EU point and the UK's own side are left "
+                "out; TAP, Medgaz and TurkStream get their routes; implied demand is supply plus storage less exports.")
+
+    def check_gas_projection() -> str:
+        rng = np.random.default_rng(3)
+        days = pd.date_range("2023-01-01", periods=760)
+        temperature = pd.Series(11.0 - 9.0 * np.cos(2 * np.pi * (days.day_of_year - 15) / 365.25) + rng.normal(0, 2.0, len(days)), index=days)
+        truth = 6000.0 + 450.0 * np.clip(18.0 - temperature, 0, None) + rng.normal(0, 150.0, len(days))
+        held = days[:-12]
+        daily = pd.DataFrame({"Norway": 2600.0, "LNG": 3400.0, "Exports": -800.0}, index=held)
+        daily["Storage withdrawal"] = truth[:-12] - 5200.0
+        daily["Implied demand"] = daily.sum(axis=1)
+        weather = pd.concat([pd.DataFrame({"date": days, "city": city, "temperature": temperature.to_numpy(), "kind": "actual"}) for city in GAS_BASKET])
+        future = days[-12:]
+        ensemble = pd.concat([pd.DataFrame({"date": future, "member": f"m{k}", "temperature": temperature.reindex(future).to_numpy() + k - 5.0}) for k in range(11)])
+        storage = pd.DataFrame({"gasDayStart": held.strftime("%Y-%m-%d"), "gasInStorage": 900.0, "workingGasVolume": 1100.0})
+        p = gas_projection(daily, weather, ensemble, storage)
+        if not p["ready"] or len(p["days"]) != 12:
+            raise AssertionError(f"The projection should cover the 12 days after the last one held: {p.get('reason')}")
+        miss = np.abs(p["demand"] - truth[-12:]).mean()
+        if miss > 300.0:
+            raise AssertionError(f"On a known rule the demand model should land near the noise (150 GWh/d): it missed by {miss:.0f}.")
+        expected = (900.0 - np.cumsum(p["demand"] - 5200.0) / 1000.0) / 1100.0 * 100.0
+        if not np.allclose(p["fill"], expected) or not np.isclose(p["net"], 5200.0):
+            raise AssertionError("Storage must take the difference between demand and supply less exports, day by day.")
+        if not (np.all(p["low"] <= p["demand"] + 1e-6) and np.all(p["high"] >= p["demand"] - 1e-6) and p["high"][-1] > p["low"][-1]):
+            raise AssertionError("The weather scenarios must give a range around the forecast, wider for colder and warmer ones.")
+        return (f"On a known rule the demand model misses by {miss:.0f} GWh/d (the noise is 150), storage follows demand less supply day by day, "
+                "and colder and warmer weather scenarios widen the range around the forecast.")
+
     def check_winter_projection() -> str:
         fill, hdd = _winter_fixture()
         today = date(2026, 11, 5)
@@ -13590,6 +13987,8 @@ def run_model_validation(current_trades: pd.DataFrame, current_curves: dict[str,
         ("Track record can't see the future", "Track record", check_track_no_lookahead),
         ("Winter model recovers known effects", "Winter outlook", check_winter_model),
         ("Winter scenarios are ordered and dated", "Winter outlook", check_winter_projection),
+        ("Gas balance: border points, duplicates and the identity", "Gas balance", check_gas_balance),
+        ("Gas balance: demand from weather and the storage path", "Gas balance", check_gas_projection),
         ("Hedge advisor: exact offset by hand", "Hedge Advisor", check_hedge_exact_offset),
         ("Hedge advisor: P&L and risk drivers", "Hedge Advisor", check_hedge_var_matches_engine),
         ("Hedge advisor: edge cases", "Hedge Advisor", check_hedge_edge_cases),
@@ -14996,6 +15395,134 @@ def _outlook_figure(outlook: dict) -> go.Figure:
     return fig
 
 
+def gas_balance_daily() -> pd.DataFrame:
+    return session_memo("gas_balance", (), lambda: gas_balance(_live_dataset_frame("gas_balance_flows"), _live_dataset_frame("gie_alsi"), _live_dataset_frame("gie_agsi_history")))
+
+
+def render_gas_projection() -> None:
+    st.subheader("The next 15 days")
+    p = session_memo("gas_projection", (), lambda: gas_projection(gas_balance_daily(), _live_dataset_frame("gas_basket_weather"),
+                                                                   _live_dataset_frame("gas_basket_ensemble"), _live_dataset_frame("gie_agsi_history")))
+    if not p["ready"]:
+        need_data_note(p["reason"])
+        return
+    days, demand, recent = p["days"], p["demand"], p["recent"]
+    ranged = "low" in p
+    span = f"{days[0]:%d %b} to {days[-1]:%d %b}"
+    change = (demand.mean() / recent.iloc[-7:].mean() - 1) * 100
+    draw = float(p["withdrawal"].sum()) / 1000.0
+    fill_text = f", to <b>{p['fill'][-1]:.1f}%</b> full on {days[-1]:%d %b}" if np.isfinite(p["fill"][-1]) else ""
+    fill_range = f" (80% range {p['fill_low'][-1]:.1f} to {p['fill_high'][-1]:.1f}%)" if ranged and np.isfinite(p["fill"][-1]) else ""
+    scenarios = f"ECMWF's {p['members']} weather scenarios and " if p["members"] else ""
+    check = p["check"]
+    test = (f"Over the last year here, each week forecast by a model that hadn't seen it and given the weather as it turned out, it missed by "
+            f"{check['miss']:,.0f} GWh/d ({check['miss'] / check['level'] * 100:.1f}%), against {check['naive']:,.0f} for last week's average. " if check else "")
+    with st.container(key="hero2"):
+        st.markdown(f'<div class="desk-note"><p>With the weather forecast, EU demand averages about <b>{demand.mean():,.0f} GWh/d</b> from {span}'
+                    + (f" (80% range {p['low'].mean():,.0f} to {p['high'].mean():,.0f}, from {scenarios}the model's own past misses)" if ranged else "")
+                    + f', {abs(change):.0f}% {"above" if change > 0 else "below"} the last week held. With supply less exports at the last two weeks\' '
+                    f'{p["net"]:,.0f} GWh/d, storage {"falls" if draw > 0 else "rises"} by <b>{abs(draw):.1f} TWh</b>{fill_text}{fill_range}.</p>'
+                    f'<p class="soft">{test}The last day held missed by {p["last_miss"]:+,.0f} GWh/d; {p["phi"]:.0%} of a miss carries to the next day, so the '
+                    'first days are moved by part of it. Beyond a week ahead the forecast is the average of the scenarios. Tested with temperatures as forecast at the '
+                    'time, on 682 days from January 2025, the model missed by 5.9% of demand a day ahead and 6.5% a week ahead, against 9.7% and 12.1% for the best '
+                    'simple rule; carrying the last miss cut the day-ahead error by a further 20%, and the 80% range held 79 to 82% of days up to five days ahead. '
+                    'Supply is held at its recent level, so an outage or a wave of LNG shows only once it starts.</p></div>', unsafe_allow_html=True)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=recent.index, y=recent.to_numpy(), mode="lines", name="Implied demand", line=dict(color=TEXT, width=2)))
+    if ranged:
+        fig.add_trace(go.Scatter(x=np.r_[days, days[::-1]], y=np.r_[p["high"], p["low"][::-1]], fill="toself", fillcolor="rgba(232,163,61,0.22)", line=dict(width=0),
+                                 name="80% range: weather and the model's misses", hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=days, y=demand, mode="lines", name="Demand, weather forecast", line=dict(color=AMBER, width=2, dash="dot")))
+    fig.add_trace(go.Scatter(x=[recent.index[-14], days[-1]], y=[p["net"], p["net"]], mode="lines", name="Supply less exports, held", line=dict(color=TEAL, width=1.5, dash="dash")))
+    fig.update_layout(title="EU gas demand: the last 60 days and the next 15, GWh/d", hovermode="x unified")
+    chart(fig, 380)
+    st.caption("Above the supply line, the difference comes out of storage; below it, it goes in.")
+    table(pd.DataFrame({"Gas day": [f"{d:%a %d %b}" for d in days], "Temperature, °C": np.round(p["temperature"], 1), "Demand, GWh/d": np.round(demand),
+                        **({"Range, GWh/d": [f"{lo:,.0f} to {hi:,.0f}" for lo, hi in zip(p["low"], p["high"])]} if ranged else {}),
+                        "Supply less exports": round(p["net"]), "From storage": np.round(p["withdrawal"]), "Storage, % full": np.round(p["fill"], 1)}),
+          height=37 * (len(days) + 1) + 3)
+    st.caption("Temperature is the average of Berlin, Milan, Paris, Madrid, Amsterdam, Vienna, Warsaw and Brussels, each weighted by its country's gas use.")
+    st.subheader("What if supply changes")
+    c1, c2, c3 = st.columns(3)
+    line = c1.selectbox("Supply from", [l for l in GAS_SHOCK_LINES if l in p["supply"]], key="gas_shock_line")
+    size = c2.number_input("Changes by, mcm/d", value=-30.0, step=5.0, key="gas_shock_size")
+    length = c3.number_input("For this many days", min_value=1, max_value=365, value=14, step=1, key="gas_shock_days")
+    volume = size * GAS_GWH_PER_MCM * length / 1000.0
+    points = volume / p["volume"] * 100.0 if np.isfinite(p["volume"]) and p["volume"] > 0 else np.nan
+    st.markdown(f"{line} has sent {p['supply'][line] / GAS_GWH_PER_MCM:,.0f} mcm/d over the last two weeks. {abs(size):,.0f} mcm/d {'less' if size < 0 else 'more'} for "
+                f"{length} days is **{abs(volume):.1f} TWh**, which leaves storage **{abs(points):.2f} points {'lower' if size < 0 else 'higher'}** at the end of it, "
+                "and at the end of winter too unless something makes up for it: more LNG, less demand or higher prices.")
+
+
+def render_gas_balance() -> None:
+    st.subheader("EU gas supply and demand")
+    daily = gas_balance_daily()
+    if daily.empty or len(daily) < 14:
+        need_data_note("This needs EU gas flows from ENTSOG with GIE's LNG and storage figures. Select Update market data: the first time, about two minutes in the background.")
+        update_button("gas_balance_update")
+        return
+    week = daily.rolling(7, min_periods=7).mean().dropna()
+    last, day = week.iloc[-1], week.index[-1]
+    year_ago = week.reindex([day - pd.Timedelta(days=364)]).iloc[0] if (day - pd.Timedelta(days=364)) in week.index else None
+    supply = [line for line in GAS_SUPPLY_LINES if line in week.columns]
+    total = float(last[supply].sum())
+    storage = float(last["Storage withdrawal"])
+    demand_change = (last["Implied demand"] / year_ago["Implied demand"] - 1) * 100 if year_ago is not None and year_ago["Implied demand"] > 0 else None
+    flow = f"draws <b>{storage:,.0f} GWh/d</b> from storage" if storage >= 0 else f"puts <b>{-storage:,.0f} GWh/d</b> into storage"
+    with st.container(key="hero"):
+        st.markdown(f'<div class="desk-note"><p>In the week to gas day {day:%d %b %Y}, the EU used about <b>{last["Implied demand"]:,.0f} GWh/d</b> '
+                    f'({last["Implied demand"] / GAS_GWH_PER_MCM:,.0f} mcm/d)'
+                    + (f', {abs(demand_change):.0f}% {"more" if demand_change > 0 else "less"} than a year before' if demand_change is not None else "")
+                    + f'. Supply was {total:,.0f} GWh/d, led by {", ".join(f"{line} {last[line] / total * 100:.0f}%" for line in sorted(supply, key=lambda l: -last[l])[:3])}, and the EU {flow}.</p>'
+                    '<p class="soft">Demand is implied: supply, plus what came out of storage, less exports. Over 45 months since January 2023 it ran 4% below '
+                    'Eurostat\'s monthly consumption on average, most months 2 to 7%: gas that never reaches the grid.</p></div>', unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    kpi(c1, "Implied demand, 7 days", f"{last['Implied demand']:,.0f} GWh/d", f"{demand_change:+.0f}% on a year before" if demand_change is not None else "No year-ago week held",
+        spark=week["Implied demand"].tail(90).tolist())
+    kpi(c2, "LNG share of supply", f"{last['LNG'] / total * 100:.0f}%", f"{last['LNG']:,.0f} GWh/d", spark=(week["LNG"] / week[supply].sum(axis=1) * 100).tail(90).tolist())
+    kpi(c3, "Norway, 7 days", f"{last.get('Norway', 0.0):,.0f} GWh/d", f"{last.get('Norway', 0.0) - week['Norway'].iloc[-8]:+,.0f} on the week before" if "Norway" in week and len(week) > 8 else "",
+        spark=week["Norway"].tail(90).tolist() if "Norway" in week else None)
+    kpi(c4, "Storage, 7 days", f"{storage:+,.0f} GWh/d", "Out of storage" if storage >= 0 else "Into storage", spark=week["Storage withdrawal"].tail(90).tolist())
+    span = week.loc[week.index >= day - pd.Timedelta(days=730)]
+    fig = go.Figure()
+    for line, color in zip(supply, SERIES * 2):
+        fig.add_trace(go.Scatter(x=span.index, y=span[line], mode="lines", stackgroup="supply", name=line, line=dict(width=0.5, color=color)))
+    fig.add_trace(go.Scatter(x=span.index, y=span["Implied demand"], mode="lines", name="Implied demand", line=dict(color=TEXT, width=2.5)))
+    fig.update_layout(title="Supply by route and implied demand, 7-day averages, GWh/d", yaxis_title="", hovermode="x unified")
+    chart(fig, 440)
+    st.caption("Where demand is above the supply stack, the gap came out of storage; where it is below, gas went into storage or was exported. "
+               f"1 mcm is about {GAS_GWH_PER_MCM} GWh. The latest days are provisional and revised by the network operators.")
+    render_gas_projection()
+    weekly = daily.resample("W-SUN").mean()
+    weekly = weekly.loc[daily.resample("W-SUN").size().reindex(weekly.index) == 7].tail(6)
+    shown = weekly.T.round(0)
+    shown.columns = [f"Week to {d:%d %b}" for d in shown.columns]
+    left, right = st.columns([3, 2], gap="large")
+    with left:
+        st.subheader("Last six full weeks, GWh/d")
+        table(shown.rename_axis("Line").reset_index(), height=37 * (len(shown) + 1) + 3)
+    with right:
+        st.subheader("Checked against Eurostat")
+        eurostat = _live_dataset_frame("eurostat_gas")
+        if not eurostat.empty:
+            monthly = daily["Implied demand"].resample("MS").agg(["sum", "size"])
+            monthly = monthly.loc[monthly["size"] >= 28, "sum"]
+            check = pd.DataFrame({"Implied, TWh": monthly / 1000, "Eurostat, TWh": eurostat.set_index(pd.to_datetime(eurostat["month"]))["GWh"] / 1000}).dropna().tail(6)
+            check["Gap, %"] = (check["Implied, TWh"] / check["Eurostat, TWh"] - 1) * 100
+            table(check.round(1).rename_axis("Month").reset_index().assign(Month=lambda f: f["Month"].dt.strftime("%b %Y")), height=37 * (len(check) + 1) + 3)
+            st.caption("Eurostat's inland consumption, published about three months late, is the independent test of the balance.")
+        else:
+            st.caption("Eurostat's monthly consumption loads with the next update.")
+    with st.expander("How this balance is built"):
+        st.markdown("**Imports** are the physical flows at every EU network point facing a country outside the EU, from the ENTSOG Transparency Platform, read once each: "
+                    "the EU operator's side only, without points that carry another operator's gas inside its pipe, and without Dornum GASPOOL, which repeats Dornum / NETRA. "
+                    "TAP's gas counts where it reaches Italy, Greece and Bulgaria, so it isn't counted twice on its way through Albania. Flows out of the EU (to Ukraine, Moldova, "
+                    "Serbia, Switzerland, the UK) are exports. **LNG** is the terminals' send-out and **storage** the net withdrawal, both from GIE (AGSI+ and ALSI). **Production** "
+                    "is the gas EU fields feed into the transmission networks (ENTSOG).\n\n"
+                    "**Demand** is what is left: ENTSOG's own figures for deliveries to consumers cover only about 60% of it, because many countries deliver through networks "
+                    "it doesn't see. Without the duplicate rules, Norway's supply came out a third too high and the balance 20% above Eurostat in summer.")
+
+
 def render_winter_outlook() -> None:
     st.subheader("Where EU storage could end this winter")
     outlook = winter_outlook()
@@ -16295,9 +16822,12 @@ def page_market_fundamentals():
     else:
         st.info("Select Update market data in the sidebar to see what the data shows.")
 
-    fund_tabs = view_tabs(["Gas storage", "Winter outlook", "LNG", "Power", "Gas flows", "Weather", "Cross-market analysis"])
+    fund_tabs = view_tabs(["Gas storage", "Winter outlook", "Gas balance", "LNG", "Power", "Gas flows", "Weather", "Cross-market analysis"])
     if fund_tabs[1]:
         render_winter_outlook()
+    if fund_tabs[2]:
+        render_gas_balance()
+    fund_tabs = fund_tabs[:2] + fund_tabs[3:]      # the views below keep their places
     if fund_tabs[0]:
         st.subheader("EU gas storage")
         history_item = _live_dataset_frame("gie_agsi_history")
